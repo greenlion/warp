@@ -783,7 +783,78 @@ EXISTSOP NOUNSTR {
 ;
 
 compRange2:
-mathExpr EQOP mathExpr {
+mathExpr LTOP INT64 {
+    /* exact comparisons with 64-bit integers, see qIntHod::compare */
+    $$ = ibis::qIntHod::compare(static_cast<ibis::math::term*>($1),
+                                ibis::qExpr::OP_LT, $3);
+}
+| INT64 LTOP mathExpr {
+    $$ = ibis::qIntHod::compare(static_cast<ibis::math::term*>($3),
+                                ibis::qExpr::OP_GT, $1);
+}
+| mathExpr LEOP INT64 {
+    $$ = ibis::qIntHod::compare(static_cast<ibis::math::term*>($1),
+                                ibis::qExpr::OP_LE, $3);
+}
+| INT64 LEOP mathExpr {
+    $$ = ibis::qIntHod::compare(static_cast<ibis::math::term*>($3),
+                                ibis::qExpr::OP_GE, $1);
+}
+| mathExpr GTOP INT64 {
+    $$ = ibis::qIntHod::compare(static_cast<ibis::math::term*>($1),
+                                ibis::qExpr::OP_GT, $3);
+}
+| INT64 GTOP mathExpr {
+    $$ = ibis::qIntHod::compare(static_cast<ibis::math::term*>($3),
+                                ibis::qExpr::OP_LT, $1);
+}
+| mathExpr GEOP INT64 {
+    $$ = ibis::qIntHod::compare(static_cast<ibis::math::term*>($1),
+                                ibis::qExpr::OP_GE, $3);
+}
+| INT64 GEOP mathExpr {
+    $$ = ibis::qIntHod::compare(static_cast<ibis::math::term*>($3),
+                                ibis::qExpr::OP_LE, $1);
+}
+| mathExpr BETWEENOP INT64 ANDOP INT64 {
+    $$ = ibis::qIntHod::between(static_cast<ibis::math::term*>($1), $3, $5);
+}
+| mathExpr LTOP UINT64 {
+    $$ = ibis::qUIntHod::compare(static_cast<ibis::math::term*>($1),
+                                ibis::qExpr::OP_LT, $3);
+}
+| UINT64 LTOP mathExpr {
+    $$ = ibis::qUIntHod::compare(static_cast<ibis::math::term*>($3),
+                                ibis::qExpr::OP_GT, $1);
+}
+| mathExpr LEOP UINT64 {
+    $$ = ibis::qUIntHod::compare(static_cast<ibis::math::term*>($1),
+                                ibis::qExpr::OP_LE, $3);
+}
+| UINT64 LEOP mathExpr {
+    $$ = ibis::qUIntHod::compare(static_cast<ibis::math::term*>($3),
+                                ibis::qExpr::OP_GE, $1);
+}
+| mathExpr GTOP UINT64 {
+    $$ = ibis::qUIntHod::compare(static_cast<ibis::math::term*>($1),
+                                ibis::qExpr::OP_GT, $3);
+}
+| UINT64 GTOP mathExpr {
+    $$ = ibis::qUIntHod::compare(static_cast<ibis::math::term*>($3),
+                                ibis::qExpr::OP_LT, $1);
+}
+| mathExpr GEOP UINT64 {
+    $$ = ibis::qUIntHod::compare(static_cast<ibis::math::term*>($1),
+                                ibis::qExpr::OP_GE, $3);
+}
+| UINT64 GEOP mathExpr {
+    $$ = ibis::qUIntHod::compare(static_cast<ibis::math::term*>($3),
+                                ibis::qExpr::OP_LE, $1);
+}
+| mathExpr BETWEENOP UINT64 ANDOP UINT64 {
+    $$ = ibis::qUIntHod::between(static_cast<ibis::math::term*>($1), $3, $5);
+}
+| mathExpr EQOP mathExpr {
     ibis::math::term *me2 = static_cast<ibis::math::term*>($3);
     ibis::math::term *me1 = static_cast<ibis::math::term*>($1);
 #if defined(DEBUG) && DEBUG + 0 > 1

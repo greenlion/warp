@@ -3573,6 +3573,25 @@ ibis::qIntHod::qIntHod(const char* col, const ibis::array_t<int64_t>& nums)
 void ibis::qIntHod::restrictRange(double left, double right) {
     if (left > right)
         return;
+    if (isrange) {
+        // tighten the bounds; values beyond the range of int64_t leave the
+        // corresponding bound unchanged
+        if (left > static_cast<double>(lo)) {
+            if (left >= static_cast<double>(INT64_MAX)) {
+                lo = 1; hi = 0; // nothing left
+                return;
+            }
+            lo = static_cast<int64_t>(ceil(left));
+        }
+        if (right < static_cast<double>(hi)) {
+            if (right < static_cast<double>(INT64_MIN)) {
+                lo = 1; hi = 0;
+                return;
+            }
+            hi = static_cast<int64_t>(floor(right));
+        }
+        return;
+    }
     uint32_t start = 0;
     uint32_t size = values.size();
     while (start < size && values[start] < left)
@@ -3591,6 +3610,10 @@ void ibis::qIntHod::restrictRange(double left, double right) {
 
 /// Print a short version of the query expression.
 void ibis::qIntHod::print(std::ostream& out) const {
+    if (isrange) {
+        printFull(out);
+        return;
+    }
     out << name << " IN (";
     if (values.size() > 0) {
         uint32_t prt = ((values.size() >> ibis::gVerbose) > 1) ?
@@ -3613,6 +3636,10 @@ void ibis::qIntHod::print(std::ostream& out) const {
 /// to ensure the resulting string can be parsed back as the same
 /// expression.
 void ibis::qIntHod::printFull(std::ostream& out) const {
+    if (isrange) { // can be parsed back into the same range
+        out << name << " BETWEEN " << lo << "LL AND " << hi << "LL";
+        return;
+    }
     out << name << " IN (";
     // std::copy(values.begin(), values.end(),
     //        std::ostream_iterator<int64_t>(out, "LL, "));
@@ -3625,15 +3652,77 @@ void ibis::qIntHod::printFull(std::ostream& out) const {
     out << ')';
 } // ibis::qIntHod::printFull
 
+/// Construct the range condition lo <= col <= hi.
+ibis::qIntHod* ibis::qIntHod::range(const char* col, int64_t lo, int64_t hi) {
+    qIntHod* ret = new qIntHod();
+    ret->name = col;
+    ret->isrange = true;
+    ret->lo = lo;
+    ret->hi = hi;
+    return ret;
+} // ibis::qIntHod::range
+
+/// Construct the range condition col op val.  Comparisons that can not
+/// match anything (such as col < minimum value) produce an empty range.
+ibis::qIntHod* ibis::qIntHod::range(const char* col, ibis::qExpr::COMPARE op,
+                               int64_t val) {
+    switch (op) {
+    case ibis::qExpr::OP_LT:
+        if (val == INT64_MIN) return range(col, 1, 0);
+        return range(col, INT64_MIN, val - 1);
+    case ibis::qExpr::OP_LE:
+        return range(col, INT64_MIN, val);
+    case ibis::qExpr::OP_GT:
+        if (val == INT64_MAX) return range(col, 1, 0);
+        return range(col, val + 1, INT64_MAX);
+    case ibis::qExpr::OP_GE:
+        return range(col, val, INT64_MAX);
+    case ibis::qExpr::OP_EQ:
+        return range(col, val, val);
+    default:
+        return 0;
+    }
+} // ibis::qIntHod::range
+
+/// Build the condition term op val.  A plain column is compared exactly,
+/// any other arithmetic expression in double precision.
+ibis::qExpr* ibis::qIntHod::compare(ibis::math::term* term,
+                                 ibis::qExpr::COMPARE op, int64_t val) {
+    if (term != 0 && term->termType() == ibis::math::VARIABLE) {
+        ibis::qExpr* ret =
+            range(static_cast<ibis::math::variable*>(term)->variableName(),
+                  op, val);
+        delete term;
+        return ret;
+    }
+    return new ibis::compRange
+        (term, op, new ibis::math::number(static_cast<double>(val)));
+} // ibis::qIntHod::compare
+
+/// Build the condition term BETWEEN lo AND hi.
+ibis::qExpr* ibis::qIntHod::between(ibis::math::term* term, int64_t lo, int64_t hi) {
+    if (term != 0 && term->termType() == ibis::math::VARIABLE) {
+        ibis::qExpr* ret =
+            range(static_cast<ibis::math::variable*>(term)->variableName(),
+                  lo, hi);
+        delete term;
+        return ret;
+    }
+    return new ibis::compRange
+        (new ibis::math::number(static_cast<double>(lo)), ibis::qExpr::OP_LE,
+         term, ibis::qExpr::OP_LE,
+         new ibis::math::number(static_cast<double>(hi)));
+} // ibis::qIntHod::between
+
 /// Constructor.  Take a single number.
 ibis::qUIntHod::qUIntHod(const char* col, uint64_t v1)
-    : ibis::qRange(ibis::qExpr::INTHOD), name(col), values(1) {
+    : ibis::qRange(ibis::qExpr::UINTHOD), name(col), values(1) {
     values[0] = v1;
 } // ibis::qUIntHod::qUIntHod
 
 /// Constructor.  Take two numbers.
 ibis::qUIntHod::qUIntHod(const char* col, uint64_t v1, uint64_t v2)
-    : ibis::qRange(ibis::qExpr::INTHOD), name(col), values(2) {
+    : ibis::qRange(ibis::qExpr::UINTHOD), name(col), values(2) {
     if (v1 == v2) {
         values.resize(1);
         values[0] = v1;
@@ -3695,6 +3784,25 @@ ibis::qUIntHod::qUIntHod(const char* col, const ibis::array_t<uint64_t>& nums)
 void ibis::qUIntHod::restrictRange(double left, double right) {
     if (left > right)
         return;
+    if (isrange) {
+        // tighten the bounds; values beyond the range of uint64_t leave the
+        // corresponding bound unchanged
+        if (left > static_cast<double>(lo)) {
+            if (left >= static_cast<double>(UINT64_MAX)) {
+                lo = 1; hi = 0; // nothing left
+                return;
+            }
+            lo = static_cast<uint64_t>(ceil(left));
+        }
+        if (right < static_cast<double>(hi)) {
+            if (right < static_cast<double>(0)) {
+                lo = 1; hi = 0;
+                return;
+            }
+            hi = static_cast<uint64_t>(floor(right));
+        }
+        return;
+    }
     uint32_t start = 0;
     uint32_t size = values.size();
     while (start < size && values[start] < left)
@@ -3713,6 +3821,10 @@ void ibis::qUIntHod::restrictRange(double left, double right) {
 
 /// Print a short version of the expression.
 void ibis::qUIntHod::print(std::ostream& out) const {
+    if (isrange) {
+        printFull(out);
+        return;
+    }
     out << name << " IN (";
     if (values.size() > 0) {
         uint32_t prt = ((values.size() >> ibis::gVerbose) > 1) ?
@@ -3735,6 +3847,10 @@ void ibis::qUIntHod::print(std::ostream& out) const {
 /// each number so that they are guaranteed to be translated to the same
 /// type query expression is the output is sent back to the parser again.
 void ibis::qUIntHod::printFull(std::ostream& out) const {
+    if (isrange) { // can be parsed back into the same range
+        out << name << " BETWEEN " << lo << "ULL AND " << hi << "ULL";
+        return;
+    }
     out << name << " IN (";
     // std::copy(values.begin(), values.end(),
     //        std::ostream_iterator<uint64_t>(out, "ULL, "));
@@ -3746,6 +3862,68 @@ void ibis::qUIntHod::printFull(std::ostream& out) const {
     }
     out << ')';
 } // ibis::qUIntHod::printFull
+
+/// Construct the range condition lo <= col <= hi.
+ibis::qUIntHod* ibis::qUIntHod::range(const char* col, uint64_t lo, uint64_t hi) {
+    qUIntHod* ret = new qUIntHod();
+    ret->name = col;
+    ret->isrange = true;
+    ret->lo = lo;
+    ret->hi = hi;
+    return ret;
+} // ibis::qUIntHod::range
+
+/// Construct the range condition col op val.  Comparisons that can not
+/// match anything (such as col < minimum value) produce an empty range.
+ibis::qUIntHod* ibis::qUIntHod::range(const char* col, ibis::qExpr::COMPARE op,
+                               uint64_t val) {
+    switch (op) {
+    case ibis::qExpr::OP_LT:
+        if (val == 0) return range(col, 1, 0);
+        return range(col, 0, val - 1);
+    case ibis::qExpr::OP_LE:
+        return range(col, 0, val);
+    case ibis::qExpr::OP_GT:
+        if (val == UINT64_MAX) return range(col, 1, 0);
+        return range(col, val + 1, UINT64_MAX);
+    case ibis::qExpr::OP_GE:
+        return range(col, val, UINT64_MAX);
+    case ibis::qExpr::OP_EQ:
+        return range(col, val, val);
+    default:
+        return 0;
+    }
+} // ibis::qUIntHod::range
+
+/// Build the condition term op val.  A plain column is compared exactly,
+/// any other arithmetic expression in double precision.
+ibis::qExpr* ibis::qUIntHod::compare(ibis::math::term* term,
+                                 ibis::qExpr::COMPARE op, uint64_t val) {
+    if (term != 0 && term->termType() == ibis::math::VARIABLE) {
+        ibis::qExpr* ret =
+            range(static_cast<ibis::math::variable*>(term)->variableName(),
+                  op, val);
+        delete term;
+        return ret;
+    }
+    return new ibis::compRange
+        (term, op, new ibis::math::number(static_cast<double>(val)));
+} // ibis::qUIntHod::compare
+
+/// Build the condition term BETWEEN lo AND hi.
+ibis::qExpr* ibis::qUIntHod::between(ibis::math::term* term, uint64_t lo, uint64_t hi) {
+    if (term != 0 && term->termType() == ibis::math::VARIABLE) {
+        ibis::qExpr* ret =
+            range(static_cast<ibis::math::variable*>(term)->variableName(),
+                  lo, hi);
+        delete term;
+        return ret;
+    }
+    return new ibis::compRange
+        (new ibis::math::number(static_cast<double>(lo)), ibis::qExpr::OP_LE,
+         term, ibis::qExpr::OP_LE,
+         new ibis::math::number(static_cast<double>(hi)));
+} // ibis::qUIntHod::between
 
 void ibis::qExists::print(std::ostream& out) const {
     if (name.empty()) return;

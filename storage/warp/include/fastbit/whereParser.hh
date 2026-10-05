@@ -1,4 +1,4 @@
-// A Bison parser, made by GNU Bison 3.7.6.
+// A Bison parser, made by GNU Bison 3.8.2.
 
 // Skeleton interface for Bison LALR(1) parsers in C++
 
@@ -121,12 +121,18 @@
 # define YY_USE(E) /* empty */
 #endif
 
-#if defined __GNUC__ && ! defined __ICC && 407 <= __GNUC__ * 100 + __GNUC_MINOR__
 /* Suppress an incorrect diagnostic about yylval being uninitialized.  */
-# define YY_IGNORE_MAYBE_UNINITIALIZED_BEGIN                            \
+#if defined __GNUC__ && ! defined __ICC && 406 <= __GNUC__ * 100 + __GNUC_MINOR__
+# if __GNUC__ * 100 + __GNUC_MINOR__ < 407
+#  define YY_IGNORE_MAYBE_UNINITIALIZED_BEGIN                           \
+    _Pragma ("GCC diagnostic push")                                     \
+    _Pragma ("GCC diagnostic ignored \"-Wuninitialized\"")
+# else
+#  define YY_IGNORE_MAYBE_UNINITIALIZED_BEGIN                           \
     _Pragma ("GCC diagnostic push")                                     \
     _Pragma ("GCC diagnostic ignored \"-Wuninitialized\"")              \
     _Pragma ("GCC diagnostic ignored \"-Wmaybe-uninitialized\"")
+# endif
 # define YY_IGNORE_MAYBE_UNINITIALIZED_END      \
     _Pragma ("GCC diagnostic pop")
 #else
@@ -178,9 +184,9 @@
 # define YYDEBUG 1
 #endif
 
-#line 26 "whereParser.yy"
+#line 25 "whereParser.yy"
 namespace ibis {
-#line 184 "whereParser.hh"
+#line 190 "whereParser.hh"
 
 
 
@@ -189,11 +195,16 @@ namespace ibis {
   class whereParser
   {
   public:
-#ifndef YYSTYPE
+#ifdef YYSTYPE
+# ifdef __GNUC__
+#  pragma GCC message "bison: do not #define YYSTYPE in C++, use %define api.value.type"
+# endif
+    typedef YYSTYPE value_type;
+#else
     /// Symbol semantic values.
-    union semantic_type
+    union value_type
     {
-#line 37 "whereParser.yy"
+#line 36 "whereParser.yy"
 
     int		 integerVal;
     int64_t	 int64Val;
@@ -202,12 +213,13 @@ namespace ibis {
     std::string *stringVal;
     ibis::qExpr *whereNode;
 
-#line 206 "whereParser.hh"
+#line 217 "whereParser.hh"
 
     };
-#else
-    typedef YYSTYPE semantic_type;
 #endif
+    /// Backward compatibility (Bison 3.8).
+    typedef value_type semantic_type;
+
     /// Symbol locations.
     typedef location location_type;
 
@@ -270,8 +282,8 @@ namespace ibis {
     DIVOP = 287,                   // "/"
     REMOP = 288,                   // "%"
     EXPOP = 289,                   // "**"
-    INT64 = 290,                   // "(64-bit) integer value"
-    UINT64 = 291,                  // "unsigned (64-bit) integer value"
+    INT64 = 290,                   // "integer value"
+    UINT64 = 291,                  // "unsigned integer value"
     NUMBER = 292,                  // "floating-point number"
     INTSEQ = 293,                  // "signed integer sequence"
     UINTSEQ = 294,                 // "unsigned integer sequence"
@@ -286,7 +298,7 @@ namespace ibis {
     };
 
     /// Token kind, as returned by yylex.
-    typedef token::yytokentype token_kind_type;
+    typedef token::token_kind_type token_kind_type;
 
     /// Backward compatibility alias (Bison 3.6).
     typedef token_kind_type token_type;
@@ -333,8 +345,8 @@ namespace ibis {
         S_DIVOP = 32,                            // "/"
         S_REMOP = 33,                            // "%"
         S_EXPOP = 34,                            // "**"
-        S_INT64 = 35,                            // "(64-bit) integer value"
-        S_UINT64 = 36,                           // "unsigned (64-bit) integer value"
+        S_INT64 = 35,                            // "integer value"
+        S_UINT64 = 36,                           // "unsigned integer value"
         S_NUMBER = 37,                           // "floating-point number"
         S_INTSEQ = 38,                           // "signed integer sequence"
         S_UINTSEQ = 39,                          // "unsigned integer sequence"
@@ -376,7 +388,7 @@ namespace ibis {
       typedef Base super_type;
 
       /// Default constructor.
-      basic_symbol ()
+      basic_symbol () YY_NOEXCEPT
         : value ()
         , location ()
       {}
@@ -398,7 +410,7 @@ namespace ibis {
 
       /// Constructor for symbols with semantic value.
       basic_symbol (typename Base::kind_type t,
-                    YY_RVREF (semantic_type) v,
+                    YY_RVREF (value_type) v,
                     YY_RVREF (location_type) l);
 
       /// Destroy the symbol.
@@ -406,6 +418,8 @@ namespace ibis {
       {
         clear ();
       }
+
+
 
       /// Destroy contents, and record that is empty.
       void clear () YY_NOEXCEPT
@@ -429,7 +443,7 @@ namespace ibis {
       void move (basic_symbol& s);
 
       /// The semantic value.
-      semantic_type value;
+      value_type value;
 
       /// The location.
       location_type location;
@@ -444,22 +458,24 @@ namespace ibis {
     /// Type access provider for token (enum) based symbols.
     struct by_kind
     {
-      /// Default constructor.
-      by_kind ();
-
-#if 201103L <= YY_CPLUSPLUS
-      /// Move constructor.
-      by_kind (by_kind&& that);
-#endif
-
-      /// Copy constructor.
-      by_kind (const by_kind& that);
-
       /// The symbol kind as needed by the constructor.
       typedef token_kind_type kind_type;
 
+      /// Default constructor.
+      by_kind () YY_NOEXCEPT;
+
+#if 201103L <= YY_CPLUSPLUS
+      /// Move constructor.
+      by_kind (by_kind&& that) YY_NOEXCEPT;
+#endif
+
+      /// Copy constructor.
+      by_kind (const by_kind& that) YY_NOEXCEPT;
+
       /// Constructor from (external) token numbers.
-      by_kind (kind_type t);
+      by_kind (kind_type t) YY_NOEXCEPT;
+
+
 
       /// Record that this symbol is empty.
       void clear () YY_NOEXCEPT;
@@ -561,7 +577,7 @@ namespace ibis {
 
 
     /// Stored state numbers (used for stacks).
-    typedef unsigned char state_type;
+    typedef short state_type;
 
     /// The arguments of the error message.
     int yy_syntax_error_arguments_ (const context& yyctx,
@@ -577,19 +593,19 @@ namespace ibis {
 
     /// Whether the given \c yypact_ value indicates a defaulted state.
     /// \param yyvalue   the value to check
-    static bool yy_pact_value_is_default_ (int yyvalue);
+    static bool yy_pact_value_is_default_ (int yyvalue) YY_NOEXCEPT;
 
     /// Whether the given \c yytable_ value indicates a syntax error.
     /// \param yyvalue   the value to check
-    static bool yy_table_value_is_error_ (int yyvalue);
+    static bool yy_table_value_is_error_ (int yyvalue) YY_NOEXCEPT;
 
     static const signed char yypact_ninf_;
     static const signed char yytable_ninf_;
 
     /// Convert a scanner token kind \a t to a symbol kind.
     /// In theory \a t should be a token_kind_type, but character literals
-    /// are valid, yet not members of the token_type enum.
-    static symbol_kind_type yytranslate_ (int t);
+    /// are valid, yet not members of the token_kind_type enum.
+    static symbol_kind_type yytranslate_ (int t) YY_NOEXCEPT;
 
     /// Convert the symbol name \a n to a form suitable for a diagnostic.
     static std::string yytnamerr_ (const char *yystr);
@@ -617,18 +633,18 @@ namespace ibis {
     // YYTABLE[YYPACT[STATE-NUM]] -- What to do in state STATE-NUM.  If
     // positive, shift that token.  If negative, reduce the rule whose
     // number is the opposite.  If YYTABLE_NINF, syntax error.
-    static const unsigned char yytable_[];
+    static const short yytable_[];
 
     static const short yycheck_[];
 
-    // YYSTOS[STATE-NUM] -- The (internal number of the) accessing
-    // symbol of state STATE-NUM.
+    // YYSTOS[STATE-NUM] -- The symbol kind of the accessing symbol of
+    // state STATE-NUM.
     static const signed char yystos_[];
 
-    // YYR1[YYN] -- Symbol number of symbol that rule YYN derives.
+    // YYR1[RULE-NUM] -- Symbol kind of the left-hand side of rule RULE-NUM.
     static const signed char yyr1_[];
 
-    // YYR2[YYN] -- Number of symbols on the right hand side of rule YYN.
+    // YYR2[RULE-NUM] -- Number of symbols on the right-hand side of rule RULE-NUM.
     static const signed char yyr2_[];
 
 
@@ -727,7 +743,7 @@ namespace ibis {
       typedef typename S::size_type size_type;
       typedef typename std::ptrdiff_t index_type;
 
-      stack (size_type n = 200)
+      stack (size_type n = 200) YY_NOEXCEPT
         : seq_ (n)
       {}
 
@@ -806,7 +822,7 @@ namespace ibis {
       class slice
       {
       public:
-        slice (const stack& stack, index_type range)
+        slice (const stack& stack, index_type range) YY_NOEXCEPT
           : stack_ (stack)
           , range_ (range)
         {}
@@ -856,14 +872,14 @@ namespace ibis {
     void yypush_ (const char* m, state_type s, YY_MOVE_REF (symbol_type) sym);
 
     /// Pop \a n symbols from the stack.
-    void yypop_ (int n = 1);
+    void yypop_ (int n = 1) YY_NOEXCEPT;
 
     /// Constants.
     enum
     {
-      yylast_ = 399,     ///< Last index in yytable_.
+      yylast_ = 571,     ///< Last index in yytable_.
       yynnts_ = 7,  ///< Number of nonterminal symbols.
-      yyfinal_ = 69 ///< Termination state number.
+      yyfinal_ = 79 ///< Termination state number.
     };
 
 
@@ -873,9 +889,9 @@ namespace ibis {
   };
 
 
-#line 26 "whereParser.yy"
+#line 25 "whereParser.yy"
 } // ibis
-#line 879 "whereParser.hh"
+#line 895 "whereParser.hh"
 
 
 
