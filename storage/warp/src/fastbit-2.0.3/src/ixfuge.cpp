@@ -292,7 +292,7 @@ int ibis::fuge::read(const char* f) {
     std::string fnm;
     indexFileName(fnm, f);
 
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0)
         return -1;
 
@@ -1115,7 +1115,7 @@ int ibis::fuge::readCoarse(const char* fn) {
         return -1;
     }
     const bool useoffset64 = (offset64.size() > bits.size());
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0) return -2;
     IBIS_BLOCK_GUARD(UnixClose, fdes);
 #if defined(_WIN32) && defined(_MSC_VER)
@@ -1254,7 +1254,7 @@ void ibis::fuge::activateCoarse() const {
             }
         }
         else if (fname != 0) { // using the named file directly
-            int fdes = UnixOpen(fname, OPEN_READONLY);
+            int fdes = ibis::zfile::openRead(fname);
             if (fdes >= 0) {
                 LOGGER(ibis::gVerbose > 8)
                     << mesg << " retrieving data from file \"" << fname << "\"";
@@ -1337,7 +1337,7 @@ void ibis::fuge::activateCoarse() const {
         }
     }
     else if (fname != 0) { // using the named file directly
-        int fdes = UnixOpen(fname, OPEN_READONLY);
+        int fdes = ibis::zfile::openRead(fname);
         if (fdes >= 0) {
             LOGGER(ibis::gVerbose > 8)
                 << mesg << " retrieving data from file \"" << fname << "\"";
@@ -1441,7 +1441,7 @@ void ibis::fuge::activateCoarse(uint32_t i) const {
 #endif
         }
         else if (fname != 0) { // using the named file directly
-            int fdes = UnixOpen(fname, OPEN_READONLY);
+            int fdes = ibis::zfile::openRead(fname);
             if (fdes >= 0) {
                 LOGGER(ibis::gVerbose > 8)
                     << mesg << "(" << i << ") retrieving data from file \""
@@ -1495,7 +1495,7 @@ void ibis::fuge::activateCoarse(uint32_t i) const {
 #endif
     }
     else if (fname != 0) { // using the named file directly
-        int fdes = UnixOpen(fname, OPEN_READONLY);
+        int fdes = ibis::zfile::openRead(fname);
         if (fdes >= 0) {
             LOGGER(ibis::gVerbose > 8)
                 << mesg << "(" << i << ") retrieving data from file \""
@@ -1581,7 +1581,7 @@ void ibis::fuge::activateCoarse(uint32_t i, uint32_t j) const {
         }
         else if (fname != 0) { // using the named file directly
             if (coffset64[j] > coffset64[i]) {
-                int fdes = UnixOpen(fname, OPEN_READONLY);
+                int fdes = ibis::zfile::openRead(fname);
                 if (fdes >= 0) {
                     LOGGER(ibis::gVerbose > 8)
                         << mesg << '(' << i << ", " << j
@@ -1663,7 +1663,7 @@ void ibis::fuge::activateCoarse(uint32_t i, uint32_t j) const {
     }
     else if (fname != 0) { // using the named file directly
         if (coffset32[j] > coffset32[i]) {
-            int fdes = UnixOpen(fname, OPEN_READONLY);
+            int fdes = ibis::zfile::openRead(fname);
             if (fdes >= 0) {
                 LOGGER(ibis::gVerbose > 8)
                     << mesg << '(' << i << ", " << j

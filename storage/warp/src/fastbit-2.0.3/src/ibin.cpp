@@ -468,7 +468,7 @@ ibis::index* ibis::bin::dup() const {
 int ibis::bin::read(const char* f) {
     std::string fnm;
     indexFileName(fnm, f);
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0)
         return -1;
     IBIS_BLOCK_GUARD(UnixClose, fdes);
@@ -2070,7 +2070,7 @@ long ibis::bin::checkBin0(const ibis::qRange& cmp, uint32_t jbin,
     }
 
     int32_t pos[2];
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0) { // failed to open file
         ierr = -2;
         return ierr;
@@ -2153,7 +2153,7 @@ long ibis::bin::checkBin1(const ibis::qRange& cmp, uint32_t jbin,
     }
 
     int32_t pos[2];
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0) { // failed to open file
         ierr = -2;
         return ierr;
@@ -11822,7 +11822,7 @@ long ibis::bin::mergeValues(const ibis::qContinuousRange& cmp,
     dataFileName(fnm);
     fnm += ".bin";
 
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- bin::mergeValues failed to open \""
@@ -11913,7 +11913,7 @@ long ibis::bin::mergeValues(const ibis::qContinuousRange& cmp,
     dataFileName(fnm);
     fnm += ".bin";
 
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- bin::mergeValues failed to open \""

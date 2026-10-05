@@ -370,7 +370,7 @@ int ibis::keywords::parseTextFile(ibis::text::tokenizer &tkn,
     if (0 == col->dataFileName(tfname, dir))
         return -2;
 
-    int tfdesc = UnixOpen(tfname.c_str(), OPEN_READONLY);
+    int tfdesc = ibis::zfile::openRead(tfname.c_str());
     if (tfdesc < 0) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- keywords::parseTextFile failed to open file \""
@@ -381,7 +381,7 @@ int ibis::keywords::parseTextFile(ibis::text::tokenizer &tkn,
 
     spname = tfname;
     spname += ".sp";
-    FILE* spfile = fopen(spname.c_str(), "rb");
+    FILE* spfile = ibis::zfile::fopenRead(spname.c_str());
     if (spfile == NULL) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- keywords::parseTextFile failed to open file \""
@@ -719,7 +719,7 @@ int ibis::keywords::read(const char* f) {
 
     fnm.erase(fnm.size()-5);
     fnm += "idx";
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0) return -1;
 
     char header[8];

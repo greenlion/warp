@@ -782,7 +782,10 @@ void ibis::column::getNullMask(ibis::bitvector& mask) const {
         fnm = dataFileName(sname);
         if (fnm != 0 && UnixStat(fnm, &st) == 0) {
             const uint32_t elm = elementSize();
-            uint32_t sz = (elm > 0 ? st.st_size / elm :  thePart->nRows());
+            // use the logical size in case the data file is compressed
+            const int64_t fsz = ibis::zfile::logicalSize(fnm);
+            uint32_t sz = (elm > 0 ? (fsz > 0 ? fsz : 0) / elm :
+                           thePart->nRows());
 
             // get the null mask file name and read the file
             fnm = nullMaskName(sname);
@@ -815,7 +818,7 @@ void ibis::column::getNullMask(ibis::bitvector& mask) const {
             LOGGER(ibis::gVerbose > 5)
                 << "column[" << fullname()
                 << "]::getNullMask -- get null mask (" << mask.cnt() << ", "
-                << mask.size() << ") [st.st_size=" << st.st_size
+                << mask.size() << ") [fsz=" << fsz
                 << ", sz=" << sz << ", ierr=" << ierr << "]";
         }
         else if (thePart != 0) { // no data file, assume every value is valid
@@ -4740,7 +4743,7 @@ long ibis::column::selectValuesT(const char* dfn,
             << " as " << typeid(T).name();
     }
     else { // has to use UnixRead family of functions
-        int fdes = UnixOpen(dfn, OPEN_READONLY);
+        int fdes = ibis::zfile::openRead(dfn);
         if (fdes < 0) {
             logWarning("selectValuesT", "failed to open file %s, ierr=%d",
                        dfn, fdes);
@@ -4943,7 +4946,7 @@ long ibis::column::selectValuesT(const char *dfn,
             << " as " << typeid(T).name();
     }
     else { // has to use UnixRead family of functions
-        int fdes = UnixOpen(dfn, OPEN_READONLY);
+        int fdes = ibis::zfile::openRead(dfn);
         if (fdes < 0) {
             LOGGER(ibis::gVerbose > 0)
                 << "Warning -- " << evt << " failed to open file "
@@ -7105,6 +7108,45 @@ long ibis::column::append(const char* dt, const char* df,
         << evt << " -- source \"" << from << "\" --> destination \""
         << to << "\", nold=" << nold << ", nnew=" << nnew;
 
+    size_t j = 0, nnew0 = 0;
+    uint32_t nold0 = 0;
+    long ret = 0;
+    if (ibis::zfile::shouldCompress(to.c_str())) {
+        // compressed destination: adjust it to nold elements and append
+        // the (decompressed) content of the source as new frames
+        int64_t lsz = ibis::zfile::logicalSize(to.c_str());
+        if (lsz < 0) lsz = 0;
+        nold0 = lsz / elem;
+        std::string content;
+        if (ibis::zfile::readAll(from.c_str(), content) != 0) {
+            LOGGER(ibis::gVerbose > 0)
+                << "Warning -- " << evt << " failed to read \"" << from
+                << "\", will write zeros in its place";
+            content.clear();
+        }
+        ret = (content.size() < (size_t)nnew*elem ?
+               content.size() : (size_t)nnew*elem);
+        nnew0 = ret / elem;
+        content.resize((size_t)nnew*elem, '\0');
+        if (lsz == 0) { // new file, the padding is part of the first append
+            content.insert(0, (size_t)nold*elem, '\0');
+        }
+        else if (ibis::zfile::resize(to.c_str(), (uint64_t)nold*elem) < 0) {
+            LOGGER(ibis::gVerbose > 0)
+                << "Warning -- " << evt << " failed to resize \"" << to
+                << "\" to " << nold << " elements";
+            return -4;
+        }
+        if (ibis::zfile::append(to.c_str(), content.data(), content.size(),
+                                elem) < 0) {
+            LOGGER(ibis::gVerbose > 0)
+                << "Warning -- " << evt << " failed to append to \"" << to
+                << '"';
+            return -3;
+        }
+        m_sorted = false; // assume no longer sorted
+    }
+    else {
     // open destination file, position the file pointer
     int dest = UnixOpen(to.c_str(), OPEN_WRITEADD, OPEN_FILEMODE);
     if (dest < 0) {
@@ -7118,9 +7160,9 @@ long ibis::column::append(const char* dt, const char* df,
     (void)_setmode(dest, _O_BINARY);
 #endif
     IBIS_BLOCK_GUARD(UnixClose, dest);
-    size_t j = UnixSeek(dest, 0, SEEK_END);
-    size_t sz = elem*nold, nnew0 = 0;
-    uint32_t nold0 = j / elem;
+    j = UnixSeek(dest, 0, SEEK_END);
+    size_t sz = elem*nold;
+    nold0 = j / elem;
     if (nold > nold0) { // existing destination smaller than expected
         memset(buf, 0, nbuf);
         while (j < sz) {
@@ -7131,7 +7173,7 @@ long ibis::column::append(const char* dt, const char* df,
             j += diff;
         }
     }
-    long ret = UnixSeek(dest, sz, SEEK_SET);
+    ret = UnixSeek(dest, sz, SEEK_SET);
     if (ret < static_cast<long>(sz)) {
         // can not move file pointer to the expected location
         LOGGER(ibis::gVerbose > 0)
@@ -7141,7 +7183,7 @@ long ibis::column::append(const char* dt, const char* df,
     }
 
     ret = 0;    // to count the number of bytes written
-    int src = UnixOpen(from.c_str(), OPEN_READONLY); // open the files
+    int src = ibis::zfile::openRead(from.c_str()); // open the files
     if (src >= 0) { // open the source file, copy it
 #if defined(_WIN32) && defined(_MSC_VER)
         (void)_setmode(src, _O_BINARY);
@@ -7211,6 +7253,7 @@ long ibis::column::append(const char* dt, const char* df,
         logMessage("append", "size of \"%s\" is %lu as expected", to.c_str(),
                    static_cast<long unsigned>(j));
     }
+    } // plain destination file
 
     ret /= elem;        // convert to the number of elements written
     LOGGER(ibis::gVerbose > 4)
@@ -7553,6 +7596,39 @@ long ibis::column::appendValues(const array_t<T>& vals,
     std::string fn = thePart->currentDataDir();
     fn += FASTBIT_DIRSEP;
     fn += m_name;
+    long ierr = 0;
+    const unsigned elem = sizeof(T);
+    ibis::util::mutexLock lock(&mutex, evt.c_str());
+    if (ibis::zfile::shouldCompress(fn.c_str())) {
+        // compressed data file: pad (or truncate) to nRows elements, then
+        // append the new values as new zstd frames
+        int64_t lsz = ibis::zfile::logicalSize(fn.c_str());
+        if (lsz < 0) lsz = 0;
+        const uint32_t oldsz = lsz / elem;
+        std::vector<T> buf;
+        if (oldsz < thePart->nRows()) {
+            mask_.adjustSize(oldsz, thePart->nRows());
+            if ((uint64_t)lsz != (uint64_t)oldsz * elem &&
+                ibis::zfile::resize(fn.c_str(), (uint64_t)oldsz*elem) < 0)
+                return -6L;
+            buf.assign(thePart->nRows() - oldsz, T());
+        }
+        else if (oldsz > thePart->nRows()) {
+            mask_.adjustSize(thePart->nRows(), thePart->nRows());
+            if (ibis::zfile::resize(fn.c_str(),
+                                    (uint64_t)thePart->nRows()*elem) < 0)
+                return -6L;
+        }
+        buf.insert(buf.end(), vals.begin(), vals.end());
+        if (ibis::zfile::append(fn.c_str(), buf.data(), buf.size()*elem,
+                                elem) < 0) {
+            LOGGER(ibis::gVerbose >= 0)
+                << "Warning -- " << evt << " failed to append "
+                << vals.size()*elem << " bytes to " << fn;
+            return -7L;
+        }
+    }
+    else {
     int curr = UnixOpen(fn.c_str(), OPEN_WRITEADD, OPEN_FILEMODE);
     if (curr < 0) {
         LOGGER(ibis::gVerbose > 0)
@@ -7565,10 +7641,7 @@ long ibis::column::appendValues(const array_t<T>& vals,
 #endif
     IBIS_BLOCK_GUARD(UnixClose, curr);
 
-    long ierr = 0;
-    const unsigned elem = sizeof(T);
     off_t oldsz = UnixSeek(curr, 0, SEEK_END);
-    ibis::util::mutexLock lock(&mutex, evt.c_str());
     if (oldsz < 0)
         oldsz = 0;
     else
@@ -7587,6 +7660,7 @@ long ibis::column::appendValues(const array_t<T>& vals,
                     << ierr;
                 return -6L;
             }
+            oldsz += nw;
         }
     }
     else if (static_cast<uint32_t>(oldsz) > thePart->nRows()) {
@@ -7601,6 +7675,7 @@ long ibis::column::appendValues(const array_t<T>& vals,
             << " bytes to " << fn << ", the write function returned " << ierr;
         return -7L;
     }
+    } // plain data file
 
     LOGGER(ibis::gVerbose > 2)
         << evt << " successfully added " << vals.size() << " element"
@@ -7630,6 +7705,31 @@ long ibis::column::appendStrings(const std::vector<std::string>& vals,
     std::string fn = thePart->currentDataDir();
     fn += FASTBIT_DIRSEP;
     fn += m_name;
+    if (ibis::zfile::shouldCompress(fn.c_str())) {
+        // compressed data file: null strings for the missing rows followed
+        // by the new strings, appended as new zstd frames
+        std::string buf;
+        if (mask_.size() < thePart->nRows()) {
+            buf.append(thePart->nRows() - mask_.size(), '\0');
+            mask_.adjustSize(0, thePart->nRows());
+        }
+        for (size_t j = 0; j < vals.size(); ++ j)
+            buf.append(vals[j].c_str(), vals[j].size()+1);
+        if (ibis::zfile::append(fn.c_str(), buf.data(), buf.size()) < 0) {
+            LOGGER(ibis::gVerbose >= 0)
+                << "Warning -- " << evt << " failed to append " << buf.size()
+                << " bytes to " << fn;
+            return -7L;
+        }
+        mask_ += msk;
+        mask_.adjustSize(thePart->nRows()+vals.size(),
+                         thePart->nRows()+vals.size());
+        if (mask_.cnt() < mask_.size()) {
+            fn += ".msk";
+            mask_.write(fn.c_str());
+        }
+        return vals.size();
+    }
     int curr = UnixOpen(fn.c_str(), OPEN_APPENDONLY, OPEN_FILEMODE);
     if (curr < 0) {
         LOGGER(ibis::gVerbose > 0)
@@ -7713,6 +7813,8 @@ long ibis::column::writeData(const char *dir, uint32_t nold, uint32_t nnew,
     uint32_t ninfile=0;
     sprintf(fn, "%s%c%s", dir, FASTBIT_DIRSEP, m_name.c_str());
     ibis::fileManager::instance().flushFile(fn);
+    // the code below writes raw bytes, handle compression around it
+    ibis::zfile::plainScope zscope(fn);
 
     FILE *fdat = fopen(fn, "ab");
     if (fdat == 0) {
@@ -8348,6 +8450,8 @@ long ibis::column::saveSelected(const ibis::bitvector& sel, const char *dest,
             }
         }
         ibis::fileManager::instance().flushFile(fname.c_str());
+        // the code below modifies raw bytes in place
+        ibis::zfile::plainScope zscope(fname.c_str());
         FILE* fptr = fopen(fname.c_str(), "r+b");
         if (fptr == 0) {
             if (ibis::gVerbose > -1)
@@ -8484,7 +8588,7 @@ long ibis::column::saveSelected(const ibis::bitvector& sel, const char *dest,
 
         purgeIndexFile(dest);
         readLock lock(this, "saveSelected");
-        FILE* sfptr = fopen(sfname.c_str(), "rb");
+        FILE* sfptr = ibis::zfile::fopenRead(sfname.c_str());
         if (sfptr == 0) {
             if (ibis::gVerbose > 0)
                 logWarning("saveSelected", "failed to open file \"%s\" for "
@@ -8492,6 +8596,8 @@ long ibis::column::saveSelected(const ibis::bitvector& sel, const char *dest,
             return -6;
         }
         ibis::fileManager::instance().flushFile(dfname.c_str());
+        // the new file is written as raw bytes, compressed when done
+        ibis::zfile::plainScope zscope(dfname.c_str());
         FILE* dfptr = fopen(dfname.c_str(), "wb");
         if (dfptr == 0) {
             if (ibis::gVerbose > 0)
@@ -8607,6 +8713,8 @@ long ibis::column::truncateData(const char* dir, uint32_t nent,
                    m_name.c_str());
         return -2;
     }
+    // the code below pads and truncates the raw bytes
+    ibis::zfile::plainScope zscope(fn);
 
     uint32_t nact = 0; // number of valid entries left in the file
     uint32_t nbyt = 0; // number of bytes in the file to be left
@@ -10843,7 +10951,7 @@ int ibis::column::searchSortedOOCC(const char* fname,
         return hits.sloppyCount();
     }
 
-    int fdes = UnixOpen(fname, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fname);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- column[" << fullname() << "]::searchSortedOOCC<"
@@ -11780,7 +11888,7 @@ int ibis::column::searchSortedOOCD(const char* fname,
         evt = oss.str();
     }
     ibis::util::timer mytimer(evt.c_str(), 5);
-    int fdes = UnixOpen(fname, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fname);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- " << evt << " failed to "
@@ -11890,7 +11998,7 @@ int ibis::column::searchSortedOOCD(const char* fname,
         evt = oss.str();
     }
     ibis::util::timer mytimer(evt.c_str(), 5);
-    int fdes = UnixOpen(fname, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fname);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- " << evt << " failed to "
@@ -12003,7 +12111,7 @@ int ibis::column::searchSortedOOCD(const char* fname,
         evt = oss.str();
     }
     ibis::util::timer mytimer(evt.c_str(), 5);
-    int fdes = UnixOpen(fname, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fname);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- " << evt << " failed to "

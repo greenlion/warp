@@ -324,7 +324,7 @@ int ibis::direkte::construct0(const char* dfname) {
         sz /= elemsize;
         if (sz > nrows)
             sz = nrows;
-        int fdes = UnixOpen(dfname, OPEN_READONLY);
+        int fdes = ibis::zfile::openRead(dfname);
         if (fdes < 0) {
             ierr = -2; // failed to open file for reading
             return ierr;
@@ -510,7 +510,7 @@ int ibis::direkte::construct(const char* dfname) {
         sz /= elemsize;
         if (sz > nrows)
             sz = nrows;
-        int fdes = UnixOpen(dfname, OPEN_READONLY);
+        int fdes = ibis::zfile::openRead(dfname);
         if (fdes < 0) {
             ierr = -2; // failed to open file for reading
             return ierr;
@@ -833,7 +833,7 @@ void ibis::direkte::serialSizes(uint64_t &wkeys, uint64_t &woffsets,
 int ibis::direkte::read(const char* f) {
     std::string fnm;
     indexFileName(fnm, f);
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0) return -1;
 
     char header[8];

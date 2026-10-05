@@ -307,7 +307,7 @@ void ibis::bylt::activateCoarse() const {
         }
     }
     else if (fname) { // using the named file directly
-        int fdes = UnixOpen(fname, OPEN_READONLY);
+        int fdes = ibis::zfile::openRead(fname);
         if (fdes < 0) {
             LOGGER(ibis::gVerbose > 0)
                 << "Warning -- " << evt << " failed to open file \"" << fname
@@ -448,7 +448,7 @@ void ibis::bylt::activateCoarse(uint32_t i) const {
         }
     }
     else if (fname) { // using the named file directly
-        int fdes = UnixOpen(fname, OPEN_READONLY);
+        int fdes = ibis::zfile::openRead(fname);
         if (fdes < 0) {
             LOGGER(ibis::gVerbose > 0)
                 << "Warning -- "  << evt << "(" << i
@@ -567,7 +567,7 @@ void ibis::bylt::activateCoarse(uint32_t i, uint32_t j) const {
         }
     }
     else if (fname) { // using the named file directly
-        int fdes = UnixOpen(fname, OPEN_READONLY);
+        int fdes = ibis::zfile::openRead(fname);
         if (fdes < 0) {
             LOGGER(ibis::gVerbose > 0)
                 << "Warning -- "<< evt << "(" << i << ", " << j
@@ -2023,7 +2023,7 @@ int ibis::bylt::read(const char* f) {
     std::string fnm;
     indexFileName(fnm, f);
 
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0) return -1;
 
     char header[8];
@@ -2182,7 +2182,7 @@ int ibis::bylt::readCoarse(const char* fn) {
     std::string fnm;
     indexFileName(fnm, fn);
 
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0) return -4;
     IBIS_BLOCK_GUARD(UnixClose, fdes);
 #if defined(_WIN32) && defined(_MSC_VER)

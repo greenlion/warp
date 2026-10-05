@@ -231,7 +231,7 @@ const ibis::RIDSet* ibis::bundle::readRIDs(const char* dir,
     if (i < nbdl) { // open the rid file and read the selected segment
         ibis::RIDSet* res = new ibis::RIDSet;
         strcpy(fn+len, "-rids");
-        int fdes = UnixOpen(fn, OPEN_READONLY);
+        int fdes = ibis::zfile::openRead(fn);
         if (fdes < 0) {
             LOGGER(errno != ENOENT || ibis::gVerbose > 10)
                 << "Warning -- bundle::readRIDs -- failed to open file \""

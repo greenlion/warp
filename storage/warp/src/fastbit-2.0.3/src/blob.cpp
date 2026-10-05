@@ -169,7 +169,7 @@ long ibis::blob::append(const char* dt, const char* df, const uint32_t nold,
         return -10;
     }
 
-    int ssrc = UnixOpen(spfrom.c_str(), OPEN_READONLY);
+    int ssrc = ibis::zfile::openRead(spfrom.c_str());
     if (ssrc < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- " << evt << " failed to open file " << spfrom
@@ -297,7 +297,7 @@ long ibis::blob::append(const char* dt, const char* df, const uint32_t nold,
         }
     }
 
-    int dsrc = UnixOpen(datasrc.c_str(), OPEN_READONLY);
+    int dsrc = ibis::zfile::openRead(datasrc.c_str());
     if (dsrc < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- " << evt << " failed to open file \"" << datasrc
@@ -709,7 +709,7 @@ long ibis::blob::countRawBytes(const ibis::bitvector& mask) const {
         }
     }
     else { // have to open the .sp file to read the starting positions
-        int fsp = UnixOpen(spfile.c_str(), OPEN_READONLY);
+        int fsp = ibis::zfile::openRead(spfile.c_str());
         if (fsp < 0) {
             LOGGER(ibis::gVerbose > 0)
                 << "Warning -- blob::countRawBytes failed to open file "
@@ -1018,7 +1018,7 @@ int ibis::blob::extractAll(const ibis::bitvector& mask,
                            ibis::array_t<uint64_t>& positions,
                            const char* rawfile,
                            const ibis::array_t<int64_t>& starts) const {
-    int fdes = UnixOpen(rawfile, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(rawfile);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- blob::extractAll failed to open " << rawfile
@@ -1107,7 +1107,7 @@ int ibis::blob::extractSome(const ibis::bitvector& mask,
                             const char* rawfile,
                             const ibis::array_t<int64_t>& starts,
                             const uint32_t limit) const {
-    int fdes = UnixOpen(rawfile, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(rawfile);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- blob::extractSome failed to open " << rawfile
@@ -1199,7 +1199,7 @@ int ibis::blob::extractSome(const ibis::bitvector& mask,
                             const char* spfile,
                             const uint32_t limit) const {
     // sdes - for spfile
-    int sdes = UnixOpen(spfile, OPEN_READONLY);
+    int sdes = ibis::zfile::openRead(spfile);
     if (sdes < 0) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- blob::extractSome failed to open " << spfile
@@ -1213,7 +1213,7 @@ int ibis::blob::extractSome(const ibis::bitvector& mask,
 #endif
 
     // rdes - for rawfile
-    int rdes = UnixOpen(rawfile, OPEN_READONLY);
+    int rdes = ibis::zfile::openRead(rawfile);
     if (rdes < 0) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- blob::extractSome failed to open " << rawfile
@@ -1435,7 +1435,7 @@ int ibis::blob::readBlob(uint32_t ind, char *&buf, uint64_t &size,
     if (buf == 0)
         return -10;
 
-    int fdes = UnixOpen(datafile, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(datafile);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 1)
             << "Warning -- blob::readBlob failed to open " << datafile
@@ -1479,7 +1479,7 @@ int ibis::blob::readBlob(uint32_t ind, char *&buf, uint64_t &size,
                          const char *spfile, const char *datafile) const {
     int64_t starts[2];
     const uint32_t spelem = 8;
-    int sdes = UnixOpen(spfile, OPEN_READONLY);
+    int sdes = ibis::zfile::openRead(spfile);
     if (sdes < 0) {
         LOGGER(ibis::gVerbose >= 0)
             << "Warning -- blob::readBlob failed to open " << spfile
@@ -1519,7 +1519,7 @@ int ibis::blob::readBlob(uint32_t ind, char *&buf, uint64_t &size,
     if (buf == 0)
         return -10;
 
-    int fdes = UnixOpen(datafile, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(datafile);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 1)
             << "Warning -- blob::readBlob failed to open " << datafile

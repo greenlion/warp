@@ -201,7 +201,7 @@ int ibis::roster::writeSorted(const char *df) const {
         }
         else {
             unsigned char tmp;
-            FILE *fpts = fopen(fnm.c_str(), "rb");
+            FILE *fpts = ibis::zfile::fopenRead(fnm.c_str());
             if (fpts != 0) {
                 for (uint32_t i = 0; i < ind.size(); ++ i) {
                     ierr = fseek(fpts, sizeof(tmp)*ind[i], SEEK_SET);
@@ -234,7 +234,7 @@ int ibis::roster::writeSorted(const char *df) const {
         }
         else {
             char tmp;
-            FILE *fpts = fopen(fnm.c_str(), "rb");
+            FILE *fpts = ibis::zfile::fopenRead(fnm.c_str());
             if (fpts != 0) {
                 for (uint32_t i = 0; i < ind.size(); ++ i) {
                     ierr = fseek(fpts, sizeof(tmp)*ind[i], SEEK_SET);
@@ -267,7 +267,7 @@ int ibis::roster::writeSorted(const char *df) const {
         }
         else {
             uint16_t tmp;
-            FILE *fpts = fopen(fnm.c_str(), "rb");
+            FILE *fpts = ibis::zfile::fopenRead(fnm.c_str());
             if (fpts != 0) {
                 for (uint32_t i = 0; i < ind.size(); ++ i) {
                     ierr = fseek(fpts, sizeof(tmp)*ind[i], SEEK_SET);
@@ -300,7 +300,7 @@ int ibis::roster::writeSorted(const char *df) const {
         }
         else {
             int16_t tmp;
-            FILE *fpts = fopen(fnm.c_str(), "rb");
+            FILE *fpts = ibis::zfile::fopenRead(fnm.c_str());
             if (fpts != 0) {
                 for (uint32_t i = 0; i < ind.size(); ++ i) {
                     ierr = fseek(fpts, sizeof(tmp)*ind[i], SEEK_SET);
@@ -333,7 +333,7 @@ int ibis::roster::writeSorted(const char *df) const {
         }
         else {
             uint32_t tmp;
-            FILE *fpts = fopen(fnm.c_str(), "rb");
+            FILE *fpts = ibis::zfile::fopenRead(fnm.c_str());
             if (fpts != 0) {
                 for (uint32_t i = 0; i < ind.size(); ++ i) {
                     ierr = fseek(fpts, sizeof(tmp)*ind[i], SEEK_SET);
@@ -366,7 +366,7 @@ int ibis::roster::writeSorted(const char *df) const {
         }
         else {
             int32_t tmp;
-            FILE *fpts = fopen(fnm.c_str(), "rb");
+            FILE *fpts = ibis::zfile::fopenRead(fnm.c_str());
             if (fpts != 0) {
                 for (uint32_t i = 0; i < ind.size(); ++ i) {
                     ierr = fseek(fpts, sizeof(tmp)*ind[i], SEEK_SET);
@@ -399,7 +399,7 @@ int ibis::roster::writeSorted(const char *df) const {
         }
         else {
             uint64_t tmp;
-            FILE *fpts = fopen(fnm.c_str(), "rb");
+            FILE *fpts = ibis::zfile::fopenRead(fnm.c_str());
             if (fpts != 0) {
                 for (uint32_t i = 0; i < ind.size(); ++ i) {
                     ierr = fseek(fpts, sizeof(tmp)*ind[i], SEEK_SET);
@@ -432,7 +432,7 @@ int ibis::roster::writeSorted(const char *df) const {
         }
         else {
             int64_t tmp;
-            FILE *fpts = fopen(fnm.c_str(), "rb");
+            FILE *fpts = ibis::zfile::fopenRead(fnm.c_str());
             if (fpts != 0) {
                 for (uint32_t i = 0; i < ind.size(); ++ i) {
                     ierr = fseek(fpts, sizeof(tmp)*ind[i], SEEK_SET);
@@ -465,7 +465,7 @@ int ibis::roster::writeSorted(const char *df) const {
         }
         else {
             float tmp;
-            FILE *fpts = fopen(fnm.c_str(), "rb");
+            FILE *fpts = ibis::zfile::fopenRead(fnm.c_str());
             if (fpts != 0) {
                 for (uint32_t i = 0; i < ind.size(); ++ i) {
                     ierr = fseek(fpts, sizeof(float)*ind[i], SEEK_SET);
@@ -498,7 +498,7 @@ int ibis::roster::writeSorted(const char *df) const {
         }
         else {
             double tmp;
-            FILE *fpts = fopen(fnm.c_str(), "rb");
+            FILE *fpts = ibis::zfile::fopenRead(fnm.c_str());
             if (fpts != 0) {
                 for (uint32_t i = 0; i < ind.size(); ++ i) {
                     ierr = fseek(fpts, sizeof(double)*ind[i], SEEK_SET);
@@ -598,7 +598,7 @@ int ibis::roster::read(const char* idxf) {
             << "roster -- read the content of " << fnm << " into memory";
     }
     else {
-        inddes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+        inddes = ibis::zfile::openRead(fnm.c_str());
         if (inddes < 0) {
             LOGGER(ibis::gVerbose > 0) 
                 << "Warning -- roster::read failed to open " << fnm;
@@ -988,7 +988,7 @@ void ibis::roster::oocSort(const char *fin) {
     if (ibis::util::getFileSize(nind.c_str()) ==
         (off_t)(sizeof(uint32_t) * nrows)) {
         // open the ind file in read only mode for future operaions.
-        inddes = UnixOpen(nind.c_str(), OPEN_READONLY);
+        inddes = ibis::zfile::openRead(nind.c_str());
 #if defined(_WIN32) && defined(_MSC_VER)
         (void)_setmode(inddes, _O_BINARY);
 #endif
@@ -1365,7 +1365,7 @@ void ibis::roster::oocSort(const char *fin) {
     }
 
     // open the ind file in read only mode for future operaions.
-    inddes = UnixOpen(nind.c_str(), OPEN_READONLY);
+    inddes = ibis::zfile::openRead(nind.c_str());
 #if defined(_WIN32) && defined(_MSC_VER)
     (void)_setmode(inddes, _O_BINARY);
 #endif
@@ -1379,7 +1379,7 @@ long ibis::roster::oocSortBlocks(const char *src, const char *dest,
                                  const char *ind, const uint32_t mblock,
                                  array_t<T>& dbuf1, array_t<T>& dbuf2,
                                  array_t<uint32_t>& ibuf) const {
-    int fdsrc = UnixOpen(src, OPEN_READONLY);
+    int fdsrc = ibis::zfile::openRead(src);
     if (fdsrc < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- oocSortBlocks failed to open " << src
@@ -1512,7 +1512,7 @@ long ibis::roster::oocMergeBlocks(const char *dsrc, const char *dout,
                                   array_t<T>& dbuf2,
                                   array_t<uint32_t>& ibuf1,
                                   array_t<uint32_t>& ibuf2) const {
-    const int fdsrc = UnixOpen(dsrc, OPEN_READONLY);
+    const int fdsrc = ibis::zfile::openRead(dsrc);
     if (fdsrc < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- oocMergeBlocks failed to open " << dsrc
@@ -1523,7 +1523,7 @@ long ibis::roster::oocMergeBlocks(const char *dsrc, const char *dout,
     (void)_setmode(fdsrc, _O_BINARY);
 #endif
     IBIS_BLOCK_GUARD(UnixClose, fdsrc);
-    const int fisrc = UnixOpen(isrc, OPEN_READONLY);
+    const int fisrc = ibis::zfile::openRead(isrc);
     if (fisrc < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- oocMergeBlocks failed to open " << isrc
@@ -1919,7 +1919,7 @@ template <typename T>
 long ibis::roster::mergeBlock2(const char *dsrc, const char *dout,
                                const uint32_t segment, array_t<T>& buf1,
                                array_t<T>& buf2, array_t<T>& buf3) {
-    const int fdsrc = UnixOpen(dsrc, OPEN_READONLY);
+    const int fdsrc = ibis::zfile::openRead(dsrc);
     if (fdsrc < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- roster::mergeBlock2 failed to open " << dsrc
@@ -2468,7 +2468,7 @@ ibis::roster::oocSearch(const ibis::array_t<T>& vals,
         << " to locate " << vals.size() << " value"
         << (vals.size()>1?"s":"");
 
-    int srtdes = UnixOpen(fname.c_str(), OPEN_READONLY);
+    int srtdes = ibis::zfile::openRead(fname.c_str());
     if (srtdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- " << evt << " failed to open the file "
@@ -2526,7 +2526,7 @@ ibis::roster::oocSearch(const ibis::array_t<T>& vals,
     if (inddes < 0) {
         fname.erase(len);
         fname += ".ind";
-        inddes = UnixOpen(fname.c_str(), OPEN_READONLY);
+        inddes = ibis::zfile::openRead(fname.c_str());
         if (inddes < 0) {
             LOGGER(ibis::gVerbose > 0)
                 << "Warning -- " << evt << " failed to open index file "
@@ -2798,7 +2798,7 @@ ibis::roster::oocSearch(const std::vector<T>& vals,
         << " to locate " << vals.size() << " value"
         << (vals.size()>1?"s":"");
 
-    int srtdes = UnixOpen(fname.c_str(), OPEN_READONLY);
+    int srtdes = ibis::zfile::openRead(fname.c_str());
     if (srtdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- " << evt << " failed to open the file "
@@ -2856,7 +2856,7 @@ ibis::roster::oocSearch(const std::vector<T>& vals,
     if (inddes < 0) {
         fname.erase(len);
         fname += ".ind";
-        inddes = UnixOpen(fname.c_str(), OPEN_READONLY);
+        inddes = ibis::zfile::openRead(fname.c_str());
         if (inddes < 0) {
             LOGGER(ibis::gVerbose > 1)
                 << "Warning -- " << evt << " failed to open index file "
