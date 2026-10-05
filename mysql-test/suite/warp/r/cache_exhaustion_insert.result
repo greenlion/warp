@@ -1,0 +1,30 @@
+#
+# The FastBit cache (warp_cache_size) is too small to buffer the rows
+# of a large INSERT.  The statement must fail with an error.  It must
+# not abort the server, and it must not leave rows with missing
+# values behind.
+#
+# Regression test: the exception FastBit throws when the row buffer
+# can not grow was not caught and terminated the server.
+#
+call mtr.add_suppression("WARP: out of memory");
+call mtr.add_suppression("WARP: could not write");
+SELECT @@warp_cache_size;
+@@warp_cache_size
+3000000
+SET SESSION cte_max_recursion_depth = 1000000;
+CREATE TABLE t1 (id INT, a INT, b BIGINT) ENGINE=WARP;
+INSERT INTO t1 VALUES (1, 10, 100), (2, 20, 200);
+INSERT INTO t1 WITH RECURSIVE s(x) AS (SELECT 3 UNION ALL SELECT x + 1 FROM s WHERE x < 200000)
+SELECT x, x * 10, x * 100 FROM s;
+ERROR HY000: Out of memory; check if mysqld or some other process uses all available memory; if not, you may have to use 'ulimit' to allow mysqld to use more memory or you can add more swap space
+# The server is still running, the failed statement left no rows with
+# default values behind and the table can still be used
+SELECT COUNT(*), SUM(a IS NULL), SUM(b = 0) FROM t1 WHERE id > 2;
+COUNT(*)	SUM(a IS NULL)	SUM(b = 0)
+0	NULL	NULL
+INSERT INTO t1 VALUES (3, 30, 300);
+SELECT id, a, b FROM t1 WHERE id = 3;
+id	a	b
+3	30	300
+DROP TABLE t1;

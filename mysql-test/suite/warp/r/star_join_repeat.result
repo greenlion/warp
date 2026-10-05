@@ -1,0 +1,37 @@
+#
+# A star join (a large WARP fact table joined with filtered dimension
+# tables) executed several times.  WARP computes the join in worker
+# threads per partition, and the join filters it builds are shared
+# between the handlers of the tables in the query.  The results must
+# match the same query on InnoDB every time.
+#
+# Regression test: the end of the dimension table scan freed the join
+# filter, which was freed again when the statement ended.  The server
+# aborted, usually on the second execution.
+#
+SET SESSION cte_max_recursion_depth = 1000000;
+SET SESSION group_concat_max_len = 10000000;
+CREATE TABLE sf (id INT, k1 INT, k2 INT, v INT) ENGINE=WARP;
+CREATE TABLE sd1 (k INT, region VARCHAR(8)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE sd2 (k INT, cat VARCHAR(8), flag INT) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO sd1 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 300)
+SELECT x, CONCAT('R', x % 5) FROM s;
+INSERT INTO sd2 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 200)
+SELECT x, CONCAT('C', x % 4), x % 3 FROM s;
+INSERT INTO sf WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 150000)
+SELECT x, 1 + x % 300, 1 + x % 200, x % 1000 FROM s;
+CREATE TABLE isf ENGINE=InnoDB SELECT * FROM sf;
+CREATE TABLE isd1 ENGINE=InnoDB SELECT * FROM sd1;
+CREATE TABLE isd2 ENGINE=InnoDB SELECT * FROM sd2;
+SELECT COUNT(*) > 0 AS expected_has_rows FROM isf f JOIN isd1 d1 ON f.k1 = d1.k JOIN isd2 d2 ON f.k2 = d2.k
+WHERE d1.region = 'R1' AND d2.flag = 1;
+expected_has_rows
+1
+execution 1: identical to InnoDB
+execution 2: identical to InnoDB
+execution 3: identical to InnoDB
+execution 4: identical to InnoDB
+execution 5: identical to InnoDB
+DROP TABLE sf, sd1, sd2, isf, isd1, isd2;
