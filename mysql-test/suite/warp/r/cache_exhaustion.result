@@ -1,0 +1,50 @@
+#
+# The FastBit cache (warp_cache_size) is too small for a star join.
+# The statement must fail with an error.  It must not abort the
+# server and it must not return an incomplete result.
+#
+# Regression test: the server aborted on an uncaught exception, or on
+# a result table whose columns could not be read completely, and a
+# worker thread that could not read a column silently treated its
+# partition as having no matching rows.
+#
+call mtr.add_suppression("WARP: could not evaluate the pushed down condition");
+call mtr.add_suppression("WARP: a join worker failed");
+call mtr.add_suppression("WARP: join worker failed");
+call mtr.add_suppression("WARP: could not read the selected rows");
+call mtr.add_suppression("WARP: scan of .* failed");
+SELECT @@warp_cache_size;
+@@warp_cache_size
+3000000
+SET SESSION cte_max_recursion_depth = 1000000;
+CREATE TABLE sf (id INT, k1 INT, k2 INT, v INT) ENGINE=WARP;
+CREATE TABLE sd1 (k INT, region VARCHAR(8)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE sd2 (k INT, cat VARCHAR(8), flag INT) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO sd1 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 300)
+SELECT x, CONCAT('R', x % 5) FROM s;
+INSERT INTO sd2 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 200)
+SELECT x, CONCAT('C', x % 4), x % 3 FROM s;
+INSERT INTO sf WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 150000)
+SELECT x, 1 + x % 300, 1 + x % 200, x % 1000 FROM s;
+SELECT d1.region, d2.cat, COUNT(*), SUM(f.v)
+FROM sf f JOIN sd1 d1 ON f.k1 = d1.k JOIN sd2 d2 ON f.k2 = d2.k
+WHERE d1.region = 'R1' AND d2.flag = 1 GROUP BY d1.region, d2.cat;
+ERROR HY000: Out of memory; check if mysqld or some other process uses all available memory; if not, you may have to use 'ulimit' to allow mysqld to use more memory or you can add more swap space
+# The server is still running and the same statement fails the same way
+SELECT d1.region, d2.cat, COUNT(*), SUM(f.v)
+FROM sf f JOIN sd1 d1 ON f.k1 = d1.k JOIN sd2 d2 ON f.k2 = d2.k
+WHERE d1.region = 'R1' AND d2.flag = 1 GROUP BY d1.region, d2.cat;
+ERROR HY000: Out of memory; check if mysqld or some other process uses all available memory; if not, you may have to use 'ulimit' to allow mysqld to use more memory or you can add more swap space
+# Statements that do not need much cache still work
+SELECT COUNT(*) FROM sd1;
+COUNT(*)
+300
+SELECT COUNT(*) FROM sd1 WHERE region = 'R1';
+COUNT(*)
+60
+SELECT COUNT(*) FROM sf WHERE k1 = 5;
+COUNT(*)
+500
+DROP TABLE sf, sd1, sd2;

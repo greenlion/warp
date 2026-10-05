@@ -1,0 +1,58 @@
+--echo #
+--echo # A star join (a large WARP fact table joined with filtered dimension
+--echo # tables) executed several times.  WARP computes the join in worker
+--echo # threads per partition, and the join filters it builds are shared
+--echo # between the handlers of the tables in the query.  The results must
+--echo # match the same query on InnoDB every time.
+--echo #
+--echo # Regression test: the end of the dimension table scan freed the join
+--echo # filter, which was freed again when the statement ended.  The server
+--echo # aborted, usually on the second execution.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 1000000;
+SET SESSION group_concat_max_len = 10000000;
+
+CREATE TABLE sf (id INT, k1 INT, k2 INT, v INT) ENGINE=WARP;
+CREATE TABLE sd1 (k INT, region VARCHAR(8)) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE sd2 (k INT, cat VARCHAR(8), flag INT) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+INSERT INTO sd1 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 300)
+  SELECT x, CONCAT('R', x % 5) FROM s;
+INSERT INTO sd2 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 200)
+  SELECT x, CONCAT('C', x % 4), x % 3 FROM s;
+INSERT INTO sf WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 150000)
+  SELECT x, 1 + x % 300, 1 + x % 200, x % 1000 FROM s;
+
+CREATE TABLE isf ENGINE=InnoDB SELECT * FROM sf;
+CREATE TABLE isd1 ENGINE=InnoDB SELECT * FROM sd1;
+CREATE TABLE isd2 ENGINE=InnoDB SELECT * FROM sd2;
+
+let $expected = `SELECT SHA2(GROUP_CONCAT(CONCAT_WS('|', region, cat, n, total) ORDER BY region, cat SEPARATOR ';'), 256)
+  FROM (SELECT d1.region, d2.cat, COUNT(*) n, SUM(f.v) total
+        FROM isf f JOIN isd1 d1 ON f.k1 = d1.k JOIN isd2 d2 ON f.k2 = d2.k
+        WHERE d1.region = 'R1' AND d2.flag = 1 GROUP BY d1.region, d2.cat) q`;
+SELECT COUNT(*) > 0 AS expected_has_rows FROM isf f JOIN isd1 d1 ON f.k1 = d1.k JOIN isd2 d2 ON f.k2 = d2.k
+  WHERE d1.region = 'R1' AND d2.flag = 1;
+
+let $n = 0;
+while ($n < 5)
+{
+  inc $n;
+  let $actual = `SELECT SHA2(GROUP_CONCAT(CONCAT_WS('|', region, cat, n, total) ORDER BY region, cat SEPARATOR ';'), 256)
+    FROM (SELECT d1.region, d2.cat, COUNT(*) n, SUM(f.v) total
+          FROM sf f JOIN sd1 d1 ON f.k1 = d1.k JOIN sd2 d2 ON f.k2 = d2.k
+          WHERE d1.region = 'R1' AND d2.flag = 1 GROUP BY d1.region, d2.cat) q`;
+  if ($actual != $expected)
+  {
+    --echo MISMATCH in execution $n: WARP $actual, InnoDB $expected
+  }
+  if ($actual == $expected)
+  {
+    --echo execution $n: identical to InnoDB
+  }
+}
+
+DROP TABLE sf, sd1, sd2, isf, isd1, isd2;
