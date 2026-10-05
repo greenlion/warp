@@ -1,0 +1,67 @@
+--echo #
+--echo # Conditions that compare a WARP column with something WARP can not push
+--echo # down (subqueries, user variables, prepared statement parameters) must
+--echo # be left to MySQL.  Every query is also run against InnoDB.
+--echo #
+--echo # Regression test: such conditions used to be accepted by the pushdown
+--echo # without being applied, so every row was returned.
+--echo #
+
+CREATE TABLE w (id INT, k INT, s VARCHAR(20)) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+CREATE TABLE r (v INT, t VARCHAR(5)) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO w VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd'), (5, 50, 'e');
+INSERT INTO i SELECT * FROM w;
+INSERT INTO r VALUES (30, 'c'), (50, 'e');
+
+SET @v = 20;
+SET @p = 40;
+SET @ps = 'b';
+
+let $n = 0;
+while ($n < 9)
+{
+  inc $n;
+  if ($n == 1) { let $where = k = (SELECT MAX(v) FROM r); }
+  if ($n == 2) { let $where = s = (SELECT t FROM r WHERE v = 30); }
+  if ($n == 3) { let $where = k > (SELECT MIN(v) FROM r); }
+  if ($n == 4) { let $where = k BETWEEN (SELECT MIN(v) FROM r) AND 45; }
+  if ($n == 5) { let $where = k IN (10, (SELECT MAX(v) FROM r)); }
+  if ($n == 6) { let $where = k = (SELECT v FROM r WHERE r.t = x.s); }
+  if ($n == 7) { let $where = k = @v; }
+  if ($n == 8) { let $where = k = 30; }
+  if ($n == 9) { let $where = s = 'c' AND k > (SELECT MIN(v) FROM r); }
+  let $w = `SELECT GROUP_CONCAT(id ORDER BY id) FROM w x WHERE $where`;
+  let $i = `SELECT GROUP_CONCAT(id ORDER BY id) FROM i x WHERE $where`;
+  if ($w != $i)
+  {
+    --echo MISMATCH for WHERE $where: WARP [$w], InnoDB [$i]
+  }
+  if ($w == $i)
+  {
+    --echo WHERE $where: ids $w
+  }
+}
+
+--echo # Prepared statement parameters
+PREPARE pw FROM 'SELECT GROUP_CONCAT(id ORDER BY id) FROM w WHERE k = ?';
+PREPARE pi FROM 'SELECT GROUP_CONCAT(id ORDER BY id) FROM i WHERE k = ?';
+EXECUTE pw USING @p;
+EXECUTE pi USING @p;
+PREPARE pw FROM 'SELECT GROUP_CONCAT(id ORDER BY id) FROM w WHERE s = ?';
+PREPARE pi FROM 'SELECT GROUP_CONCAT(id ORDER BY id) FROM i WHERE s = ?';
+EXECUTE pw USING @ps;
+EXECUTE pi USING @ps;
+DEALLOCATE PREPARE pw;
+DEALLOCATE PREPARE pi;
+
+--echo # The subquery condition stays with MySQL, the literal is pushed down
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE k = (SELECT MAX(v) FROM r);
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE k = 30;
+
+DROP TABLE w, i, r;

@@ -1,0 +1,69 @@
+#
+# WARP transactions: commit, rollback and visibility between connections
+#
+CREATE TABLE t1 (id INT, v VARCHAR(20)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+# ROLLBACK of INSERT, UPDATE and DELETE
+BEGIN;
+INSERT INTO t1 VALUES (3, 'three');
+UPDATE t1 SET v = 'changed' WHERE id = 1;
+DELETE FROM t1 WHERE id = 2;
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	changed
+3	three
+ROLLBACK;
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	one
+2	two
+# COMMIT
+BEGIN;
+INSERT INTO t1 VALUES (3, 'three');
+UPDATE t1 SET v = 'uno' WHERE id = 1;
+COMMIT;
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	uno
+2	two
+3	three
+# Uncommitted changes are not visible to other connections
+BEGIN;
+INSERT INTO t1 VALUES (4, 'four');
+UPDATE t1 SET v = 'tres' WHERE id = 3;
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	uno
+2	two
+3	three
+COMMIT;
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	uno
+2	two
+3	tres
+4	four
+# With autocommit off a statement is only kept after COMMIT
+SET autocommit = 0;
+INSERT INTO t1 VALUES (5, 'five');
+ROLLBACK;
+SET autocommit = 1;
+INSERT INTO t1 VALUES (6, 'six');
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	uno
+2	two
+3	tres
+4	four
+6	six
+# Committed data survives a restart
+# restart
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	uno
+2	two
+3	tres
+4	four
+6	six
+DROP TABLE t1;

@@ -1,0 +1,62 @@
+--echo #
+--echo # WHERE clause pushdown into WARP.  Every query is also run against an
+--echo # identical InnoDB table and the results must match.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE w (
+  id INT, k INT, s VARCHAR(30), d DATE, tm TIME, dc DECIMAL(10,2),
+  cat CHAR(6), n INT NULL
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+
+INSERT INTO w WITH RECURSIVE seq(x) AS
+  (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 20000)
+  SELECT x, x % 100, CONCAT('s', x % 37), DATE_ADD('2020-01-01', INTERVAL x % 1000 DAY),
+         SEC_TO_TIME((x % 7200) - 3600), x / 4, ELT(1 + x % 4, 'red', 'green', 'blue', 'black'),
+         IF(x % 9 = 0, NULL, x % 13)
+  FROM seq;
+INSERT INTO i SELECT * FROM w;
+
+let $n = 0;
+let $queries = 18;
+while ($n < $queries)
+{
+  inc $n;
+  if ($n == 1)  { let $cond = k = 7; }
+  if ($n == 2)  { let $cond = k <> 7; }
+  if ($n == 3)  { let $cond = k < 10 AND id > 15000; }
+  if ($n == 4)  { let $cond = k = 1 OR k = 99; }
+  if ($n == 5)  { let $cond = k IN (3, 5, 8); }
+  if ($n == 6)  { let $cond = k BETWEEN 10 AND 20; }
+  if ($n == 7)  { let $cond = s = 's5'; }
+  if ($n == 8)  { let $cond = cat = 'blue' AND k < 50; }
+  if ($n == 9)  { let $cond = d = '2020-02-01'; }
+  if ($n == 10) { let $cond = d BETWEEN '2021-01-01' AND '2021-06-30'; }
+  if ($n == 11) { let $cond = tm < '-00:30:00'; }
+  if ($n == 12) { let $cond = n IS NULL; }
+  if ($n == 13) { let $cond = n IS NOT NULL AND n = 0; }
+  if ($n == 14) { let $cond = n = 3 OR n IS NULL; }
+  if ($n == 15) { let $cond = (k = 1 OR k = 2) AND (cat = 'red' OR cat = 'green'); }
+  if ($n == 16) { let $cond = id >= 19990; }
+  if ($n == 17) { let $cond = dc > 4990.00; }
+  if ($n == 18) { let $cond = k = -1; }
+  let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $cond`;
+  let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $cond`;
+  if ($w != $i)
+  {
+    --echo MISMATCH for WHERE $cond: WARP $w, InnoDB $i
+  }
+  if ($w == $i)
+  {
+    --echo WHERE $cond: rows:sum(id) = $w
+  }
+}
+
+--echo # Aggregates over the whole table
+SELECT cat, COUNT(*), SUM(k), SUM(dc), COUNT(n) FROM w GROUP BY cat ORDER BY cat;
+SELECT cat, COUNT(*), SUM(k), SUM(dc), COUNT(n) FROM i GROUP BY cat ORDER BY cat;
+
+DROP TABLE w, i;

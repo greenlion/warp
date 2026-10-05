@@ -1,0 +1,127 @@
+#
+# Basic WARP storage engine functionality: DDL, DML and NULL handling
+#
+SELECT ENGINE, SUPPORT, TRANSACTIONS FROM INFORMATION_SCHEMA.ENGINES
+WHERE ENGINE = 'WARP';
+ENGINE	SUPPORT	TRANSACTIONS
+WARP	YES	YES
+# String columns must use utf8mb4_bin
+CREATE TABLE t_bad (c VARCHAR(10)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+ERROR HY000: Table storage engine for 'Unsupported character set or collation for column (only utf8mb4/utf8mb4_bin supported): c' doesn't have this option
+CREATE TABLE t1 (
+id INT NOT NULL,
+name VARCHAR(20),
+qty INT,
+price DECIMAL(10,2)
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+SHOW CREATE TABLE t1;
+Table	Create Table
+t1	CREATE TABLE `t1` (
+  `id` int NOT NULL,
+  `name` varchar(20) COLLATE utf8mb4_bin DEFAULT NULL,
+  `qty` int DEFAULT NULL,
+  `price` decimal(10,2) DEFAULT NULL
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+# Empty table
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+0
+SELECT * FROM t1;
+id	name	qty	price
+# INSERT and SELECT
+INSERT INTO t1 VALUES (1, 'apple', 10, 1.25), (2, 'banana', 20, 0.50),
+(3, 'cherry', NULL, 3.00), (4, NULL, 40, NULL),
+(5, '', 0, 0.00);
+SELECT * FROM t1 ORDER BY id;
+id	name	qty	price
+1	apple	10	1.25
+2	banana	20	0.50
+3	cherry	NULL	3.00
+4	NULL	40	NULL
+5		0	0.00
+SELECT COUNT(*), SUM(qty), MIN(price), MAX(price) FROM t1;
+COUNT(*)	SUM(qty)	MIN(price)	MAX(price)
+5	70	0.00	3.00
+# NULL handling
+SELECT id FROM t1 WHERE name IS NULL ORDER BY id;
+id
+4
+SELECT id FROM t1 WHERE qty IS NULL ORDER BY id;
+id
+3
+SELECT id FROM t1 WHERE name IS NOT NULL ORDER BY id;
+id
+1
+2
+3
+5
+SELECT id FROM t1 WHERE name = '' ORDER BY id;
+id
+5
+SELECT id FROM t1 WHERE qty = 0 ORDER BY id;
+id
+5
+# UPDATE
+UPDATE t1 SET qty = qty + 1 WHERE id <= 2;
+UPDATE t1 SET name = 'date' WHERE id = 4;
+UPDATE t1 SET price = NULL WHERE id = 1;
+SELECT * FROM t1 ORDER BY id;
+id	name	qty	price
+1	apple	11	NULL
+2	banana	21	0.50
+3	cherry	NULL	3.00
+4	date	40	NULL
+5		0	0.00
+# DELETE
+DELETE FROM t1 WHERE id = 2;
+DELETE FROM t1 WHERE qty IS NULL;
+SELECT * FROM t1 ORDER BY id;
+id	name	qty	price
+1	apple	11	NULL
+4	date	40	NULL
+5		0	0.00
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+3
+# Re-insert after delete
+INSERT INTO t1 VALUES (2, 'banana', 21, 0.50);
+SELECT * FROM t1 ORDER BY id;
+id	name	qty	price
+1	apple	11	NULL
+2	banana	21	0.50
+4	date	40	NULL
+5		0	0.00
+# INSERT ... SELECT into another WARP table
+CREATE TABLE t2 LIKE t1;
+INSERT INTO t2 SELECT * FROM t1 WHERE id > 1;
+SELECT * FROM t2 ORDER BY id;
+id	name	qty	price
+2	banana	21	0.50
+4	date	40	NULL
+5		0	0.00
+# RENAME and TRUNCATE
+RENAME TABLE t2 TO t3;
+SELECT COUNT(*) FROM t3;
+COUNT(*)
+3
+TRUNCATE TABLE t3;
+SELECT COUNT(*) FROM t3;
+COUNT(*)
+0
+INSERT INTO t3 VALUES (9, 'after truncate', 1, 1.00);
+SELECT * FROM t3;
+id	name	qty	price
+9	after truncate	1	1.00
+# Data persists across a restart
+# restart
+SELECT * FROM t1 ORDER BY id;
+id	name	qty	price
+1	apple	11	NULL
+2	banana	21	0.50
+4	date	40	NULL
+5		0	0.00
+SELECT * FROM t3;
+id	name	qty	price
+9	after truncate	1	1.00
+DROP TABLE t1, t3;

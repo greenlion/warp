@@ -1,0 +1,68 @@
+#
+# Conditions that compare a WARP column with something WARP can not push
+# down (subqueries, user variables, prepared statement parameters) must
+# be left to MySQL.  Every query is also run against InnoDB.
+#
+# Regression test: such conditions used to be accepted by the pushdown
+# without being applied, so every row was returned.
+#
+CREATE TABLE w (id INT, k INT, s VARCHAR(20)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+CREATE TABLE r (v INT, t VARCHAR(5)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO w VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd'), (5, 50, 'e');
+INSERT INTO i SELECT * FROM w;
+INSERT INTO r VALUES (30, 'c'), (50, 'e');
+SET @v = 20;
+SET @p = 40;
+SET @ps = 'b';
+WHERE k = (SELECT MAX(v) FROM r): ids 5
+WHERE s = (SELECT t FROM r WHERE v = 30): ids 3
+WHERE k > (SELECT MIN(v) FROM r): ids 4,5
+WHERE k BETWEEN (SELECT MIN(v) FROM r) AND 45: ids 3,4
+WHERE k IN (10, (SELECT MAX(v) FROM r)): ids 1,5
+WHERE k = (SELECT v FROM r WHERE r.t = x.s): ids 3,5
+WHERE k = @v: ids 2
+WHERE k = 30: ids 3
+WHERE s = 'c' AND k > (SELECT MIN(v) FROM r): ids 
+# Prepared statement parameters
+PREPARE pw FROM 'SELECT GROUP_CONCAT(id ORDER BY id) FROM w WHERE k = ?';
+PREPARE pi FROM 'SELECT GROUP_CONCAT(id ORDER BY id) FROM i WHERE k = ?';
+EXECUTE pw USING @p;
+GROUP_CONCAT(id ORDER BY id)
+4
+EXECUTE pi USING @p;
+GROUP_CONCAT(id ORDER BY id)
+4
+PREPARE pw FROM 'SELECT GROUP_CONCAT(id ORDER BY id) FROM w WHERE s = ?';
+PREPARE pi FROM 'SELECT GROUP_CONCAT(id ORDER BY id) FROM i WHERE s = ?';
+EXECUTE pw USING @ps;
+GROUP_CONCAT(id ORDER BY id)
+2
+EXECUTE pi USING @ps;
+GROUP_CONCAT(id ORDER BY id)
+2
+DEALLOCATE PREPARE pw;
+DEALLOCATE PREPARE pi;
+# The subquery condition stays with MySQL, the literal is pushed down
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE k = (SELECT MAX(v) FROM r);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.k = (select #2))  
+        -> Table scan on w  
+        -> Select #2 (subquery in condition; run only once)
+            -> Aggregate: max(r.v)  
+                -> Table scan on r  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`k` = (/* select#2 */ select max(`test`.`r`.`v`) from `test`.`r`))
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE k = 30;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`k` = 30)
+DROP TABLE w, i, r;

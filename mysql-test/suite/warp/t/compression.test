@@ -1,0 +1,126 @@
+--echo #
+--echo # zstd compression of FastBit column data files
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+SET SESSION group_concat_max_len = 100000000;
+
+SELECT @@global.warp_compression, @@global.warp_compression_level;
+
+--echo # Level range
+SET GLOBAL warp_compression_level = 0;
+SELECT @@global.warp_compression_level;
+SET GLOBAL warp_compression_level = 100;
+SELECT @@global.warp_compression_level;
+SET GLOBAL warp_compression_level = 3;
+
+--echo # One table written uncompressed, one compressed
+SET GLOBAL warp_compression = OFF;
+CREATE TABLE tp (id INT, k INT, s VARCHAR(30), d DATE, n INT NULL) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO tp WITH RECURSIVE seq(x) AS
+  (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 20000)
+  SELECT x, x % 100, CONCAT('value-', x % 211), DATE_ADD('2010-01-01', INTERVAL x % 3000 DAY),
+         IF(x % 5 = 0, NULL, x % 17)
+  FROM seq;
+--echo # Reading creates the string offset files, keep them uncompressed too
+SELECT COUNT(*), SUM(LENGTH(s)) FROM tp;
+
+SET GLOBAL warp_compression = ON;
+CREATE TABLE tc LIKE tp;
+INSERT INTO tc SELECT * FROM tp;
+SELECT COUNT(*), SUM(LENGTH(s)) FROM tc;
+
+--let $check_format = $MYSQL_TMP_DIR/warp_check_format.pl
+--write_file $check_format
+# Prints how many column data files of a WARP table are compressed
+sub check_format {
+  my ($table) = @_;
+  my $dir = "$ENV{MYSQLTEST_VARDIR}/mysqld.1/data/test/$table.data/p0";
+  opendir(my $dh, $dir) or die "cannot open $dir: $!";
+  my ($comp, $plain) = (0, 0);
+  foreach my $f (sort readdir($dh)) {
+    next if $f =~ /^\./ || $f =~ /\.(idx|msk)$/ || $f =~ /part/;
+    next unless -f "$dir/$f" && -s "$dir/$f";
+    open(my $fh, '<', "$dir/$f") or die "cannot open $dir/$f: $!";
+    binmode($fh);
+    read($fh, my $magic, 7);
+    close($fh);
+    if ($magic eq '#FBZSTD') { $comp++ } else { $plain++ }
+  }
+  closedir($dh);
+  print "$table: $comp compressed, $plain plain\n";
+}
+1;
+EOF
+
+--perl
+require "$ENV{MYSQL_TMP_DIR}/warp_check_format.pl";
+check_format('tp');
+check_format('tc');
+EOF
+
+--echo # Both tables hold the same data
+let $p = `SELECT SHA2(GROUP_CONCAT(CONCAT_WS('|', id, k, s, d, IFNULL(n, 'N')) ORDER BY id SEPARATOR ','), 256) FROM tp`;
+let $c = `SELECT SHA2(GROUP_CONCAT(CONCAT_WS('|', id, k, s, d, IFNULL(n, 'N')) ORDER BY id SEPARATOR ','), 256) FROM tc`;
+if ($p != $c)
+{
+  --echo compressed and uncompressed tables differ
+}
+if ($p == $c)
+{
+  --echo compressed and uncompressed tables are identical
+}
+SELECT COUNT(*) FROM tc WHERE k = 42;
+SELECT COUNT(*) FROM tc WHERE s = 'value-7';
+SELECT COUNT(*) FROM tc WHERE n IS NULL;
+SELECT COUNT(*) FROM tc WHERE d BETWEEN '2012-01-01' AND '2012-12-31';
+
+--echo # Appending to an uncompressed table keeps its existing files plain
+INSERT INTO tp VALUES (20001, 1, 'appended', '2024-01-01', 1);
+SELECT COUNT(*) FROM tp;
+--perl
+require "$ENV{MYSQL_TMP_DIR}/warp_check_format.pl";
+check_format('tp');
+EOF
+
+--echo # Small inserts into the compressed table
+let $i = 0;
+while ($i < 10)
+{
+  inc $i;
+  eval INSERT INTO tc VALUES (30000 + $i, $i, 'small', '2024-01-01', NULL);
+}
+SELECT COUNT(*), SUM(s = 'small') FROM tc;
+
+--echo # OPTIMIZE TABLE converts files to the current format
+OPTIMIZE TABLE tp;
+--perl
+require "$ENV{MYSQL_TMP_DIR}/warp_check_format.pl";
+check_format('tp');
+EOF
+SELECT COUNT(*), SUM(id), SUM(LENGTH(s)) FROM tp;
+
+SET GLOBAL warp_compression = OFF;
+OPTIMIZE TABLE tc;
+--perl
+require "$ENV{MYSQL_TMP_DIR}/warp_check_format.pl";
+check_format('tc');
+EOF
+SELECT COUNT(*), SUM(id), SUM(LENGTH(s)) FROM tc;
+SET GLOBAL warp_compression = ON;
+
+--echo # Compressed data survives a restart
+OPTIMIZE TABLE tc;
+--source include/restart_mysqld.inc
+--perl
+require "$ENV{MYSQL_TMP_DIR}/warp_check_format.pl";
+check_format('tc');
+EOF
+SELECT COUNT(*), SUM(id), SUM(LENGTH(s)), COUNT(n) FROM tc;
+SELECT COUNT(*) FROM tc WHERE s = 'value-7';
+
+DROP TABLE tp, tc;
+--remove_file $check_format
+SET GLOBAL warp_compression = DEFAULT;
+SET GLOBAL warp_compression_level = DEFAULT;

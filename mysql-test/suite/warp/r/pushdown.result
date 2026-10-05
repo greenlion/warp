@@ -1,0 +1,50 @@
+#
+# WHERE clause pushdown into WARP.  Every query is also run against an
+# identical InnoDB table and the results must match.
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE w (
+id INT, k INT, s VARCHAR(30), d DATE, tm TIME, dc DECIMAL(10,2),
+cat CHAR(6), n INT NULL
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w WITH RECURSIVE seq(x) AS
+(SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 20000)
+SELECT x, x % 100, CONCAT('s', x % 37), DATE_ADD('2020-01-01', INTERVAL x % 1000 DAY),
+SEC_TO_TIME((x % 7200) - 3600), x / 4, ELT(1 + x % 4, 'red', 'green', 'blue', 'black'),
+IF(x % 9 = 0, NULL, x % 13)
+FROM seq;
+INSERT INTO i SELECT * FROM w;
+WHERE k = 7: rows:sum(id) = 200:1991400
+WHERE k <> 7: rows:sum(id) = 19800:198018600
+WHERE k < 10 AND id > 15000: rows:sum(id) = 500:8732250
+WHERE k = 1 OR k = 99: rows:sum(id) = 400:4000000
+WHERE k IN (3, 5, 8): rows:sum(id) = 600:5973200
+WHERE k BETWEEN 10 AND 20: rows:sum(id) = 2200:21923000
+WHERE s = 's5': rows:sum(id) = 541:5407295
+WHERE cat = 'blue' AND k < 50: rows:sum(id) = 2400:23937600
+WHERE d = '2020-02-01': rows:sum(id) = 20:190620
+WHERE d BETWEEN '2021-01-01' AND '2021-06-30': rows:sum(id) = 3620:36040720
+WHERE tm < '-00:30:00': rows:sum(id) = 5399:43737300
+WHERE n IS NULL: rows:sum(id) = 2222:22227777
+WHERE n IS NOT NULL AND n = 0: rows:sum(id) = 1368:13684788
+WHERE n = 3 OR n IS NULL: rows:sum(id) = 3590:35903331
+WHERE (k = 1 OR k = 2) AND (cat = 'red' OR cat = 'green'): rows:sum(id) = 200:1990200
+WHERE id >= 19990: rows:sum(id) = 11:219945
+WHERE dc > 4990.00: rows:sum(id) = 40:799220
+WHERE k = -1: rows:sum(id) = 0:0
+# Aggregates over the whole table
+SELECT cat, COUNT(*), SUM(k), SUM(dc), COUNT(n) FROM w GROUP BY cat ORDER BY cat;
+cat	COUNT(*)	SUM(k)	SUM(dc)	COUNT(n)
+black	5000	255000	12501250.00	4445
+blue	5000	250000	12500000.00	4444
+green	5000	245000	12498750.00	4444
+red	5000	240000	12502500.00	4445
+SELECT cat, COUNT(*), SUM(k), SUM(dc), COUNT(n) FROM i GROUP BY cat ORDER BY cat;
+cat	COUNT(*)	SUM(k)	SUM(dc)	COUNT(n)
+black	5000	255000	12501250.00	4445
+blue	5000	250000	12500000.00	4444
+green	5000	245000	12498750.00	4444
+red	5000	240000	12502500.00	4445
+DROP TABLE w, i;

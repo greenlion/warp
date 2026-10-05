@@ -1,0 +1,61 @@
+--echo #
+--echo # Tables spanning several FastBit partitions.  The server runs with
+--echo # warp_partition_max_rows=64000 and warp_write_cache_size=32000.
+--echo #
+
+SELECT @@warp_partition_max_rows, @@warp_write_cache_size;
+SET SESSION cte_max_recursion_depth = 1000000;
+SET SESSION group_concat_max_len = 100000000;
+
+CREATE TABLE w (id INT, k INT, s VARCHAR(30), d DATE) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+
+--echo # One large load followed by many small inserts
+INSERT INTO w WITH RECURSIVE seq(x) AS
+  (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 200000)
+  SELECT x, x % 1000, CONCAT('str-', x % 503), DATE_ADD('2000-01-01', INTERVAL x % 5000 DAY)
+  FROM seq;
+let $n = 0;
+while ($n < 20)
+{
+  inc $n;
+  eval INSERT INTO w VALUES (300000 + $n, $n, 'single', '2024-01-01');
+}
+INSERT INTO i SELECT * FROM w;
+
+--echo # Number of partition directories
+--perl
+my $dir = "$ENV{MYSQLTEST_VARDIR}/mysqld.1/data/test/w.data";
+opendir(my $dh, $dir) or die "cannot open $dir: $!";
+my @parts = grep { /^p\d+$/ && -d "$dir/$_" } readdir($dh);
+closedir($dh);
+print "partitions: " . scalar(@parts) . "\n";
+EOF
+
+SELECT COUNT(*), SUM(id), MIN(id), MAX(id) FROM w;
+SELECT COUNT(*), SUM(id), MIN(id), MAX(id) FROM i;
+SELECT COUNT(*) FROM w WHERE k = 999;
+SELECT COUNT(*) FROM i WHERE k = 999;
+SELECT COUNT(*) FROM w WHERE s = 'str-7' AND d >= '2005-01-01';
+SELECT COUNT(*) FROM i WHERE s = 'str-7' AND d >= '2005-01-01';
+SELECT COUNT(*) FROM w WHERE id BETWEEN 63990 AND 64010;
+
+let $wsum = `SELECT SHA2(GROUP_CONCAT(CONCAT_WS('|', id, k, s, d) ORDER BY id SEPARATOR ','), 256) FROM w`;
+let $isum = `SELECT SHA2(GROUP_CONCAT(CONCAT_WS('|', id, k, s, d) ORDER BY id SEPARATOR ','), 256) FROM i`;
+if ($wsum != $isum)
+{
+  --echo WARP and InnoDB contents differ
+}
+if ($wsum == $isum)
+{
+  --echo WARP and InnoDB contents are identical
+}
+
+--echo # Updates and deletes across partitions
+UPDATE w SET k = -1 WHERE id % 50000 = 0;
+DELETE FROM w WHERE id BETWEEN 63995 AND 64005;
+SELECT COUNT(*), SUM(k = -1) FROM w;
+
+DROP TABLE w, i;
