@@ -1556,7 +1556,8 @@ int ha_warp::check(THD *, HA_CHECK_OPT *) {
   DBUG_RETURN(HA_ADMIN_OK);
 }
 
-/* OPTIMIZE TABLE rewrites every column data file in the format selected
+/* OPTIMIZE TABLE rewrites every column data file (and the starting
+   position files of string columns) in the format selected
    by warp_compression: compressed files are re-framed into full size zstd
    frames (merging the small frames created by many small inserts) and
    plain files are compressed, or, if compression is disabled, compressed
@@ -1575,21 +1576,28 @@ int ha_warp::optimize(THD *, HA_CHECK_OPT *) {
     for (uint32_t i = 0; i < part->nColumns(); ++i) {
       const ibis::column *col = part->getColumn(i);
       if (col == nullptr || col->type() == ibis::BLOB) continue;
-      std::string fname = std::string(dir) + FASTBIT_DIRSEP + col->name();
-      int ierr = 0;
-      if (compress) {
-        ierr = ibis::zfile::compact(fname.c_str());
-      } else if (ibis::zfile::isCompressed(fname.c_str())) {
-        std::string content;
-        ierr = ibis::zfile::readAll(fname.c_str(), content);
-        if (ierr == 0)
-          ierr = ibis::zfile::writeWhole(fname.c_str(), content.data(),
-                                         content.size(), 0, false);
-      }
-      if (ierr < 0) {
-        sql_print_error("WARP: OPTIMIZE failed to rewrite %s (error %d)",
-                        fname.c_str(), ierr);
-        rc = HA_ADMIN_FAILED;
+      std::vector<std::string> files;
+      files.push_back(std::string(dir) + FASTBIT_DIRSEP + col->name());
+      /* string columns also have a file with the starting positions */
+      if (col->type() == ibis::TEXT || col->type() == ibis::CATEGORY)
+        files.push_back(files[0] + ".sp");
+      for (const auto &fname : files) {
+        if (ibis::util::getFileSize(fname.c_str()) <= 0) continue;
+        int ierr = 0;
+        if (compress) {
+          ierr = ibis::zfile::compact(fname.c_str());
+        } else if (ibis::zfile::isCompressed(fname.c_str())) {
+          std::string content;
+          ierr = ibis::zfile::readAll(fname.c_str(), content);
+          if (ierr == 0)
+            ierr = ibis::zfile::writeWhole(fname.c_str(), content.data(),
+                                           content.size(), 0, false);
+        }
+        if (ierr < 0) {
+          sql_print_error("WARP: OPTIMIZE failed to rewrite %s (error %d)",
+                          fname.c_str(), ierr);
+          rc = HA_ADMIN_FAILED;
+        }
       }
     }
     ibis::fileManager::instance().flushDir(dir);
