@@ -2297,12 +2297,23 @@ int ha_warp::rnd_pos(uchar *buf, uchar *pos) {
   
   ha_statistic_increment(&System_status_var::ha_read_rnd_count);
   current_rowid = my_get_ptr(pos, ref_length);
+  /* rnd_pos can be used without a preceding table scan in this handler */
+  if(column_set.empty()) {
+    set_column_set();
+  }
+  rc = HA_ERR_KEY_NOT_FOUND;
   base_table = ibis::mensa::create(share->data_dir_name);
-  filtered_table = base_table->select(column_set.c_str(), ("r=" + std::to_string(current_rowid)).c_str());
-  cursor = filtered_table->createCursor();
-  
-  rc = find_current_row(buf, cursor);
-   
+  if(base_table != NULL) {
+    filtered_table = base_table->select(column_set.c_str(), ("r=" + std::to_string(current_rowid)).c_str());
+  }
+  if(filtered_table != NULL && filtered_table->nRows() > 0) {
+    cursor = filtered_table->createCursor();
+    /* position the cursor on the (only) matching row before reading it */
+    if(cursor != NULL && cursor->fetch() == 0) {
+      rc = find_current_row(buf, cursor);
+    }
+  }
+
   delete cursor;
   delete filtered_table;
   delete base_table;
