@@ -485,6 +485,8 @@ long ibis::part::writeValues(const char *fname,
     evt += fname;
     evt += ')';
 
+    // the values are rewritten in place as raw bytes
+    ibis::zfile::plainScope zscope(fname);
     int fdes = UnixOpen(fname, OPEN_READWRITE, OPEN_FILEMODE);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 1)
@@ -561,6 +563,8 @@ long ibis::part::reorderValues(const char *fname,
     evt += ">(";
     evt += fname;
     evt += ')';
+    // the values are rewritten in place as raw bytes
+    ibis::zfile::plainScope zscope(fname);
     int fdes = UnixOpen(fname, OPEN_READWRITE, OPEN_FILEMODE);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 1)

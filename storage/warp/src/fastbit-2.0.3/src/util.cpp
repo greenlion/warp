@@ -876,8 +876,16 @@ off_t ibis::util::getFileSize(const char* name) {
     if (name != 0 && *name != 0) {
         Stat_T buf;
         if (UnixStat(name, &buf) == 0) {
-            if ((buf.st_mode & S_IFREG) == S_IFREG)
+            if ((buf.st_mode & S_IFREG) == S_IFREG) {
+                // report the logical (decompressed) size of compressed
+                // data files
+                if ((size_t)buf.st_size >= ibis::zfile::HEADER_SIZE) {
+                    const int64_t lsz = ibis::zfile::logicalSize(name);
+                    if (lsz >= 0)
+                        return lsz;
+                }
                 return buf.st_size;
+            }
         }
         else {
             LOGGER(ibis::gVerbose > 11 || errno != ENOENT)
@@ -900,7 +908,7 @@ int ibis::util::copy(const char* to, const char* from) {
 #endif
         ) return -4;
 
-    int fdes = UnixOpen(from, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(from);
     if (fdes < 0) {
         LOGGER(errno != ENOENT || ibis::gVerbose > 10)
             << "Warning -- util::copy(" << to << ", " << from

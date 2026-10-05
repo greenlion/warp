@@ -277,7 +277,7 @@ int ibis::dictionary::read(const char* name) {
 
     // open the file to read
     int ierr = 0;
-    FILE* fptr = fopen(name, "rb");
+    FILE* fptr = ibis::zfile::fopenRead(name);
     if (fptr == 0) {
         LOGGER(ibis::gVerbose > 3)
             << "Warning -- " << evt << " failed to open the file ... "

@@ -151,6 +151,52 @@ static MYSQL_SYSVAR_ULONGLONG(
   1ULL<<63,
   0
 );
+
+/* zstd compression of column data files.  Only affects data files created
+   after the setting is changed; existing files keep their format until
+   OPTIMIZE TABLE rewrites them. */
+static bool my_compression = true;
+static uint my_compression_level = 3;
+
+static void warp_apply_compression() {
+  ibis::zfile::setLevel(my_compression ? (int)my_compression_level : 0);
+}
+
+static void warp_update_compression(THD *, SYS_VAR *, void *var_ptr,
+                                    const void *save) {
+  *static_cast<bool *>(var_ptr) = *static_cast<const bool *>(save);
+  warp_apply_compression();
+}
+
+static void warp_update_compression_level(THD *, SYS_VAR *, void *var_ptr,
+                                          const void *save) {
+  *static_cast<uint *>(var_ptr) = *static_cast<const uint *>(save);
+  warp_apply_compression();
+}
+
+static MYSQL_SYSVAR_BOOL(
+  compression,
+  my_compression,
+  PLUGIN_VAR_OPCMDARG,
+  "Compress newly written column data files with zstd",
+  NULL,
+  warp_update_compression,
+  true
+);
+
+static MYSQL_SYSVAR_UINT(
+  compression_level,
+  my_compression_level,
+  PLUGIN_VAR_RQCMDARG,
+  "zstd compression level used for column data files",
+  NULL,
+  warp_update_compression_level,
+  3,
+  1,
+  19,
+  0
+);
+
 bool is_update = false;
 std::vector<uint32_t> update_column_set;
 std::vector<uint32_t> nullable_column_set;
@@ -191,6 +237,8 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(partition_max_rows),
   MYSQL_SYSVAR(cache_size),
   MYSQL_SYSVAR(write_cache_size),
+  MYSQL_SYSVAR(compression),
+  MYSQL_SYSVAR(compression_level),
   MYSQL_SYSVAR(lock_wait_timeout),
   MYSQL_SYSVAR(partition_filter),
   MYSQL_SYSVAR(adjust_table_stats_for_joins),
@@ -763,6 +811,7 @@ class ha_warp : public handler {
   bool is_crashed() const;
   int rnd_end();
   int repair(THD *thd, HA_CHECK_OPT *check_opt);
+  int optimize(THD *thd, HA_CHECK_OPT *check_opt);
   /* This is required for SQL layer to know that we support autorepair */
   bool auto_repair() const { return 1; }
   void position(const uchar *record);

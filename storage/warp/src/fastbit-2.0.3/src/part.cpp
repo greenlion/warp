@@ -8370,7 +8370,7 @@ long ibis::part::doCompare(const char* file,
     if (ibis::gVerbose > 3)
         timer.start(); // start the timer
 
-    int fdes = UnixOpen(file, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(file);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- part::doCompare could not open file \"" << file
@@ -8615,7 +8615,7 @@ long ibis::part::doCompare(const char* file,
         timer.start(); // start the timer
 
     res.clear();
-    int fdes = UnixOpen(file, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(file);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- part::doCompare could not open file \"" << file
@@ -8847,7 +8847,7 @@ long ibis::part::doCompare(const char* file,
 
     res.clear();
     hits.clear();
-    int fdes = UnixOpen(file, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(file);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- part::doCompare failed to open file \"" << file
@@ -9520,7 +9520,7 @@ long ibis::part::negativeCompare(const char* file,
         timer.start(); // start the timer
 
     hits.clear(); // clear the existing content
-    int fdes = UnixOpen(file, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(file);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- part::negativeCompare could not open file \""
@@ -9886,7 +9886,7 @@ long ibis::part::doCompare(const char* file,
     if (ibis::gVerbose > 3)
         timer.start(); // start the timer
 
-    int fdes = UnixOpen(file, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(file);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- part::doCompare could not open file \""
@@ -10213,7 +10213,7 @@ long ibis::part::negativeCompare(const char* file,
         timer.start(); // start the timer
 
     hits.clear(); // clear the existing content
-    int fdes = UnixOpen(file, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(file);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- part::negativeCompare could not open file \""
@@ -10577,7 +10577,7 @@ long ibis::part::doCompare(const char* file,
     if (ibis::gVerbose > 3)
         timer.start(); // start the timer
 
-    int fdes = UnixOpen(file, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(file);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- part::doCompare could not open file \""
@@ -10901,7 +10901,7 @@ long ibis::part::negativeCompare(const char* file,
         timer.start(); // start the timer
 
     hits.clear(); // clear the existing content
-    int fdes = UnixOpen(file, OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(file);
     if (fdes < 0) {
         LOGGER(ibis::gVerbose > 0)
             << "Warning -- part::negativeCompare could not open file \""
@@ -19195,6 +19195,48 @@ int ibis::part::writeColumn(int fdes,
                             ibis::bitvector& totmask,
                             const ibis::bitvector& newmask) {
     const uint32_t elem = sizeof(T);
+    if (ibis::zfile::shouldCompress(fdes)) {
+        // compressed data file: build padding and new values in memory and
+        // append them as new zstd frames
+        int64_t lsz = ibis::zfile::logicalSize(fdes);
+        if (lsz < 0) lsz = 0;
+        std::vector<T> buf;
+        if ((uint64_t)lsz < (uint64_t)nold*elem) {
+            const uint32_t n1 = (uint32_t)(lsz / elem);
+            if ((uint64_t)lsz != (uint64_t)n1*elem &&
+                ibis::zfile::resize(fdes, (uint64_t)n1*elem) < 0)
+                return -3;
+            totmask.adjustSize(n1, nold);
+            buf.assign(nold - n1, fill);
+        }
+        else if ((uint64_t)lsz > (uint64_t)nold*elem) {
+            if (ibis::zfile::resize(fdes, (uint64_t)nold*elem) < 0)
+                return -3;
+            totmask.adjustSize(nold, nold);
+        }
+        else {
+            totmask.adjustSize(nold, nold);
+        }
+        const uint32_t navail = (vals.size() > voffset ?
+                                 vals.size() - voffset : 0);
+        const uint32_t ncopy = (navail < nnew ? navail : nnew);
+        buf.insert(buf.end(), vals.begin()+voffset,
+                   vals.begin()+voffset+ncopy);
+        if (ncopy < nnew)
+            buf.insert(buf.end(), nnew - ncopy, fill);
+        if (! buf.empty() &&
+            ibis::zfile::append(fdes, buf.data(), buf.size()*elem, elem) < 0) {
+            LOGGER(ibis::gVerbose > 0)
+                << "Warning -- part::writeColumn<" << typeid(T).name() << ">("
+                << fdes << ", " << nold << ", " << nnew << " ...) failed to "
+                "append to the compressed data file";
+            return -4;
+        }
+        totmask += newmask;
+        totmask.adjustSize(totmask.size(), nnew+nold);
+        return nnew;
+    }
+
     off_t pos = UnixSeek(fdes, 0, SEEK_END);
     if (pos < 0) {
         LOGGER(ibis::gVerbose > 0)
@@ -19269,6 +19311,30 @@ int ibis::part::writeStrings(const char *fnm,
             evt += oss.str();
         }
         evt += "...)";
+    }
+    if (ibis::zfile::shouldCompress(fnm)) {
+        // compressed data file: concatenate the null-terminated strings and
+        // append them as new zstd frames
+        std::string buf;
+        ibis::bitvector::word_t nnew0 = 0;
+        const uint32_t jend = (vals.size() >= nnew+voffset ? voffset+nnew :
+                               (uint32_t)vals.size());
+        for (uint32_t j = voffset; j < jend; ++ j) {
+            buf.append(vals[j].c_str(), vals[j].size()+1);
+            ++ nnew0;
+        }
+        if (nnew0 < nnew)
+            buf.append(nnew - nnew0, '\0');
+        if (ibis::zfile::append(fnm, buf.data(), buf.size()) < 0) {
+            LOGGER(ibis::gVerbose > 0)
+                << "Warning -- " << evt << " failed to append to the "
+                "compressed data file";
+            return -4;
+        }
+        totmask.adjustSize(nold, nold);
+        totmask += newmask;
+        totmask.adjustSize(nold+nnew0, nnew+nold);
+        return nnew;
     }
     FILE *fptr = fopen(fnm, "ab");
     if (fptr == 0) {
@@ -19818,7 +19884,7 @@ long ibis::part::barrel::open(const ibis::part *t) {
                 stores[i]->beginUse();
             }
             else { // getFile failed, open the name file
-                fdes[i] = UnixOpen(dfn.c_str(), OPEN_READONLY);
+                fdes[i] = ibis::zfile::openRead(dfn.c_str());
                 if (fdes[i] < 0) {
                     LOGGER(ibis::gVerbose > 0)
                         << "Warning -- barrel::open could not open file \""
@@ -20154,7 +20220,7 @@ long ibis::part::vault::open(const ibis::part *t) {
             stores[0]->beginUse();
         }
         else { // getFile failed, open the name file
-            fdes[0] = UnixOpen(dfn.c_str(), OPEN_READONLY);
+            fdes[0] = ibis::zfile::openRead(dfn.c_str());
             if (fdes[0] < 0) {
                 t->logWarning("vault::open",
                               "could not open file \"%s\"", dfn.c_str());
@@ -20216,7 +20282,7 @@ long ibis::part::vault::open(const ibis::part *t) {
             stores[i]->beginUse();
         }
         else { // getFile failed, open the name file
-            fdes[i] = UnixOpen(dfn.c_str(), OPEN_READONLY);
+            fdes[i] = ibis::zfile::openRead(dfn.c_str());
             if (fdes[i] < 0) {
                 t->logWarning("vault::open",
                               "could not open file \"%s\"", dfn.c_str());

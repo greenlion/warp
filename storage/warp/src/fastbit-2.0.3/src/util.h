@@ -504,6 +504,116 @@ namespace ibis {
         int makeDir(const char* dir);
         FASTBIT_CXX_DLLSPEC off_t getFileSize(const char* name);
         int copy(const char* to, const char* from);
+    } // namespace util
+
+    /// Support for zstd compressed column data files.
+    ///
+    /// A compressed data file starts with a fixed size header (see
+    /// ibis::zfile::header) followed by one or more zstd frames.  The
+    /// concatenation of the decompressed frames is the logical content of
+    /// the file, i.e., exactly what an uncompressed data file would hold.
+    /// Files without the header are plain (raw) data files.  Whether a file
+    /// is compressed is decided when it is created and never changes for
+    /// appends; ibis::zfile::compact can convert a file explicitly.
+    namespace zfile {
+        /// Size of the header in bytes.
+        const unsigned HEADER_SIZE = 64;
+        /// Largest number of logical bytes in a single zstd frame.
+        const size_t FRAME_SIZE = 1024 * 1024;
+
+        struct header {
+            char     magic[8];  ///< "#FBZSTD\x01"
+            uint32_t version;   ///< format version, currently 1
+            uint32_t flags;     ///< reserved
+            uint64_t raw_size;  ///< logical size of the content
+            uint64_t comp_size; ///< bytes of valid zstd frames after header
+            uint32_t nframes;   ///< number of zstd frames
+            uint32_t elem_size; ///< element size, informational only
+            char     pad[24];
+        };
+
+        /// Compression level for newly created files, 0 = do not compress.
+        FASTBIT_CXX_DLLSPEC int level();
+        FASTBIT_CXX_DLLSPEC void setLevel(int lvl);
+
+        /// Read and validate the header from an open file.  Returns 0 if
+        /// the file is compressed, 1 if it is a plain file, < 0 on error.
+        FASTBIT_CXX_DLLSPEC int readHeader(int fdes, header& hdr);
+        FASTBIT_CXX_DLLSPEC bool isCompressed(const char* fname);
+        FASTBIT_CXX_DLLSPEC bool isCompressed(int fdes);
+        /// Should new content for the named file be written compressed?
+        /// True if the file is already compressed, or if it is missing or
+        /// empty and compression is enabled.
+        FASTBIT_CXX_DLLSPEC bool shouldCompress(const char* fname);
+        /// Same as above for a file opened for reading and writing.
+        FASTBIT_CXX_DLLSPEC bool shouldCompress(int fdes);
+        /// Logical size of a file, the size on disk for plain files.
+        /// Returns -1 if the file does not exist.
+        FASTBIT_CXX_DLLSPEC int64_t logicalSize(const char* fname);
+        FASTBIT_CXX_DLLSPEC int64_t logicalSize(int fdes);
+
+        /// Decompress the logical range [begin, end) of a compressed file
+        /// into dst.  Returns the number of bytes produced or < 0.
+        FASTBIT_CXX_DLLSPEC int64_t readRange(int fdes, uint64_t begin,
+                                              uint64_t end, void* dst);
+        FASTBIT_CXX_DLLSPEC int64_t readRange(const char* fname,
+                                              uint64_t begin, uint64_t end,
+                                              void* dst);
+        /// Open a file for reading its logical content.  Plain files are
+        /// simply opened; compressed files are decompressed into an
+        /// anonymous in-memory file.  Either way the returned descriptor
+        /// supports read, lseek, fstat and mmap as on a plain data file.
+        FASTBIT_CXX_DLLSPEC int openRead(const char* fname);
+        /// Same as openRead, but returns a stdio stream.
+        FASTBIT_CXX_DLLSPEC FILE* fopenRead(const char* fname);
+        /// Read the whole logical content of a file (compressed or not).
+        FASTBIT_CXX_DLLSPEC int readAll(const char* fname, std::string& out);
+
+        /// Append bytes to a compressed file, creating it if it does not
+        /// exist or is empty.  Returns 0 on success.
+        FASTBIT_CXX_DLLSPEC int append(const char* fname, const void* buf,
+                                       size_t n, uint32_t elem=0);
+        /// Same as above for a file opened for reading and writing.
+        FASTBIT_CXX_DLLSPEC int append(int fdes, const void* buf,
+                                       size_t n, uint32_t elem=0);
+        /// Replace the content of a file.  When compress is true the new
+        /// file is compressed, otherwise it is written as a plain file.
+        FASTBIT_CXX_DLLSPEC int writeWhole(const char* fname, const void* buf,
+                                           size_t n, uint32_t elem,
+                                           bool compress);
+        /// Change the logical size of a compressed file: truncate, or pad
+        /// with the given fill pattern of size elem (zeros if fill is 0).
+        FASTBIT_CXX_DLLSPEC int resize(const char* fname, uint64_t newsize,
+                                       uint32_t elem=0, const void* fill=0);
+        /// Same as above for an open compressed file.  Truncation rewrites
+        /// the file in place.
+        FASTBIT_CXX_DLLSPEC int resize(int fdes, uint64_t newsize,
+                                       uint32_t elem=0, const void* fill=0);
+        /// Rewrite a file compressed with full size frames at the current
+        /// level (or the default level if compression is off).  Plain files
+        /// are converted.  Returns 0 on success, 1 if nothing was done.
+        FASTBIT_CXX_DLLSPEC int compact(const char* fname);
+
+        /// Temporarily turn a data file into a plain file so that legacy
+        /// code that seeks and writes raw bytes can modify it.  The file is
+        /// compressed again when the object goes out of scope if it was
+        /// compressed before, or if it did not exist (or was empty) and
+        /// compression is enabled.  Only meant for infrequent maintenance
+        /// operations because the whole file is rewritten twice.
+        class FASTBIT_CXX_DLLSPEC plainScope {
+        public:
+            explicit plainScope(const char* fname);
+            ~plainScope();
+        private:
+            std::string name_;
+            bool recompress_;
+
+            plainScope(const plainScope&);
+            plainScope& operator=(const plainScope&);
+        };
+    } // namespace zfile
+
+    namespace util {
 
         /// Set the verboseness level.  Unless the code is compiled with
         /// DEBUG macro set, the default verboseness level is 0, which will

@@ -449,7 +449,7 @@ int ibis::fade::read(const char* f) {
     indexFileName(fnm, f);
     if (fname != 0 && fnm.compare(fname) == 0)
         return 0;
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0)
         return -1;
 

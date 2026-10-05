@@ -161,7 +161,7 @@ ibis::range::range(const ibis::column* c, ibis::fileManager::storage* st,
 int ibis::range::read(const char* f) {
     std::string fnm;
     indexFileName(fnm, f);
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0)
         return -1;
 

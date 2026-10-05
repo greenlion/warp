@@ -813,6 +813,7 @@ int ibis::fileManager::getFile(const char* name, storage **st,
     if (name == 0 || *name == 0 || st == 0) return -100;
     int ierr = 0;
     uint64_t bytes = 0; // the file size in bytes
+    bool compressed = false; // is it a zstd compressed data file
     std::string evt = "fileManager::getFile";
     if (ibis::gVerbose > 2) {
         evt += '(';
@@ -823,6 +824,13 @@ int ibis::fileManager::getFile(const char* name, storage **st,
         Stat_T tmp;
         if (0 == UnixStat(name, &tmp)) {
             bytes = tmp.st_size;
+            if (bytes >= ibis::zfile::HEADER_SIZE &&
+                ibis::zfile::isCompressed(name)) {
+                // the in-memory size is the decompressed size
+                compressed = true;
+                const int64_t lsz = ibis::zfile::logicalSize(name);
+                bytes = (lsz > 0 ? lsz : 0);
+            }
             if (bytes == 0) {
                 LOGGER(ibis::gVerbose >= 0)
                     << evt << ": the named file is empty";
@@ -935,7 +943,7 @@ int ibis::fileManager::getFile(const char* name, storage **st,
         if (sz < FASTBIT_MIN_MAP_SIZE)
             sz = FASTBIT_MIN_MAP_SIZE;
     }
-    if (mapped.size() < maxOpenFiles && 
+    if (!compressed && mapped.size() < maxOpenFiles &&
         (pref == PREFER_MMAP || (pref == MMAP_LARGE_FILES && bytes >= sz))) {
         // map the file read-only
         tmp->mapFile(name);
@@ -1059,6 +1067,7 @@ int ibis::fileManager::tryGetFile(const char* name, storage **st,
 #endif
     int ierr = 0;
     uint64_t bytes = 0; // the file size in bytes
+    bool compressed = false; // is it a zstd compressed data file
     std::string evt = "fileManager::tryGetFile";
     if (ibis::gVerbose > 0) {
         evt += '(';
@@ -1086,6 +1095,13 @@ int ibis::fileManager::tryGetFile(const char* name, storage **st,
         Stat_T tmp;
         if (0 == UnixStat(name, &tmp)) {
             bytes = tmp.st_size;
+            if (bytes >= ibis::zfile::HEADER_SIZE &&
+                ibis::zfile::isCompressed(name)) {
+                // the in-memory size is the decompressed size
+                compressed = true;
+                const int64_t lsz = ibis::zfile::logicalSize(name);
+                bytes = (lsz > 0 ? lsz : 0);
+            }
             if (bytes == 0) {
                 LOGGER(ibis::gVerbose > 2)
                     << "Warning -- " << evt << " can not process an empty file";
@@ -1131,7 +1147,7 @@ int ibis::fileManager::tryGetFile(const char* name, storage **st,
         if (sz < FASTBIT_MIN_MAP_SIZE)
             sz = FASTBIT_MIN_MAP_SIZE;
     }
-    if (mapped.size() < maxOpenFiles &&
+    if (!compressed && mapped.size() < maxOpenFiles &&
         (pref == PREFER_MMAP || (pref == MMAP_LARGE_FILES && bytes >= sz))) {
         // map the file read-only
         tmp->mapFile(name);
@@ -1298,7 +1314,8 @@ ibis::fileManager::getFileSegment(const char* name, const int fdes,
     if (name != 0 && *name != 0) {
         size_t sz = (FASTBIT_MIN_MAP_SIZE << 2); // more than 4 pages
         const size_t nmapped = ibis::fileManager::instance().mapped.size();
-        if (nmapped+nmapped < maxOpenFiles && bytes >= sz) {
+        if (nmapped+nmapped < maxOpenFiles && bytes >= sz &&
+            !ibis::zfile::isCompressed(name)) {
             // map the file read-only
             try {
                 st = new ibis::fileManager::rofSegment(name, b, e);
@@ -2346,15 +2363,20 @@ off_t ibis::fileManager::storage::read(const char* fname,
         enlarge(nbytes);
     }
 
-    nread = UnixSeek(fdes, begin, SEEK_SET);
-    if (nread != begin) {
-        LOGGER(ibis::gVerbose > 2)
-            << "Warning -- " << evt << " failed to seek to " << begin
-            << " ... " << (errno!=0 ? strerror(errno) : "???");
-        return 0;
+    if (ibis::zfile::isCompressed(fdes)) {
+        nread = ibis::zfile::readRange(fdes, begin, end, m_begin);
     }
+    else {
+        nread = UnixSeek(fdes, begin, SEEK_SET);
+        if (nread != begin) {
+            LOGGER(ibis::gVerbose > 2)
+                << "Warning -- " << evt << " failed to seek to " << begin
+                << " ... " << (errno!=0 ? strerror(errno) : "???");
+            return 0;
+        }
 
-    nread = ibis::util::read(fdes, m_begin, nbytes);
+        nread = ibis::util::read(fdes, m_begin, nbytes);
+    }
     if (nread == nbytes) {
         ibis::fileManager::instance().recordPages(begin, end);
         if (ibis::gVerbose > 7) {
@@ -2404,15 +2426,20 @@ off_t ibis::fileManager::storage::read(const int fdes,
         enlarge(nbytes);
     }
 
-    nread = UnixSeek(fdes, begin, SEEK_SET);
-    if (nread != begin) {
-        LOGGER(ibis::gVerbose > 2)
-            << "Warning -- " << evt << " failed to seek to " << begin
-            << " ... " << (errno!=0 ? strerror(errno) : "???");
-        return 0;
+    if (ibis::zfile::isCompressed(fdes)) {
+        nread = ibis::zfile::readRange(fdes, begin, end, m_begin);
     }
+    else {
+        nread = UnixSeek(fdes, begin, SEEK_SET);
+        if (nread != begin) {
+            LOGGER(ibis::gVerbose > 2)
+                << "Warning -- " << evt << " failed to seek to " << begin
+                << " ... " << (errno!=0 ? strerror(errno) : "???");
+            return 0;
+        }
 
-    nread = ibis::util::read(fdes, m_begin, nbytes);
+        nread = ibis::util::read(fdes, m_begin, nbytes);
+    }
     if (nread == nbytes) {
         ibis::fileManager::instance().recordPages(begin, end);
         if (ibis::gVerbose > 7) {
@@ -2686,6 +2713,27 @@ void ibis::fileManager::roFile::doRead(const char* file) {
             << file << "\"";
         return;
     }
+    if (n >= ibis::zfile::HEADER_SIZE && ibis::zfile::isCompressed(file)) {
+        // decompress the whole file into memory
+        const int64_t lsz = ibis::zfile::logicalSize(file);
+        if (lsz < 0) return;
+        enlarge(lsz);
+        const int64_t got = ibis::zfile::readRange(file, 0, lsz, m_begin);
+        if (got != lsz) {
+            LOGGER(ibis::gVerbose > 1)
+                << "Warning -- " << evt << " failed to decompress \""
+                << file << "\", readRange returned " << got;
+            free(m_begin);
+            m_begin = 0;
+            m_end = 0;
+            return;
+        }
+        ibis::fileManager::instance().recordPages(0, tmp.st_size);
+        name = ibis::util::strnewdup(file);
+        m_end = m_begin + lsz;
+        opened = time(0);
+        return;
+    }
 
     int in = UnixOpen(file, OPEN_READONLY);
     if (in < 0) {
@@ -2758,7 +2806,15 @@ void ibis::fileManager::roFile::doRead(const char* file, off_t b, off_t e) {
 #if defined(_WIN32) && defined(_MSC_VER)
     (void)_setmode(in, _O_BINARY);
 #endif
-    i = ibis::util::read(in, m_begin, n);
+    if (ibis::zfile::isCompressed(in)) {
+        i = ibis::zfile::readRange(in, b, e, m_begin);
+    }
+    else if (UnixSeek(in, b, SEEK_SET) != b) {
+        i = -1;
+    }
+    else {
+        i = ibis::util::read(in, m_begin, n);
+    }
     ibis::fileManager::instance().recordPages(b, e);
     UnixClose(in); // close the file
     if (i == -1L) {
@@ -2806,6 +2862,11 @@ void ibis::fileManager::roFile::mapFile(const char* file) {
         LOGGER(ibis::gVerbose > 2)
             << "Warning -- roFile::mapFile failed to find out the size of \""
             << file << "\"";
+        return;
+    }
+    if (ibis::zfile::isCompressed(file)) {
+        // compressed files can not be mapped, decompress into memory
+        doRead(file);
         return;
     }
     if (tmp.st_size > 0) {
@@ -2856,6 +2917,9 @@ ibis::fileManager::rofSegment::rofSegment(const char *fn, off_t b, off_t e)
     : ibis::fileManager::roFile(), filename_(fn), begin_(b), end_(e) {
     if (fn == 0 || *fn == 0 || b >= e)
         return;
+    if (ibis::zfile::isCompressed(fn))
+        throw ibis::bad_alloc("fileManager::rofSegment::ctor can not map a "
+                              "compressed file" IBIS_FILE_LINE);
 
     doMap(fn, b, e, 0);
     if (m_begin == 0 || m_begin + (e-b) != m_end) {
@@ -3089,3 +3153,551 @@ void ibis::fileManager::roFile::doMap(const char* file, off_t b, off_t e,
 } // ibis::fileManager::roFile::doMap using mmap
 #endif
 
+
+/////////////////////////////////////////////////////////////////////////////
+// ibis::zfile -- zstd compressed data files
+/////////////////////////////////////////////////////////////////////////////
+#include <zstd.h>
+#include <atomic>
+#include <vector>
+
+namespace {
+const char FBZ_MAGIC[8] = {'#', 'F', 'B', 'Z', 'S', 'T', 'D', '\x01'};
+const uint32_t FBZ_VERSION = 1;
+const int FBZ_DEFAULT_LEVEL = 3;
+
+/// The initial compression level comes from the environment variable
+/// FASTBIT_ZSTD_LEVEL (default 0, i.e., no compression).  Applications
+/// such as the WARP storage engine call ibis::zfile::setLevel.
+int fbzInitialLevel() {
+    const char *str = getenv("FASTBIT_ZSTD_LEVEL");
+    if (str == 0 || *str == 0) return 0;
+    const int lvl = atoi(str);
+    return (lvl < 0 ? 0 : lvl > ZSTD_maxCLevel() ? ZSTD_maxCLevel() : lvl);
+}
+
+std::atomic<int> fbz_level(fbzInitialLevel());
+
+/// Per thread compression and decompression contexts.
+struct fbzContexts {
+    ZSTD_CCtx *cctx;
+    ZSTD_DCtx *dctx;
+    fbzContexts() : cctx(0), dctx(0) {}
+    ~fbzContexts() {
+        if (cctx) ZSTD_freeCCtx(cctx);
+        if (dctx) ZSTD_freeDCtx(dctx);
+    }
+    ZSTD_CCtx *c() {if (cctx == 0) cctx = ZSTD_createCCtx(); return cctx;}
+    ZSTD_DCtx *d() {if (dctx == 0) dctx = ZSTD_createDCtx(); return dctx;}
+};
+thread_local fbzContexts fbz_ctx;
+
+int64_t fbzPread(int fdes, void* buf, uint64_t n, uint64_t off) {
+    uint64_t done = 0;
+    while (done < n) {
+        ssize_t r = ::pread(fdes, static_cast<char*>(buf)+done, n-done,
+                            off+done);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) break;
+        done += r;
+    }
+    return done;
+}
+
+int64_t fbzPwrite(int fdes, const void* buf, uint64_t n, uint64_t off) {
+    uint64_t done = 0;
+    while (done < n) {
+        ssize_t r = ::pwrite(fdes, static_cast<const char*>(buf)+done,
+                             n-done, off+done);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        done += r;
+    }
+    return done;
+}
+
+void fbzInitHeader(ibis::zfile::header& hdr, uint32_t elem) {
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.magic, FBZ_MAGIC, sizeof(FBZ_MAGIC));
+    hdr.version = FBZ_VERSION;
+    hdr.elem_size = elem;
+}
+
+/// Compress n bytes into frames of at most FRAME_SIZE logical bytes and
+/// append them to out.  Returns the number of frames or < 0 on error.
+int fbzCompress(const char* src, size_t n, int lvl, std::string& out) {
+    ZSTD_CCtx *cctx = fbz_ctx.c();
+    if (cctx == 0) return -1;
+    int nframes = 0;
+    for (size_t off = 0; off < n; off += ibis::zfile::FRAME_SIZE) {
+        const size_t len = (n - off < ibis::zfile::FRAME_SIZE ?
+                            n - off : ibis::zfile::FRAME_SIZE);
+        const size_t bound = ZSTD_compressBound(len);
+        const size_t old = out.size();
+        out.resize(old + bound);
+        const size_t csz = ZSTD_compressCCtx(cctx, &out[old], bound,
+                                             src + off, len, lvl);
+        if (ZSTD_isError(csz)) {
+            LOGGER(ibis::gVerbose >= 0)
+                << "Warning -- zfile failed to compress " << len
+                << " bytes ... " << ZSTD_getErrorName(csz);
+            out.resize(old);
+            return -2;
+        }
+        out.resize(old + csz);
+        ++ nframes;
+    }
+    return nframes;
+}
+
+int fbzEffectiveLevel() {
+    int lvl = fbz_level.load();
+    return (lvl > 0 ? lvl : FBZ_DEFAULT_LEVEL);
+}
+} // anonymous namespace
+
+int ibis::zfile::level() {
+    return fbz_level.load();
+}
+
+void ibis::zfile::setLevel(int lvl) {
+    if (lvl < 0) lvl = 0;
+    if (lvl > ZSTD_maxCLevel()) lvl = ZSTD_maxCLevel();
+    fbz_level.store(lvl);
+}
+
+int ibis::zfile::readHeader(int fdes, ibis::zfile::header& hdr) {
+    if (fdes < 0) return -1;
+    const int64_t n = fbzPread(fdes, &hdr, sizeof(hdr), 0);
+    if (n < 0) return -2;
+    if (n < (int64_t)sizeof(hdr) ||
+        memcmp(hdr.magic, FBZ_MAGIC, sizeof(FBZ_MAGIC)) != 0)
+        return 1;
+    if (hdr.version != FBZ_VERSION) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- zfile found unsupported version " << hdr.version;
+        return -3;
+    }
+    return 0;
+}
+
+bool ibis::zfile::isCompressed(int fdes) {
+    ibis::zfile::header hdr;
+    return (readHeader(fdes, hdr) == 0);
+}
+
+bool ibis::zfile::isCompressed(const char* fname) {
+    if (fname == 0 || *fname == 0) return false;
+    int fdes = UnixOpen(fname, OPEN_READONLY);
+    if (fdes < 0) return false;
+    const bool ret = isCompressed(fdes);
+    UnixClose(fdes);
+    return ret;
+}
+
+bool ibis::zfile::shouldCompress(int fdes) {
+    Stat_T st;
+    if (fstat(fdes, &st) != 0) return false;
+    if (st.st_size == 0) return (level() > 0);
+    return isCompressed(fdes);
+}
+
+bool ibis::zfile::shouldCompress(const char* fname) {
+    if (fname == 0 || *fname == 0) return false;
+    Stat_T st;
+    if (UnixStat(fname, &st) != 0 || st.st_size == 0)
+        return (level() > 0);
+    return isCompressed(fname);
+}
+
+int64_t ibis::zfile::logicalSize(int fdes) {
+    ibis::zfile::header hdr;
+    const int ierr = readHeader(fdes, hdr);
+    if (ierr == 0) return hdr.raw_size;
+    if (ierr < 0) return -1;
+    Stat_T st;
+    if (fstat(fdes, &st) != 0) return -1;
+    return st.st_size;
+}
+
+int64_t ibis::zfile::logicalSize(const char* fname) {
+    if (fname == 0 || *fname == 0) return -1;
+    Stat_T st;
+    if (UnixStat(fname, &st) != 0) return -1;
+    if ((size_t)st.st_size < HEADER_SIZE) return st.st_size;
+    int fdes = UnixOpen(fname, OPEN_READONLY);
+    if (fdes < 0) return -1;
+    const int64_t ret = logicalSize(fdes);
+    UnixClose(fdes);
+    return ret;
+}
+
+int64_t ibis::zfile::readRange(int fdes, uint64_t begin, uint64_t end,
+                               void* dst) {
+    ibis::zfile::header hdr;
+    int ierr = readHeader(fdes, hdr);
+    if (ierr != 0) {
+        if (ierr > 0) { // plain file
+            return fbzPread(fdes, dst, end > begin ? end-begin : 0, begin);
+        }
+        return ierr;
+    }
+    if (end > hdr.raw_size) end = hdr.raw_size;
+    if (begin >= end) return 0;
+
+    std::string comp;
+    comp.resize(hdr.comp_size);
+    if (fbzPread(fdes, &comp[0], hdr.comp_size, HEADER_SIZE)
+        != (int64_t)hdr.comp_size) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- zfile::readRange failed to read "
+            << hdr.comp_size << " compressed bytes";
+        return -4;
+    }
+
+    ZSTD_DCtx *dctx = fbz_ctx.d();
+    if (dctx == 0) return -5;
+    char *out = static_cast<char*>(dst);
+    std::vector<char> tmp;
+    uint64_t lpos = 0; // logical position of the current frame
+    size_t cpos = 0;   // position of the current frame in comp
+    while (cpos < comp.size() && lpos < end) {
+        const size_t fcsz =
+            ZSTD_findFrameCompressedSize(comp.data()+cpos, comp.size()-cpos);
+        const unsigned long long flsz =
+            ZSTD_getFrameContentSize(comp.data()+cpos, comp.size()-cpos);
+        if (ZSTD_isError(fcsz) || flsz == ZSTD_CONTENTSIZE_ERROR ||
+            flsz == ZSTD_CONTENTSIZE_UNKNOWN) {
+            LOGGER(ibis::gVerbose >= 0)
+                << "Warning -- zfile::readRange found a corrupt frame at "
+                << cpos;
+            return -6;
+        }
+        if (lpos + flsz > begin) {
+            const uint64_t b = (begin > lpos ? begin - lpos : 0);
+            const uint64_t e = (end < lpos + flsz ? end - lpos : flsz);
+            char *target;
+            if (b == 0 && e == flsz) { // whole frame wanted
+                target = out + (lpos - begin);
+            }
+            else {
+                tmp.resize(flsz);
+                target = tmp.data();
+            }
+            const size_t dsz = ZSTD_decompressDCtx(dctx, target, flsz,
+                                                   comp.data()+cpos, fcsz);
+            if (ZSTD_isError(dsz) || dsz != flsz) {
+                LOGGER(ibis::gVerbose >= 0)
+                    << "Warning -- zfile::readRange failed to decompress "
+                    "frame at " << cpos << " ... "
+                    << (ZSTD_isError(dsz) ? ZSTD_getErrorName(dsz) : "short");
+                return -7;
+            }
+            if (target != out + (lpos - begin)) {
+                memcpy(out + (lpos + b - begin), target + b, e - b);
+            }
+        }
+        lpos += flsz;
+        cpos += fcsz;
+    }
+    return end - begin;
+}
+
+int64_t ibis::zfile::readRange(const char* fname, uint64_t begin,
+                               uint64_t end, void* dst) {
+    int fdes = UnixOpen(fname, OPEN_READONLY);
+    if (fdes < 0) return -1;
+    const int64_t ret = readRange(fdes, begin, end, dst);
+    UnixClose(fdes);
+    return ret;
+}
+
+int ibis::zfile::openRead(const char* fname) {
+    int fdes = UnixOpen(fname, OPEN_READONLY);
+    if (fdes < 0) return fdes;
+    ibis::zfile::header hdr;
+    if (readHeader(fdes, hdr) != 0)
+        return fdes; // plain file (errors are left to the caller)
+
+    // Decompress into an anonymous in-memory file so that the caller can
+    // seek and read as if it were the plain data file.
+    int mfd = -1;
+#if defined(__linux__)
+    mfd = memfd_create("fastbit-zfile", MFD_CLOEXEC);
+#endif
+    if (mfd < 0) {
+        FILE *tf = tmpfile();
+        if (tf != 0) {
+            mfd = dup(fileno(tf));
+            fclose(tf);
+        }
+    }
+    if (mfd < 0) {
+        UnixClose(fdes);
+        return -1;
+    }
+    int ierr = 0;
+    if (hdr.raw_size > 0) {
+        if (ftruncate(mfd, hdr.raw_size) != 0) {
+            ierr = -2;
+        }
+        else {
+            void *addr = mmap(0, hdr.raw_size, PROT_READ|PROT_WRITE,
+                              MAP_SHARED, mfd, 0);
+            if (addr == MAP_FAILED) {
+                ierr = -3;
+            }
+            else {
+                if (readRange(fdes, 0, hdr.raw_size, addr)
+                    != (int64_t)hdr.raw_size)
+                    ierr = -4;
+                munmap(addr, hdr.raw_size);
+            }
+        }
+    }
+    UnixClose(fdes);
+    if (ierr != 0) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- zfile::openRead(" << fname
+            << ") failed to decompress the file, error " << ierr;
+        UnixClose(mfd);
+        return -1;
+    }
+    (void) UnixSeek(mfd, 0, SEEK_SET);
+    return mfd;
+}
+
+FILE* ibis::zfile::fopenRead(const char* fname) {
+    int fdes = openRead(fname);
+    if (fdes < 0) return 0;
+    FILE *fptr = fdopen(fdes, "rb");
+    if (fptr == 0) UnixClose(fdes);
+    return fptr;
+}
+
+int ibis::zfile::readAll(const char* fname, std::string& out) {
+    out.clear();
+    int fdes = UnixOpen(fname, OPEN_READONLY);
+    if (fdes < 0) return -1;
+    IBIS_BLOCK_GUARD(UnixClose, fdes);
+    const int64_t sz = logicalSize(fdes);
+    if (sz < 0) return -2;
+    if (sz == 0) return 0;
+    out.resize(sz);
+    if (readRange(fdes, 0, sz, &out[0]) != sz) {
+        out.clear();
+        return -3;
+    }
+    return 0;
+}
+
+int ibis::zfile::append(const char* fname, const void* buf, size_t n,
+                        uint32_t elem) {
+    if (fname == 0 || *fname == 0) return -1;
+    int fdes = UnixOpen(fname, O_RDWR | O_CREAT, 0666);
+    if (fdes < 0) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- zfile::append failed to open " << fname
+            << " ... " << strerror(errno);
+        return -2;
+    }
+    IBIS_BLOCK_GUARD(UnixClose, fdes);
+    return append(fdes, buf, n, elem);
+}
+
+int ibis::zfile::append(int fdes, const void* buf, size_t n, uint32_t elem) {
+    ibis::zfile::header hdr;
+    Stat_T st;
+    if (fstat(fdes, &st) != 0) return -3;
+    if (st.st_size == 0) {
+        fbzInitHeader(hdr, elem);
+    }
+    else if (readHeader(fdes, hdr) != 0) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- zfile::append can not append to file descriptor "
+            << fdes << " because it is not a compressed data file";
+        return -4;
+    }
+    if (n == 0 && st.st_size != 0) return 0;
+
+    std::string comp;
+    const int nf = fbzCompress(static_cast<const char*>(buf), n,
+                               fbzEffectiveLevel(), comp);
+    if (nf < 0) return -5;
+
+    // Bytes beyond the frames recorded in the header are left over from an
+    // incomplete append and are overwritten.
+    const uint64_t pos = HEADER_SIZE + hdr.comp_size;
+    if (!comp.empty() &&
+        fbzPwrite(fdes, comp.data(), comp.size(), pos) != (int64_t)comp.size())
+        return -6;
+    if ((uint64_t)st.st_size > pos + comp.size()) {
+        if (ftruncate(fdes, pos + comp.size()) != 0) return -7;
+    }
+    // make sure the frames are on disk before the header refers to them
+    if (!comp.empty() && fdatasync(fdes) != 0) return -8;
+    hdr.raw_size += n;
+    hdr.comp_size += comp.size();
+    hdr.nframes += nf;
+    if (fbzPwrite(fdes, &hdr, sizeof(hdr), 0) != (int64_t)sizeof(hdr))
+        return -9;
+    return 0;
+}
+
+int ibis::zfile::writeWhole(const char* fname, const void* buf, size_t n,
+                            uint32_t elem, bool compress) {
+    if (fname == 0 || *fname == 0) return -1;
+    std::string tmpname = fname;
+    tmpname += ".fbztmp";
+    int fdes = UnixOpen(tmpname.c_str(), OPEN_WRITENEW, 0666);
+    if (fdes < 0) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- zfile::writeWhole failed to open " << tmpname
+            << " ... " << strerror(errno);
+        return -2;
+    }
+    int ierr = 0;
+    if (compress) {
+        ibis::zfile::header hdr;
+        fbzInitHeader(hdr, elem);
+        std::string comp;
+        const int nf = fbzCompress(static_cast<const char*>(buf), n,
+                                   fbzEffectiveLevel(), comp);
+        if (nf < 0) {
+            ierr = -3;
+        }
+        else {
+            hdr.raw_size = n;
+            hdr.comp_size = comp.size();
+            hdr.nframes = nf;
+            if (fbzPwrite(fdes, &hdr, sizeof(hdr), 0) != (int64_t)sizeof(hdr)
+                || fbzPwrite(fdes, comp.data(), comp.size(), HEADER_SIZE)
+                != (int64_t)comp.size())
+                ierr = -4;
+        }
+    }
+    else if (n > 0 && fbzPwrite(fdes, buf, n, 0) != (int64_t)n) {
+        ierr = -4;
+    }
+    if (ierr == 0 && fdatasync(fdes) != 0) ierr = -5;
+    UnixClose(fdes);
+    if (ierr == 0 && rename(tmpname.c_str(), fname) != 0) ierr = -6;
+    if (ierr != 0) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- zfile::writeWhole(" << fname
+            << ") failed with error code " << ierr;
+        (void) remove(tmpname.c_str());
+    }
+    return ierr;
+}
+
+int ibis::zfile::resize(const char* fname, uint64_t newsize, uint32_t elem,
+                        const void* fill) {
+    const int64_t oldsize = logicalSize(fname);
+    if (oldsize < 0) return -1;
+    if ((uint64_t)oldsize == newsize) return 0;
+    if ((uint64_t)oldsize < newsize) { // pad at the end
+        std::string pad(newsize - oldsize, '\0');
+        if (fill != 0 && elem > 0) {
+            for (size_t i = 0; i < pad.size(); ++ i)
+                pad[i] = static_cast<const char*>(fill)[(oldsize+i) % elem];
+        }
+        return append(fname, pad.data(), pad.size(), elem);
+    }
+    std::string content;
+    if (readAll(fname, content) != 0) return -2;
+    content.resize(newsize);
+    return writeWhole(fname, content.data(), content.size(), elem, true);
+}
+
+int ibis::zfile::resize(int fdes, uint64_t newsize, uint32_t elem,
+                        const void* fill) {
+    ibis::zfile::header hdr;
+    if (readHeader(fdes, hdr) != 0) return -1;
+    if (hdr.raw_size == newsize) return 0;
+    if (hdr.raw_size < newsize) { // pad at the end
+        std::string pad(newsize - hdr.raw_size, '\0');
+        if (fill != 0 && elem > 0) {
+            for (size_t i = 0; i < pad.size(); ++ i)
+                pad[i] = static_cast<const char*>(fill)
+                    [(hdr.raw_size+i) % elem];
+        }
+        return append(fdes, pad.data(), pad.size(), elem);
+    }
+    // truncate: decompress what is kept and rewrite the file in place
+    std::string content;
+    content.resize(newsize);
+    if (newsize > 0 &&
+        readRange(fdes, 0, newsize, &content[0]) != (int64_t)newsize)
+        return -2;
+    std::string comp;
+    const int nf = fbzCompress(content.data(), content.size(),
+                               fbzEffectiveLevel(), comp);
+    if (nf < 0) return -3;
+    hdr.raw_size = newsize;
+    hdr.comp_size = comp.size();
+    hdr.nframes = nf;
+    if (fbzPwrite(fdes, comp.data(), comp.size(), HEADER_SIZE)
+        != (int64_t)comp.size() ||
+        ftruncate(fdes, HEADER_SIZE + comp.size()) != 0 ||
+        fdatasync(fdes) != 0 ||
+        fbzPwrite(fdes, &hdr, sizeof(hdr), 0) != (int64_t)sizeof(hdr))
+        return -4;
+    return 0;
+}
+
+int ibis::zfile::compact(const char* fname) {
+    int fdes = UnixOpen(fname, OPEN_READONLY);
+    if (fdes < 0) return -1;
+    ibis::zfile::header hdr;
+    const int ierr = readHeader(fdes, hdr);
+    UnixClose(fdes);
+    if (ierr < 0) return -2;
+    uint32_t elem = 0;
+    if (ierr == 0) {
+        // already compressed with full size frames
+        if (hdr.nframes <= (hdr.raw_size + FRAME_SIZE - 1) / FRAME_SIZE)
+            return 1;
+        elem = hdr.elem_size;
+    }
+    std::string content;
+    if (readAll(fname, content) != 0) return -3;
+    if (content.empty()) return 1;
+    return writeWhole(fname, content.data(), content.size(), elem, true);
+}
+
+ibis::zfile::plainScope::plainScope(const char* fname)
+    : name_(fname != 0 ? fname : ""), recompress_(false) {
+    if (name_.empty()) return;
+    Stat_T st;
+    if (UnixStat(name_.c_str(), &st) != 0 || st.st_size == 0) {
+        recompress_ = (level() > 0);
+        return;
+    }
+    if (! isCompressed(name_.c_str())) return;
+    std::string content;
+    if (readAll(name_.c_str(), content) != 0 ||
+        writeWhole(name_.c_str(), content.data(), content.size(), 0, false)
+        != 0) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- zfile::plainScope failed to decompress "
+            << name_;
+        return;
+    }
+    recompress_ = true;
+}
+
+ibis::zfile::plainScope::~plainScope() {
+    if (! recompress_) return;
+    Stat_T st;
+    if (UnixStat(name_.c_str(), &st) != 0 || st.st_size == 0) return;
+    if (compact(name_.c_str()) < 0) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- zfile::plainScope failed to compress " << name_;
+    }
+}

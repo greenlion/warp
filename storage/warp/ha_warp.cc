@@ -198,6 +198,7 @@ static int warp_init_func(void *p) {
 
   ibis::init(NULL, "/tmp/fastbit.log");
   ibis::util::setVerboseLevel(0);
+  warp_apply_compression();
 #ifdef HAVE_PSI_INTERFACE
   init_warp_psi_keys();
 #endif
@@ -1553,6 +1554,49 @@ int ha_warp::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
 int ha_warp::check(THD *, HA_CHECK_OPT *) {
   DBUG_ENTER("ha_warp::check");
   DBUG_RETURN(HA_ADMIN_OK);
+}
+
+/* OPTIMIZE TABLE rewrites every column data file in the format selected
+   by warp_compression: compressed files are re-framed into full size zstd
+   frames (merging the small frames created by many small inserts) and
+   plain files are compressed, or, if compression is disabled, compressed
+   files are converted back to plain files.  The logical content of the
+   files does not change. */
+int ha_warp::optimize(THD *, HA_CHECK_OPT *) {
+  DBUG_ENTER("ha_warp::optimize");
+  int rc = HA_ADMIN_OK;
+  const bool compress = ibis::zfile::level() > 0;
+  mysql_mutex_lock(&share->mutex);
+  ibis::partList parts;
+  ibis::util::gatherParts(parts, share->data_dir_name, true);
+  for (auto part : parts) {
+    const char *dir = part->currentDataDir();
+    if (dir == nullptr || part->nRows() == 0) continue;
+    for (uint32_t i = 0; i < part->nColumns(); ++i) {
+      const ibis::column *col = part->getColumn(i);
+      if (col == nullptr || col->type() == ibis::BLOB) continue;
+      std::string fname = std::string(dir) + FASTBIT_DIRSEP + col->name();
+      int ierr = 0;
+      if (compress) {
+        ierr = ibis::zfile::compact(fname.c_str());
+      } else if (ibis::zfile::isCompressed(fname.c_str())) {
+        std::string content;
+        ierr = ibis::zfile::readAll(fname.c_str(), content);
+        if (ierr == 0)
+          ierr = ibis::zfile::writeWhole(fname.c_str(), content.data(),
+                                         content.size(), 0, false);
+      }
+      if (ierr < 0) {
+        sql_print_error("WARP: OPTIMIZE failed to rewrite %s (error %d)",
+                        fname.c_str(), ierr);
+        rc = HA_ADMIN_FAILED;
+      }
+    }
+    ibis::fileManager::instance().flushDir(dir);
+  }
+  for (auto part : parts) delete part;
+  mysql_mutex_unlock(&share->mutex);
+  DBUG_RETURN(rc);
 }
 
 bool ha_warp::check_if_incompatible_data(HA_CREATE_INFO *, uint) {
@@ -3926,16 +3970,15 @@ int warp_upgrade_tables(uint16_t version) {
         delete writer;
         std::string column_fname = std::string(datadir) + "/t";
         if(part->nRows() > 0) {
-          FILE* cfp=fopen(column_fname.c_str(), "w");
-          fseek(cfp, part->nRows()-1, SEEK_SET);
-          uint64_t zero = 0;
-          fwrite(&zero, 1, sizeof(zero), cfp);
-          int ferrno = ferror(cfp);
-          if(ferrno != 0) {
-            sql_print_error("Failed to zerofill file ", column_fname.c_str());
+          /* one zero transaction id (uint64_t) per existing row */
+          std::vector<uint64_t> zeros(part->nRows(), 0);
+          if(ibis::zfile::writeWhole(column_fname.c_str(), zeros.data(),
+                                     zeros.size() * sizeof(uint64_t),
+                                     sizeof(uint64_t),
+                                     ibis::zfile::level() > 0) != 0) {
+            sql_print_error("Failed to zerofill file %s", column_fname.c_str());
             assert(false);
           }
-          fclose(cfp);
         }
       }
     }

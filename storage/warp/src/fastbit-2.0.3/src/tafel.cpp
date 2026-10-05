@@ -2150,7 +2150,7 @@ int ibis::tafel::writeData(const char* dir, const char* tname,
         std::string cnm = mydir;
         cnm += FASTBIT_DIRSEP;
         cnm += (*it).first;
-        int fdes = UnixOpen(cnm.c_str(), OPEN_WRITEADD, OPEN_FILEMODE);
+        int fdes = UnixOpen(cnm.c_str(), OPEN_READWRITE, OPEN_FILEMODE);
         if (fdes < 0) {
             LOGGER(ibis::gVerbose >= 0)
                 << "tafel::writeData(" << mydir << ") failed to open file "

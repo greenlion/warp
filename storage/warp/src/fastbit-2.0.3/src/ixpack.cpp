@@ -651,7 +651,7 @@ int ibis::pack::read(const char* f) {
     std::string fnm;
     indexFileName(fnm, f);
 
-    int fdes = UnixOpen(fnm.c_str(), OPEN_READONLY);
+    int fdes = ibis::zfile::openRead(fnm.c_str());
     if (fdes < 0)
         return -1;
 

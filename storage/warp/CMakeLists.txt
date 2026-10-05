@@ -20,18 +20,34 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 include(ExternalProject)
+
+# FastBit compresses column data with zstd.  Use the same zstd as the server.
+IF(WITH_ZSTD STREQUAL "system")
+  SET(FASTBIT_ZSTD_CPPFLAGS "-I${ZSTD_INCLUDE_DIR}")
+  SET(FASTBIT_ZSTD_LIBS "${ZSTD_SYSTEM_LIBRARY}")
+ELSE()
+  SET(FASTBIT_ZSTD_CPPFLAGS "-I${BUNDLED_ZSTD_PATH}")
+  SET(FASTBIT_ZSTD_LIBS "$<TARGET_FILE:zstd>")
+ENDIF()
+
 ExternalProject_Add(
   fastbit-2.0.3
   #  URL https://codeforge.lbl.gov/frs/download.php/file/426/fastbit-2.0.3.tar.gz
   #GIT_REPOSITORY https://github.com/greenlion/fastbit
   SOURCE_DIR=fastbit-2.0.3
-  CONFIGURE_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/src/fastbit-2.0.3/configure --prefix=${CMAKE_CURRENT_SOURCE_DIR}
+  CONFIGURE_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/src/fastbit-2.0.3/configure --prefix=${CMAKE_CURRENT_SOURCE_DIR} CPPFLAGS=${FASTBIT_ZSTD_CPPFLAGS} LIBS=${FASTBIT_ZSTD_LIBS}
   PREFIX ${CMAKE_CURRENT_SOURCE_DIR}/
   #PATCH_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/patch_fastbit.sh ${CMAKE_CURRENT_SOURCE_DIR}
   
   BUILD_COMMAND make -j6
   BUILD_IN_SOURCE 1
+  # rebuild (incrementally) whenever the warp target is built so that
+  # changes to the FastBit sources are picked up
+  BUILD_ALWAYS 1
 )
+IF(NOT WITH_ZSTD STREQUAL "system")
+  add_dependencies(fastbit-2.0.3 zstd)
+ENDIF()
 
 #
 #ExternalProject_Add(

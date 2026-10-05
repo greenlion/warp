@@ -7926,7 +7926,7 @@ int64_t ibis::query::mergePairs(const char *pfile) const {
         return -1;
     }
     cnt = 0;
-    int indes = UnixOpen(pfile, OPEN_READONLY);
+    int indes = ibis::zfile::openRead(pfile);
     if (indes < 0) {
         logWarning("mergePairs", "failed to open %s for reading", pfile);
         return -2;
@@ -7940,7 +7940,7 @@ int64_t ibis::query::mergePairs(const char *pfile) const {
         return -3;
     }
 
-    int olddes = UnixOpen(oldfile.c_str(), OPEN_READONLY);
+    int olddes = ibis::zfile::openRead(oldfile.c_str());
     if (olddes < 0) {
         logWarning("mergePairs", "failed to open %s for reading",
                    oldfile.c_str());

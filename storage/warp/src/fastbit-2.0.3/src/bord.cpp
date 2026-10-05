@@ -2766,7 +2766,7 @@ int ibis::bord::backup(const char* dir, const char* tname,
                 "file \"" << dict << "\", ierr = " << ierr;
             cnm += ".int";
         }
-        int fdes = UnixOpen(cnm.c_str(), OPEN_WRITEADD, OPEN_FILEMODE);
+        int fdes = UnixOpen(cnm.c_str(), OPEN_READWRITE, OPEN_FILEMODE);
         if (fdes < 0) {
             LOGGER(ibis::gVerbose >= 0)
                 << "bord::backup(" << dir << ") failed to open file "
