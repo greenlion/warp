@@ -4828,6 +4828,17 @@ int ibis::bord::append(const ibis::selectClause& sc, const ibis::part& prt,
                     << "\" from column \"" << scol->name()
                     << "\" of partition " << prt.name();
                 ierr = col.append(*scol, mask);
+                if (ierr >= 0 && (uint32_t)ierr != nqq) {
+                    // The column could not read all the values, usually
+                    // because the file cache is too small.  Keeping the
+                    // column would give a table whose columns have
+                    // different lengths.
+                    LOGGER(ibis::gVerbose >= 0)
+                        << "Warning -- " << mesg << " could only add "
+                        << ierr << " of " << nqq << " values from column "
+                        << scol->name() << " of partition " << prt.name();
+                    ierr = -19;
+                }
             }
             if (col.getTimeFormat() == 0) {
                 if (var.getDecoration() != 0 && *(var.getDecoration()) != 0)
@@ -4971,6 +4982,13 @@ int ibis::bord::append(const ibis::selectClause &sc, const ibis::part& prt,
                     << " from column " << scol->name()
                     << " of partition " << prt.name();
                 ierr = col.append(*scol, newseg);
+                if (ierr >= 0 && (uint32_t)ierr != nqq) {
+                    LOGGER(ibis::gVerbose >= 0)
+                        << "Warning -- " << mesg << " could only add "
+                        << ierr << " of " << nqq << " values from column "
+                        << scol->name() << " of partition " << prt.name();
+                    ierr = -19;
+                }
             }
             if (col.getTimeFormat() == 0) {
                 if (var.getDecoration() != 0 && *(var.getDecoration()) != 0)

@@ -361,7 +361,10 @@ public:
     if(dirty) {
       //bitmap_dbug("bitmap is dirty - writing commit marker");
       //bitmap_dbug(fname.c_str());
-      int zero=0;
+      /* the commit marker is a whole block of zero bytes, the variable
+         has to be as large as the block that is written */
+      unsigned long long zero=0;
+      static_assert(sizeof(zero) == BLOCK_SIZE, "commit marker size");
       int sz = fwrite(&zero, BLOCK_SIZE, 1, log);
       fsync(fileno(log));
       fsync(fileno(fp));

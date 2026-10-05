@@ -193,7 +193,14 @@ static int warp_init_func(void *p) {
   sql_print_information("WARP storage engine initialization started");
   handlerton *warp_hton;
   if(my_cache_size>0) {
-    ibis::fileManager::adjustCacheSize(my_cache_size);
+    if(ibis::fileManager::adjustCacheSize(my_cache_size) != 0) {
+      /* FastBit refuses a size that is not larger than the memory it is
+         already using, and keeps its default size */
+      sql_print_warning("WARP: warp_cache_size = %llu is too small and was ignored, "
+                        "the FastBit cache size is %llu bytes",
+                        (unsigned long long)my_cache_size,
+                        (unsigned long long)ibis::fileManager::currentCacheSize());
+    }
   }
 
   ibis::init(NULL, "/tmp/fastbit.log");
@@ -826,7 +833,7 @@ void ha_warp::start_bulk_insert(ha_rows) {
 int ha_warp::end_bulk_insert() {
   if(writer != NULL) {
     /* foreground write actually because it is not executed in a different `thread */
-    write_buffered_rows_to_disk();
+    return write_buffered_rows_to_disk();
   }
 
   return 0;
@@ -867,24 +874,42 @@ std::string ha_warp::get_writer_partition() {
   return retval;
 }
 
-/* write the rows and destroy the writer*/
-void ha_warp::write_buffered_rows_to_disk() {
+/* Write the buffered rows to disk and empty the buffer.  Returns 0 or a
+   handler error code.  FastBit reports a lack of memory (typically a
+   FastBit cache that is too small) by throwing exceptions, which must not
+   reach the server. */
+int ha_warp::write_buffered_rows_to_disk() {
+  int rc = 0;
   mysql_mutex_lock(&share->mutex);
 
-  std::string part_dir = get_writer_partition();
-  auto part_dir_copy = strdup(part_dir.c_str());
-  auto part_name = basename(part_dir_copy);
-  writer->write(part_dir.c_str(), part_name);
-  writer->clearData();
+  try {
+    std::string part_dir = get_writer_partition();
+    std::string part_name = part_dir.substr(part_dir.find_last_of('/') + 1);
+    int written = writer->write(part_dir.c_str(), part_name.c_str());
+    if(written < 0) {
+      sql_print_error("WARP: could not write the buffered rows to %s (error %d)",
+                      part_dir.c_str(), written);
+      rc = HA_ERR_INTERNAL_ERROR;
+    }
+  } catch(...) {
+    sql_print_error("WARP: out of memory writing the buffered rows of %s.  The FastBit "
+                    "cache (warp_cache_size = %llu bytes) may be too small.",
+                    share->data_dir_name, (unsigned long long)my_cache_size);
+    rc = HA_ERR_OUT_OF_MEM;
+  }
+  try {
+    writer->clearData();
+  } catch(...) {
+  }
   /*if(update_indexes) { 
     maintain_indexes(part_dir.c_str());
   }*/
-  free(part_dir_copy);
   //delete writer;
   //writer = NULL;
   
   mysql_mutex_unlock(&share->mutex);
-};
+  return rc;
+}
 
 /*
   This is an INSERT.  The row data is converted to CSV (just like the CSV
@@ -894,6 +919,27 @@ void ha_warp::write_buffered_rows_to_disk() {
 */
 int ha_warp::write_row(uchar *buf) {
   DBUG_ENTER("ha_warp::write_row");
+  try {
+    DBUG_RETURN(write_row_impl(buf));
+  } catch(...) {
+    sql_print_error("WARP: out of memory buffering a row for %s.  The FastBit cache "
+                    "(warp_cache_size = %llu bytes) may be too small.",
+                    share->data_dir_name, (unsigned long long)my_cache_size);
+  }
+  /* The row may have been appended to some of the columns only.  FastBit
+     would pad the others with default values when the buffer is written,
+     so the buffered rows are discarded. */
+  if(writer != NULL) {
+    try {
+      writer->clearData();
+    } catch(...) {
+    }
+  }
+  DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+}
+
+int ha_warp::write_row_impl(uchar *buf) {
+  DBUG_ENTER("ha_warp::write_row_impl");
   ha_statistic_increment(&System_status_var::ha_write_count);
   
   mysql_mutex_lock(&share->mutex);
@@ -950,7 +996,7 @@ int ha_warp::write_row(uchar *buf) {
   */
   if(writer->mRows() >= my_write_cache_size) {
     // write the rows to disk and destroy the writer (a new one will be created)
-    write_buffered_rows_to_disk();
+    DBUG_RETURN(write_buffered_rows_to_disk());
   }
   DBUG_RETURN(0);
 }
@@ -1257,9 +1303,30 @@ void ha_warp::cleanup_pushdown_info() {
 
   }
   
+  if(pushdown_info != NULL) {
+    /* the pushdown information owns the FastBit objects stored on it,
+       whether they were opened by the join pushdown or by a scan */
+    delete pushdown_info->cursor;
+    delete pushdown_info->filtered_table;
+    delete pushdown_info->base_table;
+  }
   delete pushdown_info;
   pushdown_mtx.unlock();
+
+  /* end of the statement: nothing pushed down for it may be used again */
+  push_where_clause = "";
+  current_matching_dim_ridset = NULL;
+  current_matching_ridset = NULL;
+
+  for(auto &filter : fact_table_filters) {
+    retired_fact_table_filters.push_back(filter);
+  }
   fact_table_filters.clear();
+  for(auto &filter : retired_fact_table_filters) {
+    delete filter.first;
+    delete filter.second;
+  }
+  retired_fact_table_filters.clear();
   pushdown_table_count = 0;
   bitmap_merge_join_executed = false;
 }  
@@ -1655,6 +1722,11 @@ int ha_warp::rnd_init(bool) {
   }
   
   current_rowid = 0;
+  /* a scan that was ended early (an error, a LIMIT, ...) leaves these
+     pointing to a join filter of the previous statement, which is freed
+     at the end of the statement */
+  current_matching_dim_ridset = NULL;
+  current_matching_ridset = NULL;
   /* When scanning this is used to skip evaluation of transactions
      that have already been evaluated
   */  
@@ -1680,6 +1752,8 @@ int ha_warp::rnd_init(bool) {
   
   if(pushdown_info->base_table != NULL) {
     partitions = NULL;
+    /* these objects belong to the pushdown information */
+    scan_uses_pushdown_tables = true;
     base_table = pushdown_info->base_table;
     filtered_table = pushdown_info->filtered_table;
     if(filtered_table != NULL && pushdown_info->cursor != NULL) {
@@ -1772,11 +1846,17 @@ void merge_dimension_keys(
   uint32_t* running_dimension_merges, 
   std::mutex* dimension_merge_mutex ) {
  
-  filter_it->first->mtx.lock();
-  for(auto insert_it = matching_dim_rowids->begin(); insert_it != matching_dim_rowids->end(); ++insert_it) {
-    filter_it->first->add_matching_rownum(*insert_it);
+  try {
+    filter_it->first->mtx.lock();
+    for(auto insert_it = matching_dim_rowids->begin(); insert_it != matching_dim_rowids->end(); ++insert_it) {
+      filter_it->first->add_matching_rownum(*insert_it);
+    }
+    filter_it->first->mtx.unlock();
+  } catch(...) {
+    /* out of memory while merging: the filter is incomplete */
+    filter_it->first->mtx.unlock();
+    filter_it->first->failed = true;
   }
-  filter_it->first->mtx.unlock();   
   delete matching_dim_rowids;
   
   dimension_merge_mutex->lock();
@@ -1793,8 +1873,13 @@ void exec_pushdown_join(
   uint32_t* running_join_threads, 
   std::mutex* parallel_join_mutex,
   uint32_t* running_dimension_merges,
-  std::mutex* dimension_merge_mutex ) {
-          
+  std::mutex* dimension_merge_mutex,
+  std::atomic<int>* join_error ) {
+
+  /* Any failure in this thread leaves the matching rows of this partition
+     incomplete.  It is recorded in join_error so that the scan fails
+     instead of returning wrong results. */
+  try {
   std::unordered_map<uint32_t, uint8_t> tmp_matching_rids;
   auto rid_it = tmp_matching_rids.begin();
 
@@ -1804,12 +1889,14 @@ void exec_pushdown_join(
   for ( filter_exec_count = 1; filter_it != fact_table_filters->end(); ++filter_it,++filter_exec_count) {
     auto column_vals = column_query->getQualifiedLongs((filter_it->first)->fact_column.c_str());
     if(!column_vals) {
-      tmp_matching_rids.clear();
-      break;
+      /* usually the FastBit cache is too small to read the column */
+      throw std::runtime_error("could not read column " + (filter_it->first)->fact_column);
     }
+    std::unique_ptr<ibis::array_t<int64_t>> column_vals_guard(column_vals);
     
     uint32_t rownum =0;
     auto matching_dim_rowids = new std::set<uint64_t> ;
+    std::unique_ptr<std::set<uint64_t>> matching_dim_rowids_guard(matching_dim_rowids);
 
     for(auto column_it = column_vals->begin(); column_it != column_vals->end(); ++column_it) {
       
@@ -1845,14 +1932,22 @@ void exec_pushdown_join(
     
     }
     // free up columnar values
-    delete column_vals;
+    column_vals_guard.reset();
 
     dimension_merge_mutex->lock();
-    ++running_dimension_merges;
+    ++(*running_dimension_merges);
     dimension_merge_mutex->unlock();
 
     //deletes matching_dim_rowids
-    std::thread(merge_dimension_keys, filter_it, matching_dim_rowids, running_dimension_merges, dimension_merge_mutex).detach();
+    try {
+      std::thread(merge_dimension_keys, filter_it, matching_dim_rowids, running_dimension_merges, dimension_merge_mutex).detach();
+      matching_dim_rowids_guard.release();
+    } catch(...) {
+      dimension_merge_mutex->lock();
+      --(*running_dimension_merges);
+      dimension_merge_mutex->unlock();
+      throw;
+    }
 
     #if 0
     filter_it->first->mtx.lock();
@@ -1882,10 +1977,32 @@ void exec_pushdown_join(
     if(filtered_matching_ids->size() > 0) {
       find_it->second = filtered_matching_ids;
     } else {
+      delete filtered_matching_ids;
       find_it->second = NULL;
     }
   }
+  } catch(const std::exception &e) {
+    sql_print_error("WARP: join worker failed: %s", e.what());
+    *join_error = 1;
+  } catch(const char *msg) {
+    sql_print_error("WARP: join worker failed: %s", msg);
+    *join_error = 1;
+  } catch(...) {
+    sql_print_error("WARP: join worker failed with an unknown exception");
+    *join_error = 1;
+  }
 
+  /* The column files read for this partition stay in the FastBit cache
+     after the worker is done.  FastBit does not evict idle files to make
+     room for the arrays that queries allocate, so cached files of
+     finished partitions would fill the cache (about 16 MB per partition
+     here) and make later workers fail.  Nothing in this partition is
+     needed in memory until it is scanned. */
+  try {
+    ibis::fileManager::instance().flushDir((*part_it)->currentDataDir());
+  } catch(...) {
+    // the files are just not released
+  }
 
   parallel_join_mutex->lock();
   (*running_join_threads)--;
@@ -1894,8 +2011,60 @@ void exec_pushdown_join(
   delete column_query;
 }
 
+/* select() on a FastBit table returns a nil pointer when it fails, for
+   example because the FastBit cache is too small for the selected data. */
+static void warp_report_select_failure(const char *table_dir) {
+  sql_print_error("WARP: could not read the selected rows of %s.  The FastBit cache "
+                  "(warp_cache_size = %llu bytes) may be too small for this query.",
+                  table_dir, (unsigned long long)my_cache_size);
+}
+
+/* Wait for all the join worker threads and dimension merges scheduled by
+   this handler.  The threads use members of this handler, so it must not
+   continue (or be destroyed) while they are running. */
+void ha_warp::wait_for_join_threads() {
+  for(;;) {
+    parallel_join_mutex.lock();
+    bool jobs_running = (running_join_threads != 0);
+    parallel_join_mutex.unlock();
+    dimension_merge_mutex.lock();
+    bool merges_running = (running_dimension_merges != 0);
+    dimension_merge_mutex.unlock();
+    if(!jobs_running && !merges_running) break;
+    struct timespec sleep_time = {0, 10000000L}; // 10 ms
+    nanosleep(&sleep_time, NULL);
+  }
+}
+
+/* FastBit reports resource problems (typically the file cache being too
+   small for the data a query needs) by throwing exceptions.  They must not
+   escape into the server, which would terminate it. */
 int ha_warp::rnd_next(uchar *buf) {
   DBUG_ENTER("ha_warp::rnd_next");
+  const char* what = NULL;
+  std::string detail;
+  try {
+    DBUG_RETURN(rnd_next_impl(buf));
+  } catch(const std::bad_alloc &) {
+    what = "out of memory";
+  } catch(const std::exception &e) {
+    detail = e.what();
+    what = detail.c_str();
+  } catch(const char *msg) {
+    what = msg;
+  } catch(...) {
+    what = "unknown exception";
+  }
+  join_error = 1;
+  wait_for_join_threads();
+  sql_print_error("WARP: scan of %s failed: %s.  The FastBit cache (warp_cache_size = %llu bytes) "
+                  "may be too small for this query.", share->data_dir_name, what,
+                  (unsigned long long)my_cache_size);
+  DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+}
+
+int ha_warp::rnd_next_impl(uchar *buf) {
+  DBUG_ENTER("ha_warp::rnd_next_impl");
   
   // transaction id of the current row
   uint64_t row_trx_id = 0;
@@ -1907,6 +2076,13 @@ fetch_again:
     }
   
     while( part_it != partitions->end() ) {        
+      /* the list of partitions also contains the (empty) top level
+         directory of the table.  There is nothing to evaluate or join
+         in a partition without rows. */
+      if( (*part_it)->nRows() == 0 ) {
+        ++part_it;
+        continue;
+      }
       //verify that the partition is valid / not empty
       base_table = ibis::table::create((*part_it)->currentDataDir());
       rownum = 0;
@@ -1918,13 +2094,23 @@ fetch_again:
       base_table = NULL;
       filtered_table = NULL;
       
-      auto column_query = new ibis::query((const char*)(0), (*part_it), (const char*)(0));
+      if( join_error.load() != 0 ) {
+        break; // stop scheduling, a worker failed
+      }
+
+      std::unique_ptr<ibis::query> column_query(
+          new ibis::query((const char*)(0), (*part_it), (const char*)(0)));
       if( push_where_clause == "" ) {
         push_where_clause = "1=1";
       }
       
       column_query->addConditions(push_where_clause.c_str());
-      column_query->evaluate();
+      if( column_query->evaluate() < 0 ) {
+        sql_print_error("WARP: could not evaluate the pushed down condition on %s",
+                        (*part_it)->currentDataDir());
+        join_error = 1;
+        break;
+      }
       if( column_query->getNumHits() != 0 ) {
         // nothing happens if this function is called more than once during query evaluation
         // but it must be executed at least once when parallel hash join is being used
@@ -1945,12 +2131,27 @@ fetch_again:
             }
           }  
           
+          /* Every worker reads a column of its partition into memory (the
+             column file and an int64 array of its values).  The workers
+             share the FastBit cache, so the number of concurrent workers
+             is limited by what the cache can hold. */
+          const uint64_t worker_bytes =
+              std::max<uint64_t>((*part_it)->nRows(), 1) * sizeof(int64_t) * 3;
+          const uint64_t workers_by_cache =
+              std::max<uint64_t>(1, (ibis::fileManager::currentCacheSize() / 2) / worker_bytes);
+          const uint64_t max_workers =
+              std::min<uint64_t>(THDVAR(table->in_use, max_degree_of_parallelism), workers_by_cache);
+
           while(1) {
+            if( join_error.load() != 0 ) {
+              break;
+            }
             parallel_join_mutex.lock();
             auto tmp = running_join_threads;
             parallel_join_mutex.unlock();
             
-            if(tmp >= THDVAR(table->in_use, max_degree_of_parallelism) ) {
+            if(tmp >= max_workers ||
+               (tmp > 0 && ibis::fileManager::bytesFree() < worker_bytes * 2) ) {
               
               struct timespec sleep_time;
               struct timespec remaining_time;
@@ -1965,7 +2166,15 @@ fetch_again:
             ++running_join_threads;
             
             parallel_join_mutex.unlock();
-            std::thread(exec_pushdown_join,column_query, part_it, &fact_table_filters, &matching_ridset, &running_join_threads, &parallel_join_mutex, &running_dimension_merges, &dimension_merge_mutex).detach();
+            try {
+              std::thread(exec_pushdown_join, column_query.get(), part_it, &fact_table_filters, &matching_ridset, &running_join_threads, &parallel_join_mutex, &running_dimension_merges, &dimension_merge_mutex, &join_error).detach();
+              column_query.release(); // owned by the thread now
+            } catch(...) {
+              parallel_join_mutex.lock();
+              --running_join_threads;
+              parallel_join_mutex.unlock();
+              throw;
+            }
             break;
 
           }  
@@ -2012,8 +2221,22 @@ fetch_again:
     struct timespec remaining_time;
     sleep_time.tv_sec = (time_t)0;
     sleep_time.tv_nsec = 100000000L; // sleep a bit
-    parallel_join_mutex.unlock();
     nanosleep(&sleep_time, &remaining_time);
+  }
+
+  /* A failed worker or merge means some partitions were not (completely)
+     filtered.  Returning rows from here would give wrong results. */
+  {
+    bool filter_failed = false;
+    for(auto &filter : fact_table_filters) {
+      if(filter.first->failed.load()) filter_failed = true;
+    }
+    if(join_error.load() != 0 || filter_failed) {
+      sql_print_error("WARP: a join worker failed on %s.  The FastBit cache (warp_cache_size = %llu bytes) "
+                      "may be too small for this query.", share->data_dir_name,
+                      (unsigned long long)my_cache_size);
+      DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+    }
   }
   
   ha_statistic_increment(&System_status_var::ha_read_rnd_next_count);
@@ -2058,8 +2281,11 @@ fetch_again:
       filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
       
       if(!filtered_table) {
-        ++part_it;
-        goto fetch_again;
+        /* FastBit returns an empty table when no rows match, a nil pointer
+           means the selection failed (usually: not enough cache).  Skipping
+           the partition would silently drop its rows. */
+        warp_report_select_failure(share->data_dir_name);
+        DBUG_RETURN(HA_ERR_OUT_OF_MEM);
       }
       
       cursor = filtered_table->createCursor();
@@ -2085,7 +2311,8 @@ fetch_again:
       filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
       
       if(filtered_table==NULL) {
-        DBUG_RETURN(HA_ERR_END_OF_FILE);
+        warp_report_select_failure(share->data_dir_name);
+        DBUG_RETURN(HA_ERR_OUT_OF_MEM);
       }
       
       cursor = filtered_table->createCursor();  
@@ -2146,7 +2373,10 @@ fetch_again:
     }
        
     if(current_matching_dim_ridset != NULL) {
-      delete current_matching_dim_ridset;
+      /* This set is the dim_rownums member of a warp_filter_info owned by
+         the fact table's handler, which frees it at the end of the
+         statement (cleanup_pushdown_info).  Deleting it here would free
+         the whole filter object, as the set is its first member. */
       current_matching_dim_ridset = NULL;
     }
     
@@ -2232,14 +2462,21 @@ fetch_again:
 */
 int ha_warp::rnd_end() {
   DBUG_ENTER("ha_warp::rnd_end");
+
+  /* workers use members of this handler (and the part objects freed below) */
+  wait_for_join_threads();
+  join_error = 0;
   
   blobroot.Clear();
    
   push_where_clause = "";
 
-  if(cursor) delete cursor;
-  if(filtered_table) delete filtered_table;
-  if(base_table) delete base_table;
+  if(!scan_uses_pushdown_tables) {
+    if(cursor) delete cursor;
+    if(filtered_table) delete filtered_table;
+    if(base_table) delete base_table;
+  }
+  scan_uses_pushdown_tables = false;
 
   if(partitions) {
     for(auto it=partitions->begin();it!=partitions->end();++it) {
@@ -2249,8 +2486,9 @@ int ha_warp::rnd_end() {
     delete partitions;
   }
   
+  int write_rc = 0;
   if(writer != NULL) {
-    write_buffered_rows_to_disk();
+    write_rc = write_buffered_rows_to_disk();
   }
   ibis::fileManager::instance().flushDir(share->data_dir_name);
 
@@ -2261,12 +2499,16 @@ int ha_warp::rnd_end() {
   // these have to be reset for consecutive execution of queries on this 
   // THD / handle to continue working properly (ie not crash)
   matching_ridset.clear();
+  for(auto &filter : fact_table_filters) {
+    retired_fact_table_filters.push_back(filter);
+  }
   fact_table_filters.clear();
   all_dimension_merges_completed = false;
   all_jobs_completed = false;
   current_matching_ridset = NULL;
+  current_matching_dim_ridset = NULL;
   buffer.length(0);
-  DBUG_RETURN(0);
+  DBUG_RETURN(write_rc);
 }
 
 /*
@@ -2301,6 +2543,10 @@ int ha_warp::rnd_pos(uchar *buf, uchar *pos) {
   base_table = ibis::mensa::create(share->data_dir_name);
   if(base_table != NULL) {
     filtered_table = base_table->select(column_set.c_str(), ("r=" + std::to_string(current_rowid)).c_str());
+    if(filtered_table == NULL) {
+      warp_report_select_failure(share->data_dir_name);
+      rc = HA_ERR_OUT_OF_MEM;
+    }
   }
   if(filtered_table != NULL && filtered_table->nRows() > 0) {
     cursor = filtered_table->createCursor();
@@ -2395,9 +2641,13 @@ int ha_warp::index_init(uint idxno) {
         // Allocate a cursor for any queries that actually fetch columns 
         idx_cursor = idx_filtered_table->createCursor();
       }
-      pushdown_info->base_table = base_table;
+      pushdown_info->base_table = base_table; // freed with the pushdown info
       pushdown_info->filtered_table = idx_filtered_table;
       pushdown_info->cursor = idx_cursor;
+      if(idx_filtered_table == NULL) {
+        warp_report_select_failure(share->data_dir_name);
+        return HA_ERR_OUT_OF_MEM;
+      }
     }
   }
     
@@ -2662,6 +2912,11 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
   // we can't do pushdown to non-WARP tables.
   ha_warp *const ha = dynamic_cast<ha_warp *>(table->file);
   if (ha == nullptr) return;
+
+  /* The handler is reused by later statements.  A condition pushed down for
+     an earlier statement whose scan did not finish (an error, for example)
+     must not be applied to a statement that has no condition. */
+  ha->push_where_clause = "";
 
   const Item *cond = (filter != nullptr) ? filter->filter().condition : nullptr;
   if (cond == nullptr && join->where_cond == nullptr) return;
@@ -3539,9 +3794,12 @@ int ha_warp::bitmap_merge_join() {
           continue;
       }
       if(rc != 0) {
+        delete dim_cursor;
+        delete matches;
         return -1;
       }
     } // end of fetch loop
+    delete dim_cursor;
     if( matches->size() > 0 ) {
       auto filter_info = new warp_filter_info(fact_colname, dim_alias, dim_colname);
       fact_table_filters.insert(std::make_pair(filter_info, matches));
