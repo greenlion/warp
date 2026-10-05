@@ -355,20 +355,16 @@ int ha_warp::encode_quote(uchar *) {
 
       buffer.append('"');
 
+      /* FastBit's parser (ibis::util::readString) only understands a
+         backslash in front of the quote character or another backslash.
+         Every other character, including newlines, is copied as is. */
       for (; ptr < end_ptr; ptr++) {
-        if(*ptr == '"') {
+        if(*ptr == '"' || *ptr == '\\') {
           buffer.append('\\');
-          buffer.append('"');
-        } else if(*ptr == '\r') {
-          buffer.append('\\');
-          buffer.append('r');
-        } else if(*ptr == '\\') {
-          buffer.append('\\');
-          buffer.append('\\');
-        } else if(*ptr == '\n') {
-          buffer.append('\\');
-          buffer.append('n');
+          buffer.append(*ptr);
         } else if(*ptr == 0) {
+          /* FastBit stores strings null terminated, so an embedded null
+             can not be stored */
           buffer.append('\\');
           buffer.append('0');
         } else {
@@ -2716,6 +2712,52 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
   }
 }
 
+/* True while warp_push_to_engine processes a query in which a WARP table is
+   the inner table of a nested loop join.  WARP's join pushdown computes the
+   join once and assumes every table is scanned exactly once, which is not
+   true for the inner table of a nested loop (it is scanned again for every
+   outer row), so join conditions between WARP tables are left to MySQL. */
+static thread_local bool warp_inner_nested_loop_table = false;
+
+/* Does the access path (sub)tree read from a WARP table? */
+static bool warp_path_reads_warp_table(AccessPath *path, const JOIN *join) {
+  bool found = false;
+  WalkAccessPaths(path, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
+                  [&found](AccessPath *subpath, const JOIN *) {
+                    TABLE *table = GetBasicTable(subpath);
+                    if (table != nullptr &&
+                        dynamic_cast<ha_warp *>(table->file) != nullptr) {
+                      found = true;
+                    }
+                    return found;
+                  });
+  return found;
+}
+
+/* Is a WARP table the inner (rescanned) side of a nested loop join? */
+static bool warp_has_inner_nested_loop_table(AccessPath *root_path,
+                                             const JOIN *join) {
+  bool found = false;
+  WalkAccessPaths(
+      root_path, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
+      [&found](AccessPath *subpath, const JOIN *join_arg) {
+        AccessPath *inner = nullptr;
+        if (subpath->type == AccessPath::NESTED_LOOP_JOIN) {
+          inner = subpath->nested_loop_join().inner;
+        } else if (subpath->type ==
+                   AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL) {
+          inner = subpath->nested_loop_semijoin_with_duplicate_removal().inner;
+        } else if (subpath->type == AccessPath::BKA_JOIN) {
+          inner = subpath->bka_join().inner;
+        }
+        if (inner != nullptr && warp_path_reads_warp_table(inner, join_arg)) {
+          found = true;
+        }
+        return found;
+      });
+  return found;
+}
+
 /**
  * handlerton::push_to_engine implementation.  Walks the AccessPath tree and
  * offers the condition of each FILTER sitting on top of a WARP table access
@@ -2741,8 +2783,11 @@ int warp_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
     }
     return false;
   };
+  warp_inner_nested_loop_table =
+      warp_has_inner_nested_loop_table(root_path, join);
   WalkAccessPaths(root_path, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
                   func);
+  warp_inner_nested_loop_table = false;
   return 0;
 }
 
@@ -2827,6 +2872,44 @@ const Item *ha_warp::cond_push(const Item *cond) {
 }
 
 /* return 1 if this clause could not be processed (will be processed by MySQL)*/
+/* FastBit evaluates numeric comparisons in double precision, which is
+   exact only for integers of magnitude below 2^53.  Larger constants are
+   compared exactly through FastBit's 64-bit integer syntax (a value with
+   an L or U suffix), which exists for =, !=, <, <=, >, >=, BETWEEN and
+   IN lists. */
+static constexpr uint64_t WARP_EXACT_DOUBLE_LIMIT = 1ULL << 53;
+
+static bool warp_int_is_exact_double(const Item *item) {
+  const longlong v = const_cast<Item *>(item)->val_int();
+  if (item->unsigned_flag) return (ulonglong)v < WARP_EXACT_DOUBLE_LIMIT;
+  return v > -(longlong)WARP_EXACT_DOUBLE_LIMIT &&
+         v < (longlong)WARP_EXACT_DOUBLE_LIMIT;
+}
+
+/* Format an integer constant for a FastBit condition.  Returns false if the
+   comparison can not be pushed down exactly.
+   @param exact_syntax  write the value with FastBit's 64-bit integer suffix
+   @param col_unsigned  the compared column is unsigned */
+static bool warp_format_int(const Item *item, bool exact_syntax,
+                            bool col_unsigned, std::string &out) {
+  const longlong v = const_cast<Item *>(item)->val_int();
+  const bool negative = !item->unsigned_flag && v < 0;
+  if (!exact_syntax) {
+    out = item->unsigned_flag ? std::to_string((ulonglong)v)
+                              : std::to_string(v);
+    return true;
+  }
+  if (col_unsigned) {
+    if (negative) return false;
+    out = std::to_string((ulonglong)v) + "U";
+  } else {
+    if (item->unsigned_flag && (ulonglong)v > (ulonglong)LLONG_MAX)
+      return false;
+    out = std::to_string(v) + "L";
+  }
+  return true;
+}
+
 int ha_warp::append_column_filter(const Item *cond,
                                    std::string &where_clause) {
   bool field_may_be_null = false;
@@ -2947,6 +3030,12 @@ int ha_warp::append_column_filter(const Item *cond,
       if(!is_eq) {
         return 0;
       }      
+
+      // the join pushdown does not support tables that are scanned more
+      // than once (see warp_inner_nested_loop_table)
+      if(warp_inner_nested_loop_table) {
+        return 0;
+      }
       
       Item_field* f0 = (Item_field *)(arg[0]);
       Item_field* f1 = (Item_field *)(arg[1]);
@@ -3031,6 +3120,40 @@ int ha_warp::append_column_filter(const Item *cond,
       return 2;
     }
     
+    /* NOT IN and NOT BETWEEN are left to MySQL */
+    if((is_between || is_in) &&
+       down_cast<Item_func_opt_neg *>(tmp)->negated) {
+      return 0;
+    }
+
+    /* Integer constants compared with a BIGINT column that can not be
+       represented exactly as a double need FastBit's exact 64-bit integer
+       syntax.  In an IN list or BETWEEN every value has to use it. */
+    bool bigint_col = false;
+    bool col_unsigned = false;
+    bool needs_exact_syntax = false;
+    for (uint i = 0; i < tmp->arg_count; ++i) {
+      if(arg[i]->type() == Item::Type::FIELD_ITEM) {
+        const Field *fld = down_cast<Item_field *>(arg[i])->field;
+        if(fld->real_type() == MYSQL_TYPE_LONGLONG) {
+          bigint_col = true;
+          col_unsigned = fld->all_flags() & UNSIGNED_FLAG;
+        }
+      }
+    }
+    if(bigint_col) {
+      for (uint i = 0; i < tmp->arg_count; ++i) {
+        if(arg[i]->type() == Item::Type::INT_ITEM &&
+           !warp_int_is_exact_double(arg[i])) {
+          needs_exact_syntax = true;
+        }
+      }
+      if(needs_exact_syntax && op == " LIKE ") {
+        /* there is no 64-bit integer form of LIKE */
+        return 0;
+      }
+    }
+
     /* BETWEEN AND IN() need some special syntax handling */
     for (uint i = 0; i < tmp->arg_count; ++i, ++arg) {
       if(i > 0) {
@@ -3149,7 +3272,11 @@ int ha_warp::append_column_filter(const Item *cond,
       }
       
       if((*arg)->type() == Item::Type::INT_ITEM) {
-        build_where_clause += std::to_string((*arg)->val_int());
+        std::string val;
+        if(!warp_format_int(*arg, needs_exact_syntax, col_unsigned, val)) {
+          return 0;
+        }
+        build_where_clause += val;
         continue;
       }
 
@@ -3199,6 +3326,12 @@ int ha_warp::append_column_filter(const Item *cond,
         build_where_clause += "'" + escaped + "'";
         continue;
       }
+
+      /* Any other kind of argument (for example a subquery) can not be
+         translated into a FastBit condition, so MySQL has to evaluate the
+         condition.  Every supported argument type is handled above and
+         continues the loop. */
+      return 0;
     }
 
     if(is_in) {

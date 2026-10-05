@@ -6776,7 +6776,7 @@ long ibis::column::evaluateRange(const ibis::qIntHod& cmp,
                                  const ibis::bitvector& mask,
                                  ibis::bitvector& low) const {
     long ierr = -1;
-    if (cmp.getValues().empty()) {
+    if (cmp.empty()) {
         low.set(0, mask.size());
         return 0;
     }
@@ -6812,7 +6812,7 @@ long ibis::column::evaluateRange(const ibis::qIntHod& cmp,
                 ierr = low.sloppyCount();
             }
         }
-        else if (hasRoster() &&
+        else if (! cmp.isRange() && hasRoster() &&
                  (thePart->nRows()+cmp.nItems())*0.15 <
                  (2.0+log((double)cmp.nItems()))*mask.cnt()) {
             // use a sorted list
@@ -6890,7 +6890,7 @@ long ibis::column::evaluateRange(const ibis::qUIntHod& cmp,
                                  const ibis::bitvector& mask,
                                  ibis::bitvector& low) const {
     long ierr = -1;
-    if (cmp.getValues().empty()) {
+    if (cmp.empty()) {
         low.set(0, mask.size());
         return 0;
     }
@@ -6927,7 +6927,7 @@ long ibis::column::evaluateRange(const ibis::qUIntHod& cmp,
                 ierr = low.sloppyCount();
             }
         }
-        else if (hasRoster() &&
+        else if (! cmp.isRange() && hasRoster() &&
                  (thePart->nRows()+cmp.nItems())*0.15 <
                  (2.0+log((double)cmp.nItems()))*mask.cnt()) {
             // use a sorted list
@@ -9953,6 +9953,8 @@ int ibis::column::searchSorted(const ibis::qDiscreteRange& rng,
 
 int ibis::column::searchSorted(const ibis::qIntHod& rng,
                                ibis::bitvector& hits) const {
+    // range conditions are evaluated by scanning (see evaluateRange)
+    if (rng.isRange()) return -1;
     std::string dfname;
     LOGGER(dataFileName(dfname) == 0 && ibis::gVerbose > 2)
         << "column[" << fullname() << "]::searchSorted(" << rng.colName()
@@ -10144,6 +10146,8 @@ int ibis::column::searchSorted(const ibis::qIntHod& rng,
 
 int ibis::column::searchSorted(const ibis::qUIntHod& rng,
                                ibis::bitvector& hits) const {
+    // range conditions are evaluated by scanning (see evaluateRange)
+    if (rng.isRange()) return -1;
     std::string dfname;
     LOGGER(dataFileName(dfname) == 0 && ibis::gVerbose > 2)
         << "column[" << fullname() << "]::searchSorted(" << rng.colName()

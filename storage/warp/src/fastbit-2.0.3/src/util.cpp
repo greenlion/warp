@@ -254,10 +254,15 @@ int ibis::util::readString(std::string& str, const char *&buf,
     if (*buf == '\'') { // single quoted string
         ++ buf; // skip the openning quote
         while (*buf) {
+            // a backslash escapes the quote character and itself, any other
+            // backslash is kept as is
+            if (*buf == '\\' && (buf[1] == '\'' || buf[1] == '\\')) {
+                str += buf[1];
+                buf += 2;
+                continue;
+            }
             if (*buf != '\'')
                 str += *buf;
-            else if (str.size() > 0 && str[str.size()-1] == '\\')
-                str[str.size()-1] = '\'';
             else {
                 ++ buf;
                 if (*buf != 0) {
@@ -281,10 +286,15 @@ int ibis::util::readString(std::string& str, const char *&buf,
     else if (*buf == '"') { // double quoted string
         ++ buf; // skip the openning quote
         while (*buf) {
+            // a backslash escapes the quote character and itself, any other
+            // backslash is kept as is
+            if (*buf == '\\' && (buf[1] == '"' || buf[1] == '\\')) {
+                str += buf[1];
+                buf += 2;
+                continue;
+            }
             if (*buf != '"')
                 str += *buf;
-            else if (str.size() > 0 && str[str.size()-1] == '\\')
-                str[str.size()-1] = '"';
             else {
                 ++ buf;
                 if (*buf != 0) {
@@ -634,22 +644,28 @@ int ibis::util::readInt(int64_t& val, const char *&str, const char* del) {
 
     const bool neg = (*str == '-');
     if (*str == '-' || *str == '+') ++ str;
+    // Accumulate the magnitude as an unsigned value so that the most
+    // negative value (whose magnitude exceeds the largest positive value)
+    // can be represented.
+    const uint64_t limit = (neg ?
+                            static_cast<uint64_t>(INT64_MAX) + 1U :
+                            static_cast<uint64_t>(INT64_MAX));
+    uint64_t mag = 0;
     while (*str != 0 && isdigit(*str) != 0) {
-        tmp = 10 * val + (*str - '0');
-        if (tmp > val) {
-            val = tmp;
-        }
-        else if (val > 0) { // overflow
+        const unsigned digit = (*str - '0');
+        if (mag > (limit - digit) / 10) { // overflow
             LOGGER(ibis::gVerbose > 1)
                 << "Warning -- util::readInt encounters an overflow: adding "
-                << *str << " to " << val << " causes it to become " << tmp
+                << *str << " to " << mag << " exceeds the range of int64_t"
                 << ", reset val to 0";
             val = 0;
             while (*str != 0 && isdigit(*str) != 0) ++ str;
             return -3;
         }
+        mag = 10 * mag + digit;
         ++ str;
     }
+    tmp = static_cast<int64_t>(neg ? (~mag + 1U) : mag);
     // skip trail modifier U
     if (*str == 'u' || *str == 'U') ++ str;
     // skip up to two 'L'
@@ -657,7 +673,7 @@ int ibis::util::readInt(int64_t& val, const char *&str, const char* del) {
         ++ str;
         if (*str == 'l' || *str == 'L') ++ str;
     }
-    if (neg) val = -val;
+    val = tmp;
     if (*str != 0) {
         if (del == 0 || *del == 0) {
             // nothing to do

@@ -27,6 +27,9 @@ namespace ibis { // additional names related to qExpr
     class qIntHod;	///!< A container of signed integers.
     class qUIntHod;	///!< A container of unsigned integers.
     class qExists;	///!< A test for existence of a name.
+    namespace math {
+	class term;	///!< Base of arithmetic expressions.
+    }
 }
 
 /// @ingroup FastBitIBIS
@@ -399,9 +402,32 @@ public:
     qIntHod(const char* col, const std::vector<int64_t>& nums);
     qIntHod(const char* col, const ibis::array_t<int64_t>& nums);
 
+    /// Construct the range condition lo <= col <= hi.  The range is
+    /// empty, and matches nothing, if lo > hi.
+    static qIntHod* range(const char* col, int64_t lo, int64_t hi);
+    /// Construct the range condition col op val, where op is one of
+    /// OP_LT, OP_LE, OP_GT, OP_GE and OP_EQ.
+    static qIntHod* range(const char* col, ibis::qExpr::COMPARE op, int64_t val);
+    /// Build the condition term op val for the parser.  If term is a plain
+    /// column name the result is an exact range condition, otherwise it is
+    /// a compRange evaluated in double precision.  Takes ownership of term.
+    static ibis::qExpr* compare(ibis::math::term* term,
+				ibis::qExpr::COMPARE op, int64_t val);
+    /// Build the condition term BETWEEN lo AND hi, see compare.
+    static ibis::qExpr* between(ibis::math::term* term, int64_t lo, int64_t hi);
+
     /// Copy constructor.
     qIntHod(const qIntHod& ih)
-	: qRange(INTHOD), name(ih.name), values(ih.values) {};
+	: qRange(INTHOD), name(ih.name), values(ih.values),
+	  isrange(ih.isrange), lo(ih.lo), hi(ih.hi) {};
+
+    /// Is this a range condition (lo <= col <= hi) rather than a list of
+    /// values?
+    bool isRange() const {return isrange;}
+    /// Lower bound (inclusive) of a range condition.
+    int64_t lowerBound() const {return lo;}
+    /// Upper bound (inclusive) of a range condition.
+    int64_t upperBound() const {return hi;}
 
     /// Destructor.
     virtual ~qIntHod() {};
@@ -417,13 +443,22 @@ public:
     virtual bool inRange(int64_t val) const;
     virtual void restrictRange(double, double);
     virtual double leftBound() const {
+	if (isrange) return (lo > hi ? DBL_MAX : (double)lo);
 	return (values.empty() ? DBL_MAX : values.front());}
     virtual double rightBound() const {
+	if (isrange) return (lo > hi ? -DBL_MAX : (double)hi);
 	return (values.empty() ? -DBL_MAX : values.back());}
-    virtual bool empty() const {return values.empty();}
+    virtual bool empty() const {
+	return (isrange ? lo > hi : values.empty());}
     /// Duplicate thy self.
     virtual qIntHod* dup() const {return new qIntHod(*this);}
-    virtual uint32_t nItems() const {return values.size();}
+    /// Number of values matched by the condition.  For a range this is
+    /// capped at the largest uint32_t.
+    virtual uint32_t nItems() const {
+	if (! isrange) return values.size();
+	if (lo > hi) return 0;
+	const uint64_t n = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
+	return (n >= 0xFFFFFFFFULL ? 0xFFFFFFFFU : static_cast<uint32_t>(n + 1));}
 
     virtual void print(std::ostream&) const;
     virtual void printFull(std::ostream&) const;
@@ -432,8 +467,13 @@ private:
     /// Name of the column to be compared.
     std::string name;
     /// Values to be compared.  The constructor of this class shall sort
-    /// the values in ascending order.
+    /// the values in ascending order.  Not used for a range condition.
     ibis::array_t<int64_t> values;
+    /// Is this a range condition (see lo and hi)?
+    bool isrange = false;
+    /// Inclusive bounds of a range condition.
+    int64_t lo = 0;
+    int64_t hi = 0;
 }; // ibis::qIntHod
 
 /// This query expression has similar meaning as ibis::qDiscreteRange,
@@ -454,9 +494,32 @@ public:
     qUIntHod(const char* col, const std::vector<uint64_t>& nums);
     qUIntHod(const char* col, const ibis::array_t<uint64_t>& nums);
 
+    /// Construct the range condition lo <= col <= hi.  The range is
+    /// empty, and matches nothing, if lo > hi.
+    static qUIntHod* range(const char* col, uint64_t lo, uint64_t hi);
+    /// Construct the range condition col op val, where op is one of
+    /// OP_LT, OP_LE, OP_GT, OP_GE and OP_EQ.
+    static qUIntHod* range(const char* col, ibis::qExpr::COMPARE op, uint64_t val);
+    /// Build the condition term op val for the parser.  If term is a plain
+    /// column name the result is an exact range condition, otherwise it is
+    /// a compRange evaluated in double precision.  Takes ownership of term.
+    static ibis::qExpr* compare(ibis::math::term* term,
+				ibis::qExpr::COMPARE op, uint64_t val);
+    /// Build the condition term BETWEEN lo AND hi, see compare.
+    static ibis::qExpr* between(ibis::math::term* term, uint64_t lo, uint64_t hi);
+
     /// Copy constructor.
     qUIntHod(const qUIntHod& ih)
-	: qRange(UINTHOD), name(ih.name), values(ih.values) {};
+	: qRange(UINTHOD), name(ih.name), values(ih.values),
+	  isrange(ih.isrange), lo(ih.lo), hi(ih.hi) {};
+
+    /// Is this a range condition (lo <= col <= hi) rather than a list of
+    /// values?
+    bool isRange() const {return isrange;}
+    /// Lower bound (inclusive) of a range condition.
+    uint64_t lowerBound() const {return lo;}
+    /// Upper bound (inclusive) of a range condition.
+    uint64_t upperBound() const {return hi;}
 
     /// Destructor.
     virtual ~qUIntHod() {};
@@ -472,13 +535,22 @@ public:
     virtual bool inRange(uint64_t val) const;
     virtual void restrictRange(double, double);
     virtual double leftBound() const {
+	if (isrange) return (lo > hi ? DBL_MAX : (double)lo);
 	return (values.empty() ? DBL_MAX : values.front());}
     virtual double rightBound() const {
+	if (isrange) return (lo > hi ? -DBL_MAX : (double)hi);
 	return (values.empty() ? -DBL_MAX : values.back());}
-    virtual bool empty() const {return values.empty();}
+    virtual bool empty() const {
+	return (isrange ? lo > hi : values.empty());}
     /// Duplicate thy self.
     virtual qUIntHod* dup() const {return new qUIntHod(*this);}
-    virtual uint32_t nItems() const {return values.size();}
+    /// Number of values matched by the condition.  For a range this is
+    /// capped at the largest uint32_t.
+    virtual uint32_t nItems() const {
+	if (! isrange) return values.size();
+	if (lo > hi) return 0;
+	const uint64_t n = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
+	return (n >= 0xFFFFFFFFULL ? 0xFFFFFFFFU : static_cast<uint32_t>(n + 1));}
 
     virtual void print(std::ostream&) const;
     virtual void printFull(std::ostream&) const;
@@ -487,8 +559,13 @@ private:
     /// Name of the column to be compared.
     std::string name;
     /// Values to be compared.  The constructor of this class shall sort
-    /// the values in ascending order.
+    /// the values in ascending order.  Not used for a range condition.
     ibis::array_t<uint64_t> values;
+    /// Is this a range condition (see lo and hi)?
+    bool isrange = false;
+    /// Inclusive bounds of a range condition.
+    uint64_t lo = 0;
+    uint64_t hi = 0;
 }; // ibis::qUIntHod
 
 /// The class qString encapsulates information for comparing string values.
@@ -1543,6 +1620,9 @@ inline bool ibis::qDiscreteRange::inRange(double val) const {
 /// It uses a binary search if there are more than 32 elements and uses
 /// linear search otherwise.
 inline bool ibis::qIntHod::inRange(double val) const {
+    if (isrange)
+	return (val >= static_cast<double>(lo) &&
+		val <= static_cast<double>(hi));
     if (values.empty()) return false;
     if (val < values[0] || val > values.back()) return false;
 
@@ -1573,6 +1653,9 @@ inline bool ibis::qIntHod::inRange(double val) const {
 /// It uses a binary search if there are more than 32 elements and uses
 /// linear search otherwise.
 inline bool ibis::qUIntHod::inRange(double val) const {
+    if (isrange)
+	return (val >= static_cast<double>(lo) &&
+		val <= static_cast<double>(hi));
     if (values.empty()) return false;
     if (val < values[0] || val > values.back()) return false;
 
@@ -1603,6 +1686,7 @@ inline bool ibis::qUIntHod::inRange(double val) const {
 /// It uses a binary search if there are more than 32 elements and uses
 /// linear search otherwise.
 inline bool ibis::qIntHod::inRange(int64_t val) const {
+    if (isrange) return (lo <= val && val <= hi);
     if (values.empty()) return false;
     if (val < values[0] || val > values.back()) return false;
 
@@ -1633,6 +1717,7 @@ inline bool ibis::qIntHod::inRange(int64_t val) const {
 /// It uses a binary search if there are more than 32 elements and uses
 /// linear search otherwise.
 inline bool ibis::qUIntHod::inRange(uint64_t val) const {
+    if (isrange) return (lo <= val && val <= hi);
     if (values.empty()) return false;
     if (val < values[0] || val > values.back()) return false;
 
