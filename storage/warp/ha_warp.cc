@@ -2598,7 +2598,7 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
     // keep the estimated rows/cost (used for explain only).
     AccessPath *child = filter->filter().child;
     child->set_num_output_rows(filter->num_output_rows());
-    child->cost = filter->cost;
+    child->set_cost(filter->cost());
     *filter = std::move(*child);
   }
 }
@@ -3060,7 +3060,7 @@ int ha_warp::append_column_filter(const Item *cond,
       }
 
       if((*arg)->type() == Item::Type::STRING_ITEM ||
-         (*arg)->type() == Item::Type::VARBIN_ITEM) 
+         (*arg)->type() == Item::Type::HEX_BIN_ITEM) 
       {
         if(!is_eq) {
           return 0;
