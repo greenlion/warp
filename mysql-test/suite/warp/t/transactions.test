@@ -1,0 +1,55 @@
+--echo #
+--echo # WARP transactions: commit, rollback and visibility between connections
+--echo #
+
+--source include/count_sessions.inc
+
+CREATE TABLE t1 (id INT, v VARCHAR(20)) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+
+--echo # ROLLBACK of INSERT, UPDATE and DELETE
+BEGIN;
+INSERT INTO t1 VALUES (3, 'three');
+UPDATE t1 SET v = 'changed' WHERE id = 1;
+DELETE FROM t1 WHERE id = 2;
+SELECT * FROM t1 ORDER BY id;
+ROLLBACK;
+SELECT * FROM t1 ORDER BY id;
+
+--echo # COMMIT
+BEGIN;
+INSERT INTO t1 VALUES (3, 'three');
+UPDATE t1 SET v = 'uno' WHERE id = 1;
+COMMIT;
+SELECT * FROM t1 ORDER BY id;
+
+--echo # Uncommitted changes are not visible to other connections
+connect (con1, localhost, root,,);
+connection default;
+BEGIN;
+INSERT INTO t1 VALUES (4, 'four');
+UPDATE t1 SET v = 'tres' WHERE id = 3;
+connection con1;
+SELECT * FROM t1 ORDER BY id;
+connection default;
+COMMIT;
+connection con1;
+SELECT * FROM t1 ORDER BY id;
+disconnect con1;
+connection default;
+
+--echo # With autocommit off a statement is only kept after COMMIT
+SET autocommit = 0;
+INSERT INTO t1 VALUES (5, 'five');
+ROLLBACK;
+SET autocommit = 1;
+INSERT INTO t1 VALUES (6, 'six');
+SELECT * FROM t1 ORDER BY id;
+
+--echo # Committed data survives a restart
+--source include/restart_mysqld.inc
+SELECT * FROM t1 ORDER BY id;
+
+DROP TABLE t1;
+--source include/wait_until_count_sessions.inc

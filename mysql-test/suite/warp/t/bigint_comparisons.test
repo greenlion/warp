@@ -1,0 +1,150 @@
+--echo #
+--echo # Comparisons of BIGINT and BIGINT UNSIGNED columns with constants that
+--echo # can not be represented exactly as a double (magnitude 2^53 or more),
+--echo # and negated IN / BETWEEN.  Every comparison is also run against InnoDB.
+--echo #
+--echo # Regression test: such comparisons used to be evaluated by FastBit in
+--echo # double precision, unsigned constants above 2^63-1 were sent as
+--echo # negative numbers, and NOT IN / NOT BETWEEN were pushed down as IN /
+--echo # BETWEEN.  FastBit now compares 64-bit integers exactly for =, !=,
+--echo # <, <=, >, >=, BETWEEN and IN.
+--echo #
+
+CREATE TABLE w (id INT, b BIGINT, u BIGINT UNSIGNED) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w VALUES
+  (1, -9223372036854775808, 0), (2, -9223372036854775807, 1),
+  (3, -9223372036854775806, 2),
+  (4, 9223372036854775807, 18446744073709551615),
+  (5, 9223372036854775806, 18446744073709551614),
+  (6, 9007199254740992, 9007199254740992), (7, 9007199254740993, 9007199254740993),
+  (8, 9007199254740994, 9007199254740994), (9, -9007199254740993, 9223372036854775808),
+  (10, 0, 9223372036854775807), (11, 12345, 12345), (12, NULL, NULL);
+INSERT INTO i SELECT * FROM w;
+
+--let $signed_values = -9223372036854775808,-9223372036854775807,9223372036854775807,9223372036854775806,9007199254740992,9007199254740993,-9007199254740993,12345,0
+--let $unsigned_values = 18446744073709551615,18446744073709551614,9223372036854775808,9223372036854775807,9007199254740993,12345,0
+--let $ops = =,<>,<,<=,>,>=
+
+--let $checked = 0
+--let $wrong = 0
+--let $col = b
+--let $values = $signed_values
+--let $pass = 0
+while ($pass < 2)
+{
+  inc $pass;
+  if ($pass == 2)
+  {
+    --let $col = u
+    --let $values = $unsigned_values
+  }
+  --let $vlist = $values,
+  while ($vlist != '')
+  {
+    --let $v = `SELECT SUBSTRING_INDEX('$vlist', ',', 1)`
+    --let $vlist = `SELECT SUBSTRING('$vlist', LENGTH('$v') + 2)`
+    --let $olist = $ops,
+    while ($olist != '')
+    {
+      --let $op = `SELECT SUBSTRING_INDEX('$olist', ',', 1)`
+      --let $olist = `SELECT SUBSTRING('$olist', LENGTH('$op') + 2)`
+      --let $wr = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM w WHERE $col $op $v`
+      --let $ir = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM i WHERE $col $op $v`
+      inc $checked;
+      if ($wr != $ir)
+      {
+        inc $wrong;
+        --echo MISMATCH: $col $op $v WARP [$wr] InnoDB [$ir]
+      }
+    }
+  }
+}
+--echo $checked single comparisons checked, $wrong mismatches
+
+--echo # Lists, ranges and negations
+let $n = 0;
+while ($n < 14)
+{
+  inc $n;
+  if ($n == 1)  { let $where = b BETWEEN 9007199254740992 AND 9007199254740993; }
+  if ($n == 2)  { let $where = b IN (-9223372036854775808, 9007199254740993); }
+  if ($n == 3)  { let $where = b NOT IN (-9223372036854775808, 9007199254740993); }
+  if ($n == 4)  { let $where = u IN (18446744073709551615, 9223372036854775808); }
+  if ($n == 5)  { let $where = u BETWEEN 9223372036854775807 AND 18446744073709551614; }
+  if ($n == 6)  { let $where = b = 9007199254740993 OR b = 0; }
+  if ($n == 7)  { let $where = b IN (1, 2, 12345); }
+  if ($n == 8)  { let $where = b IN (12345, 0); }
+  if ($n == 9)  { let $where = u NOT IN (0, 1); }
+  if ($n == 10) { let $where = b NOT IN (12345, 0); }
+  if ($n == 11) { let $where = b NOT BETWEEN 0 AND 20000; }
+  if ($n == 12) { let $where = b IN (9007199254740993); }
+  if ($n == 13) { let $where = u = 9223372036854775808 OR u = 0; }
+  if ($n == 14) { let $where = b IN (-9223372036854775808, 9223372036854775807, 0); }
+  let $wr = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM w WHERE $where`;
+  let $ir = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM i WHERE $where`;
+  if ($wr != $ir)
+  {
+    --echo MISMATCH for WHERE $where: WARP [$wr], InnoDB [$ir]
+  }
+  if ($wr == $ir)
+  {
+    --echo WHERE $where: ids $wr
+  }
+}
+
+--echo # Comparisons with such constants are pushed down, NOT IN is
+--echo # evaluated by MySQL
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b = 9007199254740993;
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE u IN (0, 18446744073709551615);
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b > 9007199254740993;
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE u BETWEEN 9223372036854775807 AND 18446744073709551614;
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b NOT IN (1, 2);
+
+DROP TABLE w, i;
+
+--echo # Many rows clustered around values that are equal as doubles
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE w (id INT, b BIGINT, u BIGINT UNSIGNED) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 30000)
+  SELECT x,
+         CASE x % 3 WHEN 0 THEN 9007199254740992 + (x % 1000) - 500
+                    WHEN 1 THEN 9223372036854775807 - (x % 2000)
+                    ELSE -9223372036854775808 + (x % 777) END,
+         18446744073709551615 - (x % 5000)
+  FROM s;
+INSERT INTO i SELECT * FROM w;
+let $n = 0;
+while ($n < 10)
+{
+  inc $n;
+  if ($n == 1)  { let $where = b > 9007199254740993; }
+  if ($n == 2)  { let $where = b >= 9007199254740992; }
+  if ($n == 3)  { let $where = b <= 9007199254740991; }
+  if ($n == 4)  { let $where = b BETWEEN 9007199254740990 AND 9007199254740995; }
+  if ($n == 5)  { let $where = b > 9223372036854775000; }
+  if ($n == 6)  { let $where = b >= 9223372036854774000 AND b < 9223372036854775807; }
+  if ($n == 7)  { let $where = b BETWEEN -9223372036854775808 AND -9223372036854775800; }
+  if ($n == 8)  { let $where = u > 18446744073709550000; }
+  if ($n == 9)  { let $where = u BETWEEN 18446744073709547000 AND 18446744073709547010; }
+  if ($n == 10) { let $where = u < 18446744073709551615 AND b > 0; }
+  let $wr = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $where`;
+  let $ir = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $where`;
+  if ($wr != $ir)
+  {
+    --echo MISMATCH for WHERE $where: WARP $wr, InnoDB $ir
+  }
+  if ($wr == $ir)
+  {
+    --echo WHERE $where: rows:sum(id) = $wr
+  }
+}
+DROP TABLE w, i;

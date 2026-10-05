@@ -1,0 +1,60 @@
+#
+# Values that WARP has to encode specially when it buffers rows as CSV
+# text before handing them to FastBit.  Every value must round trip
+# exactly as it does in InnoDB.
+#
+# Regression test: rows with BIGINT -9223372036854775808 or a trailing
+# backslash used to be lost, and backslash, newline and carriage return
+# used to be stored escaped.
+#
+CREATE TABLE w (id INT, bi BIGINT, s VARCHAR(40)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w VALUES (1, -9223372036854775808, 'bigint minimum'),
+(2, 9223372036854775807, 'bigint maximum'),
+(3, 0, 'back\\slash'),
+(4, 0, 'new\nline'),
+(5, 0, 'carriage\rreturn'),
+(6, 0, 'tab\there'),
+(7, 0, 'quote''s'),
+(8, 0, 'double"quote'),
+(9, 0, 'comma,separated'),
+(10, 0, 'trailing backslash\\');
+INSERT INTO i VALUES (1, -9223372036854775808, 'bigint minimum'),
+(2, 9223372036854775807, 'bigint maximum'),
+(3, 0, 'back\\slash'),
+(4, 0, 'new\nline'),
+(5, 0, 'carriage\rreturn'),
+(6, 0, 'tab\there'),
+(7, 0, 'quote''s'),
+(8, 0, 'double"quote'),
+(9, 0, 'comma,separated'),
+(10, 0, 'trailing backslash\\');
+# WARP
+SELECT id, bi, HEX(s) FROM w ORDER BY id;
+id	bi	HEX(s)
+1	-9223372036854775808	626967696E74206D696E696D756D
+2	9223372036854775807	626967696E74206D6178696D756D
+3	0	6261636B5C736C617368
+4	0	6E65770A6C696E65
+5	0	63617272696167650D72657475726E
+6	0	7461620968657265
+7	0	71756F74652773
+8	0	646F75626C652271756F7465
+9	0	636F6D6D612C736570617261746564
+10	0	747261696C696E67206261636B736C6173685C
+# InnoDB (expected)
+SELECT id, bi, HEX(s) FROM i ORDER BY id;
+id	bi	HEX(s)
+1	-9223372036854775808	626967696E74206D696E696D756D
+2	9223372036854775807	626967696E74206D6178696D756D
+3	0	6261636B5C736C617368
+4	0	6E65770A6C696E65
+5	0	63617272696167650D72657475726E
+6	0	7461620968657265
+7	0	71756F74652773
+8	0	646F75626C652271756F7465
+9	0	636F6D6D612C736570617261746564
+10	0	747261696C696E67206261636B736C6173685C
+DROP TABLE w, i;

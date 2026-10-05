@@ -1,0 +1,68 @@
+--echo #
+--echo # Joins and multi-table UPDATE / DELETE (positioned reads by rowid).
+--echo # The same statements are run against InnoDB and the results compared.
+--echo #
+--echo # Nested loop joins between two WARP tables are covered by
+--echo # warp.nested_loop_join, so the joins between WARP tables use a hash
+--echo # join and the multi-table statements join with InnoDB.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+SET SESSION group_concat_max_len = 1000000;
+
+CREATE TABLE wf (id INT, k INT, s VARCHAR(20), n INT NULL) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE wd (id INT, tag VARCHAR(10)) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+INSERT INTO wf WITH RECURSIVE seq(x) AS
+  (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 5000)
+  SELECT x, x % 50, CONCAT('row', x), x % 7 FROM seq;
+INSERT INTO wd WITH RECURSIVE seq(x) AS
+  (SELECT 10 UNION ALL SELECT x + 10 FROM seq WHERE x < 5000)
+  SELECT x, CONCAT('t', x % 7) FROM seq;
+
+CREATE TABLE inf ENGINE=InnoDB SELECT * FROM wf;
+CREATE TABLE ind ENGINE=InnoDB SELECT * FROM wd;
+ALTER TABLE ind ADD INDEX (id);
+
+--echo # Hash joins between WARP tables
+SELECT /*+ BNL(f, d) */ COUNT(*), SUM(f.k) FROM wf f JOIN wd d ON f.id = d.id WHERE d.tag = 't3';
+SELECT COUNT(*), SUM(f.k) FROM inf f JOIN ind d ON f.id = d.id WHERE d.tag = 't3';
+SELECT /*+ BNL(f, d) */ d.tag, COUNT(*) FROM wf f JOIN wd d ON f.id = d.id GROUP BY d.tag ORDER BY d.tag;
+SELECT d.tag, COUNT(*) FROM inf f JOIN ind d ON f.id = d.id GROUP BY d.tag ORDER BY d.tag;
+
+--echo # Joins between WARP and InnoDB tables
+SELECT COUNT(*), SUM(f.k) FROM wf f JOIN ind d ON f.id = d.id WHERE d.tag = 't3';
+SELECT COUNT(*), SUM(f.k) FROM ind d STRAIGHT_JOIN wf f ON f.id = d.id WHERE d.tag = 't3';
+
+--echo # Multi-table UPDATE
+UPDATE wf f JOIN ind d ON f.id = d.id SET f.s = d.tag, f.n = NULL WHERE d.tag = 't3';
+UPDATE inf f JOIN ind d ON f.id = d.id SET f.s = d.tag, f.n = NULL WHERE d.tag = 't3';
+
+--echo # Multi-table DELETE
+DELETE f FROM wf f JOIN ind d ON f.id = d.id WHERE d.tag = 't5';
+DELETE f FROM inf f JOIN ind d ON f.id = d.id WHERE d.tag = 't5';
+
+SELECT COUNT(*), SUM(s = 't3'), SUM(n IS NULL) FROM wf;
+SELECT COUNT(*), SUM(s = 't3'), SUM(n IS NULL) FROM inf;
+
+let $w = `SELECT SHA2(GROUP_CONCAT(CONCAT_WS('|', id, k, s, IFNULL(n, 'N')) ORDER BY id SEPARATOR ','), 256) FROM wf`;
+let $i = `SELECT SHA2(GROUP_CONCAT(CONCAT_WS('|', id, k, s, IFNULL(n, 'N')) ORDER BY id SEPARATOR ','), 256) FROM inf`;
+if ($w != $i)
+{
+  --echo WARP and InnoDB contents differ after multi-table UPDATE/DELETE
+}
+if ($w == $i)
+{
+  --echo WARP and InnoDB contents are identical
+}
+
+--echo # Rolled back multi-table UPDATE leaves the table unchanged
+BEGIN;
+UPDATE wf f JOIN ind d ON f.id = d.id SET f.s = 'rolled' WHERE d.tag = 't1';
+SELECT SUM(s = 'rolled') FROM wf;
+ROLLBACK;
+SELECT SUM(s = 'rolled') FROM wf;
+
+DROP TABLE wf, wd, inf, ind;

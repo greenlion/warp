@@ -1,0 +1,34 @@
+--echo #
+--echo # Values that WARP has to encode specially when it buffers rows as CSV
+--echo # text before handing them to FastBit.  Every value must round trip
+--echo # exactly as it does in InnoDB.
+--echo #
+--echo # Regression test: rows with BIGINT -9223372036854775808 or a trailing
+--echo # backslash used to be lost, and backslash, newline and carriage return
+--echo # used to be stored escaped.
+--echo #
+
+CREATE TABLE w (id INT, bi BIGINT, s VARCHAR(40)) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+
+let $values = (1, -9223372036854775808, 'bigint minimum'),
+              (2, 9223372036854775807, 'bigint maximum'),
+              (3, 0, 'back\\\\slash'),
+              (4, 0, 'new\\nline'),
+              (5, 0, 'carriage\\rreturn'),
+              (6, 0, 'tab\\there'),
+              (7, 0, 'quote''s'),
+              (8, 0, 'double"quote'),
+              (9, 0, 'comma,separated'),
+              (10, 0, 'trailing backslash\\\\');
+eval INSERT INTO w VALUES $values;
+eval INSERT INTO i VALUES $values;
+
+--echo # WARP
+SELECT id, bi, HEX(s) FROM w ORDER BY id;
+--echo # InnoDB (expected)
+SELECT id, bi, HEX(s) FROM i ORDER BY id;
+
+DROP TABLE w, i;

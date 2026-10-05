@@ -1,0 +1,53 @@
+#
+# Nested loop joins between two WARP tables, where the inner WARP table
+# is scanned again for every row of the outer table.  The results must
+# match the same statements on InnoDB.
+#
+# Regression test: WARP's join pushdown used to be applied to the inner
+# table of a nested loop, which found only one matching row or crashed
+# the server in ha_warp::rnd_next, and made multi-table UPDATE and
+# DELETE between WARP tables change a single row.
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE wf (id INT, k INT, s VARCHAR(20)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE wd (id INT, tag VARCHAR(10)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO wf WITH RECURSIVE seq(x) AS
+(SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 5000)
+SELECT x, x % 50, CONCAT('row', x) FROM seq;
+INSERT INTO wd WITH RECURSIVE seq(x) AS
+(SELECT 10 UNION ALL SELECT x + 10 FROM seq WHERE x < 5000)
+SELECT x, CONCAT('t', x % 7) FROM seq;
+CREATE TABLE inf ENGINE=InnoDB SELECT * FROM wf;
+CREATE TABLE ind ENGINE=InnoDB SELECT * FROM wd;
+# Fact table inner
+SELECT /*+ NO_BNL(f) JOIN_ORDER(d, f) */ COUNT(*), SUM(f.k)
+FROM wf f JOIN wd d ON f.id = d.id WHERE d.tag = 't3';
+COUNT(*)	SUM(f.k)
+72	1440
+SELECT /*+ NO_BNL(f) JOIN_ORDER(d, f) */ COUNT(*), SUM(f.k)
+FROM inf f JOIN ind d ON f.id = d.id WHERE d.tag = 't3';
+COUNT(*)	SUM(f.k)
+72	1440
+# Dimension table inner
+SELECT /*+ NO_BNL(d) JOIN_ORDER(f, d) */ COUNT(*), SUM(f.k)
+FROM wf f JOIN wd d ON f.id = d.id WHERE d.tag = 't3';
+COUNT(*)	SUM(f.k)
+72	1440
+SELECT /*+ NO_BNL(d) JOIN_ORDER(f, d) */ COUNT(*), SUM(f.k)
+FROM inf f JOIN ind d ON f.id = d.id WHERE d.tag = 't3';
+COUNT(*)	SUM(f.k)
+72	1440
+# Multi-table UPDATE and DELETE between WARP tables
+UPDATE wf f JOIN wd d ON f.id = d.id SET f.s = d.tag WHERE d.tag = 't3';
+UPDATE inf f JOIN ind d ON f.id = d.id SET f.s = d.tag WHERE d.tag = 't3';
+DELETE f FROM wf f JOIN wd d ON f.id = d.id WHERE d.tag = 't5';
+DELETE f FROM inf f JOIN ind d ON f.id = d.id WHERE d.tag = 't5';
+SELECT COUNT(*), SUM(s = 't3') FROM wf;
+COUNT(*)	SUM(s = 't3')
+4929	72
+SELECT COUNT(*), SUM(s = 't3') FROM inf;
+COUNT(*)	SUM(s = 't3')
+4929	72
+DROP TABLE wf, wd, inf, ind;

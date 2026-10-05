@@ -1,0 +1,69 @@
+--echo #
+--echo # Round trip of the data types supported by WARP.
+--echo # BIGINT's minimum value and strings containing backslashes or newlines
+--echo # are covered by warp.csv_encoding.
+--echo #
+
+CREATE TABLE t1 (
+  id INT,
+  ti TINYINT, uti TINYINT UNSIGNED,
+  si SMALLINT, usi SMALLINT UNSIGNED,
+  mi MEDIUMINT,
+  i INT, ui INT UNSIGNED,
+  bi BIGINT, ubi BIGINT UNSIGNED,
+  f FLOAT, d DOUBLE,
+  dc DECIMAL(20,6),
+  y YEAR,
+  c CHAR(10), vc VARCHAR(100), tx TEXT
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+INSERT INTO t1 VALUES
+  (1, -128, 255, -32768, 65535, -8388608, -2147483648, 4294967295,
+   -9223372036854775807, 18446744073709551615, -1.5, -2.25,
+   -12345678901234.123456, 1901, 'a', 'b', 'c'),
+  (2, 127, 0, 32767, 0, 8388607, 2147483647, 0,
+   9223372036854775807, 0, 3.5, 1e100,
+   99999999999999.999999, 2155, 'abcdefghij', REPEAT('x', 100), REPEAT('long text ', 50)),
+  (3, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 2000, '', '', ''),
+  (4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+   NULL, NULL, NULL, NULL, NULL),
+  (5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0.25, 0.125, 0.000001, 1999,
+   'späce', 'ünïcødé ✓', 'quote '', comma and\ttab');
+SELECT * FROM t1 ORDER BY id;
+
+CREATE TABLE t2 (
+  id INT,
+  dt DATE,
+  dtm DATETIME,
+  dtm6 DATETIME(6),
+  ts TIMESTAMP NULL,
+  tm TIME,
+  tm3 TIME(3)
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+INSERT INTO t2 VALUES
+  (1, '2024-02-29', '2024-02-29 12:34:56', '2024-02-29 12:34:56.123456',
+   '2024-03-01 01:02:03', '12:34:56', '12:34:56.789'),
+  (2, '1000-01-01', '1000-01-01 00:00:00', '1000-01-01 00:00:00.000000',
+   '1970-01-02 00:00:00', '-01:00:00', '-00:00:00.001'),
+  (3, '9999-12-31', '9999-12-31 23:59:59', '9999-12-31 23:59:59.999999',
+   '2038-01-19 03:14:07', '838:59:59', '-838:59:59.000'),
+  (4, NULL, NULL, NULL, NULL, NULL, NULL),
+  (5, '2000-01-01', '2000-01-01 00:00:00', '2000-01-01 00:00:00.5',
+   '2000-01-01 00:00:00', '00:00:00', '23:59:59.999');
+SELECT * FROM t2 ORDER BY id;
+
+--echo # Temporal comparisons
+SELECT id FROM t2 WHERE dt = '2024-02-29';
+SELECT id FROM t2 WHERE dtm > '2000-01-01 00:00:00' ORDER BY id;
+SELECT id FROM t2 WHERE dt < DATE_SUB('2001-01-01', INTERVAL 1 DAY) ORDER BY id;
+SELECT id FROM t2 WHERE tm < '00:00:00' ORDER BY id;
+SELECT id FROM t2 WHERE tm > CAST('100:00:00' AS TIME) ORDER BY id;
+SELECT id FROM t2 WHERE tm BETWEEN CAST('-1:00:00' AS TIME) AND ADDTIME('00:00:00', '01:00:00') ORDER BY id;
+
+--echo # Values survive a restart
+--source include/restart_mysqld.inc
+SELECT * FROM t1 ORDER BY id;
+SELECT * FROM t2 ORDER BY id;
+
+DROP TABLE t1, t2;

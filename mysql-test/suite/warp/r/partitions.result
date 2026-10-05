@@ -1,0 +1,70 @@
+#
+# Tables spanning several FastBit partitions.  The server runs with
+# warp_partition_max_rows=64000 and warp_write_cache_size=32000.
+#
+SELECT @@warp_partition_max_rows, @@warp_write_cache_size;
+@@warp_partition_max_rows	@@warp_write_cache_size
+64000	32000
+SET SESSION cte_max_recursion_depth = 1000000;
+SET SESSION group_concat_max_len = 100000000;
+CREATE TABLE w (id INT, k INT, s VARCHAR(30), d DATE) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+# One large load followed by many small inserts
+INSERT INTO w WITH RECURSIVE seq(x) AS
+(SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 200000)
+SELECT x, x % 1000, CONCAT('str-', x % 503), DATE_ADD('2000-01-01', INTERVAL x % 5000 DAY)
+FROM seq;
+INSERT INTO w VALUES (300000 + 1, 1, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 2, 2, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 3, 3, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 4, 4, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 5, 5, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 6, 6, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 7, 7, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 8, 8, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 9, 9, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 10, 10, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 11, 11, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 12, 12, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 13, 13, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 14, 14, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 15, 15, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 16, 16, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 17, 17, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 18, 18, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 19, 19, 'single', '2024-01-01');
+INSERT INTO w VALUES (300000 + 20, 20, 'single', '2024-01-01');
+INSERT INTO i SELECT * FROM w;
+# Number of partition directories
+partitions: 4
+SELECT COUNT(*), SUM(id), MIN(id), MAX(id) FROM w;
+COUNT(*)	SUM(id)	MIN(id)	MAX(id)
+200020	20006100210	1	300020
+SELECT COUNT(*), SUM(id), MIN(id), MAX(id) FROM i;
+COUNT(*)	SUM(id)	MIN(id)	MAX(id)
+200020	20006100210	1	300020
+SELECT COUNT(*) FROM w WHERE k = 999;
+COUNT(*)
+200
+SELECT COUNT(*) FROM i WHERE k = 999;
+COUNT(*)
+200
+SELECT COUNT(*) FROM w WHERE s = 'str-7' AND d >= '2005-01-01';
+COUNT(*)
+250
+SELECT COUNT(*) FROM i WHERE s = 'str-7' AND d >= '2005-01-01';
+COUNT(*)
+250
+SELECT COUNT(*) FROM w WHERE id BETWEEN 63990 AND 64010;
+COUNT(*)
+21
+WARP and InnoDB contents are identical
+# Updates and deletes across partitions
+UPDATE w SET k = -1 WHERE id % 50000 = 0;
+DELETE FROM w WHERE id BETWEEN 63995 AND 64005;
+SELECT COUNT(*), SUM(k = -1) FROM w;
+COUNT(*)	SUM(k = -1)
+200009	4
+DROP TABLE w, i;
