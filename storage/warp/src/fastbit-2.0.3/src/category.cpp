@@ -1523,6 +1523,10 @@ void ibis::text::startPositions(const char *dir, char *buf,
     std::string spfile = dfile;
     spfile += ".sp";
     mutexLock lock(this, "text::startPositions");
+    // The .sp file is updated in place with raw writes below.  If it is
+    // compressed (or new while compression is enabled) work on a plain
+    // copy and compress it again when done.
+    ibis::zfile::plainScope spscope(spfile.c_str());
     // A compressed data file is scanned through a decompressed in-memory
     // copy; the (rare) modifications are applied to the real file below.
     const bool dcomp = ibis::zfile::isCompressed(dfile.c_str());
@@ -3038,6 +3042,64 @@ int ibis::text::readString(std::string& res, int fdes, long be, long en,
     return 0;
 } // ibis::text::readString
 
+namespace {
+/// If the data file or the starting position file of a text column is
+/// compressed, load both through the file manager, which caches the
+/// decompressed content, and return true.  The caller then extracts the
+/// strings from memory instead of reading the files piece by piece.
+bool fbzLoadStrings(const std::string& dfile, ibis::array_t<int64_t>& sp,
+                    ibis::array_t<char>& raw) {
+    const std::string spfile = dfile + ".sp";
+    if (! ibis::zfile::isCompressed(dfile.c_str()) &&
+        ! ibis::zfile::isCompressed(spfile.c_str()))
+        return false;
+    if (ibis::fileManager::instance().getFile(spfile.c_str(), sp) != 0)
+        return false;
+    if (ibis::fileManager::instance().getFile(dfile.c_str(), raw) != 0)
+        raw.clear(); // an empty data file
+    return (sp.size() > 0 && sp.back() <= (int64_t)raw.size());
+}
+
+/// Extract the string of row i (without the null terminator).
+inline void fbzExtractString(const ibis::array_t<int64_t>& sp,
+                             const ibis::array_t<char>& raw, uint32_t i,
+                             std::string& out) {
+    out.clear();
+    if (i + 1 < sp.size() && sp[i] < sp[i+1]) {
+        const int64_t len = sp[i+1] - sp[i] - 1; // drop the terminator
+        if (len > 0) out.assign(raw.begin() + sp[i], len);
+    }
+}
+
+/// Extract the strings marked 1 in mask.
+int fbzExtractStrings(const ibis::array_t<int64_t>& sp,
+                      const ibis::array_t<char>& raw,
+                      const ibis::bitvector& mask,
+                      std::vector<std::string>& res) {
+    std::string tmp;
+    for (ibis::bitvector::indexSet ix = mask.firstIndexSet();
+         ix.nIndices() > 0; ++ ix) {
+        const ibis::bitvector::word_t *ind = ix.indices();
+        if (ix.isRange()) {
+            for (ibis::bitvector::word_t i = ind[0];
+                 i < ind[1] && i + 1 < sp.size(); ++ i) {
+                fbzExtractString(sp, raw, i, tmp);
+                res.push_back(tmp);
+            }
+        }
+        else {
+            for (unsigned j = 0; j < ix.nIndices(); ++ j) {
+                if (ind[j] + 1 < sp.size()) {
+                    fbzExtractString(sp, raw, ind[j], tmp);
+                    res.push_back(tmp);
+                }
+            }
+        }
+    }
+    return res.size();
+}
+} // anonymous namespace
+
 /// Read the string value of <code>i</code>th row.
 /// It goes through a two-stage process by reading from two files, first
 /// from the .sp file to read the position of the string in the second file
@@ -3051,6 +3113,14 @@ int ibis::text::readString(uint32_t i, std::string &ret) const {
     std::string fnm = thePart->currentDataDir();
     fnm += FASTBIT_DIRSEP;
     fnm += m_name;
+    {   // compressed files are served from the file manager's cache
+        ibis::array_t<int64_t> sp;
+        ibis::array_t<char> raw;
+        if (fbzLoadStrings(fnm, sp, raw) && i + 1 < sp.size()) {
+            fbzExtractString(sp, raw, i, ret);
+            return 0;
+        }
+    }
     fnm += ".sp"; // starting position file
 
     long ierr = 0;
@@ -3195,6 +3265,12 @@ int ibis::text::readStrings1(const ibis::bitvector &msk,
     std::string fnm = thePart->currentDataDir();
     fnm += FASTBIT_DIRSEP;
     fnm += m_name;
+    {   // compressed files are served from the file manager's cache
+        ibis::array_t<int64_t> sp;
+        ibis::array_t<char> raw;
+        if (fbzLoadStrings(fnm, sp, raw) && sp.size() >= msk.size()+1U)
+            return fbzExtractStrings(sp, raw, msk, ret);
+    }
     fnm += ".sp"; // starting position file
     try {
         ret.reserve(msk.cnt());
@@ -3338,6 +3414,12 @@ int ibis::text::readStrings2(const ibis::bitvector& mask,
     std::string fnm = thePart->currentDataDir();
     fnm += FASTBIT_DIRSEP;
     fnm += m_name;
+    {   // compressed files are served from the file manager's cache
+        ibis::array_t<int64_t> csp;
+        ibis::array_t<char> raw;
+        if (fbzLoadStrings(fnm, csp, raw) && csp.size() >= mask.size()+1U)
+            return fbzExtractStrings(csp, raw, mask, res);
+    }
     fnm += ".sp";
     const array_t<int64_t>
         sp(fnm.c_str(), static_cast<off_t>(0),
@@ -3977,6 +4059,8 @@ int ibis::text::writeStrings(const char *to, const char *from,
     (void)_setmode(rtfile, _O_BINARY);
 #endif
 
+    // the starting positions are appended as raw bytes as well
+    ibis::zfile::plainScope spscope(spto);
     int stfile = UnixOpen(spto, OPEN_APPENDONLY, OPEN_FILEMODE);
     if (rtfile < 0) {
         LOGGER(ibis::gVerbose >= 0)
