@@ -14,6 +14,9 @@ please refer to the LICENSE file.
 For further information on MySQL or additional documentation, visit
   http://dev.mysql.com/doc/
 
+For updates to MySQL NDB Cluster 8.0 code see 
+  https://github.com/mysql/mysql-server/tree/cluster-8.0
+
 For additional downloads and the source of MySQL, visit
   http://dev.mysql.com/downloads/
 
