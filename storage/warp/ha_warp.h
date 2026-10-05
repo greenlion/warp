@@ -79,6 +79,9 @@
 #include "sql/sql_optimizer.h"
 
 // Fastbit includes
+#include <atomic>
+#include <memory>
+#include <stdexcept>
 #include "include/fastbit/ibis.h"
 #include "include/fastbit/query.h"
 #include "include/fastbit/bundle.h"
@@ -251,6 +254,8 @@ private:
   std::set<uint64_t> dim_rownums;
   bool frozen = false;
 public:
+  /* set if the dimension keys could not be merged completely */
+  std::atomic<bool> failed{false};
   std::string fact_column = "";
   std::string dim_alias = "";
   std::string dim_column = "";
@@ -321,9 +326,9 @@ class warp_pushdown_information {
   uint64_t rowcount = 0;
 
   // fastbit objects for iterating the filtered table (may be opened in ::cond_push)
-  ibis::table* base_table;
-  ibis::table* filtered_table;
-  ibis::table::cursor* cursor;
+  ibis::table* base_table = NULL;
+  ibis::table* filtered_table = NULL;
+  ibis::table::cursor* cursor = NULL;
   
   // This points to a field on a specific table
   // in the join.  It is used to project the join
@@ -331,7 +336,7 @@ class warp_pushdown_information {
   // opened, and to construct an in-memory hash
   // index if there is key on the dimension table
   std::unordered_map<Field*, warp_join_info> join_info;
-  fact_table_filter* fact_table_filters;
+  fact_table_filter* fact_table_filters = NULL;
   // if an index exists for the join in the dimension
   // table, then an in memory has index will be built
   // on the table to improve join performance because
@@ -656,7 +661,10 @@ class ha_warp : public handler {
   int find_current_row(uchar *buf, ibis::table::cursor* cursor);
   int create_writer(TABLE *table_arg);
   std::string get_writer_partition();
-  void write_buffered_rows_to_disk();
+  int write_buffered_rows_to_disk();
+  /* write_row does its work in write_row_impl so that exceptions thrown by
+     FastBit are turned into handler errors */
+  int write_row_impl(uchar *buf);
   void foreground_write();
   int append_column_filter(const Item* cond, std::string& push_where_clause); 
   void maintain_indexes(const char* datadir);
@@ -719,6 +727,14 @@ class ha_warp : public handler {
 
   uint32_t rownum = 0;
   uint32_t running_join_threads = 0;
+  /* Set by the join worker threads (or the scan) when a partition could not
+     be processed, for example because the FastBit cache is too small.
+     Results are incomplete in that case, so the scan must fail. */
+  std::atomic<int> join_error{0};
+  /* rnd_next does its work in rnd_next_impl so that exceptions thrown by
+     FastBit are turned into handler errors */
+  int rnd_next_impl(uchar *buf);
+  void wait_for_join_threads();
   
   uint64_t fetch_count = 0;
   bool all_jobs_completed = false;
@@ -729,6 +745,14 @@ class ha_warp : public handler {
   //static void warp_filter_table(ibis::mensa::table* filtered_table, std::string filter_column, std::vector<std::string>* batch, std::string push_where_clause, std::vector<uint64_t> matching_rowids, std::mutex* mtx, uint64_t* thread_count);
  
   fact_table_filter fact_table_filters;
+  /* Join filters from earlier scans in this statement.  Dimension table
+     scans may still refer to them, so they are freed at the end of the
+     statement (cleanup_pushdown_info). */
+  std::vector<std::pair<warp_filter_info*, std::unordered_map<uint64_t, uint64_t>*>>
+      retired_fact_table_filters;
+  /* True when the scan uses the FastBit table and cursor owned by the
+     table's pushdown information, which frees them at statement end. */
+  bool scan_uses_pushdown_tables = false;
 
   // used for index lookups
   //std::string          idx_where_clause   = "";
