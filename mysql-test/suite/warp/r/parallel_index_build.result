@@ -1,0 +1,64 @@
+#
+# The first query that uses a column builds the bitmap index of the
+# column.  When a condition uses several columns, the missing indexes
+# are built at the same time (up to warp_max_degree_of_parallelism
+# threads).  The result of every query is compared with InnoDB, and
+# the index files built in parallel must be identical to the ones
+# built one after another.
+#
+SET SESSION cte_max_recursion_depth = 1000000;
+CREATE TABLE w (id BIGINT, a INT, b BIGINT, c SMALLINT, d DATE, e DOUBLE,
+f TINYINT, g INT, n INT NULL) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE ws LIKE w;
+INSERT INTO w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 150000)
+SELECT x, (x * 7919) % 100003, (x * 104729) % 10000019, x % 1000,
+DATE_ADD('2000-01-01', INTERVAL x % 3000 DAY), (x % 997) / 7.0,
+x % 50, x % 17, IF(x % 13 = 0, NULL, x % 41)
+FROM s;
+INSERT INTO ws SELECT * FROM w WHERE id <= 5000;
+CREATE TABLE i ENGINE=InnoDB SELECT * FROM w;
+CREATE TABLE is_small ENGINE=InnoDB SELECT * FROM ws;
+# A condition on eight columns: every column needs an index
+removed 6 index files
+SET SESSION warp_max_degree_of_parallelism = 1;
+one thread: the result is identical to InnoDB
+index files: 42 in 3 partitions, per partition: 14 14 14
+removed 42 index files
+SET SESSION warp_max_degree_of_parallelism = 8;
+eight threads: the result is identical to InnoDB
+index files: 42 in 3 partitions, per partition: 14 14 14
+the index files are identical to the saved ones
+# More shapes of conditions, each one starting without any index
+WHERE a < 1000 OR b > 9990000 OR c = 5: rows:sum(id) = 1799:135178670
+WHERE (a < 50000 AND c < 100) OR (e > 100 AND f = 3): rows:sum(id) = 8384:625755364
+WHERE n IS NULL AND a > 100 AND g < 5: rows:sum(id) = 3389:254342400
+WHERE d BETWEEN '2002-01-01' AND '2002-12-31' AND f IN (1, 2, 3) AND e < 50: rows:sum(id) = 699:57417550
+WHERE a < 20 AND b < 1000 AND c < 1: rows:sum(id) = 0:0
+WHERE a = 1 AND b = 1 AND c = 1: rows:sum(id) = 0:0
+WHERE NOT (a < 90000) AND c > 10 AND g <> 3: rows:sum(id) = 13970:1048284755
+WHERE n = 7 AND a BETWEEN 100 AND 60000 AND f > 10: rows:sum(id) = 1589:118680662
+WHERE b < 5000000 AND g IN (1, 5, 9) AND c BETWEEN 100 AND 200: rows:sum(id) = 1339:99938846
+# A partition with fewer than 10000 rows (binning is switched off)
+removed 0 index files
+small table: the result is identical to InnoDB
+index files: 10 in 1 partitions, per partition: 10
+# Two connections run their first queries at the same time, on the same
+# and on different columns
+removed 18 index files
+SET SESSION warp_max_degree_of_parallelism = 8;
+SET SESSION warp_max_degree_of_parallelism = 8;
+SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE a < 40000 AND b < 6000000 AND c < 500 AND f < 30;
+SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE a < 40000 AND e < 60 AND g > 2 AND d >= '2004-01-01';
+CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0))
+10791:803272241
+CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0))
+10675:900376605
+# InnoDB, expected
+10791:803272241
+10675:900376605
+index files: 42 in 3 partitions, per partition: 14 14 14
+# The files built concurrently by two connections work for later queries
+query 1 after the concurrent builds: identical to InnoDB
+query 2 after the concurrent builds: identical to InnoDB
+DROP TABLE w, ws, i, is_small;

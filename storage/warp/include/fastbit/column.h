@@ -126,6 +126,21 @@ public:
     virtual int  attachIndex(double *, uint64_t, int64_t *, uint64_t,
                              uint32_t *, uint64_t) const;
     virtual void loadIndex(const char* iopt=0, int ropt=0) const throw ();
+    /// Load or build the index like loadIndex, but a failure (for example
+    /// not enough memory while other indexes are being built at the same
+    /// time) leaves the column untouched instead of disabling its index.
+    /// Used when several indexes are built concurrently, see
+    /// ibis::part::prebuildIndexes.
+    void loadIndexNoPoison() const throw ();
+    /// The index specification that loadIndex would use, or a null pointer
+    /// if there is none.  The argument overrides the specification of the
+    /// column.
+    const char* resolveIndexSpec(const char* iopt=0) const;
+    /// Is the index specification one that turns indexing off?
+    static bool isNoIndexSpec(const char* spec);
+    /// Rough estimate of the memory needed to build the index with the
+    /// given specification, in bytes.
+    uint64_t estimateIndexBytes(const char* spec) const;
     virtual void unloadIndex() const;
     virtual long indexSize() const;
 
@@ -538,6 +553,8 @@ protected:
 private:
     /// The actual read-write lock used by readLock, writeLock and
     /// softWriteLock.
+    void loadIndexInternal(const char* iopt, int ropt, bool poison) const throw ();
+
     mutable pthread_rwlock_t rwlock;
     /// The mutual exclusion lock used by indexLock and others.
     mutable pthread_mutex_t mutex;

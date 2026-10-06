@@ -28,6 +28,11 @@
 #include <typeinfo>     // typeid
 #include <stdexcept>    // std::invalid_argument
 #include <memory>       // std::unique_ptr
+#include <thread>       // std::thread, used by prebuildIndexes
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <set>
 #include <cctype>       // std::tolower
 
 #include <stdio.h>      // popen, pclose
@@ -6729,6 +6734,187 @@ int ibis::part::buildIndexes(const ibis::table::stringArray &iopt, int nthr) {
     }
     return 0;
 } // ibis::part::buildIndexes
+
+namespace {
+/// Collect the names of the columns of the leaf expressions that make
+/// evaluation build an index (see ibis::column::indexLock): the continuous
+/// and discrete ranges, and the keyword searches.  The other leaves do not
+/// use an index (integer lists, strings, comparisons of expressions).
+void collectIndexedColumnNames(const ibis::qExpr* e,
+                               std::vector<std::string>& names) {
+    if (e == 0) return;
+    switch (e->getType()) {
+    case ibis::qExpr::RANGE:
+    case ibis::qExpr::DRANGE:
+        names.push_back(static_cast<const ibis::qRange*>(e)->colName());
+        break;
+    case ibis::qExpr::KEYWORD:
+        names.push_back(static_cast<const ibis::qKeyword*>(e)->colName());
+        break;
+    case ibis::qExpr::ALLWORDS:
+        names.push_back(static_cast<const ibis::qAllWords*>(e)->colName());
+        break;
+    default:
+        collectIndexedColumnNames(e->getLeft(), names);
+        collectIndexedColumnNames(e->getRight(), names);
+        break;
+    }
+} // collectIndexedColumnNames
+} // anonymous namespace
+
+/// Build the missing indexes of the columns used by a query condition at
+/// the same time.
+///
+/// Evaluating a condition builds the index of a column the first time the
+/// column is used, and writes it to the data directory.  For a condition
+/// that involves several columns that happens one column after another.
+/// This function builds those indexes concurrently, before the condition
+/// is evaluated, using up to @c nthreads threads including the calling
+/// thread.  Evaluation then finds the indexes in memory.
+///
+/// @param cond The condition about to be evaluated.
+/// @param nthreads The number of threads to use.  Nothing is done for
+/// fewer than two threads.
+/// @param takeLock Acquire a read lock on this data partition.  It has to be
+/// true if the caller does not hold a read lock on the partition already.
+///
+/// @note It only builds indexes that evaluation would build and that do
+/// not exist yet.  It does nothing if fewer than two indexes are needed,
+/// because there is nothing to run concurrently.  A column whose index
+/// can not be built here, for example because the file cache is full, is
+/// left alone and its index is built later, by evaluation, as usual.  The
+/// number of indexes under construction is limited by the memory they are
+/// expected to need and the space available in the file cache.
+void ibis::part::prebuildIndexes(const ibis::qExpr* cond, unsigned nthreads,
+                                 bool takeLock) const {
+    if (nthreads < 2 || cond == 0 || nEvents == 0)
+        return;
+
+    std::unique_ptr<ibis::part::readLock> lock;
+    if (takeLock)
+        lock.reset(new ibis::part::readLock(this, "part::prebuildIndexes"));
+
+    std::vector<std::string> names;
+    collectIndexedColumnNames(cond, names);
+    if (names.size() < 2) return;
+
+    struct job {
+        const ibis::column* col;
+        uint64_t bytes;
+    };
+    std::vector<job> jobs;
+    std::set<const ibis::column*> seen;
+    for (size_t i = 0; i < names.size(); ++ i) {
+        const ibis::column* col = getColumn(names[i].c_str());
+        if (col == 0 || ! seen.insert(col).second)
+            continue;
+        switch (col->type()) {
+        case ibis::OID:
+        case ibis::BLOB:
+        case ibis::BIT:
+        case ibis::UNKNOWN_TYPE:
+            continue; // no index is built for these
+        default:
+            break;
+        }
+        const char* spec = col->resolveIndexSpec();
+        if (ibis::column::isNoIndexSpec(spec))
+            continue;
+        if (col->hasIndex())
+            continue; // loading an index from a file is not worth a thread
+        job j;
+        j.col = col;
+        j.bytes = col->estimateIndexBytes(spec);
+        jobs.push_back(j);
+    }
+    if (jobs.size() < 2) return;
+
+    // the largest first, so that a large one is not left for the end
+    for (size_t i = 1; i < jobs.size(); ++ i) {
+        job j = jobs[i];
+        size_t k = i;
+        while (k > 0 && jobs[k-1].bytes < j.bytes) {
+            jobs[k] = jobs[k-1];
+            -- k;
+        }
+        jobs[k] = j;
+    }
+
+    const uint64_t cache = ibis::fileManager::currentCacheSize();
+    uint64_t budget = ibis::fileManager::bytesFree();
+    if (budget > cache / 2)
+        budget = cache / 2;
+
+    std::atomic<size_t> next(0);
+    std::mutex mtx;
+    std::condition_variable cv;
+    uint64_t inuse = 0;  // estimated bytes of the builds under way
+    unsigned running = 0; // number of builds under way
+
+    auto worker = [&]() {
+        for (;;) {
+            const size_t i = next.fetch_add(1);
+            if (i >= jobs.size()) break;
+            const uint64_t need = jobs[i].bytes;
+            {   // wait until the build fits, but never wait while idle
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&]() {
+                    return running == 0 || inuse + need <= budget;
+                });
+                inuse += need;
+                ++ running;
+            }
+            try {
+                jobs[i].col->loadIndexNoPoison();
+            }
+            catch (...) {
+                // evaluation builds this index later
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                inuse -= need;
+                -- running;
+            }
+            cv.notify_all();
+        }
+    };
+
+    ibis::horometer timer;
+    if (ibis::gVerbose > 2)
+        timer.start();
+    unsigned nw = (nthreads < jobs.size() ? nthreads :
+                   static_cast<unsigned>(jobs.size()));
+    // the helpers are taken from the budget of the statement, which the
+    // other parallel work of the statement draws from as well
+    ibis::util::ThreadLease lease(nw - 1);
+    const std::shared_ptr<ibis::util::ThreadBudget> thread_budget = lease.budget();
+    auto helper = [&]() {
+        ibis::util::ThreadBudgetScope scope(thread_budget);
+        worker();
+    };
+    std::vector<std::thread> helpers;
+    for (unsigned t = 0; t < lease.granted(); ++ t) {
+        try {
+            helpers.push_back(std::thread(helper));
+        }
+        catch (...) {
+            break; // run with the threads that could be started
+        }
+    }
+    worker(); // the calling thread works as well
+    for (size_t t = 0; t < helpers.size(); ++ t)
+        helpers[t].join();
+
+    if (ibis::gVerbose > 2) {
+        timer.stop();
+        ibis::util::logger lg;
+        lg() << "part[" << name() << "]::prebuildIndexes processed "
+             << jobs.size() << " column" << (jobs.size() > 1 ? "s" : "")
+             << " with " << helpers.size() + 1 << " thread"
+             << (helpers.size() > 0 ? "s" : "") << " in "
+             << timer.realTime() << " sec";
+    }
+} // ibis::part::prebuildIndexes
 
 /// Load indexes of all columns.  This function iterates through all
 /// columns and load the index associated with each one of them by

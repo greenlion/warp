@@ -1052,6 +1052,16 @@ int ibis::query::evaluate(const bool evalSelect) {
                     dstime = mypart->timestamp();
                 }
 
+                // build the missing indexes of the columns in the condition
+                // at the same time (does nothing unless the calling thread
+                // allows more than one thread, see
+                // ibis::util::setIndexBuildThreads)
+                if (ibis::util::getIndexBuildThreads() > 1 &&
+                    conds.getExpr() != 0 && ! conds->directEval())
+                    mypart->prebuildIndexes
+                        (conds.getExpr(), ibis::util::getIndexBuildThreads(),
+                         false); // the read lock is held
+
                 ierr = computeHits(); // do actual computation here
                 if (ierr < 0) return ierr;
             }

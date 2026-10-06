@@ -55,6 +55,8 @@ public:
 
     virtual int buildIndexes(const char* iopt, int nthr);
     virtual int buildIndexes(const ibis::table::stringArray&, int nthr=1);
+    void prebuildIndexes(const ibis::qExpr* cond, unsigned nthreads,
+                         bool takeLock=false) const;
     void buildSorted(const char* colname) const;
     void loadIndexes(const char* iopt=0, int ropt=0) const;
     void unloadIndexes() const;

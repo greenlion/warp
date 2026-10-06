@@ -40,6 +40,8 @@
 #include <iostream>  
 #include <string> 
 #include <thread>
+#include <future>
+#include <map>
 #include <forward_list>
 #include <unordered_map>
 #include <time.h>
@@ -232,9 +234,42 @@ static MYSQL_THDVAR_BOOL(adjust_table_stats_for_joins, PLUGIN_VAR_NOCMDARG,
                           "Sets the largest table in a query to have a row count of 2.  Can cause problems with some MySQL subquery optimizations.",
                           nullptr, nullptr, true);
 
+static MYSQL_THDVAR_ULONG(parallel_min_rows, PLUGIN_VAR_RQCMDARG,
+                          "Smallest number of rows of a piece of a partition that is processed by a thread of its own "
+                          "(see warp_max_degree_of_parallelism).",
+                          nullptr, nullptr, 262144, 1, ULONG_MAX, 0);
+
 static MYSQL_THDVAR_ULONG(max_degree_of_parallelism, PLUGIN_VAR_RQCMDARG,
                           "Maximum number of threads which can be used for join optimization",
                           nullptr, nullptr, std::thread::hardware_concurrency(), 1, std::thread::hardware_concurrency() * 4, 0);
+
+/* While an object of this class exists, the statement of the calling
+   thread has a budget of max_degree_of_parallelism threads (the calling
+   thread included) which FastBit and WARP share: the missing indexes of a
+   condition are built at the same time, join workers run, and partitions
+   are prepared ahead of the scan.  The budget is kept in the handler so
+   that it is not created again for every row.  The setting belongs to the
+   calling thread and is restored afterward.  A value of 1 does everything
+   one step after another. */
+class warp_index_build_scope {
+ public:
+  warp_index_build_scope(THD *thd,
+                         std::shared_ptr<ibis::util::ThreadBudget> &budget)
+      : scope_(make_budget(thd, budget)) {}
+
+ private:
+  static const std::shared_ptr<ibis::util::ThreadBudget> &
+  make_budget(THD *thd, std::shared_ptr<ibis::util::ThreadBudget> &budget) {
+    const unsigned dop =
+        (thd == nullptr ? 1U
+                        : static_cast<unsigned>(THDVAR(thd, max_degree_of_parallelism)));
+    if (!budget || budget->capacity() + 1 != dop) {
+      budget = std::make_shared<ibis::util::ThreadBudget>(dop);
+    }
+    return budget;
+  }
+  ibis::util::ThreadBudgetScope scope_;
+};
 
 SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(partition_max_rows),
@@ -246,6 +281,7 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(partition_filter),
   MYSQL_SYSVAR(adjust_table_stats_for_joins),
   MYSQL_SYSVAR(max_degree_of_parallelism),
+  MYSQL_SYSVAR(parallel_min_rows),
   NULL
 };
 
@@ -668,6 +704,22 @@ class ha_warp : public handler {
   void foreground_write();
   int append_column_filter(const Item* cond, std::string& push_where_clause); 
   void maintain_indexes(const char* datadir);
+
+  /* Look ahead: while the connection thread returns the rows of one
+     partition, the next partitions are opened and selected (read and
+     decompressed) by threads of the statement's thread budget.  Nothing
+     is prefetched when the budget has no thread to spare. */
+  struct prefetched_partition {
+    ibis::table* base_table = NULL;
+    ibis::table* filtered_table = NULL;
+  };
+  std::map<std::string, std::future<prefetched_partition>> prefetched_partitions;
+  std::shared_ptr<ibis::util::ThreadBudget> thread_budget;
+  bool start_prefetch(const std::string& datadir);
+  void prefetch_following_partitions();
+  bool take_prefetched(const std::string& datadir, ibis::table** base,
+                       ibis::table** filtered);
+  void discard_prefetched();
   void open_deleted_bitmap(int lock_mode = LOCK_SH);
   void close_deleted_bitmap();
   bool is_deleted(uint64_t rowid);

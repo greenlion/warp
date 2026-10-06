@@ -888,6 +888,47 @@ int ibis::util::readDouble(double& val, const char *&str, const char* del) {
 
 /// Return size of the file in bytes.  The value 0 is returned if
 /// file does not exist.
+namespace {
+thread_local std::shared_ptr<ibis::util::ThreadBudget> fbThreadBudget;
+}
+
+std::shared_ptr<ibis::util::ThreadBudget> ibis::util::ThreadBudget::current() {
+    return fbThreadBudget;
+}
+
+void ibis::util::ThreadBudget::setCurrent
+(const std::shared_ptr<ibis::util::ThreadBudget>& b) {
+    fbThreadBudget = b;
+}
+
+unsigned ibis::util::ThreadBudget::tryAcquire(unsigned want) {
+    unsigned have = avail_.load();
+    while (have > 0) {
+        const unsigned take = (want < have ? want : have);
+        if (take == 0)
+            return 0;
+        if (avail_.compare_exchange_weak(have, have - take)) {
+            const unsigned used = capacity_ - (have - take);
+            unsigned pk = peak_.load();
+            while (used > pk && ! peak_.compare_exchange_weak(pk, used)) {}
+            return take;
+        }
+    }
+    return 0;
+}
+
+void ibis::util::ThreadBudget::release(unsigned n) {
+    avail_.fetch_add(n);
+}
+
+unsigned ibis::util::getIndexBuildThreads() {
+    return (fbThreadBudget ? fbThreadBudget->capacity() + 1 : 1);
+}
+
+void ibis::util::setIndexBuildThreads(unsigned n) {
+    fbThreadBudget.reset(new ibis::util::ThreadBudget(n));
+}
+
 off_t ibis::util::getFileSize(const char* name) {
     if (name != 0 && *name != 0) {
         Stat_T buf;

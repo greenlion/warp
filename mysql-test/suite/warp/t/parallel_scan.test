@@ -1,0 +1,133 @@
+--echo #
+--echo # Work inside one partition runs in several threads: the rows of a
+--echo # star join are probed in slices, and the next partitions of a scan
+--echo # are read ahead by threads of the statement's thread budget
+--echo # (warp_max_degree_of_parallelism, warp_parallel_min_rows).  Results
+--echo # must be the same as InnoDB's, and unordered results must come back
+--echo # in the same order as with one thread.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 1000000;
+SET SESSION group_concat_max_len = 100000000;
+
+CREATE TABLE sf (id INT, k1 INT, k2 INT, v INT, s VARCHAR(10)) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE sd1 (k INT, region VARCHAR(8)) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE sd2 (k INT, cat VARCHAR(8), flag INT) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+INSERT INTO sd1 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 300)
+  SELECT x, CONCAT('R', x % 5) FROM s;
+INSERT INTO sd2 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 200)
+  SELECT x, CONCAT('C', x % 4), x % 3 FROM s;
+INSERT INTO sf WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 150000)
+  SELECT x, 1 + x % 300, 1 + x % 200, x % 1000, CONCAT('s', x % 17) FROM s;
+
+CREATE TABLE isf ENGINE=InnoDB SELECT * FROM sf;
+CREATE TABLE isd1 ENGINE=InnoDB SELECT * FROM sd1;
+CREATE TABLE isd2 ENGINE=InnoDB SELECT * FROM sd2;
+
+--echo # Reference results from InnoDB
+let $join_ref = `SELECT SHA2(GROUP_CONCAT(CONCAT_WS('|', region, cat, n, total) ORDER BY region, cat SEPARATOR ';'), 256)
+  FROM (SELECT d1.region, d2.cat, COUNT(*) n, SUM(f.v) total
+        FROM isf f JOIN isd1 d1 ON f.k1 = d1.k JOIN isd2 d2 ON f.k2 = d2.k
+        WHERE d1.region = 'R1' AND d2.flag = 1 GROUP BY d1.region, d2.cat) q`;
+let $rows_ref = `SELECT SHA2(GROUP_CONCAT(f.id ORDER BY f.id SEPARATOR ','), 256)
+  FROM isf f JOIN isd1 d1 ON f.k1 = d1.k JOIN isd2 d2 ON f.k2 = d2.k
+  WHERE d1.region = 'R2' AND d2.flag = 0 AND f.v < 700`;
+let $scan_ref = `SELECT CONCAT(COUNT(*), ':', SUM(id)) FROM isf WHERE v > 990 OR s = 's3'`;
+let $all_ref = `SELECT SHA2(GROUP_CONCAT(id ORDER BY id SEPARATOR ','), 256) FROM isf`;
+SELECT COUNT(*) > 0 AS the_join_has_rows
+  FROM isf f JOIN isd1 d1 ON f.k1 = d1.k JOIN isd2 d2 ON f.k2 = d2.k
+  WHERE d1.region = 'R2' AND d2.flag = 0 AND f.v < 700;
+
+--echo # One thread: the reference for the order of unordered results
+SET SESSION warp_max_degree_of_parallelism = 1;
+let $serial_rows = `SELECT SHA2(GROUP_CONCAT(f.id SEPARATOR ','), 256)
+  FROM sf f JOIN sd1 d1 ON f.k1 = d1.k JOIN sd2 d2 ON f.k2 = d2.k
+  WHERE d1.region = 'R2' AND d2.flag = 0 AND f.v < 700`;
+let $serial_all = `SELECT SHA2(GROUP_CONCAT(id SEPARATOR ','), 256) FROM sf`;
+let $serial_limit = `SELECT GROUP_CONCAT(id SEPARATOR ',') FROM (SELECT id FROM sf WHERE v < 3 LIMIT 7) q`;
+
+let $c = 0;
+while ($c < 5)
+{
+  inc $c;
+  if ($c == 1) { let $dop = 1;  let $min_rows = 262144; }
+  if ($c == 2) { let $dop = 4;  let $min_rows = 50; }
+  if ($c == 3) { let $dop = 8;  let $min_rows = 1000; }
+  if ($c == 4) { let $dop = 16; let $min_rows = 7; }
+  if ($c == 5) { let $dop = 32; let $min_rows = 262144; }
+  eval SET SESSION warp_max_degree_of_parallelism = $dop;
+  eval SET SESSION warp_parallel_min_rows = $min_rows;
+
+  let $got = `SELECT SHA2(GROUP_CONCAT(CONCAT_WS('|', region, cat, n, total) ORDER BY region, cat SEPARATOR ';'), 256)
+    FROM (SELECT d1.region, d2.cat, COUNT(*) n, SUM(f.v) total
+          FROM sf f JOIN sd1 d1 ON f.k1 = d1.k JOIN sd2 d2 ON f.k2 = d2.k
+          WHERE d1.region = 'R1' AND d2.flag = 1 GROUP BY d1.region, d2.cat) q`;
+  if ($got != $join_ref)
+  {
+    --echo MISMATCH of the join aggregate with $dop threads, $min_rows rows: WARP $got, InnoDB $join_ref
+  }
+
+  let $got = `SELECT SHA2(GROUP_CONCAT(f.id ORDER BY f.id SEPARATOR ','), 256)
+    FROM sf f JOIN sd1 d1 ON f.k1 = d1.k JOIN sd2 d2 ON f.k2 = d2.k
+    WHERE d1.region = 'R2' AND d2.flag = 0 AND f.v < 700`;
+  if ($got != $rows_ref)
+  {
+    --echo MISMATCH of the joined rows with $dop threads, $min_rows rows: WARP $got, InnoDB $rows_ref
+  }
+
+  let $got = `SELECT SHA2(GROUP_CONCAT(f.id SEPARATOR ','), 256)
+    FROM sf f JOIN sd1 d1 ON f.k1 = d1.k JOIN sd2 d2 ON f.k2 = d2.k
+    WHERE d1.region = 'R2' AND d2.flag = 0 AND f.v < 700`;
+  if ($got != $serial_rows)
+  {
+    --echo MISMATCH: the order of the joined rows with $dop threads, $min_rows rows differs from one thread
+  }
+
+  let $got = `SELECT CONCAT(COUNT(*), ':', SUM(id)) FROM sf WHERE v > 990 OR s = 's3'`;
+  if ($got != $scan_ref)
+  {
+    --echo MISMATCH of the filtered scan with $dop threads: WARP $got, InnoDB $scan_ref
+  }
+
+  let $got = `SELECT SHA2(GROUP_CONCAT(id ORDER BY id SEPARATOR ','), 256) FROM sf`;
+  if ($got != $all_ref)
+  {
+    --echo MISMATCH of the full scan with $dop threads: WARP $got, InnoDB $all_ref
+  }
+
+  let $got = `SELECT SHA2(GROUP_CONCAT(id SEPARATOR ','), 256) FROM sf`;
+  if ($got != $serial_all)
+  {
+    --echo MISMATCH: the order of the rows of a scan with $dop threads differs from one thread
+  }
+
+  --echo # Scans that stop early leave partitions that were read ahead
+  --disable_query_log
+  --disable_result_log
+  let $k = 0;
+  while ($k < 10)
+  {
+    inc $k;
+    let $got = `SELECT GROUP_CONCAT(id SEPARATOR ',') FROM (SELECT id FROM sf WHERE v < 3 LIMIT 7) q`;
+    if ($got != $serial_limit)
+    {
+      --echo MISMATCH of LIMIT with $dop threads: $got instead of $serial_limit
+    }
+    SELECT COUNT(*) FROM (SELECT id FROM sf LIMIT 3) q;
+  }
+  --enable_result_log
+  --enable_query_log
+  --echo configuration $c: $dop threads, pieces of at least $min_rows rows: checked
+}
+
+--echo # A scan that fails halfway does not leave threads behind
+SET SESSION warp_max_degree_of_parallelism = 8;
+--error ER_DATA_OUT_OF_RANGE
+SELECT SUM(CAST(id AS SIGNED) * 1000000000000000) FROM sf;
+SELECT COUNT(*) FROM sf;
+
+DROP TABLE sf, sd1, sd2, isf, isd1, isd2;

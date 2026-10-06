@@ -314,6 +314,14 @@ int ibis::countQuery::evaluate() {
             mask.adjustSize(mypart->nRows(), mypart->nRows());
 
         if (conds.getExpr() != 0) { // usual range query
+            // build the missing indexes of the columns in the condition at
+            // the same time (does nothing unless the calling thread allows
+            // more than one thread, see ibis::util::setIndexBuildThreads)
+            if (ibis::util::getIndexBuildThreads() > 1 &&
+                ! conds->directEval())
+                mypart->prebuildIndexes
+                    (conds.getExpr(), ibis::util::getIndexBuildThreads(),
+                     true); // this function holds no lock on the partition
 #ifndef DONOT_REORDER_EXPRESSION
             if (! conds->directEval()) {
                 ibis::query::weight wt(mypart);
