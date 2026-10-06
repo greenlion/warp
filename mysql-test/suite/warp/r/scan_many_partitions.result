@@ -1,0 +1,34 @@
+#
+# A scan of a table with many partitions, with a small FastBit cache
+# (warp_cache_size).  The column files of the partitions that were
+# scanned stay in the cache, and FastBit does not evict idle files to
+# make room for the arrays a query allocates.  The scan must release the
+# files of the partitions it has passed instead of failing with
+# "out of memory" when the cache is full of idle files.
+#
+# Regression test: a star join over a 180 million row table failed with
+# an out of memory error although the cache was large.
+#
+call mtr.add_suppression("WARP: could not read the selected rows");
+call mtr.add_suppression("WARP: scan of .* failed");
+call mtr.add_suppression("WARP: a join worker failed");
+SET SESSION cte_max_recursion_depth = 1000000;
+SELECT @@warp_cache_size, @@warp_partition_max_rows;
+@@warp_cache_size	@@warp_partition_max_rows
+8000000	64000
+CREATE TABLE f (id INT, k INT, a INT, b INT, c INT) ENGINE=WARP;
+CREATE TABLE d (k INT, region VARCHAR(8)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO d WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 100)
+SELECT x, CONCAT('R', x % 5) FROM s;
+INSERT INTO f WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 640000)
+SELECT x, 1 + x % 100, x % 1000, x % 77, x % 13 FROM s;
+CREATE TABLE fi ENGINE=InnoDB SELECT * FROM f;
+CREATE TABLE di ENGINE=InnoDB SELECT * FROM d;
+execution 1: the scan is identical to InnoDB
+execution 1: the join is identical to InnoDB
+execution 2: the scan is identical to InnoDB
+execution 2: the join is identical to InnoDB
+execution 3: the scan is identical to InnoDB
+execution 3: the join is identical to InnoDB
+DROP TABLE f, d, fi, di;

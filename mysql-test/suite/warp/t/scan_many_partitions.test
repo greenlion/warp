@@ -1,0 +1,57 @@
+--echo #
+--echo # A scan of a table with many partitions, with a small FastBit cache
+--echo # (warp_cache_size).  The column files of the partitions that were
+--echo # scanned stay in the cache, and FastBit does not evict idle files to
+--echo # make room for the arrays a query allocates.  The scan must release the
+--echo # files of the partitions it has passed instead of failing with
+--echo # "out of memory" when the cache is full of idle files.
+--echo #
+--echo # Regression test: a star join over a 180 million row table failed with
+--echo # an out of memory error although the cache was large.
+--echo #
+
+call mtr.add_suppression("WARP: could not read the selected rows");
+call mtr.add_suppression("WARP: scan of .* failed");
+call mtr.add_suppression("WARP: a join worker failed");
+
+SET SESSION cte_max_recursion_depth = 1000000;
+SELECT @@warp_cache_size, @@warp_partition_max_rows;
+
+CREATE TABLE f (id INT, k INT, a INT, b INT, c INT) ENGINE=WARP;
+CREATE TABLE d (k INT, region VARCHAR(8)) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO d WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 100)
+  SELECT x, CONCAT('R', x % 5) FROM s;
+INSERT INTO f WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 640000)
+  SELECT x, 1 + x % 100, x % 1000, x % 77, x % 13 FROM s;
+CREATE TABLE fi ENGINE=InnoDB SELECT * FROM f;
+CREATE TABLE di ENGINE=InnoDB SELECT * FROM d;
+
+let $n = 0;
+while ($n < 3)
+{
+  inc $n;
+  let $expected = `SELECT CONCAT(COUNT(*), ':', SUM(a), ':', SUM(b), ':', SUM(c)) FROM fi WHERE b % 7 = 3`;
+  let $actual = `SELECT CONCAT(COUNT(*), ':', SUM(a), ':', SUM(b), ':', SUM(c)) FROM f WHERE b % 7 = 3`;
+  if ($actual != $expected)
+  {
+    --echo MISMATCH of the scan in execution $n: WARP $actual, InnoDB $expected
+  }
+  if ($actual == $expected)
+  {
+    --echo execution $n: the scan is identical to InnoDB
+  }
+
+  let $expected = `SELECT CONCAT(COUNT(*), ':', SUM(f.a), ':', SUM(f.b)) FROM fi f JOIN di d ON f.k = d.k WHERE d.region = 'R2' AND f.c < 9`;
+  let $actual = `SELECT CONCAT(COUNT(*), ':', SUM(f.a), ':', SUM(f.b)) FROM f JOIN d ON f.k = d.k WHERE d.region = 'R2' AND f.c < 9`;
+  if ($actual != $expected)
+  {
+    --echo MISMATCH of the join in execution $n: WARP $actual, InnoDB $expected
+  }
+  if ($actual == $expected)
+  {
+    --echo execution $n: the join is identical to InnoDB
+  }
+}
+
+DROP TABLE f, d, fi, di;
