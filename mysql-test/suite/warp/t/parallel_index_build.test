@@ -1,0 +1,193 @@
+--echo #
+--echo # The first query that uses a column builds the bitmap index of the
+--echo # column.  When a condition uses several columns, the missing indexes
+--echo # are built at the same time (up to warp_max_degree_of_parallelism
+--echo # threads).  The result of every query is compared with InnoDB, and
+--echo # the index files built in parallel must be identical to the ones
+--echo # built one after another.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 1000000;
+
+CREATE TABLE w (id BIGINT, a INT, b BIGINT, c SMALLINT, d DATE, e DOUBLE,
+                f TINYINT, g INT, n INT NULL) ENGINE=WARP
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE ws LIKE w;
+INSERT INTO w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 150000)
+  SELECT x, (x * 7919) % 100003, (x * 104729) % 10000019, x % 1000,
+         DATE_ADD('2000-01-01', INTERVAL x % 3000 DAY), (x % 997) / 7.0,
+         x % 50, x % 17, IF(x % 13 = 0, NULL, x % 41)
+  FROM s;
+INSERT INTO ws SELECT * FROM w WHERE id <= 5000;
+CREATE TABLE i ENGINE=InnoDB SELECT * FROM w;
+CREATE TABLE is_small ENGINE=InnoDB SELECT * FROM ws;
+
+let $dir = $MYSQLTEST_VARDIR/mysqld.1/data/test/w.data;
+let $sdir = $MYSQLTEST_VARDIR/mysqld.1/data/test/ws.data;
+
+--write_file $MYSQL_TMP_DIR/idx_tool.pl
+use strict;
+use Digest::MD5;
+my ($dir, $cmd, $file) = @ARGV;
+my @idx = sort glob("$dir/p*/*.idx");
+sub digest {
+  my $all = Digest::MD5->new;
+  foreach my $f (@idx) {
+    open(my $fh, '<', $f) or die "cannot open $f: $!";
+    binmode($fh);
+    my $one = Digest::MD5->new;
+    $one->addfile($fh);
+    close($fh);
+    (my $rel = $f) =~ s/^\Q$dir\E//;
+    $all->add("$rel " . $one->hexdigest . "\n");
+  }
+  return $all->hexdigest;
+}
+if ($cmd eq 'remove') {
+  my $n = unlink @idx;
+  print "removed $n index files\n";
+} elsif ($cmd eq 'report') {
+  my %parts;
+  foreach my $f (@idx) { $f =~ m{/(p\d+)/} and $parts{$1}++; }
+  my @counts = map { $parts{$_} } sort keys %parts;
+  print "index files: " . scalar(@idx) . " in " . scalar(keys %parts) .
+        " partitions, per partition: @counts\n";
+} elsif ($cmd eq 'save') {
+  open(my $fh, '>', $file) or die;
+  print $fh digest();
+  close($fh);
+} elsif ($cmd eq 'compare') {
+  open(my $fh, '<', $file) or die;
+  my $saved = <$fh>;
+  close($fh);
+  print((digest() eq $saved) ? "the index files are identical to the saved ones\n"
+                             : "THE INDEX FILES DIFFER FROM THE SAVED ONES\n");
+}
+EOF
+
+--echo # A condition on eight columns: every column needs an index
+let $where = a < 50000 AND b BETWEEN 1000000 AND 8000000 AND c < 700 AND d >= '2003-01-01' AND e < 100 AND f < 40 AND g > 3;
+let $expected = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $where`;
+
+--exec perl $MYSQL_TMP_DIR/idx_tool.pl $dir remove
+SET SESSION warp_max_degree_of_parallelism = 1;
+let $actual = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $where`;
+if ($actual != $expected)
+{
+  --echo MISMATCH with one thread: WARP $actual, InnoDB $expected
+}
+if ($actual == $expected)
+{
+  --echo one thread: the result is identical to InnoDB
+}
+--exec perl $MYSQL_TMP_DIR/idx_tool.pl $dir report
+--exec perl $MYSQL_TMP_DIR/idx_tool.pl $dir save $MYSQL_TMP_DIR/idx_serial.txt
+
+--exec perl $MYSQL_TMP_DIR/idx_tool.pl $dir remove
+SET SESSION warp_max_degree_of_parallelism = 8;
+let $actual = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $where`;
+if ($actual != $expected)
+{
+  --echo MISMATCH with eight threads: WARP $actual, InnoDB $expected
+}
+if ($actual == $expected)
+{
+  --echo eight threads: the result is identical to InnoDB
+}
+--exec perl $MYSQL_TMP_DIR/idx_tool.pl $dir report
+--exec perl $MYSQL_TMP_DIR/idx_tool.pl $dir compare $MYSQL_TMP_DIR/idx_serial.txt
+
+--echo # More shapes of conditions, each one starting without any index
+let $n = 0;
+while ($n < 9)
+{
+  inc $n;
+  if ($n == 1) { let $where = a < 1000 OR b > 9990000 OR c = 5; }
+  if ($n == 2) { let $where = (a < 50000 AND c < 100) OR (e > 100 AND f = 3); }
+  if ($n == 3) { let $where = n IS NULL AND a > 100 AND g < 5; }
+  if ($n == 4) { let $where = d BETWEEN '2002-01-01' AND '2002-12-31' AND f IN (1, 2, 3) AND e < 50; }
+  if ($n == 5) { let $where = a < 20 AND b < 1000 AND c < 1; }
+  if ($n == 6) { let $where = a = 1 AND b = 1 AND c = 1; }
+  if ($n == 7) { let $where = NOT (a < 90000) AND c > 10 AND g <> 3; }
+  if ($n == 8) { let $where = n = 7 AND a BETWEEN 100 AND 60000 AND f > 10; }
+  if ($n == 9) { let $where = b < 5000000 AND g IN (1, 5, 9) AND c BETWEEN 100 AND 200; }
+  let $expected = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $where`;
+  --exec perl $MYSQL_TMP_DIR/idx_tool.pl $dir remove > /dev/null
+  let $actual = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $where`;
+  if ($actual != $expected)
+  {
+    --echo MISMATCH for WHERE $where: WARP $actual, InnoDB $expected
+  }
+  if ($actual == $expected)
+  {
+    --echo WHERE $where: rows:sum(id) = $actual
+  }
+}
+
+--echo # A partition with fewer than 10000 rows (binning is switched off)
+--exec perl $MYSQL_TMP_DIR/idx_tool.pl $sdir remove
+let $where = a < 50000 AND b BETWEEN 1000000 AND 8000000 AND c < 700 AND e < 100 AND f < 40;
+let $expected = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM is_small WHERE $where`;
+let $actual = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM ws WHERE $where`;
+if ($actual != $expected)
+{
+  --echo MISMATCH on the small table: WARP $actual, InnoDB $expected
+}
+if ($actual == $expected)
+{
+  --echo small table: the result is identical to InnoDB
+}
+--exec perl $MYSQL_TMP_DIR/idx_tool.pl $sdir report
+
+--echo # Two connections run their first queries at the same time, on the same
+--echo # and on different columns
+--exec perl $MYSQL_TMP_DIR/idx_tool.pl $dir remove
+let $where1 = a < 40000 AND b < 6000000 AND c < 500 AND f < 30;
+let $where2 = a < 40000 AND e < 60 AND g > 2 AND d >= '2004-01-01';
+let $expected1 = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $where1`;
+let $expected2 = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $where2`;
+connect (con1, localhost, root,,);
+connect (con2, localhost, root,,);
+connection con1;
+SET SESSION warp_max_degree_of_parallelism = 8;
+connection con2;
+SET SESSION warp_max_degree_of_parallelism = 8;
+connection con1;
+--send_eval SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $where1
+connection con2;
+--send_eval SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $where2
+connection con1;
+--reap
+connection con2;
+--reap
+connection default;
+disconnect con1;
+disconnect con2;
+--echo # InnoDB, expected
+--echo $expected1
+--echo $expected2
+--exec perl $MYSQL_TMP_DIR/idx_tool.pl $dir report
+
+--echo # The files built concurrently by two connections work for later queries
+let $actual = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $where1`;
+if ($actual != $expected1)
+{
+  --echo MISMATCH: WARP $actual, InnoDB $expected1
+}
+if ($actual == $expected1)
+{
+  --echo query 1 after the concurrent builds: identical to InnoDB
+}
+let $actual = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $where2`;
+if ($actual != $expected2)
+{
+  --echo MISMATCH: WARP $actual, InnoDB $expected2
+}
+if ($actual == $expected2)
+{
+  --echo query 2 after the concurrent builds: identical to InnoDB
+}
+
+--remove_file $MYSQL_TMP_DIR/idx_tool.pl
+--remove_file $MYSQL_TMP_DIR/idx_serial.txt
+DROP TABLE w, ws, i, is_small;

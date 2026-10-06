@@ -19,6 +19,8 @@
 #include <limits>       // std::numeric_limits
 #include <typeinfo>     // typeid
 #include <memory>       // std::unique_ptr
+#include <mutex>        // std::recursive_mutex used by indexFileLock
+#include <functional>   // std::hash
 
 #if defined(_WIN32) && defined(_MSC_VER)
 #pragma warning(disable:4786)   // some identifier longer than 256 characters
@@ -5737,8 +5739,39 @@ int ibis::column::attachIndex(double *keys, uint64_t nkeys,
 /// @note Accesses to this function are serialized through a write lock on
 /// the column.  It blocks while acquire the write lock.
 void ibis::column::loadIndex(const char* iopt, int ropt) const throw () {
-    if ((idx != 0 && !idx->empty()) || (thePart != 0 && thePart->nRows() == 0))
-        return;
+    loadIndexInternal(iopt, ropt, true);
+}
+
+/// Same as loadIndex, but when the index can not be built, the column is
+/// left as it was.  loadIndex removes the index files and, unless the
+/// parameter retryIndexOnFailure is set, replaces the index specification
+/// of the column with "noindex", so that no further attempt is made.  That
+/// is not appropriate when several indexes are built at the same time and a
+/// failure is likely to be a lack of memory caused by the others.  The
+/// index is then built again, one at a time, when a query needs it.
+void ibis::column::loadIndexNoPoison() const throw () {
+    if (m_type == ibis::TEXT || m_type == ibis::CATEGORY) {
+        loadIndex(); // these classes have their own implementation
+    }
+    else {
+        loadIndexInternal(0, 0, false);
+    }
+}
+
+/// Is the index specification one that turns indexing off?  An index is
+/// not used if the specification starts with "noindex", "null" or "none".
+bool ibis::column::isNoIndexSpec(const char* spec) {
+    return (spec != 0 &&
+            (strncmp(spec, "noindex", 7) == 0 ||
+             strncmp(spec, "null", 4) == 0 ||
+             strncmp(spec, "none", 4) == 0));
+} // ibis::column::isNoIndexSpec
+
+/// The index specification loadIndex would use.  The order is: the
+/// argument, the specification of the column, the specification of the
+/// data partition and finally the parameter tableName.columnName.index.
+/// Returns a null pointer or an empty string if there is none.
+const char* ibis::column::resolveIndexSpec(const char* iopt) const {
     if (iopt == 0 || *iopt == static_cast<char>(0))
         iopt = indexSpec(); // index spec of the column
     if ((iopt == 0 || *iopt == static_cast<char>(0)) && thePart != 0)
@@ -5755,15 +5788,68 @@ void ibis::column::loadIndex(const char* iopt, int ropt) const throw () {
         idxnm += ".index";
         iopt = ibis::gParameters()[idxnm.c_str()];
     }
-    if (iopt != 0) {
-        // no index is to be used if the index specification start
-        // with "noindex", "null" or "none".
-        if (strncmp(iopt, "noindex", 7) == 0 ||
-            strncmp(iopt, "null", 4) == 0 ||
-            strncmp(iopt, "none", 4) == 0) {
-            return;
-        }
+    return iopt;
+} // ibis::column::resolveIndexSpec
+
+/// A rough estimate of the memory needed to build the index.  It is used
+/// to decide how many indexes may be built at the same time, so it errs on
+/// the large side.  The column file is read into memory, and the index
+/// needs memory for its bitmaps, which grows with the number of distinct
+/// values (about 250 bytes for each value while the bitmaps are being
+/// collected, about 100 bytes for the binary encoded indexes of large
+/// partitions) or, for the binned indexes of floating-point columns, with
+/// the number of rows.
+uint64_t ibis::column::estimateIndexBytes(const char* spec) const {
+    const uint64_t nr = (thePart != 0 ? thePart->nRows() : 0);
+    const uint64_t data = nr * (elementSize() > 0 ? elementSize() : 8);
+    if (nr == 0) return 0;
+    if (m_type == ibis::FLOAT || m_type == ibis::DOUBLE ||
+        (spec != 0 && strstr(spec, "precision") != 0)) {
+        return data + nr * 64U; // granule bins
     }
+
+    uint64_t distinct = nr;
+    if (lower <= upper) { // the bounds are known
+        const double range = upper - lower + 1.0;
+        if (range > 0.0 && range < static_cast<double>(distinct))
+            distinct = static_cast<uint64_t>(range);
+    }
+    if (m_type == ibis::BYTE || m_type == ibis::UBYTE) {
+        if (distinct > 256U) distinct = 256U;
+    }
+    else if (m_type == ibis::SHORT || m_type == ibis::USHORT) {
+        if (distinct > 65536U) distinct = 65536U;
+    }
+    const uint64_t perValue =
+        (spec != 0 && strstr(spec, "binary") != 0 && nr >= 1000000U ? 100U :
+         250U);
+    return data + nr * 8U + distinct * perValue;
+} // ibis::column::estimateIndexBytes
+
+namespace {
+/// Returns a locked mutex that serializes the loading and building of the
+/// index file of one column of one data directory.  A fixed set of mutexes
+/// is shared by all files; two files that map to the same mutex only wait
+/// for each other.
+std::unique_lock<std::recursive_mutex> indexFileLock(const char* dir,
+                                                     const char* name) {
+    static std::recursive_mutex locks[256];
+    std::string key(dir);
+    key += '/';
+    key += name;
+    return std::unique_lock<std::recursive_mutex>
+        (locks[std::hash<std::string>()(key) % 256]);
+}
+}
+
+void ibis::column::loadIndexInternal(const char* iopt, int ropt,
+                                     bool poison) const throw () {
+    if ((idx != 0 && !idx->empty()) || (thePart != 0 && thePart->nRows() == 0))
+        return;
+    iopt = resolveIndexSpec(iopt);
+    // no index is to be used if the index specification start
+    // with "noindex", "null" or "none".
+    if (isNoIndexSpec(iopt)) return;
 
     std::string evt = "column";
     if (ibis::gVerbose > 1) {
@@ -5773,6 +5859,14 @@ void ibis::column::loadIndex(const char* iopt, int ropt) const throw () {
     }
     evt += "::loadIndex";
     writeLock lock(this, evt.c_str());
+    // Other threads may be loading or building the index of the same column
+    // of the same partition through another ibis::part (WARP opens several
+    // for one directory).  They would write the same file at the same time
+    // and a failed write removes the file.  Only one of them goes at a time,
+    // the others find the finished file.
+    std::unique_lock<std::recursive_mutex> filelock;
+    if (thePart != 0 && thePart->currentDataDir() != 0)
+        filelock = indexFileLock(thePart->currentDataDir(), name());
     if (idx != 0) {
         if (idx->empty()) {
             delete idx;
@@ -5863,6 +5957,13 @@ void ibis::column::loadIndex(const char* iopt, int ropt) const throw () {
     }
 
     // final error handling -- remove left over files
+    if (! poison) {
+        // a failure that is probably caused by other index builds running
+        // at the same time, the caller builds the index again later
+        LOGGER(ibis::gVerbose > 1)
+            << evt << " could not build the index, leaving the column as is";
+        return;
+    }
     if (thePart != 0) {
         purgeIndexFile();
         std::string key = thePart->name();

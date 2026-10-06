@@ -1,0 +1,1 @@
+--warp-partition-max-rows=64000 --warp-write-cache-size=32000

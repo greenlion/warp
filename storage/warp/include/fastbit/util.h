@@ -15,6 +15,8 @@
 #include <sstream>      // std::ostringstream used by ibis::util::logger
 #include <cctype>       // std::isspace
 #include <cstring>      // std::strcpy
+#include <atomic>       // std::atomic used by ibis::util::ThreadBudget
+#include <memory>       // std::shared_ptr used by ibis::util::ThreadBudget
 
 #include <float.h>
 #include <math.h>       // fabs, floor, ceil, log10, nextafter...
@@ -626,6 +628,95 @@ namespace ibis {
                              long unsigned &denominator,
                              long unsigned &numerator);
         inline double rand();
+
+        /// A budget of extra worker threads shared by everything one
+        /// statement runs: the index builders, the row range scans and the
+        /// join workers.  The thread that owns the statement is not counted,
+        /// so a budget for a degree of parallelism of N holds N-1 tokens.
+        /// Acquiring tokens never blocks.  A caller that gets fewer tokens
+        /// than it asked for simply does more of the work itself, so there
+        /// is no wait cycle and a budget of 0 means serial execution.
+        class FASTBIT_CXX_DLLSPEC ThreadBudget {
+        public:
+            /// Construct a budget for a degree of parallelism of dop.
+            explicit ThreadBudget(unsigned dop)
+                : capacity_(dop > 1 ? dop - 1 : 0), avail_(capacity_),
+                  peak_(0) {}
+
+            /// The number of extra threads this budget allows.
+            unsigned capacity() const {return capacity_;}
+            /// The largest number of tokens in use at the same time.
+            unsigned peak() const {return peak_.load();}
+            /// Take up to want tokens; returns the number taken (maybe 0).
+            unsigned tryAcquire(unsigned want);
+            /// Give back n tokens obtained from tryAcquire.
+            void release(unsigned n);
+
+            /// The budget of the calling thread; empty means serial.
+            static std::shared_ptr<ThreadBudget> current();
+            static void setCurrent(const std::shared_ptr<ThreadBudget>& b);
+
+        private:
+            unsigned capacity_;
+            std::atomic<unsigned> avail_;
+            std::atomic<unsigned> peak_;
+            ThreadBudget(const ThreadBudget&);
+            ThreadBudget& operator=(const ThreadBudget&);
+        };
+
+        /// Installs a budget as the one of the calling thread for the
+        /// lifetime of the object and restores the previous one afterward.
+        /// Worker threads use it to pass the budget of their parent on.
+        class ThreadBudgetScope {
+        public:
+            explicit ThreadBudgetScope(const std::shared_ptr<ThreadBudget>& b)
+                : saved_(ThreadBudget::current()) {ThreadBudget::setCurrent(b);}
+            ~ThreadBudgetScope() {ThreadBudget::setCurrent(saved_);}
+        private:
+            std::shared_ptr<ThreadBudget> saved_;
+            ThreadBudgetScope(const ThreadBudgetScope&);
+            ThreadBudgetScope& operator=(const ThreadBudgetScope&);
+        };
+
+        /// Takes up to want tokens from the budget of the calling thread
+        /// for the lifetime of the object.  Hold it only around a fork and
+        /// join region.
+        class ThreadLease {
+        public:
+            explicit ThreadLease(unsigned want)
+                : budget_(ThreadBudget::current()),
+                  granted_(budget_ && want > 0 ? budget_->tryAcquire(want) : 0) {}
+            ~ThreadLease() {if (granted_ > 0) budget_->release(granted_);}
+            /// Number of extra threads that may be started.
+            unsigned granted() const {return granted_;}
+            const std::shared_ptr<ThreadBudget>& budget() const {return budget_;}
+        private:
+            std::shared_ptr<ThreadBudget> budget_;
+            unsigned granted_;
+            ThreadLease(const ThreadLease&);
+            ThreadLease& operator=(const ThreadLease&);
+        };
+
+        /// The number of threads (the calling thread included) that the
+        /// statement of the calling thread may use for building the
+        /// missing indexes of a query.  1 means one after another.
+        FASTBIT_CXX_DLLSPEC unsigned getIndexBuildThreads();
+        /// Install a new budget for a degree of parallelism of n.
+        FASTBIT_CXX_DLLSPEC void setIndexBuildThreads(unsigned n);
+
+        /// Gives the calling thread a new budget for a degree of
+        /// parallelism of n for the lifetime of the object and restores
+        /// the previous budget afterward.
+        class indexBuildThreadsScope {
+        public:
+            explicit indexBuildThreadsScope(unsigned n)
+                : saved_(ThreadBudget::current()) {setIndexBuildThreads(n);}
+            ~indexBuildThreadsScope() {ThreadBudget::setCurrent(saved_);}
+        private:
+            std::shared_ptr<ThreadBudget> saved_;
+            indexBuildThreadsScope(const indexBuildThreadsScope&);
+            indexBuildThreadsScope& operator=(const indexBuildThreadsScope&);
+        };
 
         ///@{
         FASTBIT_CXX_DLLSPEC uint32_t checksum(const char* str, uint32_t sz);
@@ -1611,7 +1702,9 @@ char* getpass(const char* prompt);
 inline double ibis::util::rand() {
     // The internal variable @c seed is always an odd number.  Don't use it
     // directly.
-    static uint32_t seed = 1;
+    // The seed is per thread so that concurrent index builds do not race
+    // on it.
+    static thread_local uint32_t seed = 1;
     static const uint32_t alpha = 69069;
     static const double scale = ::pow(0.5, 32);
     seed = static_cast<uint32_t>(seed * alpha);

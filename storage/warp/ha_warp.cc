@@ -812,6 +812,7 @@ int ha_warp::open(const char *name, int, uint, const dd::Table *) {
 */
 int ha_warp::close(void) {
   DBUG_ENTER("ha_warp::close");
+  discard_prefetched();
   if(writer) {
     writer->clearData();
     delete writer;
@@ -1252,18 +1253,16 @@ static void warp_release_partition(const char *partition_dir) {
   }
 }
 
-void ha_warp::maintain_indexes(const char *datadir) {
-  
-  ibis::table::stringArray columns;
-  std::string opt = "";
-  
+/* Brings the indexes of the columns of a partition up to date.  The
+   function does not use the handler, so look ahead threads can run it. */
+static void warp_maintain_partition_indexes(const char *datadir,
+                                            const std::vector<uint> &field_indexes) {
   auto tbl = new ibis::part(datadir);
-  for (Field **field = table->field; *field; field++) {
-    std::string columnIndexFilename = std::string(datadir) + "/c" + std::to_string((*field)->field_index()) + ".idx";
-    std::string columnIndexNullFilename = std::string(datadir) + "/n" + std::to_string((*field)->field_index());
+  for (uint field_index : field_indexes) {
+    std::string columnIndexFilename = std::string(datadir) + "/c" + std::to_string(field_index) + ".idx";
     if(file_exists(columnIndexFilename)) {
       ibis::fileManager::instance().flushFile(columnIndexFilename.c_str());
-      auto col = tbl->getColumn((*field)->field_index());
+      auto col = tbl->getColumn(field_index);
       if(col->hasIndex()) {
         col->loadIndex();
         if (col->indexedRows() != tbl->nRows() ) {
@@ -1279,6 +1278,116 @@ void ha_warp::maintain_indexes(const char *datadir) {
       }
     }
   }
+}
+
+void ha_warp::maintain_indexes(const char *datadir) {
+  std::vector<uint> field_indexes;
+  for (Field **field = table->field; *field; field++) {
+    field_indexes.push_back((*field)->field_index());
+  }
+  warp_maintain_partition_indexes(datadir, field_indexes);
+}
+
+/* Starts opening and selecting the partition in a thread of the thread
+   budget of the statement.  Returns false if there is no thread to spare
+   (the partition is then opened by the connection thread when it is
+   needed). */
+bool ha_warp::start_prefetch(const std::string& datadir) {
+  /* The partitions read ahead take cache space, so nothing is read ahead
+     when a good part of the cache is in use already. */
+  if(ibis::fileManager::bytesFree() < ibis::fileManager::currentCacheSize() / 2) {
+    return false;
+  }
+  auto budget = ibis::util::ThreadBudget::current();
+  if(!budget || budget->tryAcquire(1) == 0) {
+    return false;
+  }
+  std::vector<uint> field_indexes;
+  for (Field **field = table->field; *field; field++) {
+    field_indexes.push_back((*field)->field_index());
+  }
+  const std::string columns = column_set;
+  const std::string where = push_where_clause;
+  try {
+    prefetched_partitions.emplace(datadir, std::async(std::launch::async,
+      [budget, datadir, field_indexes, columns, where]() {
+        ibis::util::ThreadBudgetScope budget_scope(budget);
+        prefetched_partition result;
+        try {
+          result.base_table = ibis::table::create(datadir.c_str());
+          if(result.base_table != NULL) {
+            warp_maintain_partition_indexes(datadir.c_str(), field_indexes);
+            result.filtered_table = result.base_table->select(columns.c_str(), where.c_str());
+          }
+        } catch(...) {
+          delete result.filtered_table;
+          result.filtered_table = NULL;
+        }
+        budget->release(1);
+        return result;
+      }));
+  } catch(...) {
+    budget->release(1);
+    return false;
+  }
+  return true;
+}
+
+/* Keeps the next few partitions that will be returned being prepared. */
+void ha_warp::prefetch_following_partitions() {
+  static const size_t depth = 3;
+  if(partitions == NULL || ibis::util::ThreadBudget::current() == nullptr) {
+    return;
+  }
+  auto it = part_it;
+  if(it == partitions->end()) {
+    return;
+  }
+  for(++it; it != partitions->end() && prefetched_partitions.size() < depth; ++it) {
+    if(*it == NULL) {
+      continue;
+    }
+    const std::string dir((*it)->currentDataDir());
+    if(dir == std::string(share->data_dir_name)) {
+      continue; // the top level directory has no rows
+    }
+    if(matching_ridset.size() > 0) {
+      auto find_it = matching_ridset.find(dir);
+      if(find_it == matching_ridset.end() || find_it->second == NULL) {
+        continue; // no row of this partition is returned
+      }
+    }
+    if(prefetched_partitions.count(dir) > 0) {
+      continue;
+    }
+    if(!start_prefetch(dir)) {
+      break;
+    }
+  }
+}
+
+/* Takes the tables opened by a look ahead thread, waiting for it if it is
+   still working.  Returns false if the partition was not prefetched. */
+bool ha_warp::take_prefetched(const std::string& datadir, ibis::table** base,
+                              ibis::table** filtered) {
+  auto find_it = prefetched_partitions.find(datadir);
+  if(find_it == prefetched_partitions.end()) {
+    return false;
+  }
+  prefetched_partition result = find_it->second.get();
+  prefetched_partitions.erase(find_it);
+  *base = result.base_table;
+  *filtered = result.filtered_table;
+  return true;
+}
+
+void ha_warp::discard_prefetched() {
+  for(auto &entry : prefetched_partitions) {
+    prefetched_partition result = entry.second.get();
+    delete result.filtered_table;
+    delete result.base_table;
+  }
+  prefetched_partitions.clear();
 }
 
 /* The ::extra function is called a bunch of times before and after various
@@ -1715,6 +1824,7 @@ bool ha_warp::check_if_incompatible_data(HA_CREATE_INFO *, uint) {
 */
 int ha_warp::rnd_init(bool) {
   DBUG_ENTER("ha_warp::rnd_init");
+  discard_prefetched();
   fetch_count = 0;
   auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
   char* partition_filter = THDVAR(table->in_use, partition_filter);
@@ -1892,14 +2002,18 @@ void exec_pushdown_join(
   std::mutex* parallel_join_mutex,
   uint32_t* running_dimension_merges,
   std::mutex* dimension_merge_mutex,
-  std::atomic<int>* join_error ) {
+  std::atomic<int>* join_error,
+  size_t min_slice_rows ) {
 
   /* Any failure in this thread leaves the matching rows of this partition
      incomplete.  It is recorded in join_error so that the scan fails
      instead of returning wrong results. */
   try {
-  std::unordered_map<uint32_t, uint8_t> tmp_matching_rids;
-  auto rid_it = tmp_matching_rids.begin();
+  /* match_count[i] is the number of filters that row i+1 of the rows of
+     the query has satisfied so far.  Every row is looked up in the
+     dimension keys of the first filter, later filters only look up the
+     rows that satisfied all previous filters. */
+  std::vector<uint8_t> match_count;
 
   uint8_t filter_exec_count = 0;
   auto filter_it = fact_table_filters->begin();
@@ -1912,42 +2026,83 @@ void exec_pushdown_join(
     }
     std::unique_ptr<ibis::array_t<int64_t>> column_vals_guard(column_vals);
     
-    uint32_t rownum =0;
+    const size_t nvals = column_vals->size();
+    if( filter_exec_count == 1 ) {
+      match_count.assign(nvals, 0);
+    } else if( match_count.size() != nvals ) {
+      throw std::runtime_error("the join column " + (filter_it->first)->fact_column + " has a different number of values");
+    }
     auto matching_dim_rowids = new std::set<uint64_t> ;
     std::unique_ptr<std::set<uint64_t>> matching_dim_rowids_guard(matching_dim_rowids);
 
-    for(auto column_it = column_vals->begin(); column_it != column_vals->end(); ++column_it) {
-      
-      ++rownum;
-      if( filter_exec_count > 1 ) {
-        /* if this is the second or later pass over column data
-           if this rownum did not already match, then it does not
-           have to be looked up again.  Lookups into filter_it->second
-           are 64 bit while lookups into matching_rids are 32 bit.  That
-           makes this lookup considerably faster than the column lookup.
-        */
-        rid_it = tmp_matching_rids.find(rownum);
-        if( rid_it == tmp_matching_rids.end() ) {
+    /* The look ups of the rows [lo, hi) are independent of each other:
+       the dimension keys are only read and every row has its own counter.
+       The rows are split into slices that are probed at the same time if
+       the thread budget of the statement has threads to spare.  The
+       dimension rows of a slice are collected in a vector of its own. */
+    const std::unordered_map<uint64_t, uint64_t>* dim_keys = filter_it->second;
+    const int64_t* vals = column_vals->begin();
+    uint8_t* counts = match_count.data();
+    const uint8_t previous_count = filter_exec_count - 1;
+    auto probe = [=](size_t lo, size_t hi, std::vector<uint64_t>* dim_rows) {
+      for(size_t i = lo; i < hi; ++i) {
+        /* the lookups into the counters are 8 bit and make the second
+           and later passes considerably faster than the key lookups */
+        if( counts[i] != previous_count ) {
           continue;
         }
-
-        if( rid_it->second != filter_exec_count - 1 ) {
+        auto find_it = dim_keys->find(vals[i]);
+        if( find_it == dim_keys->end() ) {
           continue;
         }
+        counts[i] = filter_exec_count;
+        dim_rows->push_back(find_it->second);
+      }
+    };
 
-      }  
-      auto find_it = filter_it->second->find(*column_it);
-      if( find_it == filter_it->second->end() ) {
-        continue;
+    const size_t min_slice = std::max<size_t>(min_slice_rows, 1);
+    size_t nslices = 1;
+    if( nvals >= 2 * min_slice ) {
+      nslices = std::min<size_t>(nvals / min_slice, 64);
+    }
+    ibis::util::ThreadLease lease(nslices > 1 ? nslices - 1 : 0);
+    nslices = lease.granted() + 1;
+    std::vector<std::vector<uint64_t>> slice_dim_rows(nslices);
+    std::vector<std::exception_ptr> slice_errors(nslices);
+    auto run_slice = [&](size_t k) {
+      try {
+        probe(nvals * k / nslices, nvals * (k + 1) / nslices, &slice_dim_rows[k]);
+      } catch(...) {
+        slice_errors[k] = std::current_exception();
       }
-      if( filter_exec_count == 1 ) {
-        tmp_matching_rids.insert(std::make_pair(rownum,1)); 
-      } else {
-        rid_it->second++;
+    };
+    std::vector<std::thread> slice_threads;
+    size_t started = 1; // slice 0 is run by this thread
+    for(; started < nslices; ++started) {
+      try {
+        const size_t k = started;
+        const std::shared_ptr<ibis::util::ThreadBudget> budget = lease.budget();
+        slice_threads.emplace_back([&run_slice, budget, k]() {
+          ibis::util::ThreadBudgetScope budget_scope(budget);
+          run_slice(k);
+        });
+      } catch(...) {
+        break;
       }
-     
-      matching_dim_rowids->insert(find_it->second);
-    
+    }
+    run_slice(0);
+    for(size_t k = started; k < nslices; ++k) {
+      run_slice(k); // the slices that could not get a thread
+    }
+    for(auto &t : slice_threads) {
+      t.join();
+    }
+    for(size_t k = 0; k < nslices; ++k) {
+      if( slice_errors[k] ) {
+        std::rethrow_exception(slice_errors[k]);
+      }
+      matching_dim_rowids->insert(slice_dim_rows[k].begin(), slice_dim_rows[k].end());
+      std::vector<uint64_t>().swap(slice_dim_rows[k]);
     }
     // free up columnar values
     column_vals_guard.reset();
@@ -1979,16 +2134,19 @@ void exec_pushdown_join(
 
   }
   
-  if( tmp_matching_rids.size() > 0 ) {
+  if( match_count.size() > 0 ) {
     
     auto tmp = std::string((*part_it)->currentDataDir());
     auto find_it = matching_ridset->find(tmp);
     assert(find_it != matching_ridset->end());
 
+    /* the row numbers are in ascending order, so the rows are fetched
+       in the order they are stored */
     auto filtered_matching_ids = new std::vector<uint32_t>;
-    for(auto tmp_it = tmp_matching_rids.begin(); tmp_it != tmp_matching_rids.end(); ++tmp_it) {
-      if( tmp_it->second == fact_table_filters->size() ) {
-        filtered_matching_ids->push_back(tmp_it->first);
+    const uint8_t all_filters = fact_table_filters->size();
+    for(size_t i = 0; i < match_count.size(); ++i) {
+      if( match_count[i] == all_filters ) {
+        filtered_matching_ids->push_back(i + 1);
       }
     }
     
@@ -2059,6 +2217,7 @@ void ha_warp::wait_for_join_threads() {
    escape into the server, which would terminate it. */
 int ha_warp::rnd_next(uchar *buf) {
   DBUG_ENTER("ha_warp::rnd_next");
+  warp_index_build_scope index_build_scope(ha_thd(), thread_budget);
   const char* what = NULL;
   std::string detail;
   try {
@@ -2157,8 +2316,14 @@ fetch_again:
               std::max<uint64_t>((*part_it)->nRows(), 1) * sizeof(int64_t) * 3;
           const uint64_t workers_by_cache =
               std::max<uint64_t>(1, (ibis::fileManager::currentCacheSize() / 2) / worker_bytes);
-          const uint64_t max_workers =
-              std::min<uint64_t>(THDVAR(table->in_use, max_degree_of_parallelism), workers_by_cache);
+          /* The number of workers is limited by the thread budget of the
+             statement (every worker takes a token, the connection thread
+             is free) and by what the cache can hold.  A worker is always
+             allowed when none is running, otherwise nothing would run
+             when the degree of parallelism is 1. */
+          const uint64_t max_workers = workers_by_cache;
+          std::shared_ptr<ibis::util::ThreadBudget> join_budget =
+              ibis::util::ThreadBudget::current();
 
           while(1) {
             if( join_error.load() != 0 ) {
@@ -2168,13 +2333,19 @@ fetch_again:
             auto tmp = running_join_threads;
             parallel_join_mutex.unlock();
             
-            if(tmp >= max_workers ||
-               (tmp > 0 && ibis::fileManager::bytesFree() < worker_bytes * 2) ) {
-              
+            bool wait_for_worker =
+              (tmp >= max_workers ||
+               (tmp > 0 && ibis::fileManager::bytesFree() < worker_bytes * 2));
+            unsigned token = 0;
+            if( !wait_for_worker && tmp > 0 ) {
+              token = join_budget ? join_budget->tryAcquire(1) : 0;
+              wait_for_worker = (token == 0);
+            }
+            if( wait_for_worker ) {
               struct timespec sleep_time;
               struct timespec remaining_time;
               sleep_time.tv_sec = (time_t)0;
-              sleep_time.tv_nsec = 100000000L; // sleep a millisecond
+              sleep_time.tv_nsec = 1000000L; // sleep a millisecond
               
               nanosleep(&sleep_time, &remaining_time);
               continue;
@@ -2185,12 +2356,29 @@ fetch_again:
             
             parallel_join_mutex.unlock();
             try {
-              std::thread(exec_pushdown_join, column_query.get(), part_it, &fact_table_filters, &matching_ridset, &running_join_threads, &parallel_join_mutex, &running_dimension_merges, &dimension_merge_mutex, &join_error).detach();
+              ibis::query* cq = column_query.get();
+              ibis::partList::iterator pit = part_it;
+              fact_table_filter* ftf = &fact_table_filters;
+              auto* mrs = &matching_ridset;
+              auto* rjt = &running_join_threads;
+              auto* pjm = &parallel_join_mutex;
+              auto* rdm = &running_dimension_merges;
+              auto* dmm = &dimension_merge_mutex;
+              auto* jerr = &join_error;
+              const size_t min_rows = THDVAR(table->in_use, parallel_min_rows);
+              std::thread([=]() {
+                /* the worker works under the budget of the statement, the
+                   token is given back when it is done */
+                ibis::util::ThreadBudgetScope budget_scope(join_budget);
+                exec_pushdown_join(cq, pit, ftf, mrs, rjt, pjm, rdm, dmm, jerr, min_rows);
+                if( token > 0 ) join_budget->release(token);
+              }).detach();
               column_query.release(); // owned by the thread now
             } catch(...) {
               parallel_join_mutex.lock();
               --running_join_threads;
               parallel_join_mutex.unlock();
+              if( token > 0 ) join_budget->release(token);
               throw;
             }
             break;
@@ -2220,7 +2408,7 @@ fetch_again:
     struct timespec sleep_time;
     struct timespec remaining_time;
     sleep_time.tv_sec = (time_t)0;
-    sleep_time.tv_nsec = 100000000L; // sleep a bit
+    sleep_time.tv_nsec = 1000000L; // sleep a millisecond
     parallel_join_mutex.unlock();
     nanosleep(&sleep_time, &remaining_time);
   }
@@ -2238,7 +2426,7 @@ fetch_again:
     struct timespec sleep_time;
     struct timespec remaining_time;
     sleep_time.tv_sec = (time_t)0;
-    sleep_time.tv_nsec = 100000000L; // sleep a bit
+    sleep_time.tv_nsec = 1000000L; // sleep a millisecond
     nanosleep(&sleep_time, &remaining_time);
   }
 
@@ -2291,12 +2479,19 @@ fetch_again:
       current_matching_ridset = find_it->second;
       current_matching_ridset_it = find_it->second->begin();
       
-      base_table = ibis::table::create(find_it->first.c_str());
-      assert(base_table != NULL);
+      if( !take_prefetched(find_it->first, &base_table, &filtered_table) ||
+          filtered_table == NULL ) {
+        /* not read ahead, or the read ahead did not work (for example
+           because the cache was busy): read it here */
+        delete base_table;
+        base_table = ibis::table::create(find_it->first.c_str());
+        assert(base_table != NULL);
             
-      // this will do some IO to read in projected columns that where not used for filters
-      maintain_indexes(find_it->first.c_str());
-      filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
+        // this will do some IO to read in projected columns that where not used for filters
+        maintain_indexes(find_it->first.c_str());
+        filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
+      }
+      prefetch_following_partitions();
       
       if(!filtered_table) {
         /* FastBit returns an empty table when no rows match, a nil pointer
@@ -2322,11 +2517,16 @@ fetch_again:
         }
       }
       
-      base_table = ibis::table::create((*part_it)->currentDataDir());
-      assert(base_table != NULL);
+      if( !take_prefetched(std::string((*part_it)->currentDataDir()), &base_table, &filtered_table) ||
+          filtered_table == NULL ) {
+        delete base_table;
+        base_table = ibis::table::create((*part_it)->currentDataDir());
+        assert(base_table != NULL);
       
-      maintain_indexes((*part_it)->currentDataDir());
-      filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
+        maintain_indexes((*part_it)->currentDataDir());
+        filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
+      }
+      prefetch_following_partitions();
       
       if(filtered_table==NULL) {
         warp_report_select_failure(share->data_dir_name);
@@ -2492,6 +2692,7 @@ int ha_warp::rnd_end() {
 
   /* workers use members of this handler (and the part objects freed below) */
   wait_for_join_threads();
+  discard_prefetched();
   join_error = 0;
   
   blobroot.Clear();
@@ -2562,6 +2763,7 @@ void ha_warp::position(const uchar *) {
 int ha_warp::rnd_pos(uchar *buf, uchar *pos) {
   int rc;
   DBUG_ENTER("ha_warp::rnd_pos");
+  warp_index_build_scope index_build_scope(ha_thd(), thread_budget);
   
   ha_statistic_increment(&System_status_var::ha_read_rnd_count);
   current_rowid = my_get_ptr(pos, ref_length);
@@ -2642,6 +2844,7 @@ int ha_warp::index_init(uint idxno, bool) {
 
 
 int ha_warp::index_init(uint idxno) {
+  warp_index_build_scope index_build_scope(ha_thd(), thread_budget);
   active_index = idxno;
   last_trx_id = 0;
   current_trx = NULL;

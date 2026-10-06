@@ -1,0 +1,61 @@
+#
+# Work inside one partition runs in several threads: the rows of a
+# star join are probed in slices, and the next partitions of a scan
+# are read ahead by threads of the statement's thread budget
+# (warp_max_degree_of_parallelism, warp_parallel_min_rows).  Results
+# must be the same as InnoDB's, and unordered results must come back
+# in the same order as with one thread.
+#
+SET SESSION cte_max_recursion_depth = 1000000;
+SET SESSION group_concat_max_len = 100000000;
+CREATE TABLE sf (id INT, k1 INT, k2 INT, v INT, s VARCHAR(10)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE sd1 (k INT, region VARCHAR(8)) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE sd2 (k INT, cat VARCHAR(8), flag INT) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO sd1 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 300)
+SELECT x, CONCAT('R', x % 5) FROM s;
+INSERT INTO sd2 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 200)
+SELECT x, CONCAT('C', x % 4), x % 3 FROM s;
+INSERT INTO sf WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 150000)
+SELECT x, 1 + x % 300, 1 + x % 200, x % 1000, CONCAT('s', x % 17) FROM s;
+CREATE TABLE isf ENGINE=InnoDB SELECT * FROM sf;
+CREATE TABLE isd1 ENGINE=InnoDB SELECT * FROM sd1;
+CREATE TABLE isd2 ENGINE=InnoDB SELECT * FROM sd2;
+# Reference results from InnoDB
+SELECT COUNT(*) > 0 AS the_join_has_rows
+FROM isf f JOIN isd1 d1 ON f.k1 = d1.k JOIN isd2 d2 ON f.k2 = d2.k
+WHERE d1.region = 'R2' AND d2.flag = 0 AND f.v < 700;
+the_join_has_rows
+1
+# One thread: the reference for the order of unordered results
+SET SESSION warp_max_degree_of_parallelism = 1;
+SET SESSION warp_max_degree_of_parallelism = 1;
+SET SESSION warp_parallel_min_rows = 262144;
+# Scans that stop early leave partitions that were read ahead
+configuration 1: 1 threads, pieces of at least 262144 rows: checked
+SET SESSION warp_max_degree_of_parallelism = 4;
+SET SESSION warp_parallel_min_rows = 50;
+# Scans that stop early leave partitions that were read ahead
+configuration 2: 4 threads, pieces of at least 50 rows: checked
+SET SESSION warp_max_degree_of_parallelism = 8;
+SET SESSION warp_parallel_min_rows = 1000;
+# Scans that stop early leave partitions that were read ahead
+configuration 3: 8 threads, pieces of at least 1000 rows: checked
+SET SESSION warp_max_degree_of_parallelism = 16;
+SET SESSION warp_parallel_min_rows = 7;
+# Scans that stop early leave partitions that were read ahead
+configuration 4: 16 threads, pieces of at least 7 rows: checked
+SET SESSION warp_max_degree_of_parallelism = 32;
+SET SESSION warp_parallel_min_rows = 262144;
+# Scans that stop early leave partitions that were read ahead
+configuration 5: 32 threads, pieces of at least 262144 rows: checked
+# A scan that fails halfway does not leave threads behind
+SET SESSION warp_max_degree_of_parallelism = 8;
+SELECT SUM(CAST(id AS SIGNED) * 1000000000000000) FROM sf;
+ERROR 22003: BIGINT value is out of range in '(cast(`test`.`sf`.`id` as signed) * 1000000000000000)'
+SELECT COUNT(*) FROM sf;
+COUNT(*)
+150000
+DROP TABLE sf, sd1, sd2, isf, isd1, isd2;
