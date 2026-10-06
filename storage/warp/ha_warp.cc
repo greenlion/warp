@@ -1234,6 +1234,24 @@ void index_builder(ibis::table* tbl, const char* cname, const char* comment) {
 /* Fastbit will normally maintain the indexes automatically, but if the type
    of bitmap index is to be set manually, the comment on the field will be
    taken into account. */
+/* Called when a scan is done with a partition (the FastBit tables that read
+   it are deleted).  The column files of the partition stay in the FastBit
+   cache so that a later query finds them there, but FastBit does not evict
+   idle files to make room for the arrays queries allocate.  A scan of a
+   large table would fill the cache with files of partitions that it has
+   already passed and fail with "out of memory" although most of the cache
+   is idle.  Once a quarter of the cache is gone, the files of the
+   partitions that were scanned are dropped. */
+static void warp_release_partition(const char *partition_dir) {
+  if (partition_dir == NULL) {
+    return;
+  }
+  const uint64_t cache = ibis::fileManager::currentCacheSize();
+  if (ibis::fileManager::bytesFree() < cache / 4) {
+    ibis::fileManager::instance().flushDir(partition_dir);
+  }
+}
+
 void ha_warp::maintain_indexes(const char *datadir) {
   
   ibis::table::stringArray columns;
@@ -2368,6 +2386,13 @@ fetch_again:
       }
       
       // move to the next partition
+      delete cursor;
+      cursor = NULL;
+      delete filtered_table;
+      filtered_table = NULL;
+      delete base_table;
+      base_table = NULL;
+      warp_release_partition((*part_it)->currentDataDir());
       ++part_it;
       goto next_ridset;
     }
@@ -2381,6 +2406,7 @@ fetch_again:
     }
     
     if(partitions != NULL) {
+      const std::string finished_partition((*part_it)->currentDataDir());
       ++part_it;
       if(part_it == partitions->end()) {
         DBUG_RETURN(HA_ERR_END_OF_FILE); 
@@ -2391,6 +2417,7 @@ fetch_again:
       filtered_table=NULL;
       delete base_table;
       base_table=NULL;
+      warp_release_partition(finished_partition.c_str());
       
       goto fetch_again;
     }
@@ -2480,6 +2507,9 @@ int ha_warp::rnd_end() {
 
   if(partitions) {
     for(auto it=partitions->begin();it!=partitions->end();++it) {
+      if(*it != NULL) {
+        warp_release_partition((*it)->currentDataDir());
+      }
       delete *it;
       *it=NULL;
     } 
