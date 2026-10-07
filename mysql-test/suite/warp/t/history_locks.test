@@ -1,0 +1,192 @@
+--echo #
+--echo # History locks are made when a transaction updates or deletes a row, they
+--echo # keep the old version of the row visible for the transactions that are older.
+--echo # They are removed when the transaction that made them is finished and no
+--echo # transaction (read only ones too) is older than it.
+--echo #
+--echo # Regression test: the cleanup was switched off because it crashed the
+--echo # server (it used an iterator after it erased the lock), it looked for the
+--echo # largest open transaction instead of the oldest, it knew nothing about read
+--echo # only transactions, and lookups were not protected against the cleanup.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE w (id INT, v INT) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 8000)
+  SELECT x, x % 10 FROM s;
+INSERT INTO i SELECT * FROM w;
+
+let $q_locks = SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_history_locks';
+let $q_active = SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_active_transactions';
+
+--echo # Nothing is open and there are no locks
+let $locks = `$q_locks`;
+let $active = `$q_active`;
+--echo history locks: $locks, active transactions: $active
+
+--echo # Statements that delete and update, nobody else is there: the locks go away
+DELETE FROM w WHERE id <= 100;
+UPDATE w SET v = v + 100 WHERE id BETWEEN 101 AND 200;
+let $locks = `$q_locks`;
+let $active = `$q_active`;
+--echo history locks: $locks, active transactions: $active
+
+--echo # An older snapshot keeps the locks
+connect (reader, localhost, root,,);
+connection reader;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT COUNT(*), SUM(v) FROM w;
+connection default;
+DELETE FROM w WHERE id BETWEEN 201 AND 400;
+UPDATE w SET v = -1 WHERE id BETWEEN 401 AND 500;
+let $locks = `$q_locks`;
+let $active = `$q_active`;
+let $has = `SELECT $locks > 0`;
+--echo the locks exist while the older transaction is open: $has, active transactions: $active
+--echo # the snapshot still sees the old rows, the others see the new state
+connection reader;
+SELECT COUNT(*), SUM(v) FROM w;
+connection default;
+SELECT COUNT(*), SUM(v) FROM w;
+connection reader;
+COMMIT;
+connection default;
+let $locks = `$q_locks`;
+let $active = `$q_active`;
+--echo after the older transaction ended, history locks: $locks, active transactions: $active
+SELECT COUNT(*), SUM(v) FROM w;
+
+--echo # The locks of an open transaction stay when other transactions end
+connect (writer, localhost, root,,);
+connection writer;
+BEGIN;
+DELETE FROM w WHERE id BETWEEN 501 AND 600;
+connection default;
+INSERT INTO w VALUES (900001, 1);
+SELECT COUNT(*) FROM w;
+connection reader;
+BEGIN;
+SELECT COUNT(*) FROM w;
+COMMIT;
+connection default;
+let $locks = `$q_locks`;
+let $has = `SELECT $locks > 0`;
+--echo the locks of the open transaction exist: $has
+connection writer;
+ROLLBACK;
+connection default;
+let $locks = `$q_locks`;
+--echo after the rollback, history locks: $locks
+SELECT COUNT(*) FROM w;
+
+--echo # A transaction that is older than the one that deleted keeps the lock after
+--echo # the deleting transaction committed
+connection reader;
+BEGIN;
+SELECT COUNT(*) FROM w WHERE id BETWEEN 601 AND 700;
+connection writer;
+BEGIN;
+DELETE FROM w WHERE id BETWEEN 601 AND 700;
+COMMIT;
+connection default;
+let $locks = `$q_locks`;
+let $has = `SELECT $locks > 0`;
+--echo the old reader needs the locks: $has
+connection reader;
+SELECT COUNT(*) FROM w WHERE id BETWEEN 601 AND 700;
+COMMIT;
+connection default;
+let $locks = `$q_locks`;
+--echo after the old reader ended, history locks: $locks
+SELECT COUNT(*) FROM w WHERE id BETWEEN 601 AND 700;
+disconnect reader;
+disconnect writer;
+
+--echo # Readers look up history locks while the cleanup removes them.  An old
+--echo # snapshot keeps the locks, the changes are made one after the other, the
+--echo # readers scan the table with several connections and the old snapshot ends
+--echo # in the middle of that, which removes all the locks.
+DELIMITER |;
+CREATE PROCEDURE scan_w()
+BEGIN
+  DECLARE n INT DEFAULT 0;
+  DECLARE c BIGINT;
+  WHILE n < 200 DO
+    SELECT COUNT(*) INTO c FROM w;
+    SET n = n + 1;
+  END WHILE;
+END|
+DELIMITER ;|
+
+# the InnoDB table starts from what the WARP table has
+DELETE FROM i;
+INSERT INTO i SELECT * FROM w;
+
+connect (old, localhost, root,,);
+connect (r1, localhost, root,,);
+connect (r2, localhost, root,,);
+connect (r3, localhost, root,,);
+connect (r4, localhost, root,,);
+
+let $round = 0;
+while ($round < 3)
+{
+  inc $round;
+  connection old;
+  SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+  BEGIN;
+  SELECT COUNT(*) INTO @before FROM w;
+  connection default;
+  eval DELETE FROM w WHERE id BETWEEN $round * 1000 + 1000 AND $round * 1000 + 1999 AND id % 2 = 0;
+  eval UPDATE w SET v = v + 1 WHERE id BETWEEN $round * 1000 + 1000 AND $round * 1000 + 1999;
+  eval DELETE FROM i WHERE id BETWEEN $round * 1000 + 1000 AND $round * 1000 + 1999 AND id % 2 = 0;
+  eval UPDATE i SET v = v + 1 WHERE id BETWEEN $round * 1000 + 1000 AND $round * 1000 + 1999;
+  let $locks = `$q_locks`;
+  let $has = `SELECT $locks > 0`;
+  --echo round $round: the old snapshot holds history locks: $has
+  connection r1;
+  --send CALL scan_w()
+  connection r2;
+  --send CALL scan_w()
+  connection r3;
+  --send CALL scan_w()
+  connection r4;
+  --send CALL scan_w()
+  connection old;
+  COMMIT;
+  connection r1;
+  --reap
+  connection r2;
+  --reap
+  connection r3;
+  --reap
+  connection r4;
+  --reap
+  connection default;
+  let $locks = `$q_locks`;
+  --echo round $round: after the old snapshot ended and the readers finished, history locks: $locks
+}
+
+let $w = `SELECT CONCAT(COUNT(*), ':', SUM(v)) FROM w`;
+let $i = `SELECT CONCAT(COUNT(*), ':', SUM(v)) FROM i`;
+if ($w != $i)
+{
+  --echo MISMATCH after the changes: WARP $w, InnoDB $i
+}
+if ($w == $i)
+{
+  --echo the table is the same as InnoDB's
+}
+let $active = `$q_active`;
+--echo active transactions: $active
+
+disconnect old;
+disconnect r1;
+disconnect r2;
+disconnect r3;
+disconnect r4;
+DROP PROCEDURE scan_w;
+DROP TABLE w, i;
