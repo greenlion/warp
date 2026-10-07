@@ -525,6 +525,13 @@ class warp_trx {
   void write_insert_log_rowid(uint64_t rowid);
   void write_delete_log_rowid(uint64_t rowid);
   void open_log();
+
+  /* Closes the transaction log and removes its file.  A transaction opens
+     its log when it starts, whether it changes data or not, so the log is
+     removed whenever the transaction ends: commit, rollback, a read only
+     transaction or a connection that goes away. */
+  void close_log();
+  ~warp_trx() { close_log(); }
 };
 
 class warp_global_data {
