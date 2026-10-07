@@ -1,0 +1,142 @@
+#
+# History locks are made when a transaction updates or deletes a row, they
+# keep the old version of the row visible for the transactions that are older.
+# They are removed when the transaction that made them is finished and no
+# transaction (read only ones too) is older than it.
+#
+# Regression test: the cleanup was switched off because it crashed the
+# server (it used an iterator after it erased the lock), it looked for the
+# largest open transaction instead of the oldest, it knew nothing about read
+# only transactions, and lookups were not protected against the cleanup.
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE w (id INT, v INT) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 8000)
+SELECT x, x % 10 FROM s;
+INSERT INTO i SELECT * FROM w;
+# Nothing is open and there are no locks
+history locks: 0, active transactions: 0
+# Statements that delete and update, nobody else is there: the locks go away
+DELETE FROM w WHERE id <= 100;
+UPDATE w SET v = v + 100 WHERE id BETWEEN 101 AND 200;
+history locks: 0, active transactions: 0
+# An older snapshot keeps the locks
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT COUNT(*), SUM(v) FROM w;
+COUNT(*)	SUM(v)
+7900	45550
+DELETE FROM w WHERE id BETWEEN 201 AND 400;
+UPDATE w SET v = -1 WHERE id BETWEEN 401 AND 500;
+the locks exist while the older transaction is open: 1, active transactions: 1
+# the snapshot still sees the old rows, the others see the new state
+SELECT COUNT(*), SUM(v) FROM w;
+COUNT(*)	SUM(v)
+7900	45550
+SELECT COUNT(*), SUM(v) FROM w;
+COUNT(*)	SUM(v)
+7700	44100
+COMMIT;
+after the older transaction ended, history locks: 0, active transactions: 0
+SELECT COUNT(*), SUM(v) FROM w;
+COUNT(*)	SUM(v)
+7700	44100
+# The locks of an open transaction stay when other transactions end
+BEGIN;
+DELETE FROM w WHERE id BETWEEN 501 AND 600;
+INSERT INTO w VALUES (900001, 1);
+SELECT COUNT(*) FROM w;
+COUNT(*)
+7701
+BEGIN;
+SELECT COUNT(*) FROM w;
+COUNT(*)
+7701
+COMMIT;
+the locks of the open transaction exist: 1
+ROLLBACK;
+after the rollback, history locks: 0
+SELECT COUNT(*) FROM w;
+COUNT(*)
+7701
+# A transaction that is older than the one that deleted keeps the lock after
+# the deleting transaction committed
+BEGIN;
+SELECT COUNT(*) FROM w WHERE id BETWEEN 601 AND 700;
+COUNT(*)
+100
+BEGIN;
+DELETE FROM w WHERE id BETWEEN 601 AND 700;
+COMMIT;
+the old reader needs the locks: 1
+SELECT COUNT(*) FROM w WHERE id BETWEEN 601 AND 700;
+COUNT(*)
+100
+COMMIT;
+after the old reader ended, history locks: 0
+SELECT COUNT(*) FROM w WHERE id BETWEEN 601 AND 700;
+COUNT(*)
+0
+# Readers look up history locks while the cleanup removes them.  An old
+# snapshot keeps the locks, the changes are made one after the other, the
+# readers scan the table with several connections and the old snapshot ends
+# in the middle of that, which removes all the locks.
+CREATE PROCEDURE scan_w()
+BEGIN
+DECLARE n INT DEFAULT 0;
+DECLARE c BIGINT;
+WHILE n < 200 DO
+SELECT COUNT(*) INTO c FROM w;
+SET n = n + 1;
+END WHILE;
+END|
+DELETE FROM i;
+INSERT INTO i SELECT * FROM w;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT COUNT(*) INTO @before FROM w;
+DELETE FROM w WHERE id BETWEEN 1 * 1000 + 1000 AND 1 * 1000 + 1999 AND id % 2 = 0;
+UPDATE w SET v = v + 1 WHERE id BETWEEN 1 * 1000 + 1000 AND 1 * 1000 + 1999;
+DELETE FROM i WHERE id BETWEEN 1 * 1000 + 1000 AND 1 * 1000 + 1999 AND id % 2 = 0;
+UPDATE i SET v = v + 1 WHERE id BETWEEN 1 * 1000 + 1000 AND 1 * 1000 + 1999;
+round 1: the old snapshot holds history locks: 1
+CALL scan_w();
+CALL scan_w();
+CALL scan_w();
+CALL scan_w();
+COMMIT;
+round 1: after the old snapshot ended and the readers finished, history locks: 0
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT COUNT(*) INTO @before FROM w;
+DELETE FROM w WHERE id BETWEEN 2 * 1000 + 1000 AND 2 * 1000 + 1999 AND id % 2 = 0;
+UPDATE w SET v = v + 1 WHERE id BETWEEN 2 * 1000 + 1000 AND 2 * 1000 + 1999;
+DELETE FROM i WHERE id BETWEEN 2 * 1000 + 1000 AND 2 * 1000 + 1999 AND id % 2 = 0;
+UPDATE i SET v = v + 1 WHERE id BETWEEN 2 * 1000 + 1000 AND 2 * 1000 + 1999;
+round 2: the old snapshot holds history locks: 1
+CALL scan_w();
+CALL scan_w();
+CALL scan_w();
+CALL scan_w();
+COMMIT;
+round 2: after the old snapshot ended and the readers finished, history locks: 0
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT COUNT(*) INTO @before FROM w;
+DELETE FROM w WHERE id BETWEEN 3 * 1000 + 1000 AND 3 * 1000 + 1999 AND id % 2 = 0;
+UPDATE w SET v = v + 1 WHERE id BETWEEN 3 * 1000 + 1000 AND 3 * 1000 + 1999;
+DELETE FROM i WHERE id BETWEEN 3 * 1000 + 1000 AND 3 * 1000 + 1999 AND id % 2 = 0;
+UPDATE i SET v = v + 1 WHERE id BETWEEN 3 * 1000 + 1000 AND 3 * 1000 + 1999;
+round 3: the old snapshot holds history locks: 1
+CALL scan_w();
+CALL scan_w();
+CALL scan_w();
+CALL scan_w();
+COMMIT;
+round 3: after the old snapshot ended and the readers finished, history locks: 0
+the table is the same as InnoDB's
+active transactions: 0
+DROP PROCEDURE scan_w;
+DROP TABLE w, i;

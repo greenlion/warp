@@ -45,6 +45,8 @@
 #include <forward_list>
 #include <unordered_map>
 #include <unordered_set>
+#include <shared_mutex>
+#include <set>
 #include <time.h>
 
 // MySQL utility includes
@@ -537,6 +539,9 @@ class warp_trx {
   /* true while the transaction is on the list of the open transactions of
      warp_state */
   bool open_registered = false;
+
+  /* true while the transaction is on the list of all the transactions */
+  bool active_registered = false;
 };
 
 class warp_global_data {
@@ -546,8 +551,9 @@ class warp_global_data {
   // used when reading/modifying the lock structures
 
   std::mutex lock_mtx;
-  std::mutex history_lock_mtx;
-  char history_lock_writing = 0;
+  /* protects history_locks: shared to look a lock up, exclusive to add and
+     to remove locks */
+  std::shared_mutex history_lock_mtx;
   std::string shutdown_clean_file = "shutdown_clean.warp";
   std::string warp_state_file     = "state.warp";
   /* the committed transactions of older versions: a list of 8 byte numbers */
@@ -598,6 +604,18 @@ class warp_global_data {
   /* Number of history locks created.  While it is zero no row has a history
      lock and a scan does not have to look for one for every row. */
   std::atomic<uint64_t> history_lock_count{0};
+  /* how many history locks were ever created, and the state of the last
+     cleanup: if neither changed there is nothing new to remove */
+  uint64_t history_lock_inserts = 0;
+  uint64_t history_cleaned_inserts = 0;
+  uint64_t history_cleaned_oldest = 0;
+
+  /* The transaction ids of all the transactions that exist, the read only
+     ones too.  A history lock keeps the row it describes visible for the
+     older transactions, so it can be removed when no transaction is older
+     than the one that created it. */
+  std::mutex active_trx_mtx;
+  std::set<uint64_t> active_trx;
 
   // write the current state to the state file
   void write();
@@ -659,6 +677,15 @@ class warp_global_data {
   bool has_history_locks() const {
     return history_lock_count.load(std::memory_order_acquire) != 0;
   }
+  void add_history_lock(uint64_t rowid, uint64_t trx_id);
+  uint64_t history_lock_total() const {
+    return history_lock_count.load(std::memory_order_acquire);
+  }
+  void register_active_trx(uint64_t trx_id);
+  void unregister_active_trx(uint64_t trx_id);
+  /* the smallest id of the transactions that exist, UINT64_MAX if none */
+  uint64_t oldest_active_trx();
+  uint64_t active_trx_total();
   uint64_t get_next_trx_id();
   bool is_transaction_open(uint64_t check_trx_id);
   void mark_transaction_closed(uint64_t trx_id);

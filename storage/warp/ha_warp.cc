@@ -172,6 +172,30 @@ struct st_mysql_storage_engine warp_storage_engine = { MYSQL_HANDLERTON_INTERFAC
 static int warp_init_func(void *p);
 static int warp_done_func(void *p);
 
+/* Status variables: Warp_history_locks is the number of history locks that
+   exist (see warp_global_data::cleanup_history_locks), Warp_active_transactions
+   the number of transactions that exist (read only ones too) */
+static int show_warp_history_locks(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) =
+      (warp_state != NULL ? (longlong)warp_state->history_lock_total() : 0);
+  return 0;
+}
+
+static int show_warp_active_transactions(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) =
+      (warp_state != NULL ? (longlong)warp_state->active_trx_total() : 0);
+  return 0;
+}
+
+static SHOW_VAR warp_status_variables[] = {
+    {"Warp_history_locks", (char *)&show_warp_history_locks, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Warp_active_transactions", (char *)&show_warp_active_transactions, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}};
+
 mysql_declare_plugin(warp){
   MYSQL_STORAGE_ENGINE_PLUGIN,
   &warp_storage_engine,
@@ -183,7 +207,7 @@ mysql_declare_plugin(warp){
   NULL,           /* Plugin check uninstall */
   warp_done_func, /* Plugin Deinit */
   0x203 /* Based on Fastbit 2.0.3 */,
-  NULL,             /* status variables                */
+  warp_status_variables, /* status variables                */
   system_variables, /* system variables    */
   NULL,             /* config options                  */
   0,                /* flags                           */
@@ -4378,6 +4402,8 @@ warp_trx* ha_warp::create_trx(THD* thd) {
   trx->isolation_level = thd_get_trx_isolation(thd);
   thd->get_ha_data(warp_hton->slot)->ha_ptr = (void*)trx;
   trx->begin();
+  warp_state->register_active_trx(trx->trx_id);
+  trx->active_registered = true;
   trx->open_log();
   trx->autocommit = !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_TABLE_LOCK);
   trx_mutex.unlock();
@@ -4402,6 +4428,9 @@ warp_trx::~warp_trx() {
   close_log();
   if(open_registered && warp_state != NULL) {
     warp_state->unregister_open_trx(trx_id);
+  }
+  if(active_registered && warp_state != NULL) {
+    warp_state->unregister_active_trx(trx_id);
   }
 }
 
@@ -4464,42 +4493,47 @@ int warp_trx::begin() {
   return retval;
 }
 
-// This causes some visibility problems - leave commented for now
-// revisit in BETA 3.
+/* Removes the history locks that nobody needs any more.
+
+   A history lock is made when a transaction T updates or deletes a row.  The
+   transactions that are older than T must still see the row, and a
+   transaction that is newer than T finds the delete in the delete bitmap once
+   T committed.  So the lock of T can go when T is not open (it committed or
+   rolled back) and no transaction that exists is older than T.  The
+   transactions that exist include the read only ones, which are not open
+   transactions (they do not write), see active_trx.  Without history locks a
+   scan does not have to look for one for every row. */
 void warp_global_data::cleanup_history_locks() {
-#ifdef WARP_CLEANUP_HISTORY_LOCKS  
+  if(history_lock_count.load(std::memory_order_acquire) == 0) {
+    return;
+  }
+  const uint64_t oldest_active = oldest_active_trx();
+
   commit_mtx.lock();
   history_lock_mtx.lock();
 
-  uint64_t oldest_open_trx_id = 0;
-  for(auto trx_it = open_trx.begin(); trx_it != open_trx.end(); ++trx_it) {
-    dbug("open trx_id: " << *trx_it);
-    if(oldest_open_trx_id < *trx_it) {
-      oldest_open_trx_id = *trx_it;
+  /* nothing new since the last cleanup: no lock was added and the oldest
+     transaction is the same one, so the same locks are needed */
+  if(history_lock_inserts != history_cleaned_inserts ||
+     oldest_active != history_cleaned_oldest) {
+    auto history_lock_it = history_locks.begin();
+    while(history_lock_it != history_locks.end()) {
+      const uint64_t lock_trx_id = history_lock_it->second;
+      if(lock_trx_id < oldest_active &&
+         open_trx.find(lock_trx_id) == open_trx.end()) {
+        dbug("Removing HISTORY lock of trx: " << lock_trx_id << " for rowid: " << history_lock_it->first);
+        history_lock_it = history_locks.erase(history_lock_it);
+      } else {
+        ++history_lock_it;
+      }
     }
-  }
-  dbug("Oldest open trx: " << oldest_open_trx_id);
-     
-  if(!oldest_open_trx_id) {
-    history_lock_mtx.unlock();
-    commit_mtx.unlock();
-    return;
-  };
-
-  
-  
-  auto history_lock_it = history_locks.begin();
-  while(history_lock_it != history_locks.end()) {
-    if(history_lock_it->second < oldest_open_trx_id) {
-      dbug("Removing HISTORY lock on trx: " << oldest_open_trx_id << " for rowid: " << history_lock_it->first);
-      history_locks.erase(history_lock_it);
-    }
-    ++history_lock_it;
+    history_cleaned_inserts = history_lock_inserts;
+    history_cleaned_oldest = oldest_active;
+    history_lock_count.store(history_locks.size(), std::memory_order_release);
   }
   
   history_lock_mtx.unlock();
   commit_mtx.unlock();
-#endif
 }
 
 // used when a transaction commits
@@ -4708,8 +4742,10 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
   */
   thd->get_ha_data(hton->slot)->ha_ptr = NULL;
   warp_state->free_locks(current_trx);
-  warp_state->cleanup_history_locks();
+  /* the transaction does not exist any more when the locks are cleaned up,
+     otherwise it would keep its own history locks */
   delete current_trx;
+  warp_state->cleanup_history_locks();
   return 0;
 }
 
@@ -4745,9 +4781,9 @@ int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
   
   // destroy the transaction
   warp_state->free_locks(current_trx);
-  warp_state->cleanup_history_locks();
   delete current_trx;
   thd->get_ha_data(hton->slot)->ha_ptr = NULL;
+  warp_state->cleanup_history_locks();
   return 0;
 }
 
@@ -5152,19 +5188,7 @@ int warp_global_data::create_lock(uint64_t rowid, warp_trx* trx, int lock_type) 
   // for more information about history locks, see 
   // ha_warp::update_row comments
   if(lock_type == LOCK_HISTORY) {
-    retry_hist_lock:
-    history_lock_mtx.lock();
-    if(history_lock_writing == 1) {
-      history_lock_mtx.unlock();
-      goto retry_hist_lock;
-    }
-    history_lock_writing=1;
-    history_lock_mtx.unlock();
-    history_locks.emplace(std::pair<uint64_t, uint64_t>(rowid, trx->trx_id));
-    history_lock_count.fetch_add(1, std::memory_order_release);
-    history_lock_mtx.lock();
-    history_lock_writing=0;
-    history_lock_mtx.unlock();
+    add_history_lock(rowid, trx->trx_id);
     return LOCK_HISTORY;
   }
 
@@ -5496,23 +5520,8 @@ int warp_global_data::downgrade_to_history_lock(uint64_t rowid, warp_trx* trx) {
   // and is no longer visible to newer transactions
   // if a history lock doesn't exist the deleted bitmap
   // will be checked
-  retry_lock:
-  history_lock_mtx.lock();
-  if(history_lock_writing == 1) {
-    history_lock_mtx.unlock();
-    goto retry_lock;
-  }
-  history_lock_writing=1;
-  history_lock_mtx.unlock();
-  history_locks.emplace(std::pair<uint64_t, uint64_t>(rowid, trx->trx_id));
-    history_lock_count.fetch_add(1, std::memory_order_release);
-  history_lock_mtx.lock();
-  history_lock_writing=0;
-  history_lock_mtx.unlock();
+  add_history_lock(rowid, trx->trx_id);
 
-  
-
-  
   return 0;
 }
 
@@ -5539,18 +5548,39 @@ uint64_t warp_global_data::get_history_lock(uint64_t rowid) {
   if(history_lock_count.load(std::memory_order_acquire) == 0) {
     return 0;
   }
-  wait_for_writer:
-  history_lock_mtx.lock();
-  if(history_lock_writing == 1) {
-    history_lock_mtx.unlock();
-    goto wait_for_writer;
-  }
-  history_lock_mtx.unlock();
+  std::shared_lock<std::shared_mutex> guard(history_lock_mtx);
   auto it = history_locks.find(rowid);
   if(it == history_locks.end()) {
     return 0;
   }
   return it->second;
+}
+
+void warp_global_data::add_history_lock(uint64_t rowid, uint64_t trx_id) {
+  std::unique_lock<std::shared_mutex> guard(history_lock_mtx);
+  history_locks.emplace(std::pair<uint64_t, uint64_t>(rowid, trx_id));
+  ++history_lock_inserts;
+  history_lock_count.store(history_locks.size(), std::memory_order_release);
+}
+
+void warp_global_data::register_active_trx(uint64_t trx_id) {
+  std::lock_guard<std::mutex> guard(active_trx_mtx);
+  active_trx.insert(trx_id);
+}
+
+void warp_global_data::unregister_active_trx(uint64_t trx_id) {
+  std::lock_guard<std::mutex> guard(active_trx_mtx);
+  active_trx.erase(trx_id);
+}
+
+uint64_t warp_global_data::oldest_active_trx() {
+  std::lock_guard<std::mutex> guard(active_trx_mtx);
+  return active_trx.empty() ? UINT64_MAX : *active_trx.begin();
+}
+
+uint64_t warp_global_data::active_trx_total() {
+  std::lock_guard<std::mutex> guard(active_trx_mtx);
+  return active_trx.size();
 }
 
 warp_global_data::~warp_global_data() {
