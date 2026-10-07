@@ -1,0 +1,259 @@
+--echo #
+--echo # SELECT COUNT(*) without a condition does not fetch the rows, it counts
+--echo # the visible rows from the transaction id and row id columns.  The count
+--echo # must be what a scan of the table returns (the condition id >= 0 makes
+--echo # the scan: it is pushed down and the handler's rows are fetched), in every
+--echo # transaction state, and the same as InnoDB's.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 1000000;
+
+CREATE TABLE w (id INT, v INT) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 150000)
+  SELECT x, x % 7 FROM s;
+INSERT INTO i SELECT * FROM w;
+
+--echo # the table after the load
+let $fast = `SELECT COUNT(*) FROM w`;
+let $scan = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+let $inno = `SELECT COUNT(*) FROM i`;
+if ($fast != $scan)
+{
+  --echo MISMATCH: count(*) $fast, scan $scan
+}
+if ($fast != $inno)
+{
+  --echo MISMATCH: count(*) $fast, InnoDB $inno
+}
+if ($fast == $scan)
+{
+  --echo count(*) = $fast, same as the scan
+}
+
+--echo # The rows are not fetched: no row is read from the handler
+FLUSH STATUS;
+SELECT COUNT(*) FROM w;
+SELECT VARIABLE_VALUE = 0 AS no_rows_fetched FROM performance_schema.session_status WHERE VARIABLE_NAME = 'Handler_read_rnd_next';
+FLUSH STATUS;
+SELECT COUNT(*) FROM w WHERE id >= 0;
+SELECT VARIABLE_VALUE > 0 AS rows_fetched FROM performance_schema.session_status WHERE VARIABLE_NAME = 'Handler_read_rnd_next';
+
+DELETE FROM w WHERE v = 3;
+DELETE FROM i WHERE v = 3;
+--echo # after DELETE
+let $fast = `SELECT COUNT(*) FROM w`;
+let $scan = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+let $inno = `SELECT COUNT(*) FROM i`;
+if ($fast != $scan)
+{
+  --echo MISMATCH: count(*) $fast, scan $scan
+}
+if ($fast != $inno)
+{
+  --echo MISMATCH: count(*) $fast, InnoDB $inno
+}
+if ($fast == $scan)
+{
+  --echo count(*) = $fast, same as the scan
+}
+UPDATE w SET v = 100 WHERE id % 10 = 0;
+UPDATE i SET v = 100 WHERE id % 10 = 0;
+--echo # after UPDATE
+let $fast = `SELECT COUNT(*) FROM w`;
+let $scan = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+let $inno = `SELECT COUNT(*) FROM i`;
+if ($fast != $scan)
+{
+  --echo MISMATCH: count(*) $fast, scan $scan
+}
+if ($fast != $inno)
+{
+  --echo MISMATCH: count(*) $fast, InnoDB $inno
+}
+if ($fast == $scan)
+{
+  --echo count(*) = $fast, same as the scan
+}
+INSERT INTO w SELECT id + 1000000, v FROM w WHERE id <= 1000;
+INSERT INTO i SELECT id + 1000000, v FROM i WHERE id <= 1000;
+--echo # after INSERT ... SELECT
+let $fast = `SELECT COUNT(*) FROM w`;
+let $scan = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+let $inno = `SELECT COUNT(*) FROM i`;
+if ($fast != $scan)
+{
+  --echo MISMATCH: count(*) $fast, scan $scan
+}
+if ($fast != $inno)
+{
+  --echo MISMATCH: count(*) $fast, InnoDB $inno
+}
+if ($fast == $scan)
+{
+  --echo count(*) = $fast, same as the scan
+}
+
+--echo # A transaction sees its own rows, a rollback removes them
+BEGIN;
+INSERT INTO w VALUES (2000001, 1), (2000002, 1), (2000003, 1);
+--echo # inside the transaction, with 3 new rows
+let $fast = `SELECT COUNT(*) FROM w`;
+let $scan = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+let $inno = $scan;
+if ($fast != $scan)
+{
+  --echo MISMATCH: count(*) $fast, scan $scan
+}
+if ($fast != $inno)
+{
+  --echo MISMATCH: count(*) $fast, InnoDB $inno
+}
+if ($fast == $scan)
+{
+  --echo count(*) = $fast, same as the scan
+}
+ROLLBACK;
+--echo # after ROLLBACK
+let $fast = `SELECT COUNT(*) FROM w`;
+let $scan = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+let $inno = $scan;
+if ($fast != $scan)
+{
+  --echo MISMATCH: count(*) $fast, scan $scan
+}
+if ($fast != $inno)
+{
+  --echo MISMATCH: count(*) $fast, InnoDB $inno
+}
+if ($fast == $scan)
+{
+  --echo count(*) = $fast, same as the scan
+}
+
+--echo # Another connection does not see uncommitted rows or deletes
+connect (con1, localhost, root,,);
+connection con1;
+BEGIN;
+INSERT INTO w SELECT id + 3000000, v FROM w WHERE id <= 500;
+DELETE FROM w WHERE id BETWEEN 5000 AND 5100;
+connection default;
+--echo # other connection, changes not committed
+let $fast = `SELECT COUNT(*) FROM w`;
+let $scan = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+let $inno = $scan;
+if ($fast != $scan)
+{
+  --echo MISMATCH: count(*) $fast, scan $scan
+}
+if ($fast != $inno)
+{
+  --echo MISMATCH: count(*) $fast, InnoDB $inno
+}
+if ($fast == $scan)
+{
+  --echo count(*) = $fast, same as the scan
+}
+connection con1;
+COMMIT;
+connection default;
+--echo # after the other connection committed
+let $fast = `SELECT COUNT(*) FROM w`;
+let $scan = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+let $inno = $scan;
+if ($fast != $scan)
+{
+  --echo MISMATCH: count(*) $fast, scan $scan
+}
+if ($fast != $inno)
+{
+  --echo MISMATCH: count(*) $fast, InnoDB $inno
+}
+if ($fast == $scan)
+{
+  --echo count(*) = $fast, same as the scan
+}
+
+--echo # A repeatable read transaction keeps its snapshot
+connect (con2, localhost, root,,);
+connection con2;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+let $before = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+connection default;
+INSERT INTO w SELECT id + 4000000, v FROM w WHERE id <= 700;
+DELETE FROM w WHERE id BETWEEN 9000 AND 9200;
+connection con2;
+--echo # snapshot of the other transaction
+let $fast = `SELECT COUNT(*) FROM w`;
+let $scan = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+let $inno = $scan;
+if ($fast != $scan)
+{
+  --echo MISMATCH: count(*) $fast, scan $scan
+}
+if ($fast != $inno)
+{
+  --echo MISMATCH: count(*) $fast, InnoDB $inno
+}
+if ($fast == $scan)
+{
+  --echo count(*) = $fast, same as the scan
+}
+let $after = `SELECT COUNT(*) FROM w`;
+if ($before != $after)
+{
+  --echo MISMATCH: the snapshot changed from $before to $after
+}
+if ($before == $after)
+{
+  --echo the snapshot did not change
+}
+COMMIT;
+--echo # after the snapshot ended
+let $fast = `SELECT COUNT(*) FROM w`;
+let $scan = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+let $inno = $scan;
+if ($fast != $scan)
+{
+  --echo MISMATCH: count(*) $fast, scan $scan
+}
+if ($fast != $inno)
+{
+  --echo MISMATCH: count(*) $fast, InnoDB $inno
+}
+if ($fast == $scan)
+{
+  --echo count(*) = $fast, same as the scan
+}
+connection default;
+disconnect con1;
+disconnect con2;
+
+--echo # A locking read scans the table (it takes the row locks)
+BEGIN;
+FLUSH STATUS;
+let $locked = `SELECT COUNT(*) FROM w FOR SHARE`;
+let $plain = `SELECT COUNT(*) FROM w WHERE id >= 0`;
+if ($locked != $plain)
+{
+  --echo MISMATCH: locking count $locked, scan $plain
+}
+if ($locked == $plain)
+{
+  --echo locking count(*) = scan
+}
+COMMIT;
+
+--echo # Empty tables
+CREATE TABLE e (id INT) ENGINE=WARP;
+SELECT COUNT(*) FROM e;
+INSERT INTO e VALUES (1), (2);
+SELECT COUNT(*) FROM e;
+DELETE FROM e;
+SELECT COUNT(*) FROM e;
+TRUNCATE TABLE e;
+SELECT COUNT(*) FROM e;
+
+DROP TABLE w, i, e;

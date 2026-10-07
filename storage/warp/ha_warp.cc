@@ -73,6 +73,7 @@
   derivative works thereof, in binary and source code form.
 */
 #define WARP_BITMAP_DEBUG
+#include <optional>
 #include "ha_warp.h"
 #ifdef WARP_USE_SIMD_INTERSECTION
 #include "include/lemire-sorted-simd/codecfactory.h"
@@ -943,14 +944,15 @@ int ha_warp::write_row_impl(uchar *buf) {
   DBUG_ENTER("ha_warp::write_row_impl");
   ha_statistic_increment(&System_status_var::ha_write_count);
   
-  mysql_mutex_lock(&share->mutex);
-  if(share->next_rowid == 0 || share->rowids_generated >= WARP_ROWID_BATCH_SIZE) {
-    share->next_rowid = warp_state->get_next_rowid_batch();
-    share->rowids_generated = 0;
-  } 
-  current_rowid = share->next_rowid--;
-  share->rowids_generated++;
-  mysql_mutex_unlock(&share->mutex);
+  /* The row ids of this handler are consecutive.  If they came one at a time
+     from a counter shared by all the connections that write to the table,
+     the rows of a parallel load would have ids that are far apart. */
+  if(local_rowids_left == 0) {
+    local_next_rowid = warp_state->get_next_rowid_batch(WARP_HANDLER_ROWID_BATCH_SIZE);
+    local_rowids_left = WARP_HANDLER_ROWID_BATCH_SIZE;
+  }
+  current_rowid = local_next_rowid--;
+  --local_rowids_left;
     
   /* This will return a cached writer unless a background
     write was started on the last insert.  In that case
@@ -2217,7 +2219,6 @@ void ha_warp::wait_for_join_threads() {
    escape into the server, which would terminate it. */
 int ha_warp::rnd_next(uchar *buf) {
   DBUG_ENTER("ha_warp::rnd_next");
-  warp_index_build_scope index_build_scope(ha_thd(), thread_budget);
   const char* what = NULL;
   std::string detail;
   try {
@@ -2243,11 +2244,22 @@ int ha_warp::rnd_next(uchar *buf) {
 int ha_warp::rnd_next_impl(uchar *buf) {
   DBUG_ENTER("ha_warp::rnd_next_impl");
   
+  /* The thread budget of the statement is only needed when a partition is
+     opened or joins are scheduled, not for every row that is returned, so
+     it is installed when it is first needed in this call. */
+  std::optional<warp_index_build_scope> index_build_scope;
+  auto use_thread_budget = [&]() {
+    if(!index_build_scope) {
+      index_build_scope.emplace(ha_thd(), thread_budget);
+    }
+  };
+
   // transaction id of the current row
   uint64_t row_trx_id = 0;
 fetch_again:  
   
   if( !full_partition_scan && partitions != NULL && bitmap_merge_join_executed == false ) {
+    use_thread_budget();
     if( std::string((*part_it)->currentDataDir()) == std::string(share->data_dir_name) ) {
       ++part_it;
     }
@@ -2455,6 +2467,7 @@ fetch_again:
     }
     
     if( current_matching_ridset == NULL ) {
+      use_thread_budget();
       auto find_it = matching_ridset.find(std::string((*part_it)->currentDataDir()));
       
       if( find_it == matching_ridset.end() ) {
@@ -2509,6 +2522,7 @@ fetch_again:
     
     // table scan (possibly with filters) without any joins
     if(cursor == NULL) {
+      use_thread_budget();
       if( std::string((*part_it)->currentDataDir()) == std::string(share->data_dir_name) ) {
       
         ++part_it;
@@ -2682,6 +2696,111 @@ fetch_again:
   find_current_row(buf, cursor);
 
   DBUG_RETURN(0);
+}
+
+/* Counts the rows that a scan of the table would return, without building a
+   row for MySQL for each of them: only the transaction id column (and the row
+   id column, if rows could have been deleted) is read and the same visibility
+   rules as in rnd_next are applied to every row.  Returns false if the rows
+   can not be counted this way, the caller then scans the table. */
+bool ha_warp::count_visible_rows(ha_rows *num_rows) {
+  /* a scan that locks rows, a partition filter or a pushed down condition
+     or join changes what a scan returns */
+  if(lock_in_share_mode || lock_for_update) {
+    return false;
+  }
+  const char *partition_filter = THDVAR(table->in_use, partition_filter);
+  if(partition_filter != NULL && *partition_filter != 0) {
+    return false;
+  }
+  if(push_where_clause != "" && push_where_clause != "1=1") {
+    return false;
+  }
+  auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
+  if(pushdown_info != NULL &&
+     (pushdown_info->base_table != NULL || !pushdown_info->join_info.empty())) {
+    return false;
+  }
+
+  /* the rows are not visible for every transaction, and the cached answer
+     of is_trx_visible_to_read must not come from an earlier scan */
+  last_trx_id = 0;
+
+  /* if no row was ever deleted or updated, every row of a visible
+     transaction is visible and the row ids are not needed */
+  const bool check_rowids =
+      warp_state->has_history_locks() ||
+      warp_state->delete_bitmap->may_have_bits();
+
+  ibis::partList parts;
+  ibis::util::gatherParts(parts, share->data_dir_name, true);
+  ha_rows total = 0;
+  bool ok = true;
+  for(auto it = parts.begin(); it != parts.end() && ok; ++it) {
+    ibis::part *part = *it;
+    if(part == NULL || part->nRows() == 0 ||
+       std::string(part->currentDataDir()) == std::string(share->data_dir_name)) {
+      continue; /* the top level directory has no rows */
+    }
+    const ibis::column *tcol = part->getColumn("t");
+    const ibis::column *rcol = part->getColumn("r");
+    ibis::array_t<uint64_t> trx_ids;
+    ibis::array_t<uint64_t> row_ids;
+    if(tcol == NULL || rcol == NULL ||
+       tcol->getValuesArray(&trx_ids) != 0 || trx_ids.size() != part->nRows() ||
+       (check_rowids &&
+        (rcol->getValuesArray(&row_ids) != 0 || row_ids.size() != part->nRows()))) {
+      ok = false;
+      break;
+    }
+    const size_t nrows = trx_ids.size();
+    uint64_t previous_trx = 0;
+    bool visible = false;
+    bool have_previous = false;
+    for(size_t i = 0; i < nrows; ++i) {
+      const uint64_t trx_id = trx_ids[i];
+      if(!have_previous || trx_id != previous_trx) {
+        previous_trx = trx_id;
+        have_previous = true;
+        visible = is_trx_visible_to_read(trx_id);
+      }
+      if(!visible) {
+        continue;
+      }
+      if(check_rowids) {
+        /* is_row_visible_to_read looks at current_rowid */
+        current_rowid = row_ids[i];
+        if(!is_row_visible_to_read(current_rowid)) {
+          continue;
+        }
+      }
+      ++total;
+    }
+    trx_ids = ibis::array_t<uint64_t>();
+    row_ids = ibis::array_t<uint64_t>();
+    warp_release_partition(part->currentDataDir());
+  }
+  for(auto it = parts.begin(); it != parts.end(); ++it) {
+    delete *it;
+    *it = NULL;
+  }
+  if(ok) {
+    *num_rows = total;
+  }
+  return ok;
+}
+
+/* Called for SELECT COUNT(*) without a condition.  The generic version scans
+   the table and builds every row; this counts the visible rows directly. */
+int ha_warp::records(ha_rows *num_rows) {
+  try {
+    if(count_visible_rows(num_rows)) {
+      return 0;
+    }
+  } catch(...) {
+    /* out of memory in FastBit, the scan reports it the usual way */
+  }
+  return handler::records(num_rows);
 }
 
 /*
@@ -4623,6 +4742,13 @@ int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
 
 bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
 
+  /* No row has a history lock and nothing was ever deleted (the usual case):
+     every row is visible, there is nothing to look up */
+  if(!warp_state->has_history_locks() &&
+     !warp_state->delete_bitmap->may_have_bits()) {
+    return true;
+  }
+
   uint64_t history_trx_id = warp_state->get_history_lock(rowid);
   
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
@@ -4923,9 +5049,9 @@ uint64_t warp_global_data::get_next_trx_id() {
   return next_trx_id;
 }
 
-uint64_t warp_global_data::get_next_rowid_batch() {
+uint64_t warp_global_data::get_next_rowid_batch(uint64_t count) {
   mtx.lock();
-  next_rowid += WARP_ROWID_BATCH_SIZE;
+  next_rowid += count;
   write();
   mtx.unlock();
   return next_rowid;
@@ -4988,6 +5114,7 @@ int warp_global_data::create_lock(uint64_t rowid, warp_trx* trx, int lock_type) 
     history_lock_writing=1;
     history_lock_mtx.unlock();
     history_locks.emplace(std::pair<uint64_t, uint64_t>(rowid, trx->trx_id));
+    history_lock_count.fetch_add(1, std::memory_order_release);
     history_lock_mtx.lock();
     history_lock_writing=0;
     history_lock_mtx.unlock();
@@ -5331,6 +5458,7 @@ int warp_global_data::downgrade_to_history_lock(uint64_t rowid, warp_trx* trx) {
   history_lock_writing=1;
   history_lock_mtx.unlock();
   history_locks.emplace(std::pair<uint64_t, uint64_t>(rowid, trx->trx_id));
+    history_lock_count.fetch_add(1, std::memory_order_release);
   history_lock_mtx.lock();
   history_lock_writing=0;
   history_lock_mtx.unlock();
@@ -5360,6 +5488,10 @@ int warp_global_data::free_locks(warp_trx* trx) {
 // returns 0 if no history lock or the trx_id that created
 // the lock otherwise
 uint64_t warp_global_data::get_history_lock(uint64_t rowid) {
+  /* no row has a history lock (the usual case) */
+  if(history_lock_count.load(std::memory_order_acquire) == 0) {
+    return 0;
+  }
   wait_for_writer:
   history_lock_mtx.lock();
   if(history_lock_writing == 1) {

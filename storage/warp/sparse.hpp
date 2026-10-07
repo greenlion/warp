@@ -23,6 +23,13 @@
 #include <sys/file.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <atomic>
+#include <mutex>
+#include <vector>
+#include <stdint.h>
+#include <assert.h>
 
 #define MODE_SET 1
 #define MODE_UNSET 0
@@ -43,6 +50,66 @@ private:
   int dirty=0;
   int have_lock=LOCK_UN;
   unsigned long long fpos = 0;
+
+  /* The read path (is_set) does not use the FILE of the writer.  It reads
+     through a read only memory map of the file, so that a lookup is a load
+     from memory, not a seek and a read.  A map covers the whole blocks of the
+     file at the time it was made.  Writers (set_bit, commit, close, open)
+     change the file and then bump read_generation, which makes the readers
+     map the file again the next time they look a bit up.  The old maps stay
+     around until the object is destroyed because another thread may still
+     read from one, so a lookup needs no lock.  A bit past the end of the
+     map is not set. */
+  struct read_map {
+    const uint64_t *base;
+    size_t len;          /* bytes, a multiple of BLOCK_SIZE */
+    uint64_t generation; /* read_generation when the map was made */
+  };
+  std::atomic<read_map*> rmap{NULL};
+  std::atomic<uint64_t> read_generation{1};
+  std::mutex rmap_mtx;
+  std::vector<read_map*> rmap_all;      /* every map ever made, freed at the end */
+  std::vector<std::pair<void*, size_t>> rmap_mappings;
+  std::atomic<bool> rmap_failed{false}; /* mmap did not work, use the FILE */
+  std::mutex slow_mtx;                  /* the FILE path is shared by all threads */
+
+  /* Make a new map of the file if the file changed since the last one. */
+  const read_map *refresh_read_map() {
+    std::lock_guard<std::mutex> guard(rmap_mtx);
+    const uint64_t gen = read_generation.load(std::memory_order_acquire);
+    read_map *cur = rmap.load(std::memory_order_acquire);
+    if(cur != NULL && cur->generation == gen) {
+      return cur;
+    }
+    const uint64_t *base = NULL;
+    size_t len = 0;
+    int fd = ::open(fname.c_str(), O_RDONLY);
+    if(fd >= 0) {
+      struct stat st;
+      if(fstat(fd, &st) == 0 && st.st_size >= (off_t)BLOCK_SIZE) {
+        len = ((size_t)st.st_size / BLOCK_SIZE) * BLOCK_SIZE;
+        void *addr = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+        if(addr == MAP_FAILED) {
+          len = 0;
+          rmap_failed = true;
+        } else {
+          base = static_cast<const uint64_t *>(addr);
+          rmap_mappings.emplace_back(addr, len);
+        }
+      }
+      ::close(fd);
+    } else {
+      rmap_failed = true;
+    }
+    read_map *fresh = new read_map{base, len, gen};
+    rmap_all.push_back(fresh);
+    rmap.store(fresh, std::memory_order_release);
+    return fresh;
+  }
+
+  void file_changed() {
+    read_generation.fetch_add(1, std::memory_order_release);
+  }
 
 public:
   bool is_dirty() {
@@ -198,6 +265,8 @@ public:
   }
 
 	~sparsebitmap() {
+    for(auto &m : rmap_mappings) munmap(m.first, m.second);
+    for(auto *m : rmap_all) delete m;
     unlock();
     if(fp){ fsync(fileno(fp)); fclose(fp); }
     if(log) { fsync(fileno(log)); fclose(log); }
@@ -257,6 +326,7 @@ public:
     fpos = 0;
     dirty = 0;
     //bitmap_dbug("bits at open: " + std::to_string(bits));
+    file_changed();
 
     return 0;
   }
@@ -277,6 +347,7 @@ public:
     unlock();
     log = NULL;
     fp = NULL;
+    file_changed();
 
     /* release the lock held on the index*/
 
@@ -381,10 +452,45 @@ public:
   }
 
 
-  /* check to see if a particular bit is set */
+  /* check to see if a particular bit is set.  This is called for every row
+     of a scan, so it reads from the memory map of the file (see read_map)
+     and does not take locks or make system calls. */
   inline int is_set(unsigned long long bitnum) {
     assert(bitnum > 0);
-    //bitmap_dbug("is_set: bit " + std::to_string(bitnum));
+    const read_map *m = rmap.load(std::memory_order_acquire);
+    if(m == NULL ||
+       m->generation != read_generation.load(std::memory_order_acquire)) {
+      m = refresh_read_map();
+    }
+    if(rmap_failed) {
+      return is_set_file(bitnum);
+    }
+    int bit_offset;
+    unsigned long long at_byte = ((bitnum / MAX_BITS) + ((bit_offset = (bitnum % MAX_BITS)) != 0) - 1) * BLOCK_SIZE;
+    if(at_byte + BLOCK_SIZE > m->len) {
+      return 0; /* past the end of the file, nothing was ever set there */
+    }
+    const uint64_t word =
+        __atomic_load_n(&m->base[at_byte / BLOCK_SIZE], __ATOMIC_RELAXED);
+    return (word >> bit_offset) & 1;
+  }
+
+  /* True if the file may have a bit set (it is not empty).  A scan does not
+     have to look at the bitmap for every row if this is false. */
+  inline bool may_have_bits() {
+    const read_map *m = rmap.load(std::memory_order_acquire);
+    if(m == NULL ||
+       m->generation != read_generation.load(std::memory_order_acquire)) {
+      m = refresh_read_map();
+    }
+    return rmap_failed || m->len > 0;
+  }
+
+  /* The way bits were read before the memory map, used if the file can not
+     be mapped.  The FILE and the cached block are shared, so one thread at a
+     time. */
+  int is_set_file(unsigned long long bitnum) {
+    std::lock_guard<std::mutex> guard(slow_mtx);
     if(!fp) open(fname, LOCK_SH);
     lock(LOCK_SH);
     

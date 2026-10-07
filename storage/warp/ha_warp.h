@@ -107,6 +107,11 @@
 */
 const uint16_t WARP_VERSION = 2;
 const uint64_t WARP_ROWID_BATCH_SIZE = 100000;
+/* Every handler gets its own run of consecutive row ids, so that the rows a
+   connection writes have ids that are close together (the rows of one scan
+   then touch few blocks of the delete bitmap).  64 ids are one block of the
+   bitmap, and what a handler does not use is lost, so the run is short. */
+const uint64_t WARP_HANDLER_ROWID_BATCH_SIZE = 4096;
 
 #define BLOB_MEMROOT_ALLOC_SIZE 8192
 
@@ -575,6 +580,9 @@ class warp_global_data {
   
   // rowid, trx_id
   std::unordered_map<uint64_t, uint64_t> history_locks;
+  /* Number of history locks created.  While it is zero no row has a history
+     lock and a scan does not have to look for one for every row. */
+  std::atomic<uint64_t> history_lock_count{0};
 
   // write the current state to the state file
   void write();
@@ -615,7 +623,11 @@ class warp_global_data {
   // writes the clean shutdown file
   ~warp_global_data();
   
-  uint64_t get_next_rowid_batch();
+  uint64_t get_next_rowid_batch(uint64_t count = WARP_ROWID_BATCH_SIZE);
+  /* true if any row may have a history lock */
+  bool has_history_locks() const {
+    return history_lock_count.load(std::memory_order_acquire) != 0;
+  }
   uint64_t get_next_trx_id();
   bool is_transaction_open(uint64_t check_trx_id);
   void mark_transaction_closed(uint64_t trx_id);
@@ -728,6 +740,10 @@ class ha_warp : public handler {
 
   bool lock_in_share_mode = false;
   bool lock_for_update = false;
+  /* the row ids this handler has not used yet are local_next_rowid,
+     local_next_rowid - 1 .. , local_rowids_left of them */
+  uint64_t local_next_rowid = 0;
+  uint64_t local_rowids_left = 0;
 
   //std::string unique_check_where_clause = "";
   //bool table_checked_unique_keys = false;
@@ -886,6 +902,11 @@ class ha_warp : public handler {
   int check(THD *thd, HA_CHECK_OPT *check_opt);
   bool is_crashed() const;
   int rnd_end();
+
+  /* count(*) without a condition: reads only the transaction id and row id
+     columns instead of fetching every row, see ha_warp::records */
+  int records(ha_rows *num_rows) override;
+  bool count_visible_rows(ha_rows *num_rows);
   int repair(THD *thd, HA_CHECK_OPT *check_opt);
   int optimize(THD *thd, HA_CHECK_OPT *check_opt);
   /* This is required for SQL layer to know that we support autorepair */
