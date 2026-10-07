@@ -1,0 +1,92 @@
+--echo #
+--echo # The committed transactions are a bitmap on disk (commit_bitmap.warp), a
+--echo # bit for every transaction id, instead of a list that is loaded into
+--echo # memory when the server starts.  Committed transactions stay committed
+--echo # across restarts, transactions that did not commit are not visible, and
+--echo # the list of older versions (commits.warp) is converted once.
+--echo #
+
+CREATE TABLE w (id INT, v INT) ENGINE=WARP;
+INSERT INTO w VALUES (1, 1), (2, 2);
+
+--echo # transactions that commit, roll back and are open
+BEGIN;
+INSERT INTO w VALUES (3, 3), (4, 4);
+COMMIT;
+BEGIN;
+INSERT INTO w VALUES (5, 5);
+ROLLBACK;
+BEGIN;
+INSERT INTO w VALUES (6, 6);
+DELETE FROM w WHERE id = 2;
+COMMIT;
+INSERT INTO w VALUES (7, 7);
+
+connect (con1, localhost, root,,);
+connection con1;
+BEGIN;
+INSERT INTO w VALUES (8, 8);
+connection default;
+
+--echo # the open transaction is not visible to the others
+SELECT id, v FROM w ORDER BY id;
+connection con1;
+SELECT id, v FROM w ORDER BY id;
+connection default;
+--echo # its commit makes the rows visible
+connection con1;
+COMMIT;
+connection default;
+SELECT id, v FROM w ORDER BY id;
+disconnect con1;
+
+--echo # a transaction that is open when the server is killed does not commit
+connect (con2, localhost, root,,);
+connection con2;
+BEGIN;
+INSERT INTO w VALUES (9, 9), (10, 10);
+DELETE FROM w WHERE id = 1;
+connection default;
+--source include/kill_and_restart_mysqld.inc
+disconnect con2;
+--echo # the committed rows are still committed, the open transaction is gone
+SELECT id, v FROM w ORDER BY id;
+
+--echo # after a normal restart
+INSERT INTO w VALUES (11, 11);
+--source include/restart_mysqld.inc
+SELECT id, v FROM w ORDER BY id;
+--list_files $MYSQLTEST_VARDIR/mysqld.1/data commit*.warp
+--list_files $MYSQLTEST_VARDIR/mysqld.1/data commits*
+
+--echo # The list of the committed transactions of older versions is converted
+--source include/shutdown_mysqld.inc
+--perl
+use strict;
+my $dir = "$ENV{MYSQLTEST_VARDIR}/mysqld.1/data";
+open(my $in, '<:raw', "$dir/commit_bitmap.warp") or die "no bitmap: $!";
+my @ids;
+my $block = 0;
+while (read($in, my $buf, 8) == 8) {
+  my $word = unpack('Q<', $buf);
+  for my $offset (0 .. 63) {
+    next unless ($word >> $offset) & 1;
+    push @ids, ($offset == 0 ? ($block + 1) * 64 : $block * 64 + $offset);
+  }
+  ++$block;
+}
+close($in);
+open(my $out, '>:raw', "$dir/commits.warp") or die "can not write the list: $!";
+print $out pack('Q<', $_) foreach sort { $a <=> $b } @ids;
+close($out);
+unlink("$dir/commit_bitmap.warp") or die "can not remove the bitmap: $!";
+print STDERR "converted " . scalar(@ids) . " ids to the old list format\n";
+EOF
+--source include/start_mysqld.inc
+--echo # the same transactions are committed after the conversion
+SELECT id, v FROM w ORDER BY id;
+--list_files $MYSQLTEST_VARDIR/mysqld.1/data commit*.warp*
+INSERT INTO w VALUES (12, 12);
+SELECT COUNT(*) FROM w;
+
+DROP TABLE w;

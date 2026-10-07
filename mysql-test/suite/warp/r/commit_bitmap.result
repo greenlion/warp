@@ -1,0 +1,95 @@
+#
+# The committed transactions are a bitmap on disk (commit_bitmap.warp), a
+# bit for every transaction id, instead of a list that is loaded into
+# memory when the server starts.  Committed transactions stay committed
+# across restarts, transactions that did not commit are not visible, and
+# the list of older versions (commits.warp) is converted once.
+#
+CREATE TABLE w (id INT, v INT) ENGINE=WARP;
+INSERT INTO w VALUES (1, 1), (2, 2);
+# transactions that commit, roll back and are open
+BEGIN;
+INSERT INTO w VALUES (3, 3), (4, 4);
+COMMIT;
+BEGIN;
+INSERT INTO w VALUES (5, 5);
+ROLLBACK;
+BEGIN;
+INSERT INTO w VALUES (6, 6);
+DELETE FROM w WHERE id = 2;
+COMMIT;
+INSERT INTO w VALUES (7, 7);
+BEGIN;
+INSERT INTO w VALUES (8, 8);
+# the open transaction is not visible to the others
+SELECT id, v FROM w ORDER BY id;
+id	v
+1	1
+3	3
+4	4
+6	6
+7	7
+SELECT id, v FROM w ORDER BY id;
+id	v
+1	1
+3	3
+4	4
+6	6
+7	7
+8	8
+# its commit makes the rows visible
+COMMIT;
+SELECT id, v FROM w ORDER BY id;
+id	v
+1	1
+3	3
+4	4
+6	6
+7	7
+8	8
+# a transaction that is open when the server is killed does not commit
+BEGIN;
+INSERT INTO w VALUES (9, 9), (10, 10);
+DELETE FROM w WHERE id = 1;
+# Kill and restart
+# the committed rows are still committed, the open transaction is gone
+SELECT id, v FROM w ORDER BY id;
+id	v
+1	1
+3	3
+4	4
+6	6
+7	7
+8	8
+# after a normal restart
+INSERT INTO w VALUES (11, 11);
+# restart
+SELECT id, v FROM w ORDER BY id;
+id	v
+1	1
+3	3
+4	4
+6	6
+7	7
+8	8
+11	11
+commit_bitmap.warp
+# The list of the committed transactions of older versions is converted
+# restart
+# the same transactions are committed after the conversion
+SELECT id, v FROM w ORDER BY id;
+id	v
+1	1
+3	3
+4	4
+6	6
+7	7
+8	8
+11	11
+commit_bitmap.warp
+commits.warp.converted
+INSERT INTO w VALUES (12, 12);
+SELECT COUNT(*) FROM w;
+COUNT(*)
+8
+DROP TABLE w;

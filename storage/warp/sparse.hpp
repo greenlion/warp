@@ -111,6 +111,15 @@ private:
     read_generation.fetch_add(1, std::memory_order_release);
   }
 
+  /* set_bit_direct writes through a file descriptor of its own */
+  int dfd = -1;
+  std::mutex direct_mtx;
+  unsigned long long direct_size = 0;
+  /* the file grows by this many bytes at a time (a bit per transaction: one
+     step covers 8 million transactions), so that the readers' memory map is
+     replaced rarely */
+  static const unsigned long long DIRECT_GROW_BYTES = 1ULL << 20;
+
 public:
   bool is_dirty() {
     return dirty == 1;
@@ -265,6 +274,7 @@ public:
   }
 
 	~sparsebitmap() {
+    if(dfd >= 0) { fdatasync(dfd); ::close(dfd); dfd = -1; }
     for(auto &m : rmap_mappings) munmap(m.first, m.second);
     for(auto *m : rmap_all) delete m;
     unlock();
@@ -509,6 +519,52 @@ public:
     }
     int retval = (bits >> bit_offset) & 1; 
     return retval ;
+  }
+
+  /* Sets one bit and makes it durable at once: the 8 byte block that holds
+     the bit is read, changed and written back, and the file is synced.  There
+     is no write ahead log and no commit, because a single block is the unit of
+     the change.  This is for bitmaps in which a bit is set by itself, like the
+     bitmap of the committed transactions; the readers (is_set) see the change
+     through their memory map, the file only grows in large steps, which makes
+     them map it again.  Set sync to false and call sync_direct() at the end
+     when many bits are set together.
+      0 = successful write
+     -2 = read/write failure */
+  int set_bit_direct(unsigned long long bitnum, bool sync = true) {
+    assert(bitnum > 0);
+    std::lock_guard<std::mutex> guard(direct_mtx);
+    if(dfd < 0) {
+      dfd = ::open(fname.c_str(), O_RDWR | O_CLOEXEC);
+      if(dfd < 0) return -2;
+      struct stat st;
+      if(fstat(dfd, &st) != 0) return -2;
+      direct_size = st.st_size;
+    }
+    int bit_offset;
+    unsigned long long at_byte = ((bitnum / MAX_BITS) + ((bit_offset = (bitnum % MAX_BITS)) != 0) - 1) * BLOCK_SIZE;
+    if(at_byte + BLOCK_SIZE > direct_size) {
+      const unsigned long long want =
+          ((at_byte + BLOCK_SIZE + DIRECT_GROW_BYTES - 1) / DIRECT_GROW_BYTES) * DIRECT_GROW_BYTES;
+      if(ftruncate(dfd, want) != 0) return -2;
+      direct_size = want;
+      file_changed();
+    }
+    uint64_t block = 0;
+    ssize_t got = pread(dfd, &block, BLOCK_SIZE, at_byte);
+    if(got < 0) return -2;
+    if(got != (ssize_t)BLOCK_SIZE) block = 0;
+    block |= 1ULL << bit_offset;
+    if(pwrite(dfd, &block, BLOCK_SIZE, at_byte) != (ssize_t)BLOCK_SIZE) return -2;
+    if(sync && fdatasync(dfd) != 0) return -2;
+    return 0;
+  }
+
+  /* make the bits set with set_bit_direct(bit, false) durable */
+  int sync_direct() {
+    std::lock_guard<std::mutex> guard(direct_mtx);
+    if(dfd >= 0 && fdatasync(dfd) != 0) return -2;
+    return 0;
   }
 
   /* set a bit in the index */
