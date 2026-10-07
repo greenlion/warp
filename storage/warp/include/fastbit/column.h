@@ -174,6 +174,7 @@ public:
     array_t<double>*  getDoubleArray() const;
     virtual int getValuesArray(void* vals) const;
     virtual ibis::fileManager::storage* getRawData() const;
+    ibis::fileManager::storage* getRawDataImpl(bool pin) const;
     virtual bool hasRawData() const;
     int  getDataflag() const {return dataflag;}
     void setDataflag(int df) {dataflag = df;}

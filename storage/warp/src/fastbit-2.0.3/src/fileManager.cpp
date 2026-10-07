@@ -102,6 +102,26 @@ template int ibis::fileManager::tryGetFile<float>
 template int ibis::fileManager::tryGetFile<double>
 (char const*, array_t<double>&, ACCESS_PREFERENCE);
 
+// A file that getFile returns is only protected from being removed from the
+// cache (flushDir, flushFile, unload) by the references that the users hold.
+// The raw getFile hands out a pointer after it released the mutex of the
+// file manager, and the user takes its reference some time later (array_t
+// does that in its constructor).  If another thread removes the files of a
+// directory in between, it finds the file unused and deletes it, and the
+// user uses a deleted object.  The callers that ask for it (the array_t
+// versions of getFile) get a reference that is taken while the mutex is
+// held, and drop it again when their own reference is in place.
+namespace {
+thread_local int fbPinRequest = 0;
+thread_local bool fbPinned = false;
+inline void pinForCaller(ibis::fileManager::storage* st) {
+    if (fbPinRequest != 0 && st != 0) {
+        st->beginUse();
+        fbPinned = true;
+    }
+}
+}
+
 // time to wait for other threads to unload files in use
 #ifndef FASTBIT_MAX_WAIT_TIME
 #if defined(DEBUG) || defined(_DEBUG)
@@ -124,15 +144,24 @@ int ibis::fileManager::getFile(const char* name, array_t<T>& arr,
     int ierr;
     try {
         storage *st = 0;
+        fbPinRequest = 1;
+        fbPinned = false;
         ierr = getFile(name, &st, pref);
+        fbPinRequest = 0;
         if (ierr == 0) {
             if (st) {
                 array_t<T> tmp(st);
+                if (fbPinned) st->endUse(); // the array has its own reference
+                fbPinned = false;
                 arr.swap(tmp);
             }
             else {
                 arr.clear();
             }
+        }
+        else if (fbPinned && st != 0) {
+            st->endUse();
+            fbPinned = false;
         }
 
         LOGGER(ibis::gVerbose > 12)
@@ -157,15 +186,24 @@ int ibis::fileManager::tryGetFile(const char* name, array_t<T>& arr,
     int ierr;
     try {
         storage *st = 0;
+        fbPinRequest = 1;
+        fbPinned = false;
         ierr = tryGetFile(name, &st, pref);
+        fbPinRequest = 0;
         if (ierr == 0) {
             if (st) {
                 array_t<T> tmp(st);
+                if (fbPinned) st->endUse(); // the array has its own reference
+                fbPinned = false;
                 arr.swap(tmp);
             }
             else {
                 arr.clear();
             }
+        }
+        else if (fbPinned && st != 0) {
+            st->endUse();
+            fbPinned = false;
         }
 
         LOGGER(ibis::gVerbose > 12)
@@ -177,6 +215,40 @@ int ibis::fileManager::tryGetFile(const char* name, array_t<T>& arr,
     }
     return ierr;
 } // ibis::fileManager::tryGetFile
+
+void ibis::fileManager::makeRoom(uint64_t nbytes) {
+    if (maxBytes == 0 || nbytes + totalBytes() <= maxBytes) return;
+    ibis::util::mutexLock lck(&mutex, "fileManager::makeRoom");
+    (void) unload(nbytes);
+}
+
+int ibis::fileManager::getFilePinned(const char* name, storage** st,
+                                     ACCESS_PREFERENCE pref) {
+    fbPinRequest = 1;
+    fbPinned = false;
+    int ierr = getFile(name, st, pref);
+    fbPinRequest = 0;
+    if (ierr != 0 && fbPinned && st != 0 && *st != 0)
+        (*st)->endUse();
+    if (ierr != 0 && st != 0)
+        *st = 0;
+    fbPinned = false;
+    return ierr;
+}
+
+int ibis::fileManager::tryGetFilePinned(const char* name, storage** st,
+                                        ACCESS_PREFERENCE pref) {
+    fbPinRequest = 1;
+    fbPinned = false;
+    int ierr = tryGetFile(name, st, pref);
+    fbPinRequest = 0;
+    if (ierr != 0 && fbPinned && st != 0 && *st != 0)
+        (*st)->endUse();
+    if (ierr != 0 && st != 0)
+        *st = 0;
+    fbPinned = false;
+    return ierr;
+}
 
 // print the current status of the file manager
 void ibis::fileManager::printStatus(std::ostream& out) const {
@@ -852,14 +924,14 @@ int ibis::fileManager::getFile(const char* name, storage **st,
     // is the named file among those mapped ?
     fileList::iterator it = mapped.find(name);
     if (it != mapped.end()) { // found it
-        *st = (*it).second;
+        *st = (*it).second; pinForCaller(*st);
         return ierr;
     }
 
     // is the named file among those incore
     it = incore.find(name);
     if (it != incore.end()) { // found it
-        *st = (*it).second;
+        *st = (*it).second; pinForCaller(*st);
         return ierr;
     }
 
@@ -877,12 +949,12 @@ int ibis::fileManager::getFile(const char* name, storage **st,
 
         it = mapped.find(name);
         if (it != mapped.end()) {
-            *st = (*it).second;
+            *st = (*it).second; pinForCaller(*st);
             return ierr;
         }
         it = incore.find(name);
         if (it != incore.end()) {
-            *st = (*it).second;
+            *st = (*it).second; pinForCaller(*st);
             return ierr;
         }
         return -110; // the pending read did not succeed. retry?
@@ -1032,7 +1104,7 @@ int ibis::fileManager::getFile(const char* name, storage **st,
             }
         }
 
-        *st = tmp; // pass tmp to the caller
+        *st = tmp; pinForCaller(*st); // pass tmp to the caller
         ierr = 0;
     }
     else {
@@ -1080,14 +1152,14 @@ int ibis::fileManager::tryGetFile(const char* name, storage **st,
     // is the named file among those mapped ?
     fileList::iterator it = mapped.find(name);
     if (it != mapped.end()) { // found it
-        *st = (*it).second;
+        *st = (*it).second; pinForCaller(*st);
         return ierr;
     }
 
     // is the named file among those incore
     it = incore.find(name);
     if (it != incore.end()) { // found it
-        *st = (*it).second;
+        *st = (*it).second; pinForCaller(*st);
         return ierr;
     }
 
@@ -1236,7 +1308,7 @@ int ibis::fileManager::tryGetFile(const char* name, storage **st,
             }
         }
 
-        *st = tmp; // pass tmp to the caller
+        *st = tmp; pinForCaller(*st); // pass tmp to the caller
         ierr = 0;
     }
     else {

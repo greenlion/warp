@@ -1010,7 +1010,13 @@ ibis::array_t<double>* ibis::column::getDoubleArray() const {
 int ibis::column::getValuesArray(void* vals) const {
     if (dataflag < 0) return -1;
     int ierr = 0;
-    ibis::fileManager::storage *tmp = getRawData();
+    ibis::fileManager::storage *tmp = getRawDataImpl(true);
+    // the reference of the pin is given back when this function returns, the
+    // array that is made below has its own
+    struct pinRelease {
+        ibis::fileManager::storage *st;
+        ~pinRelease() {if (st != 0) st->endUse();}
+    } release = {tmp};
     if (tmp != 0) {
         if (vals == 0) return ierr; // return 0 to indicate data in memory
 
@@ -1092,6 +1098,12 @@ bool ibis::column::hasRawData() const {
 
 /// Return the content of base data file as a storage object.
 ibis::fileManager::storage* ibis::column::getRawData() const {
+    return getRawDataImpl(false);
+}
+
+/// If pin is true the storage object is returned with a reference that the
+/// caller has to give back with endUse(), see fileManager::getFilePinned.
+ibis::fileManager::storage* ibis::column::getRawDataImpl(bool pin) const {
     if (dataflag < 0) return 0;
 
     std::string sname;
@@ -1102,7 +1114,8 @@ ibis::fileManager::storage* ibis::column::getRawData() const {
     }
 
     ibis::fileManager::storage *res = 0;
-    int ierr = ibis::fileManager::instance().getFile(fnm, &res);
+    int ierr = (pin ? ibis::fileManager::instance().getFilePinned(fnm, &res)
+                : ibis::fileManager::instance().getFile(fnm, &res));
     if (ierr != 0) {
         logWarning("getRawData",
                    "the file manager faild to retrieve the content "
@@ -4670,8 +4683,18 @@ long ibis::column::selectValuesT(const char* dfn,
         else
             ierr = getValuesArray(&vals);
 
-        if (ierr >= 0)
+        if (ierr >= 0) {
+            // The array refers to the copy of the file in the file cache.
+            // The caller keeps the values, a result table for example, for
+            // as long as it likes, which would keep the file "in use" and
+            // out of reach of the writers that append to it: the next
+            // reader would be given the old copy of the file.  The values
+            // are copied, the file is released.
+            ibis::fileManager::instance().makeRoom
+                (static_cast<uint64_t>(vals.size()) * sizeof(T));
+            vals.nosharing();
             ierr = vals.size();
+        }
         return ierr;
     }
 

@@ -82,6 +82,22 @@ public:
 		ACCESS_PREFERENCE pref=MMAP_LARGE_FILES);
     int tryGetFile(const char* name, storage** st,
 		   ACCESS_PREFERENCE pref=MMAP_LARGE_FILES);
+    /// The same as getFile and tryGetFile, but the storage object is
+    /// returned with one reference that is taken while the mutex of the
+    /// file manager is held.  Without it another thread may remove the file
+    /// from the cache between the return of getFile and the moment the
+    /// caller starts using the object.  The caller has to give the
+    /// reference back with endUse() once it holds its own (an array_t or an
+    /// index object).
+    int getFilePinned(const char* name, storage** st,
+		      ACCESS_PREFERENCE pref=MMAP_LARGE_FILES);
+    int tryGetFilePinned(const char* name, storage** st,
+			 ACCESS_PREFERENCE pref=MMAP_LARGE_FILES);
+    /// Frees up cached files that nobody uses, if needed, so that the memory
+    /// of the given size can be allocated outside of the cache (a copy of
+    /// an array for example).  Memory that is not made with the file manager
+    /// is not made room for, it fails if the cache is full.
+    void makeRoom(uint64_t nbytes);
     static storage* getFileSegment(const char* name, const int fdes,
 				   const off_t b, const off_t e);
 

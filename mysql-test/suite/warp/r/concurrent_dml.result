@@ -1,0 +1,109 @@
+#
+# Several connections change and read a WARP table at the same time.
+#
+# Regression test: this failed with "Out of memory" errors, wrong results and
+# server crashes.  The causes were (1) cond_push kept the condition it was
+# building in static variables that all the connections shared, so a session
+# got the conditions of another one, (2) a scan could read the files of a
+# partition while rows were appended to them, (3) the result of a scan kept
+# the file in the FastBit cache in use, so the files that the writers appended
+# to were read as they were before, (4) a file of the cache could be
+# removed between the moment it was returned and the moment the caller held
+# a reference to it, and (5) a stale index was written over while others
+# had it mapped.
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE w (id INT, v INT) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 8000)
+SELECT x, x % 10 FROM s;
+INSERT INTO i SELECT * FROM w;
+CREATE PROCEDURE churn_w(base INT)
+BEGIN
+DECLARE n INT DEFAULT 0;
+WHILE n < 150 DO
+UPDATE w SET v = v + 1 WHERE id = base + n;
+IF n % 3 = 0 THEN DELETE FROM w WHERE id = base + n; END IF;
+SET n = n + 1;
+END WHILE;
+END|
+CREATE PROCEDURE churn_i(base INT)
+BEGIN
+DECLARE n INT DEFAULT 0;
+WHILE n < 150 DO
+UPDATE i SET v = v + 1 WHERE id = base + n;
+IF n % 3 = 0 THEN DELETE FROM i WHERE id = base + n; END IF;
+SET n = n + 1;
+END WHILE;
+END|
+CREATE PROCEDURE scan_w()
+BEGIN
+DECLARE n INT DEFAULT 0;
+DECLARE c BIGINT;
+WHILE n < 60 DO
+SELECT COUNT(*) INTO c FROM w WHERE id >= 0;
+SELECT SUM(v) INTO c FROM w;
+SELECT COUNT(*) INTO c FROM w;
+SET n = n + 1;
+END WHILE;
+END|
+CREATE PROCEDURE own_range(base INT, OUT wrong INT)
+BEGIN
+DECLARE n INT DEFAULT 0;
+DECLARE c BIGINT;
+SET wrong = 0;
+WHILE n < 150 DO
+SELECT COUNT(*) INTO c FROM w WHERE id BETWEEN base AND base + 99 AND v >= 0;
+IF c <> 100 THEN SET wrong = wrong + 1; END IF;
+SELECT COUNT(*) INTO c FROM w WHERE id >= base AND id < base + 50;
+IF c <> 50 THEN SET wrong = wrong + 1; END IF;
+SELECT COUNT(*) INTO c FROM w WHERE v = 3 AND id BETWEEN base AND base + 9;
+IF c <> 1 THEN SET wrong = wrong + 1; END IF;
+SET n = n + 1;
+END WHILE;
+END|
+# The same changes on InnoDB, one after the other
+CALL churn_i(1001);
+CALL churn_i(2001);
+CALL churn_i(3001);
+CALL churn_i(4001);
+# Four sessions change different rows of the table while two scan it
+CALL churn_w(1001);
+CALL churn_w(2001);
+CALL churn_w(3001);
+CALL churn_w(4001);
+CALL scan_w();
+CALL scan_w();
+# The table is what InnoDB has after the same changes
+the table is the same as InnoDB's
+# Six sessions read different ranges with different conditions at the same time
+CALL own_range(1 * 100 + 5000, @wrong);
+CALL own_range(2 * 100 + 5000, @wrong);
+CALL own_range(3 * 100 + 5000, @wrong);
+CALL own_range(4 * 100 + 5000, @wrong);
+CALL own_range(5 * 100 + 5000, @wrong);
+CALL own_range(6 * 100 + 5000, @wrong);
+SELECT @wrong;
+@wrong
+0
+SELECT @wrong;
+@wrong
+0
+SELECT @wrong;
+@wrong
+0
+SELECT @wrong;
+@wrong
+0
+SELECT @wrong;
+@wrong
+0
+SELECT @wrong;
+@wrong
+0
+DROP PROCEDURE churn_w;
+DROP PROCEDURE churn_i;
+DROP PROCEDURE scan_w;
+DROP PROCEDURE own_range;
+DROP TABLE w, i;
