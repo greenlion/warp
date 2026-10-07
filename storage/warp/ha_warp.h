@@ -44,6 +44,7 @@
 #include <map>
 #include <forward_list>
 #include <unordered_map>
+#include <unordered_set>
 #include <time.h>
 
 // MySQL utility includes
@@ -531,7 +532,11 @@ class warp_trx {
      removed whenever the transaction ends: commit, rollback, a read only
      transaction or a connection that goes away. */
   void close_log();
-  ~warp_trx() { close_log(); }
+  ~warp_trx();
+
+  /* true while the transaction is on the list of the open transactions of
+     warp_state */
+  bool open_registered = false;
 };
 
 class warp_global_data {
@@ -545,7 +550,10 @@ class warp_global_data {
   char history_lock_writing = 0;
   std::string shutdown_clean_file = "shutdown_clean.warp";
   std::string warp_state_file     = "state.warp";
+  /* the committed transactions of older versions: a list of 8 byte numbers */
   std::string commit_filename     = "commits.warp";
+  /* the bitmap of the committed transactions */
+  std::string commit_bitmap_file  = "commit_bitmap.warp";
   std::string delete_bitmap_file  = "deletes.warp";
 
   uint64_t rowid_batch_size = 10000;
@@ -611,11 +619,27 @@ class warp_global_data {
   
 
   public:
-  //sparsebitmap* commit_bitmap = NULL;
+  /* One bit for each committed transaction (the bit number is the
+     transaction id).  This replaces the list of the committed transactions
+     that was kept in memory, which grew with every transaction. */
+  sparsebitmap* commit_bitmap = NULL;
   sparsebitmap* delete_bitmap = NULL;
-  
-  std::unordered_map<uint64_t, int> commit_list;
-  FILE* commit_file;
+
+  /* The transactions that are open for writes, they may commit or roll
+     back.  A transaction that is neither open nor has its bit set in the
+     commit bitmap rolled back, or did not write.  The set only has the
+     transactions that exist at the moment, protected by commit_mtx. */
+  std::unordered_set<uint64_t> open_trx;
+
+  /* true if the transaction committed */
+  bool is_trx_committed(uint64_t trx_id) {
+    return commit_bitmap != NULL && commit_bitmap->is_set(trx_id);
+  }
+  /* the transaction ended (commit or rollback) and is not open any more */
+  void unregister_open_trx(uint64_t trx_id);
+  /* converts the list of the committed transactions of older versions
+     (commits.warp) to the bitmap */
+  bool migrate_commit_list();
   
   // opens and reads the state file.  
   // if the on-disk version of data is older than the current verion

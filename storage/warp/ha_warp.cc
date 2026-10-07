@@ -4360,6 +4360,7 @@ int ha_warp::external_lock(THD *thd, int lock_type){
       // keys in transactions doing concurrent inserts
       if(!current_trx->dirty) {
         warp_state->register_open_trx(current_trx->trx_id);
+        current_trx->open_registered = true;
         current_trx->dirty = true;
       }
     } 
@@ -4392,6 +4393,22 @@ void warp_trx::open_log() {
       assert(false);
     }
   }
+}
+
+/* a transaction object that goes away without commit or rollback (a failed
+   autocommit statement, for example) must not stay on the list of open
+   transactions, others would wait for it */
+warp_trx::~warp_trx() {
+  close_log();
+  if(open_registered && warp_state != NULL) {
+    warp_state->unregister_open_trx(trx_id);
+  }
+}
+
+void warp_global_data::unregister_open_trx(uint64_t trx_id) {
+  commit_mtx.lock();
+  open_trx.erase(trx_id);
+  commit_mtx.unlock();
 }
 
 void warp_trx::close_log() {
@@ -4455,15 +4472,11 @@ void warp_global_data::cleanup_history_locks() {
   history_lock_mtx.lock();
 
   uint64_t oldest_open_trx_id = 0;
-  auto trx_it = commit_list.begin();
-  while(trx_it != commit_list.end()) {
-    dbug("trx_id: " << trx_it->first << ", state: " << trx_it->second);
-    if(trx_it->second == WARP_UNCOMMITTED_TRX) {
-      if(oldest_open_trx_id < trx_it->first) {
-        oldest_open_trx_id = trx_it->first;
-      }
+  for(auto trx_it = open_trx.begin(); trx_it != open_trx.end(); ++trx_it) {
+    dbug("open trx_id: " << *trx_it);
+    if(oldest_open_trx_id < *trx_it) {
+      oldest_open_trx_id = *trx_it;
     }
-    ++trx_it;
   }
   dbug("Oldest open trx: " << oldest_open_trx_id);
      
@@ -4484,14 +4497,6 @@ void warp_global_data::cleanup_history_locks() {
     ++history_lock_it;
   }
   
-  // remove the rolled back trx from the commit list
-  trx_it = commit_list.begin();
-  while(trx_it != commit_list.end()) {
-    if(trx_it->first < oldest_open_trx_id && trx_it->second == WARP_ROLLED_BACK_TRX) {
-      commit_list.erase(trx_it);
-    }
-  }
-
   history_lock_mtx.unlock();
   commit_mtx.unlock();
 #endif
@@ -4505,11 +4510,10 @@ void warp_trx::commit() {
   uint64_t rowid = 0;
   char marker;
   
-  auto commit_it = warp_state->commit_list.find(trx_id);
   if(dirty) {
   
-    if(commit_it == warp_state->commit_list.end()) {
-      sql_print_error("Open transaction not in commit list");
+    if(warp_state->open_trx.find(trx_id) == warp_state->open_trx.end()) {
+      sql_print_error("Open transaction is not registered as open");
       assert(false);
     }
 
@@ -4559,19 +4563,16 @@ void warp_trx::commit() {
       assert(false);
     }
     
-    // mark the transaction committed
-    int sz = fwrite(&trx_id, sizeof(trx_id), 1, warp_state->commit_file);
-    if(sz != 1) {
-      sql_print_error("Failed to write to commits file");
+    // mark the transaction committed: set its bit in the commit bitmap and
+    // make sure it is on disk
+    if(warp_state->commit_bitmap->set_bit_direct(trx_id) != 0) {
+      sql_print_error("Failed to write to the commit bitmap");
       assert(false);
     }
-    // ensure commit marker is on disk
-    fflush(warp_state->commit_file);
-    fsync(fileno(warp_state->commit_file));
-    
-    commit_it->second = WARP_COMMITTED_TRX;
-    
-    
+
+    // the transaction is not open any more
+    warp_state->open_trx.erase(trx_id);
+    open_registered = false;
   }
   close_log();
   
@@ -4581,13 +4582,12 @@ void warp_trx::commit() {
 // used when a transaction or statement rolls back
 void warp_trx::rollback(bool all) {
   commit_mtx.lock();
-  auto commit_it = warp_state->commit_list.find(trx_id);
   size_t savepoint_at = 0;
   uint64_t rowid = 0;
   char marker;
   if(dirty) {
-    if(commit_it == warp_state->commit_list.end()) {
-      sql_print_error("Open transaction not in commit list");
+    if(warp_state->open_trx.find(trx_id) == warp_state->open_trx.end()) {
+      sql_print_error("Open transaction is not registered as open");
       assert(false);
     }
     int sz;
@@ -4662,9 +4662,10 @@ void warp_trx::rollback(bool all) {
       fsync(fileno(log));
     }
   } else {
-    /* TRX rollback removes the trx from the commit list */
-
-    commit_it->second = WARP_ROLLED_BACK_TRX;
+    /* a rolled back transaction is not open any more and its bit in the
+       commit bitmap is never set, so its rows are not visible */
+    warp_state->open_trx.erase(trx_id);
+    open_registered = false;
     close_log();
   } 
 
@@ -4792,7 +4793,6 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
 
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
-  auto commit_it = warp_state->commit_list.find(row_trx_id);
   
   //dbug("trx_id:" << current_trx->trx_id << " row_trx_id: " << row_trx_id);
 
@@ -4802,24 +4802,17 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
     return is_trx_visible;
   }
   
-  /* not on the commit list so it was rolled back or not recovered */
-  if(commit_it == warp_state->commit_list.end()) {
+  /* Only the rows of committed transactions are visible to others.  If the
+     bit of the transaction is not set it is still open, was rolled back or
+     could not be recovered (transaction ids start at 1). */
+  if(row_trx_id == 0 || !warp_state->is_trx_committed(row_trx_id)) {
     is_trx_visible = false;
     return is_trx_visible;
   }
 
-  if(commit_it->second == WARP_ROLLED_BACK_TRX) {
-    is_trx_visible = false;
-    return is_trx_visible;
-  }
-
-  /* older trx are only visible if committed */
+  /* older trx are visible if committed */
   if(row_trx_id < current_trx->trx_id) {
-    if(commit_it->second == false) {
-      is_trx_visible = false;
-    } else {
-      is_trx_visible = true;
-    }
+    is_trx_visible = true;
     return is_trx_visible;
   }
 
@@ -4829,8 +4822,8 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
     return is_trx_visible;
   }
 
-  // if RC or RU if the trx is committed it is visible
-  is_trx_visible = commit_it->second;
+  // if RC or RU and the trx is committed it is visible
+  is_trx_visible = true;
   return is_trx_visible;
 
 }
@@ -4982,22 +4975,24 @@ warp_global_data::warp_global_data() {
   // this file will be rewritten at clean shutdown
   unlink(shutdown_clean_file.c_str());
  
-  commit_file = fopen(commit_filename.c_str(), "ab+");
-   if(!commit_file) {  
-     sql_print_error("Could not open commit file: %s", commit_filename.c_str());
+  /* The committed transactions are a bitmap, a bit for every transaction
+     id, which is read through a memory map.  Nothing has to be loaded here.
+     The file is created if it does not exist. */
+  try {
+    commit_bitmap = new sparsebitmap(commit_bitmap_file, LOCK_SH);
+  } catch(...) {
+    sql_print_error("Could not open commit bitmap: %s", commit_bitmap_file.c_str());
     assert(false);
   }
- 
-  fseek(commit_file, 0, SEEK_SET);
-  int sz = 0;
-  uint64_t trx_id;
 
-  /* load list of committed transactions to the commit list */
-  while( (sz = fread(&trx_id, sizeof(trx_id), 1, commit_file)) == 1) {
-     commit_list.emplace(std::pair<uint64_t, bool>(trx_id, true));
+  /* older versions kept a list of the committed transaction ids */
+  if(!migrate_commit_list()) {
+    sql_print_error("Could not convert %s to the commit bitmap %s",
+                    commit_filename.c_str(), commit_bitmap_file.c_str());
+    assert(false);
   }
   
-  // this will create the commits.warp bitmap if it does not exist
+  // this will create the deletes.warp bitmap if it does not exist
   try {
      delete_bitmap = new sparsebitmap(delete_bitmap_file, LOCK_SH); 
   } catch(...) {
@@ -5018,6 +5013,46 @@ warp_global_data::warp_global_data() {
   // ALL OK - DATABASE IS OPEN AND INITIALIZED!
 }
 
+/* The versions of WARP before the commit bitmap kept the committed
+   transactions in the file commits.warp, a list of 8 byte transaction ids,
+   which was loaded into memory when the server started.  The ids of the list
+   are set in the commit bitmap and the file is renamed so that this is done
+   once.  Returns false if the list could not be converted. */
+bool warp_global_data::migrate_commit_list() {
+  struct stat st;
+  if(stat(commit_filename.c_str(), &st) != 0) {
+    return true; /* nothing to convert */
+  }
+  FILE *old_list = fopen(commit_filename.c_str(), "rb");
+  if(old_list == NULL) {
+    return false;
+  }
+  uint64_t trx_id = 0;
+  uint64_t converted = 0;
+  while(fread(&trx_id, sizeof(trx_id), 1, old_list) == 1) {
+    if(trx_id == 0) {
+      continue;
+    }
+    if(commit_bitmap->set_bit_direct(trx_id, false) != 0) {
+      fclose(old_list);
+      return false;
+    }
+    ++converted;
+  }
+  fclose(old_list);
+  if(commit_bitmap->sync_direct() != 0) {
+    return false;
+  }
+  std::string converted_name = commit_filename + ".converted";
+  if(rename(commit_filename.c_str(), converted_name.c_str()) != 0) {
+    return false;
+  }
+  sql_print_information("WARP: converted %llu committed transactions from %s to the commit bitmap %s",
+                        (unsigned long long)converted, commit_filename.c_str(),
+                        commit_bitmap_file.c_str());
+  return true;
+}
+
 /* Check the state of the database. 
   1) the state file must exist
   2) the state file must be the correct size
@@ -5034,15 +5069,20 @@ warp_global_data::warp_global_data() {
 bool warp_global_data::check_state() {
   struct stat st;
   int state_exists = (stat(warp_state_file.c_str(), &st) == 0);
-  int commit_file_exists = (stat(commit_filename.c_str(), &st) == 0);
+  /* the committed transactions are in the commit bitmap, or in the list of
+     older versions that is converted when the server starts */
+  int commit_file_exists = (stat(commit_bitmap_file.c_str(), &st) == 0) ||
+                           (stat(commit_filename.c_str(), &st) == 0);
 
   if((state_exists && !commit_file_exists)) {
-    sql_print_error("warp_state found but commits.warp is missing! Database can not be initialized.");
+    sql_print_error("warp_state found but the commit bitmap (%s) is missing! Database can not be initialized.",
+                    commit_bitmap_file.c_str());
     return false;
   } 
   
   if((!state_exists && commit_file_exists)) {
-    sql_print_error("commits.warp is found but warp_state is missing! Database can not be initialized.");
+    sql_print_error("the commit bitmap (%s) is found but warp_state is missing! Database can not be initialized.",
+                    commit_bitmap_file.c_str());
     return false;
   } 
   
@@ -5072,29 +5112,21 @@ uint64_t warp_global_data::get_next_rowid_batch(uint64_t count) {
   return next_rowid;
 }
 
-/* Only transactions that are for write are registered on the transaction list
+/* Only transactions that are for write are registered as open
    called in ::external_lock when a transaction first makes changes
 */
 void warp_global_data::register_open_trx(uint64_t trx_id) {
   commit_mtx.lock();
-  commit_list.emplace(std::pair<uint64_t, int>(trx_id, WARP_UNCOMMITTED_TRX));
+  open_trx.insert(trx_id);
   commit_mtx.unlock();
 }
 
-/* if trx not on commit list it is could be either rolled back or has not made any changes yet
-   if trx is on commit list and is WARP_UNCOMMITTED_TRX then the transaction is open for writes
-   if it is any other value then the transaction is not open anymore and has committed or
-   rolled back - it will be removed when the history locks are cleaned up...
+/* A transaction is open if it made changes and has not committed or rolled
+   back yet.  Committed transactions have their bit set in the commit bitmap.
 */
 bool warp_global_data::is_transaction_open(uint64_t trx_id) {
-  bool retval = false;
   commit_mtx.lock();
-  auto commit_it = commit_list.find(trx_id);
-  if(commit_it == commit_list.end()) {
-    retval = false;
-  } else {
-    retval = (commit_it->second == WARP_UNCOMMITTED_TRX);
-  }
+  bool retval = (open_trx.find(trx_id) != open_trx.end());
   commit_mtx.unlock();
   return retval;
 }
@@ -5522,7 +5554,8 @@ uint64_t warp_global_data::get_history_lock(uint64_t rowid) {
 }
 
 warp_global_data::~warp_global_data() {
-  fclose(commit_file);
+  delete commit_bitmap;
+  commit_bitmap = NULL;
   /*
   if(commit_bitmap->close(1) != 0) {
     sql_print_error("Could not close bitmap %s", commit_bitmap->get_fname().c_str());
