@@ -182,6 +182,7 @@ ibis::index* ibis::index::create(const ibis::column* c, const char* dfname,
 
     if (dfname != 0 && *dfname != 0) { // first attempt to read the index
         ibis::fileManager::storage* st=0;
+        bool stPinned = false; // st has a reference of the caller
         std::string file;
         const char* header = 0;
         char buf[12];
@@ -235,7 +236,9 @@ ibis::index* ibis::index::create(const ibis::column* c, const char* dfname,
             }
             if (useGetFile) {
                 // manage the index file as a whole
-                ierr = ibis::fileManager::instance().tryGetFile
+                // the file is pinned until the index object has its own
+                // reference, see fileManager::getFilePinned
+                ierr = ibis::fileManager::instance().tryGetFilePinned
                     (file.c_str(), &st, prf);
                 if (ierr != 0) {
                     LOGGER(ibis::gVerbose > 6)
@@ -243,8 +246,10 @@ ibis::index* ibis::index::create(const ibis::column* c, const char* dfname,
                         << ") failed with return code " << ierr;
                     st = 0;
                 }
-                if (st)
+                if (st) {
                     header = st->begin();
+                    stPinned = true;
+                }
             }
             if (header == 0) {
                 // attempt to read the file using read(2)
@@ -284,6 +289,10 @@ ibis::index* ibis::index::create(const ibis::column* c, const char* dfname,
                     tm4.start();
                 ind = readOld(c, file.c_str(), st,
                               static_cast<INDEX_TYPE>(header[5]));
+                if (stPinned) { // the index has its own reference now
+                    st->endUse();
+                    stPinned = false;
+                }
                 if (ind == 0) {
                     LOGGER(ibis::gVerbose > 0)
                         << "Warning -- " << evt
@@ -303,6 +312,8 @@ ibis::index* ibis::index::create(const ibis::column* c, const char* dfname,
                 }
             }
         }
+        if (stPinned && st != 0) // the file was not used
+            st->endUse();
     } // if (dfname != 0 && *dfname != 0)
     if (ind != 0) // successfully read an index
         return ind;

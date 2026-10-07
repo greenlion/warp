@@ -1,0 +1,164 @@
+--echo #
+--echo # Several connections change and read a WARP table at the same time.
+--echo #
+--echo # Regression test: this failed with "Out of memory" errors, wrong results and
+--echo # server crashes.  The causes were (1) cond_push kept the condition it was
+--echo # building in static variables that all the connections shared, so a session
+--echo # got the conditions of another one, (2) a scan could read the files of a
+--echo # partition while rows were appended to them, (3) the result of a scan kept
+--echo # the file in the FastBit cache in use, so the files that the writers appended
+--echo # to were read as they were before, (4) a file of the cache could be
+--echo # removed between the moment it was returned and the moment the caller held
+--echo # a reference to it, and (5) a stale index was written over while others
+--echo # had it mapped.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE w (id INT, v INT) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 8000)
+  SELECT x, x % 10 FROM s;
+INSERT INTO i SELECT * FROM w;
+
+DELIMITER |;
+CREATE PROCEDURE churn_w(base INT)
+BEGIN
+  DECLARE n INT DEFAULT 0;
+  WHILE n < 150 DO
+    UPDATE w SET v = v + 1 WHERE id = base + n;
+    IF n % 3 = 0 THEN DELETE FROM w WHERE id = base + n; END IF;
+    SET n = n + 1;
+  END WHILE;
+END|
+CREATE PROCEDURE churn_i(base INT)
+BEGIN
+  DECLARE n INT DEFAULT 0;
+  WHILE n < 150 DO
+    UPDATE i SET v = v + 1 WHERE id = base + n;
+    IF n % 3 = 0 THEN DELETE FROM i WHERE id = base + n; END IF;
+    SET n = n + 1;
+  END WHILE;
+END|
+CREATE PROCEDURE scan_w()
+BEGIN
+  DECLARE n INT DEFAULT 0;
+  DECLARE c BIGINT;
+  WHILE n < 60 DO
+    SELECT COUNT(*) INTO c FROM w WHERE id >= 0;
+    SELECT SUM(v) INTO c FROM w;
+    SELECT COUNT(*) INTO c FROM w;
+    SET n = n + 1;
+  END WHILE;
+END|
+# Every session counts the rows of its own range with a condition of its own.
+# If a session got the condition of another one the count would be wrong.
+CREATE PROCEDURE own_range(base INT, OUT wrong INT)
+BEGIN
+  DECLARE n INT DEFAULT 0;
+  DECLARE c BIGINT;
+  SET wrong = 0;
+  WHILE n < 150 DO
+    SELECT COUNT(*) INTO c FROM w WHERE id BETWEEN base AND base + 99 AND v >= 0;
+    IF c <> 100 THEN SET wrong = wrong + 1; END IF;
+    SELECT COUNT(*) INTO c FROM w WHERE id >= base AND id < base + 50;
+    IF c <> 50 THEN SET wrong = wrong + 1; END IF;
+    SELECT COUNT(*) INTO c FROM w WHERE v = 3 AND id BETWEEN base AND base + 9;
+    IF c <> 1 THEN SET wrong = wrong + 1; END IF;
+    SET n = n + 1;
+  END WHILE;
+END|
+DELIMITER ;|
+
+--echo # The same changes on InnoDB, one after the other
+CALL churn_i(1001);
+CALL churn_i(2001);
+CALL churn_i(3001);
+CALL churn_i(4001);
+
+--echo # Four sessions change different rows of the table while two scan it
+connect (c1, localhost, root,,);
+connect (c2, localhost, root,,);
+connect (c3, localhost, root,,);
+connect (c4, localhost, root,,);
+connect (r1, localhost, root,,);
+connect (r2, localhost, root,,);
+connection c1;
+--send CALL churn_w(1001)
+connection c2;
+--send CALL churn_w(2001)
+connection c3;
+--send CALL churn_w(3001)
+connection c4;
+--send CALL churn_w(4001)
+connection r1;
+--send CALL scan_w()
+connection r2;
+--send CALL scan_w()
+connection c1;
+--reap
+connection c2;
+--reap
+connection c3;
+--reap
+connection c4;
+--reap
+connection r1;
+--reap
+connection r2;
+--reap
+connection default;
+disconnect c1;
+disconnect c2;
+disconnect c3;
+disconnect c4;
+disconnect r1;
+disconnect r2;
+
+--echo # The table is what InnoDB has after the same changes
+let $w = `SELECT CONCAT(COUNT(*), ':', SUM(v)) FROM w`;
+let $i = `SELECT CONCAT(COUNT(*), ':', SUM(v)) FROM i`;
+if ($w != $i)
+{
+  --echo MISMATCH after the concurrent changes: WARP $w, InnoDB $i
+}
+if ($w == $i)
+{
+  --echo the table is the same as InnoDB's
+}
+
+--echo # Six sessions read different ranges with different conditions at the same time
+connect (s1, localhost, root,,);
+connect (s2, localhost, root,,);
+connect (s3, localhost, root,,);
+connect (s4, localhost, root,,);
+connect (s5, localhost, root,,);
+connect (s6, localhost, root,,);
+let $s = 1;
+while ($s <= 6)
+{
+  connection s$s;
+  --send_eval CALL own_range($s * 100 + 5000, @wrong)
+  inc $s;
+}
+let $s = 1;
+while ($s <= 6)
+{
+  connection s$s;
+  --reap
+  SELECT @wrong;
+  inc $s;
+}
+connection default;
+let $s = 1;
+while ($s <= 6)
+{
+  disconnect s$s;
+  inc $s;
+}
+
+DROP PROCEDURE churn_w;
+DROP PROCEDURE churn_i;
+DROP PROCEDURE scan_w;
+DROP PROCEDURE own_range;
+DROP TABLE w, i;

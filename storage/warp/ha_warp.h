@@ -210,9 +210,6 @@ static MYSQL_SYSVAR_UINT(
   0
 );
 
-bool is_update = false;
-std::vector<uint32_t> update_column_set;
-std::vector<uint32_t> nullable_column_set;
 /*
 static MYSQL_SYSVAR_ULONGLONG(
   lock_wait_timeout,
@@ -728,9 +725,6 @@ std::unordered_map<const char*, uint64_t> get_table_counts_in_schema(char* table
 const char* get_table_with_most_rows(std::unordered_map<const char*, uint64_t>* table_counts, std::unordered_map<std::string, bool> query_tables = {});
 uint64_t get_least_row_count(std::unordered_map<const char*, uint64_t>* table_counts);
 bool has_empty_table(std::unordered_map<const char*, uint64_t>* table_counts);
-//If any table is empty or limit 0 then abort the scan
-bool abort_query = false;
-bool full_partition_scan = false;
 warp_trx* warp_get_trx(handlerton* hton, THD* thd);
 
 //This is the handler where the majority of the work is done.  Handles
@@ -758,6 +752,9 @@ class ha_warp : public handler {
 
   ibis::partList* partitions = NULL;
   ibis::partList::iterator part_it;
+  /* the scan reads the partitions one after the other, without a join.  A
+     member: a global is changed by the scans of the other connections */
+  bool full_partition_scan = false;
 
   void update_row_count();
   int reset_table();
@@ -790,6 +787,7 @@ class ha_warp : public handler {
   bool take_prefetched(const std::string& datadir, ibis::table** base,
                        ibis::table** filtered);
   void discard_prefetched();
+  void release_scanned_table();
   void open_deleted_bitmap(int lock_mode = LOCK_SH);
   void close_deleted_bitmap();
   bool is_deleted(uint64_t rowid);

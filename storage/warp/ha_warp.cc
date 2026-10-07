@@ -172,6 +172,79 @@ struct st_mysql_storage_engine warp_storage_engine = { MYSQL_HANDLERTON_INTERFAC
 static int warp_init_func(void *p);
 static int warp_done_func(void *p);
 
+/* The data files of a table: readers and writers.
+
+   A writer appends rows to the column files of a partition one column after
+   the other and updates the row count of the partition.  A scan that opens
+   the partition at that moment sees a row count that the column files do not
+   have yet (bord::append could only add 8005 of 8006 values, error -19) and
+   fails.  Scans and the other code that read the data files hold the lock of
+   the table shared while they do that, the writer holds it exclusive.  The
+   rows that a scan returns are in memory (a table that select made), so
+   the lock is not held while they are returned.
+
+   The locks are kept by the name of the data directory of the table, so
+   code that only has the name (the dimension table of a join) finds the same
+   lock.  A thread that holds a lock for reading does not take it again. */
+static std::shared_ptr<std::shared_mutex> warp_table_lock(const char *data_dir) {
+  static std::mutex registry_mtx;
+  static std::unordered_map<std::string, std::shared_ptr<std::shared_mutex>> registry;
+  std::lock_guard<std::mutex> guard(registry_mtx);
+  auto it = registry.find(data_dir);
+  if(it == registry.end()) {
+    it = registry.emplace(std::string(data_dir), std::make_shared<std::shared_mutex>()).first;
+  }
+  return it->second;
+}
+
+static thread_local std::unordered_map<const std::shared_mutex *, int> warp_read_locks_held;
+
+class warp_table_read_lock {
+ public:
+  explicit warp_table_read_lock(const char *data_dir)
+      : lock_(warp_table_lock(data_dir)) {
+    if(warp_read_locks_held[lock_.get()]++ == 0) {
+      lock_->lock_shared();
+    }
+  }
+  ~warp_table_read_lock() {
+    auto it = warp_read_locks_held.find(lock_.get());
+    if(--(it->second) == 0) {
+      warp_read_locks_held.erase(it);
+      lock_->unlock_shared();
+    }
+  }
+  warp_table_read_lock(const warp_table_read_lock &) = delete;
+  warp_table_read_lock &operator=(const warp_table_read_lock &) = delete;
+
+ private:
+  std::shared_ptr<std::shared_mutex> lock_;
+};
+
+class warp_table_write_lock {
+ public:
+  explicit warp_table_write_lock(const char *data_dir)
+      : lock_(warp_table_lock(data_dir)) {
+    /* a thread that reads can not wait for the writers, it would wait
+       for itself */
+    if(warp_read_locks_held.find(lock_.get()) == warp_read_locks_held.end()) {
+      lock_->lock();
+      locked_ = true;
+    } else {
+      sql_print_warning("WARP: rows are written by a thread that is reading %s", data_dir);
+    }
+  }
+  ~warp_table_write_lock() {
+    if(locked_) lock_->unlock();
+  }
+  warp_table_write_lock(const warp_table_write_lock &) = delete;
+  warp_table_write_lock &operator=(const warp_table_write_lock &) = delete;
+
+ private:
+  std::shared_ptr<std::shared_mutex> lock_;
+  bool locked_ = false;
+};
+
 /* Status variables: Warp_history_locks is the number of history locks that
    exist (see warp_global_data::cleanup_history_locks), Warp_active_transactions
    the number of transactions that exist (read only ones too) */
@@ -547,19 +620,7 @@ int ha_warp::set_column_set() {
   */
   column_set += "r,t";
 
-  update_column_set.clear();
-  nullable_column_set.clear();
   count=0;
-  for (Field **field = table->field; *field; field++) {
-    if(bitmap_is_set(table->write_set, (*field)->field_index())) { 
-      update_column_set.push_back((*field)->field_index());
-    }
-    if((*field)->is_nullable()) {
-        nullable_column_set.push_back(1);
-    } else {
-       nullable_column_set.push_back(0);
-    }
-  }
 
   DBUG_RETURN(count + 1);
 }
@@ -786,14 +847,14 @@ int ha_warp::reset_table() {
 
 void ha_warp::update_row_count() {
   DBUG_ENTER("ha_warp::row_count");
-  if(base_table == NULL) {
-    base_table = new ibis::mensa(share->data_dir_name);
-  }
-
-  stats.records = base_table->nRows();
-
-  //delete base_table;
-  //base_table = NULL;
+  /* The table is only opened to count the rows.  It must not be kept: it
+     holds the column files of the partitions in the FastBit cache, and as long
+     as one connection with the table open does that, the files the writers
+     append to can not be removed from the cache (they are "in use") and the
+     scans that follow read the old copy with the new number of rows. */
+  warp_table_read_lock data_lock(share->data_dir_name);
+  std::unique_ptr<ibis::mensa> counted(new ibis::mensa(share->data_dir_name));
+  stats.records = counted->nRows();
   DBUG_VOID_RETURN;
 }
 
@@ -910,6 +971,8 @@ int ha_warp::write_buffered_rows_to_disk() {
   mysql_mutex_lock(&share->mutex);
 
   try {
+    /* no scan reads the partition while it is written */
+    warp_table_write_lock data_lock(share->data_dir_name);
     std::string part_dir = get_writer_partition();
     std::string part_name = part_dir.substr(part_dir.find_last_of('/') + 1);
     int written = writer->write(part_dir.c_str(), part_name.c_str());
@@ -918,6 +981,10 @@ int ha_warp::write_buffered_rows_to_disk() {
                       part_dir.c_str(), written);
       rc = HA_ERR_INTERNAL_ERROR;
     }
+    /* The rows were appended to the column files.  A copy of a file that is in
+       the FastBit cache is shorter than the file now, and the scans that
+       come later would read the old copy with the new row count. */
+    ibis::fileManager::instance().flushDir(part_dir.c_str());
   } catch(...) {
     sql_print_error("WARP: out of memory writing the buffered rows of %s.  The FastBit "
                     "cache (warp_cache_size = %llu bytes) may be too small.",
@@ -1038,7 +1105,6 @@ int ha_warp::write_row_impl(uchar *buf) {
 // scans this verion of the row will not be visible to this or 
 // newer transactions and will be visible to older transactions.
 int ha_warp::update_row(const uchar *, uchar *new_data) {
-  is_update=true;
   DBUG_ENTER("ha_warp::update_row");
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
@@ -1077,7 +1143,6 @@ int ha_warp::update_row(const uchar *, uchar *new_data) {
   }
   
   ha_statistic_increment(&System_status_var::ha_update_count);
-  is_update=false;
 
   
   DBUG_RETURN(retval);
@@ -1284,7 +1349,11 @@ static void warp_release_partition(const char *partition_dir) {
    function does not use the handler, so look ahead threads can run it. */
 static void warp_maintain_partition_indexes(const char *datadir,
                                             const std::vector<uint> &field_indexes) {
-  auto tbl = new ibis::part(datadir);
+  /* the scans that run at the same time would load, rebuild and unload the
+     same index files */
+  static std::mutex maintain_mtx;
+  std::lock_guard<std::mutex> maintain_guard(maintain_mtx);
+  std::unique_ptr<ibis::part> tbl(new ibis::part(datadir));
   for (uint field_index : field_indexes) {
     std::string columnIndexFilename = std::string(datadir) + "/c" + std::to_string(field_index) + ".idx";
     if(file_exists(columnIndexFilename)) {
@@ -1295,11 +1364,14 @@ static void warp_maintain_partition_indexes(const char *datadir,
         if (col->indexedRows() != tbl->nRows() ) {
           // update the index if the existing one does not
           // have the same number of rows as the current data
-          // partition
+          // partition.  The file is removed and made again, not written
+          // over: scans of other connections may have the old file mapped
+          // into memory, and a file that shrinks under a mapping kills the
+          // process.  Those scans keep the old file, and the new one is made
+          // while the lock of the index file is held.
           col->unloadIndex();
-          //col->purgeIndexFile();
-          auto idx = ibis::index::create(col, NULL);
-          delete idx;
+          col->purgeIndexFile();
+          col->loadIndex();
         }
         col->unloadIndex();
       }
@@ -1335,16 +1407,21 @@ bool ha_warp::start_prefetch(const std::string& datadir) {
   }
   const std::string columns = column_set;
   const std::string where = push_where_clause;
+  const std::string table_dir = share->data_dir_name;
   try {
     prefetched_partitions.emplace(datadir, std::async(std::launch::async,
-      [budget, datadir, field_indexes, columns, where]() {
+      [budget, datadir, field_indexes, columns, where, table_dir]() {
         ibis::util::ThreadBudgetScope budget_scope(budget);
         prefetched_partition result;
         try {
+          warp_table_read_lock data_lock(table_dir.c_str());
           result.base_table = ibis::table::create(datadir.c_str());
           if(result.base_table != NULL) {
             warp_maintain_partition_indexes(datadir.c_str(), field_indexes);
             result.filtered_table = result.base_table->select(columns.c_str(), where.c_str());
+            /* the rows were copied, see ha_warp::release_scanned_table */
+            delete result.base_table;
+            result.base_table = NULL;
           }
         } catch(...) {
           delete result.filtered_table;
@@ -1406,6 +1483,20 @@ bool ha_warp::take_prefetched(const std::string& datadir, ibis::table** base,
   *base = result.base_table;
   *filtered = result.filtered_table;
   return true;
+}
+
+/* The table that select was run on is not needed to return the rows, they
+   were copied into filtered_table.  If it were kept until the scan ends, the
+   column and index files of the partition that it uses would stay "in use" in
+   the FastBit cache all that time.  A cached file in use can not be removed,
+   so when another connection appends rows to the partition and its files are
+   flushed from the cache, the old copy of an index (or of a column) stays,
+   and the first statements that follow do not see the new rows. */
+void ha_warp::release_scanned_table() {
+  if(filtered_table != NULL) {
+    delete base_table;
+    base_table = NULL;
+  }
 }
 
 void ha_warp::discard_prefetched() {
@@ -1935,6 +2026,10 @@ int ha_warp::rnd_init(bool) {
     
   } else {
     base_table = NULL;
+    /* The partitions are found by reading their metadata, which a writer that
+       appends to a partition rewrites.  A partition whose metadata is read
+       at that moment is not found, the scan then returns no rows at all. */
+    warp_table_read_lock partitions_lock(share->data_dir_name);
     if( (get_pushdown_info_count(current_thd) > 1 && pushdown_info->is_fact_table) || partition_filter_partition_name != "" ) {
       partitions = new ibis::partList;
     
@@ -2272,6 +2367,9 @@ int ha_warp::rnd_next_impl(uchar *buf) {
   /* The thread budget of the statement is only needed when a partition is
      opened or joins are scheduled, not for every row that is returned, so
      it is installed when it is first needed in this call. */
+  /* the join workers read the partitions of the table in their threads,
+     the lock is held from when they are scheduled until they are done */
+  std::optional<warp_table_read_lock> join_read_lock;
   std::optional<warp_index_build_scope> index_build_scope;
   auto use_thread_budget = [&]() {
     if(!index_build_scope) {
@@ -2285,6 +2383,7 @@ fetch_again:
   
   if( !full_partition_scan && partitions != NULL && bitmap_merge_join_executed == false ) {
     use_thread_budget();
+    join_read_lock.emplace(share->data_dir_name);
     if( std::string((*part_it)->currentDataDir()) == std::string(share->data_dir_name) ) {
       ++part_it;
     }
@@ -2467,6 +2566,9 @@ fetch_again:
     nanosleep(&sleep_time, &remaining_time);
   }
 
+  /* the workers are done with the files */
+  join_read_lock.reset();
+
   /* A failed worker or merge means some partitions were not (completely)
      filtered.  Returning rows from here would give wrong results. */
   {
@@ -2521,6 +2623,7 @@ fetch_again:
           filtered_table == NULL ) {
         /* not read ahead, or the read ahead did not work (for example
            because the cache was busy): read it here */
+        warp_table_read_lock data_lock(share->data_dir_name);
         delete base_table;
         base_table = ibis::table::create(find_it->first.c_str());
         assert(base_table != NULL);
@@ -2528,6 +2631,7 @@ fetch_again:
         // this will do some IO to read in projected columns that where not used for filters
         maintain_indexes(find_it->first.c_str());
         filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
+        release_scanned_table();
       }
       prefetch_following_partitions();
       
@@ -2558,12 +2662,14 @@ fetch_again:
       
       if( !take_prefetched(std::string((*part_it)->currentDataDir()), &base_table, &filtered_table) ||
           filtered_table == NULL ) {
+        warp_table_read_lock data_lock(share->data_dir_name);
         delete base_table;
         base_table = ibis::table::create((*part_it)->currentDataDir());
         assert(base_table != NULL);
       
         maintain_indexes((*part_it)->currentDataDir());
         filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
+        release_scanned_table();
       }
       prefetch_following_partitions();
       
@@ -2695,6 +2801,7 @@ fetch_again:
   }
   
   
+
   // Lock rows during a read if requested
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   int lock_taken = 0;
@@ -2746,6 +2853,9 @@ bool ha_warp::count_visible_rows(ha_rows *num_rows) {
      (pushdown_info->base_table != NULL || !pushdown_info->join_info.empty())) {
     return false;
   }
+
+  /* no row is written while the columns are read */
+  warp_table_read_lock data_lock(share->data_dir_name);
 
   /* the rows are not visible for every transaction, and the cached answer
      of is_trx_visible_to_read must not come from an earlier scan */
@@ -2916,6 +3026,7 @@ int ha_warp::rnd_pos(uchar *buf, uchar *pos) {
     set_column_set();
   }
   rc = HA_ERR_KEY_NOT_FOUND;
+  warp_table_read_lock data_lock(share->data_dir_name);
   base_table = ibis::mensa::create(share->data_dir_name);
   if(base_table != NULL) {
     filtered_table = base_table->select(column_set.c_str(), ("r=" + std::to_string(current_rowid)).c_str());
@@ -2954,6 +3065,7 @@ ulong ha_warp::index_flags(uint, uint, bool) const {
 ha_rows ha_warp::records_in_range(uint, key_range *, key_range *) {
   close_in_extra = true;
   auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
+  warp_table_read_lock data_lock(pushdown_info->datadir);
   auto estimator = ibis::mensa::create(pushdown_info->datadir);
   uint64_t min=0;
   uint64_t max=0;
@@ -3011,6 +3123,7 @@ int ha_warp::index_init(uint idxno) {
     }
   } else {
     if(base_table == NULL) {
+      warp_table_read_lock data_lock(share->data_dir_name);
       base_table = new ibis::mensa(share->data_dir_name);
       idx_filtered_table =
         base_table->select(column_set.c_str(), push_where_clause.c_str());
@@ -3431,10 +3544,15 @@ int warp_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
    This code is called from ha_warp::engine_push in 8.0.20+
 */
 const Item *ha_warp::cond_push(const Item *cond) {
-  static int depth=0;
-  static int unpushed_condition_count = 0;
-  static int condition_count = 0;
-  static std::string where_clause = "";
+  /* This state belongs to the statement that is being planned, it must not be
+     shared: every connection has a thread and pushes its conditions at the
+     same time as the others.  With ordinary static variables the sessions
+     added their conditions to one string, so one statement could be given the
+     conditions of another one (or a half made condition such as "a = 1 AND "). */
+  static thread_local int depth=0;
+  static thread_local int unpushed_condition_count = 0;
+  static thread_local int condition_count = 0;
+  static thread_local std::string where_clause = "";
 
   // reset the variables when called at depth 0
   if(depth == 0) {
@@ -4168,6 +4286,7 @@ int ha_warp::bitmap_merge_join() {
     /* open the dimension table to read the data - the pointers are stored on the pushdown
         info structure so that they can be re-used in the scan
     */
+    warp_table_read_lock dim_data_lock(dim_pushdown_info->datadir);
     dim_pushdown_info->base_table = ibis::mensa::create(dim_pushdown_info->datadir);
     if(dim_pushdown_info->base_table == NULL) {
       continue;
@@ -5612,6 +5731,9 @@ std::string ha_warp::explain_extra() const {
 
 // get the number of rows in all the tables in the current schema
 std::unordered_map<const char*, uint64_t> get_table_counts_in_schema(char* table_dir) {
+  /* the counts are kept for the next call, by all the connections */
+  static std::mutex table_counts_mtx;
+  std::lock_guard<std::mutex> table_counts_guard(table_counts_mtx);
   static std::unordered_map<const char*, uint64_t> table_counts;
   ibis::partList parts;
   if(!table_counts.empty()) return table_counts;
@@ -5661,6 +5783,8 @@ const char* get_table_with_most_rows(std::unordered_map<const char*, uint64_t>* 
 
 // return the path to the table with the most rows in the database
 uint64_t get_least_row_count(std::unordered_map<const char*, uint64_t>* table_counts) {
+  static std::mutex least_row_count_mtx;
+  std::lock_guard<std::mutex> least_row_count_guard(least_row_count_mtx);
   static uint64_t min_cnt = -1ULL;
   if(min_cnt < -1ULL) {
     return min_cnt;
