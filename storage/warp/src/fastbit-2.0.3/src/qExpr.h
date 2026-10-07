@@ -569,7 +569,11 @@ private:
 }; // ibis::qUIntHod
 
 /// The class qString encapsulates information for comparing string values.
-/// Only equality comparison is supported at this point.  It does not
+/// Equality is the default comparison.  A string can also be compared
+/// with one bound (<, <=, >, >=) or with two inclusive bounds (BETWEEN).
+/// Strings are compared the way MySQL compares utf8mb4_bin strings,
+/// byte by byte, with trailing spaces insignificant (see
+/// ibis::util::padSpaceCompare).  It does not
 /// ensure the names are valid in any way.  When the check does happen,
 /// the left side will be checked first.  If it matches the name of a
 /// ibis::column, the right side will be assumed to be the value one is
@@ -580,14 +584,34 @@ private:
 /// will evaluate to NULL (i.e., no hit).
 class FASTBIT_CXX_DLLSPEC ibis::qString : public ibis::qExpr {
 public:
+    /// How the column is compared with the string.  STR_BETWEEN compares
+    /// with the inclusive range [rightString(), upperString()].
+    enum COMPARE {STR_EQ=0, STR_LT, STR_LE, STR_GT, STR_GE, STR_BETWEEN};
+
     // construct the qString from two strings
-    qString() : qExpr(STRING), lstr(0), rstr(0) {};
+    qString() : qExpr(STRING), lstr(0), rstr(0), ustr(0), cmp_(STR_EQ) {};
     qString(const char* ls, const char* rs);
-    virtual ~qString() {delete [] rstr; delete [] lstr;}
+    /// Column ls compared with the string rs, "ls op rs".
+    qString(const char* ls, COMPARE op, const char* rs);
+    /// Column ls between the strings lo and hi, both inclusive.
+    qString(const char* ls, const char* lo, const char* hi);
+    virtual ~qString() {delete [] ustr; delete [] rstr; delete [] lstr;}
 
     const char* leftString() const {return lstr;}
     const char* rightString() const {return rstr;}
-    void swapLeftRight() {char* tmp = lstr; lstr = rstr; rstr = tmp;}
+    /// The upper bound of a BETWEEN comparison, NULL for the others.
+    const char* upperString() const {return ustr;}
+    COMPARE comparison() const {return cmp_;}
+    bool isRange() const {return cmp_ != STR_EQ;}
+    /// The two sides are exchanged.  The comparison is mirrored so that
+    /// the expression keeps its meaning.
+    void swapLeftRight() {
+        char* tmp = lstr; lstr = rstr; rstr = tmp;
+        if (cmp_ == STR_LT) cmp_ = STR_GT;
+        else if (cmp_ == STR_LE) cmp_ = STR_GE;
+        else if (cmp_ == STR_GT) cmp_ = STR_LT;
+        else if (cmp_ == STR_GE) cmp_ = STR_LE;
+    }
 
     virtual qString* dup() const {return new qString(*this);}
     virtual void print(std::ostream&) const;
@@ -597,12 +621,17 @@ public:
 private:
     char* lstr;
     char* rstr;
+    char* ustr; ///< Upper bound of BETWEEN.
+    COMPARE cmp_;
 
     /// Copy Constructor.  Deep copy.
     qString(const qString& rhs) : qExpr(STRING),
 	lstr(ibis::util::strnewdup(rhs.lstr)),
-	rstr(ibis::util::strnewdup(rhs.rstr)) {}
+	rstr(ibis::util::strnewdup(rhs.rstr)),
+	ustr(rhs.ustr ? ibis::util::strnewdup(rhs.ustr) : 0),
+	cmp_(rhs.cmp_) {}
     qString& operator=(const qString&);
+    static char* unescape(const char* str);
 }; // ibis::qString
 
 /// This data structure holds a single name.  Note that the name in this

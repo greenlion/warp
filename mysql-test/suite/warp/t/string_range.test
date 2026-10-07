@@ -1,0 +1,316 @@
+--echo #
+--echo # Comparisons of string columns with string constants (<, <=, >, >= and
+--echo # BETWEEN) are evaluated by FastBit.  MySQL compares utf8mb4_bin strings byte
+--echo # by byte and ignores the spaces at the end of a string (PAD SPACE), FastBit
+--echo # must give the same results.  Every condition is also run against an
+--echo # identical InnoDB table and the results must match.
+--echo #
+--echo # Regression test: BETWEEN and the other comparisons of strings were not
+--echo # pushed down, MySQL evaluated them for every row (SSB query 2.2).
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE pool (k INT, s VARCHAR(20)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO pool VALUES
+  (1, ''),
+  (2, ' '),
+  (3, 'a'),
+  (4, 'a '),
+  (5, 'a  '),
+  (6, 'a	'),
+  (7, 'a	b'),
+  (8, 'A'),
+  (9, 'ab'),
+  (10, 'abc'),
+  (11, 'abc '),
+  (12, 'abd'),
+  (13, 'b'),
+  (14, 'b '),
+  (15, 'B'),
+  (16, 'MFGR#2221'),
+  (17, 'MFGR#2222'),
+  (18, 'MFGR#2228'),
+  (19, 'MFGR#2229'),
+  (20, 'MFGR#22'),
+  (21, 'MFGR#2230'),
+  (22, 'é'),
+  (23, 'été'),
+  (24, '中'),
+  (25, 'z'),
+  (26, 'zz'),
+  (27, 'a b'),
+  (28, 'a  b'),
+  (29, 'a!'),
+  (30, '~'),
+  (31, '!'),
+  (32, 'a\''),
+  (33, 'a\\');
+
+CREATE TABLE w (id INT, v VARCHAR(20), c CHAR(10), n VARCHAR(20) NULL, p INT)
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO w WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 6000)
+  SELECT x, pool.s, pool.s, IF(x % 5 = 0, NULL, pool.s), x % 100
+  FROM seq JOIN pool ON pool.k = 1 + (x * 7) % 33;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO i SELECT * FROM w;
+SELECT COUNT(*), COUNT(n), COUNT(DISTINCT v) FROM w;
+
+let $checked = 0;
+let $wrong = 0;
+let $n = 0;
+while ($n < 221)
+{
+  inc $n;
+  if ($n == 1) { let $cond = v < 'a'; }
+  if ($n == 2) { let $cond = v <= 'a'; }
+  if ($n == 3) { let $cond = v > 'a'; }
+  if ($n == 4) { let $cond = v >= 'a'; }
+  if ($n == 5) { let $cond = v < 'a '; }
+  if ($n == 6) { let $cond = v <= 'a '; }
+  if ($n == 7) { let $cond = v > 'a '; }
+  if ($n == 8) { let $cond = v >= 'a '; }
+  if ($n == 9) { let $cond = v < 'abc'; }
+  if ($n == 10) { let $cond = v <= 'abc'; }
+  if ($n == 11) { let $cond = v > 'abc'; }
+  if ($n == 12) { let $cond = v >= 'abc'; }
+  if ($n == 13) { let $cond = v < 'MFGR#2225'; }
+  if ($n == 14) { let $cond = v <= 'MFGR#2225'; }
+  if ($n == 15) { let $cond = v > 'MFGR#2225'; }
+  if ($n == 16) { let $cond = v >= 'MFGR#2225'; }
+  if ($n == 17) { let $cond = v < ''; }
+  if ($n == 18) { let $cond = v <= ''; }
+  if ($n == 19) { let $cond = v > ''; }
+  if ($n == 20) { let $cond = v >= ''; }
+  if ($n == 21) { let $cond = v < ' '; }
+  if ($n == 22) { let $cond = v <= ' '; }
+  if ($n == 23) { let $cond = v > ' '; }
+  if ($n == 24) { let $cond = v >= ' '; }
+  if ($n == 25) { let $cond = v < 'z'; }
+  if ($n == 26) { let $cond = v <= 'z'; }
+  if ($n == 27) { let $cond = v > 'z'; }
+  if ($n == 28) { let $cond = v >= 'z'; }
+  if ($n == 29) { let $cond = v < 'é'; }
+  if ($n == 30) { let $cond = v <= 'é'; }
+  if ($n == 31) { let $cond = v > 'é'; }
+  if ($n == 32) { let $cond = v >= 'é'; }
+  if ($n == 33) { let $cond = v < 'zzz'; }
+  if ($n == 34) { let $cond = v <= 'zzz'; }
+  if ($n == 35) { let $cond = v > 'zzz'; }
+  if ($n == 36) { let $cond = v >= 'zzz'; }
+  if ($n == 37) { let $cond = v < 'B'; }
+  if ($n == 38) { let $cond = v <= 'B'; }
+  if ($n == 39) { let $cond = v > 'B'; }
+  if ($n == 40) { let $cond = v >= 'B'; }
+  if ($n == 41) { let $cond = v < 'a	'; }
+  if ($n == 42) { let $cond = v <= 'a	'; }
+  if ($n == 43) { let $cond = v > 'a	'; }
+  if ($n == 44) { let $cond = v >= 'a	'; }
+  if ($n == 45) { let $cond = v < 'a  b'; }
+  if ($n == 46) { let $cond = v <= 'a  b'; }
+  if ($n == 47) { let $cond = v > 'a  b'; }
+  if ($n == 48) { let $cond = v >= 'a  b'; }
+  if ($n == 49) { let $cond = v BETWEEN 'a' AND 'b'; }
+  if ($n == 50) { let $cond = v BETWEEN 'a ' AND 'a  '; }
+  if ($n == 51) { let $cond = v BETWEEN 'MFGR#2221' AND 'MFGR#2228'; }
+  if ($n == 52) { let $cond = v BETWEEN '' AND ' '; }
+  if ($n == 53) { let $cond = v BETWEEN 'b' AND 'a'; }
+  if ($n == 54) { let $cond = v BETWEEN 'abc' AND 'abd'; }
+  if ($n == 55) { let $cond = v BETWEEN 'é' AND '中'; }
+  if ($n == 56) { let $cond = v BETWEEN 'a' AND 'a'; }
+  if ($n == 57) { let $cond = v BETWEEN 'a	' AND 'a b'; }
+  if ($n == 58) { let $cond = v BETWEEN 'a' AND 'b' AND p < 50; }
+  if ($n == 59) { let $cond = v BETWEEN 'a' AND 'b' OR p = 7; }
+  if ($n == 60) { let $cond = v BETWEEN 'a' AND 'b' OR v IS NULL; }
+  if ($n == 61) { let $cond = NOT (v BETWEEN 'a' AND 'b'); }
+  if ($n == 62) { let $cond = v NOT BETWEEN 'a' AND 'b'; }
+  if ($n == 63) { let $cond = NOT (v < 'abc'); }
+  if ($n == 64) { let $cond = 'abc' < v; }
+  if ($n == 65) { let $cond = 'abc' >= v; }
+  if ($n == 66) { let $cond = v >= 'a' AND v < 'b'; }
+  if ($n == 67) { let $cond = c < 'a'; }
+  if ($n == 68) { let $cond = c <= 'a'; }
+  if ($n == 69) { let $cond = c > 'a'; }
+  if ($n == 70) { let $cond = c >= 'a'; }
+  if ($n == 71) { let $cond = c < 'a '; }
+  if ($n == 72) { let $cond = c <= 'a '; }
+  if ($n == 73) { let $cond = c > 'a '; }
+  if ($n == 74) { let $cond = c >= 'a '; }
+  if ($n == 75) { let $cond = c < 'abc'; }
+  if ($n == 76) { let $cond = c <= 'abc'; }
+  if ($n == 77) { let $cond = c > 'abc'; }
+  if ($n == 78) { let $cond = c >= 'abc'; }
+  if ($n == 79) { let $cond = c < 'MFGR#2225'; }
+  if ($n == 80) { let $cond = c <= 'MFGR#2225'; }
+  if ($n == 81) { let $cond = c > 'MFGR#2225'; }
+  if ($n == 82) { let $cond = c >= 'MFGR#2225'; }
+  if ($n == 83) { let $cond = c < ''; }
+  if ($n == 84) { let $cond = c <= ''; }
+  if ($n == 85) { let $cond = c > ''; }
+  if ($n == 86) { let $cond = c >= ''; }
+  if ($n == 87) { let $cond = c < ' '; }
+  if ($n == 88) { let $cond = c <= ' '; }
+  if ($n == 89) { let $cond = c > ' '; }
+  if ($n == 90) { let $cond = c >= ' '; }
+  if ($n == 91) { let $cond = c < 'z'; }
+  if ($n == 92) { let $cond = c <= 'z'; }
+  if ($n == 93) { let $cond = c > 'z'; }
+  if ($n == 94) { let $cond = c >= 'z'; }
+  if ($n == 95) { let $cond = c < 'é'; }
+  if ($n == 96) { let $cond = c <= 'é'; }
+  if ($n == 97) { let $cond = c > 'é'; }
+  if ($n == 98) { let $cond = c >= 'é'; }
+  if ($n == 99) { let $cond = c < 'zzz'; }
+  if ($n == 100) { let $cond = c <= 'zzz'; }
+  if ($n == 101) { let $cond = c > 'zzz'; }
+  if ($n == 102) { let $cond = c >= 'zzz'; }
+  if ($n == 103) { let $cond = c < 'B'; }
+  if ($n == 104) { let $cond = c <= 'B'; }
+  if ($n == 105) { let $cond = c > 'B'; }
+  if ($n == 106) { let $cond = c >= 'B'; }
+  if ($n == 107) { let $cond = c < 'a	'; }
+  if ($n == 108) { let $cond = c <= 'a	'; }
+  if ($n == 109) { let $cond = c > 'a	'; }
+  if ($n == 110) { let $cond = c >= 'a	'; }
+  if ($n == 111) { let $cond = c < 'a  b'; }
+  if ($n == 112) { let $cond = c <= 'a  b'; }
+  if ($n == 113) { let $cond = c > 'a  b'; }
+  if ($n == 114) { let $cond = c >= 'a  b'; }
+  if ($n == 115) { let $cond = c BETWEEN 'a' AND 'b'; }
+  if ($n == 116) { let $cond = c BETWEEN 'a ' AND 'a  '; }
+  if ($n == 117) { let $cond = c BETWEEN 'MFGR#2221' AND 'MFGR#2228'; }
+  if ($n == 118) { let $cond = c BETWEEN '' AND ' '; }
+  if ($n == 119) { let $cond = c BETWEEN 'b' AND 'a'; }
+  if ($n == 120) { let $cond = c BETWEEN 'abc' AND 'abd'; }
+  if ($n == 121) { let $cond = c BETWEEN 'é' AND '中'; }
+  if ($n == 122) { let $cond = c BETWEEN 'a' AND 'a'; }
+  if ($n == 123) { let $cond = c BETWEEN 'a	' AND 'a b'; }
+  if ($n == 124) { let $cond = c BETWEEN 'a' AND 'b' AND p < 50; }
+  if ($n == 125) { let $cond = c BETWEEN 'a' AND 'b' OR p = 7; }
+  if ($n == 126) { let $cond = c BETWEEN 'a' AND 'b' OR c IS NULL; }
+  if ($n == 127) { let $cond = NOT (c BETWEEN 'a' AND 'b'); }
+  if ($n == 128) { let $cond = c NOT BETWEEN 'a' AND 'b'; }
+  if ($n == 129) { let $cond = NOT (c < 'abc'); }
+  if ($n == 130) { let $cond = 'abc' < c; }
+  if ($n == 131) { let $cond = 'abc' >= c; }
+  if ($n == 132) { let $cond = c >= 'a' AND c < 'b'; }
+  if ($n == 133) { let $cond = n < 'a'; }
+  if ($n == 134) { let $cond = n <= 'a'; }
+  if ($n == 135) { let $cond = n > 'a'; }
+  if ($n == 136) { let $cond = n >= 'a'; }
+  if ($n == 137) { let $cond = n < 'a '; }
+  if ($n == 138) { let $cond = n <= 'a '; }
+  if ($n == 139) { let $cond = n > 'a '; }
+  if ($n == 140) { let $cond = n >= 'a '; }
+  if ($n == 141) { let $cond = n < 'abc'; }
+  if ($n == 142) { let $cond = n <= 'abc'; }
+  if ($n == 143) { let $cond = n > 'abc'; }
+  if ($n == 144) { let $cond = n >= 'abc'; }
+  if ($n == 145) { let $cond = n < 'MFGR#2225'; }
+  if ($n == 146) { let $cond = n <= 'MFGR#2225'; }
+  if ($n == 147) { let $cond = n > 'MFGR#2225'; }
+  if ($n == 148) { let $cond = n >= 'MFGR#2225'; }
+  if ($n == 149) { let $cond = n < ''; }
+  if ($n == 150) { let $cond = n <= ''; }
+  if ($n == 151) { let $cond = n > ''; }
+  if ($n == 152) { let $cond = n >= ''; }
+  if ($n == 153) { let $cond = n < ' '; }
+  if ($n == 154) { let $cond = n <= ' '; }
+  if ($n == 155) { let $cond = n > ' '; }
+  if ($n == 156) { let $cond = n >= ' '; }
+  if ($n == 157) { let $cond = n < 'z'; }
+  if ($n == 158) { let $cond = n <= 'z'; }
+  if ($n == 159) { let $cond = n > 'z'; }
+  if ($n == 160) { let $cond = n >= 'z'; }
+  if ($n == 161) { let $cond = n < 'é'; }
+  if ($n == 162) { let $cond = n <= 'é'; }
+  if ($n == 163) { let $cond = n > 'é'; }
+  if ($n == 164) { let $cond = n >= 'é'; }
+  if ($n == 165) { let $cond = n < 'zzz'; }
+  if ($n == 166) { let $cond = n <= 'zzz'; }
+  if ($n == 167) { let $cond = n > 'zzz'; }
+  if ($n == 168) { let $cond = n >= 'zzz'; }
+  if ($n == 169) { let $cond = n < 'B'; }
+  if ($n == 170) { let $cond = n <= 'B'; }
+  if ($n == 171) { let $cond = n > 'B'; }
+  if ($n == 172) { let $cond = n >= 'B'; }
+  if ($n == 173) { let $cond = n < 'a	'; }
+  if ($n == 174) { let $cond = n <= 'a	'; }
+  if ($n == 175) { let $cond = n > 'a	'; }
+  if ($n == 176) { let $cond = n >= 'a	'; }
+  if ($n == 177) { let $cond = n < 'a  b'; }
+  if ($n == 178) { let $cond = n <= 'a  b'; }
+  if ($n == 179) { let $cond = n > 'a  b'; }
+  if ($n == 180) { let $cond = n >= 'a  b'; }
+  if ($n == 181) { let $cond = n BETWEEN 'a' AND 'b'; }
+  if ($n == 182) { let $cond = n BETWEEN 'a ' AND 'a  '; }
+  if ($n == 183) { let $cond = n BETWEEN 'MFGR#2221' AND 'MFGR#2228'; }
+  if ($n == 184) { let $cond = n BETWEEN '' AND ' '; }
+  if ($n == 185) { let $cond = n BETWEEN 'b' AND 'a'; }
+  if ($n == 186) { let $cond = n BETWEEN 'abc' AND 'abd'; }
+  if ($n == 187) { let $cond = n BETWEEN 'é' AND '中'; }
+  if ($n == 188) { let $cond = n BETWEEN 'a' AND 'a'; }
+  if ($n == 189) { let $cond = n BETWEEN 'a	' AND 'a b'; }
+  if ($n == 190) { let $cond = n BETWEEN 'a' AND 'b' AND p < 50; }
+  if ($n == 191) { let $cond = n BETWEEN 'a' AND 'b' OR p = 7; }
+  if ($n == 192) { let $cond = n BETWEEN 'a' AND 'b' OR n IS NULL; }
+  if ($n == 193) { let $cond = NOT (n BETWEEN 'a' AND 'b'); }
+  if ($n == 194) { let $cond = n NOT BETWEEN 'a' AND 'b'; }
+  if ($n == 195) { let $cond = NOT (n < 'abc'); }
+  if ($n == 196) { let $cond = 'abc' < n; }
+  if ($n == 197) { let $cond = 'abc' >= n; }
+  if ($n == 198) { let $cond = n >= 'a' AND n < 'b'; }
+  if ($n == 199) { let $cond = v < 'abc' COLLATE utf8mb4_0900_ai_ci; }
+  if ($n == 200) { let $cond = v COLLATE utf8mb4_0900_ai_ci BETWEEN 'a' AND 'b'; }
+  if ($n == 201) { let $cond = v COLLATE utf8mb4_0900_bin BETWEEN 'a' AND 'b'; }
+  if ($n == 202) { let $cond = v BETWEEN _utf8mb4 0x61 AND _utf8mb4 0x62; }
+  if ($n == 203) { let $cond = v BETWEEN 'a' AND 'b' AND c BETWEEN 'A' AND 'B'; }
+  if ($n == 204) { let $cond = v BETWEEN c AND 'b'; }
+  if ($n == 205) { let $cond = v < c; }
+  if ($n == 206) { let $cond = v = 'a'; }
+  if ($n == 207) { let $cond = v = 'a '; }
+  if ($n == 208) { let $cond = v = 'a  '; }
+  if ($n == 209) { let $cond = v = ''; }
+  if ($n == 210) { let $cond = v = ' '; }
+  if ($n == 211) { let $cond = c = 'a'; }
+  if ($n == 212) { let $cond = c = 'a  '; }
+  if ($n == 213) { let $cond = c = ''; }
+  if ($n == 214) { let $cond = n = 'a'; }
+  if ($n == 215) { let $cond = n = 'a  '; }
+  if ($n == 216) { let $cond = 'a ' = v; }
+  if ($n == 217) { let $cond = v <> 'a'; }
+  if ($n == 218) { let $cond = v = 'a' OR v = 'b '; }
+  if ($n == 219) { let $cond = v = 'abc ' AND p < 60; }
+  if ($n == 220) { let $cond = v IN ('a', 'b'); }
+  if ($n == 221) { let $cond = v <=> 'a '; }
+  let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $cond`;
+  let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $cond`;
+  inc $checked;
+  if ($w != $i)
+  {
+    inc $wrong;
+    --echo MISMATCH for WHERE $cond: WARP $w, InnoDB $i
+  }
+}
+--echo $checked conditions checked, $wrong mismatches
+
+--echo # The conditions that FastBit evaluates have no Filter in the plan, the others do
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v BETWEEN 'a' AND 'b';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v < 'abc';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE n >= 'a';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE 'abc' < c;
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE c BETWEEN 'MFGR#2221' AND 'MFGR#2228' AND p < 10;
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v NOT BETWEEN 'a' AND 'b';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v COLLATE utf8mb4_0900_ai_ci BETWEEN 'a' AND 'b';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v BETWEEN c AND 'b';
+
+DROP TABLE w, i, pool;

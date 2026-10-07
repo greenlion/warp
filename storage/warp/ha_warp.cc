@@ -3398,6 +3398,130 @@ static bool warp_format_int(const Item *item, bool exact_syntax,
   return true;
 }
 
+/* Pushes a comparison of a string column with string constants (<, <=, >, >=
+   and BETWEEN) down to FastBit.  The result must be the same as MySQL's:
+   WARP strings are utf8mb4_bin, which MySQL compares byte by byte with the
+   trailing spaces not counting (PAD SPACE), and FastBit compares the same
+   way (ibis::util::padSpaceCompare).  A pushed condition is not evaluated
+   by MySQL again, so the conditions that can not be pushed are left to it:
+   other collations (an explicit COLLATE, for example), binary strings,
+   constants that are not plain strings and strings with a NUL character.
+
+   op is the operator of the comparison (not used for BETWEEN).  Returns true
+   and appends the FastBit condition to out if the condition was pushed. */
+static bool warp_push_string_range(Item_func *func, bool is_between,
+                                   const std::string &op, std::string &out) {
+  Item **args = func->arguments();
+  const uint nargs = func->arg_count;
+  const Item_field *col_item = NULL;
+  std::string fb_op = op;
+  const Item *consts[2] = {NULL, NULL};
+  uint nconsts = 0;
+
+  if(is_between) {
+    if(nargs != 3 || args[0]->type() != Item::Type::FIELD_ITEM) {
+      return false;
+    }
+    col_item = down_cast<Item_field *>(args[0]);
+    consts[0] = args[1];
+    consts[1] = args[2];
+    nconsts = 2;
+  } else {
+    if(nargs != 2) {
+      return false;
+    }
+    if(args[0]->type() == Item::Type::FIELD_ITEM) {
+      col_item = down_cast<Item_field *>(args[0]);
+      consts[0] = args[1];
+    } else if(args[1]->type() == Item::Type::FIELD_ITEM) {
+      /* constant OP column: the column goes first, so mirror the operator */
+      col_item = down_cast<Item_field *>(args[1]);
+      consts[0] = args[0];
+      if(op == " < ") fb_op = " > ";
+      else if(op == " <= ") fb_op = " >= ";
+      else if(op == " > ") fb_op = " < ";
+      else if(op == " >= ") fb_op = " <= ";
+      else return false;
+    } else {
+      return false;
+    }
+    nconsts = 1;
+  }
+
+  const Field *fld = col_item->field;
+  const enum_field_types rt = fld->real_type();
+  if(rt != MYSQL_TYPE_VARCHAR && rt != MYSQL_TYPE_STRING &&
+     rt != MYSQL_TYPE_VAR_STRING) {
+    return false;
+  }
+  /* only the utf8mb4_bin collation of WARP columns, for the column and for
+     the comparison */
+  if(fld->charset()->number != 46) {
+    return false;
+  }
+  const CHARSET_INFO *cmp_cs = func->compare_collation();
+  if(cmp_cs == NULL || cmp_cs->number != 46) {
+    return false;
+  }
+
+  std::string values[2];
+  for(uint i = 0; i < nconsts; ++i) {
+    if(consts[i]->type() != Item::Type::STRING_ITEM) {
+      return false;
+    }
+    Item *citem = const_cast<Item *>(consts[i]);
+    String s;
+    String *val = citem->val_str(&s);
+    if(val == NULL) {
+      return false;
+    }
+    const char *ptr = val->ptr();
+    bool ascii = true;
+    for(size_t j = 0; j < val->length(); ++j) {
+      const char c = ptr[j];
+      if(c == 0) {
+        return false; /* FastBit strings end at a NUL */
+      }
+      if(static_cast<unsigned char>(c) >= 0x80) {
+        ascii = false;
+      }
+    }
+    /* a constant in another character set would have to be converted */
+    if(!ascii && strncmp(citem->collation.collation->csname, "utf8mb4", 7)) {
+      return false;
+    }
+    std::string escaped;
+    for(size_t j = 0; j < val->length(); ++j) {
+      const char c = ptr[j];
+      if(c == '\'') {
+        escaped += "\\'";
+      } else if(c == '\\') {
+        escaped += "\\\\";
+      } else {
+        escaped += c;
+      }
+    }
+    values[i] = "'" + escaped + "'";
+  }
+
+  const std::string field_index = std::to_string(fld->field_index());
+  std::string cond;
+  if(fld->is_nullable()) {
+    cond = "(n" + field_index + " = 0 AND ";
+  }
+  cond += "c" + field_index;
+  if(is_between) {
+    cond += " BETWEEN " + values[0] + " AND " + values[1];
+  } else {
+    cond += fb_op + values[0];
+  }
+  if(fld->is_nullable()) {
+    cond += ")";
+  }
+  out += cond;
+  return true;
+}
+
 int ha_warp::append_column_filter(const Item *cond,
                                    std::string &where_clause) {
   bool field_may_be_null = false;
@@ -3612,6 +3736,16 @@ int ha_warp::append_column_filter(const Item *cond,
     if((is_between || is_in) &&
        down_cast<Item_func_opt_neg *>(tmp)->negated) {
       return 0;
+    }
+
+    /* Strings compared with <, <=, >, >= and BETWEEN */
+    if(is_between || op == " < " || op == " <= " || op == " > " ||
+       op == " >= ") {
+      std::string string_condition;
+      if(warp_push_string_range(tmp, is_between, op, string_condition)) {
+        where_clause += string_condition;
+        return 1;
+      }
     }
 
     /* Integer constants compared with a BIGINT column that can not be

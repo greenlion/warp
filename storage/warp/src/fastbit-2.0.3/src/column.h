@@ -233,6 +233,11 @@ public:
     virtual long stringSearch(const std::vector<std::string>&,
 			      ibis::bitvector&) const;
     virtual long stringSearch(const char*) const;
+    /// Find the strings in the range between lo and hi, compared like
+    /// ibis::util::padSpaceCompare.  A null bound is no bound.
+    virtual long stringRangeSearch(const char* lo, bool loIncl,
+                                   const char* hi, bool hiIncl,
+                                   ibis::bitvector& hits) const;
     virtual long stringSearch(const std::vector<std::string>&) const;
     virtual long keywordSearch(const char*, ibis::bitvector&) const;
     virtual long keywordSearch(const char*) const;

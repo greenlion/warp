@@ -816,6 +816,31 @@ void ibis::dictionary::patternSearch(const char* pat,
 #endif
 } // ibis::dictionary::patternSearch
 
+/// Find the codes of the strings in the range between lo and hi.  The
+/// strings are compared with ibis::util::padSpaceCompare.  A null bound
+/// means no bound on that side.
+void ibis::dictionary::rangeSearch(const char* lo, bool loIncl,
+                                   const char* hi, bool hiIncl,
+                                   array_t<uint32_t>& matches) const {
+    if (key_.size() == 0) return;
+    const size_t llen = (lo != 0 ? std::strlen(lo) : 0);
+    const size_t hlen = (hi != 0 ? std::strlen(hi) : 0);
+    for (MYMAP::const_iterator j = key_.begin(); j != key_.end(); ++ j) {
+        const size_t len = std::strlen(j->first);
+        if (lo != 0) {
+            const int c = ibis::util::padSpaceCompare(j->first, len, lo, llen);
+            if (c < 0 || (c == 0 && ! loIncl))
+                continue;
+        }
+        if (hi != 0) {
+            const int c = ibis::util::padSpaceCompare(j->first, len, hi, hlen);
+            if (c > 0 || (c == 0 && ! hiIncl))
+                continue;
+        }
+        matches.push_back(j->second);
+    }
+} // ibis::dictionary::rangeSearch
+
 /// Convert a string to its integer code.  Returns 0xFFFFFFFFU for null
 /// strings, 0:size()-1 for strings in the dictionary, and
 /// dictionary::size() for unknown values.

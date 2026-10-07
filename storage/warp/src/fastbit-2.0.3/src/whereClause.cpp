@@ -364,7 +364,18 @@ int ibis::whereClause::verifyExpr(ibis::qExpr *&xp0, const ibis::part& part0,
                 const_cast<ibis::qString*>(str)->swapLeftRight();
             }
         }
-        if (col != 0) {
+        if (col != 0 && str->isRange()) {
+            // <, <=, >, >= and BETWEEN compare strings only, there is no
+            // meaningful conversion to a number
+            if (col->type() != ibis::TEXT && col->type() != ibis::CATEGORY) {
+                ++ ierr;
+                LOGGER(ibis::gVerbose > 2)
+                    << "Warning -- whereClause::verifyExpr -- column "
+                    << col->name() << " is not a string column, can not "
+                    "compare it with a string range";
+            }
+        }
+        else if (col != 0) {
             if (col->type() == ibis::UINT && col->getDictionary() != 0) {
                 uint32_t ind = (*col->getDictionary())[str->rightString()];
                 if (ind <= col->getDictionary()->size()) {

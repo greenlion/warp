@@ -42,6 +42,9 @@ public:
 			      ibis::bitvector& hits) const;
     virtual long stringSearch(const char* str) const;
     virtual long stringSearch(const std::vector<std::string>& strs) const;
+    virtual long stringRangeSearch(const char* lo, bool loIncl,
+                                   const char* hi, bool hiIncl,
+                                   ibis::bitvector& hits) const;
 
     virtual long patternSearch(const char*, ibis::bitvector&) const;
     virtual long patternSearch(const char*) const;
@@ -142,6 +145,9 @@ public:
 			      ibis::bitvector& hits) const;
     virtual long stringSearch(const char* str) const;
     virtual long stringSearch(const std::vector<std::string>& vals) const;
+    virtual long stringRangeSearch(const char* lo, bool loIncl,
+                                   const char* hi, bool hiIncl,
+                                   ibis::bitvector& hits) const;
 
     virtual long patternSearch(const char* pat) const;
     virtual long patternSearch(const char* pat, ibis::bitvector &hits) const;

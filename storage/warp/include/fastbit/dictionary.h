@@ -54,6 +54,8 @@ public:
     uint32_t operator[](const char* str) const;
     const char* find(const char* str) const;
     void patternSearch(const char* pat, array_t<uint32_t>& matches) const;
+    void rangeSearch(const char* lo, bool loIncl, const char* hi,
+                     bool hiIncl, array_t<uint32_t>& matches) const;
 
     uint32_t insert(const char*, uint32_t);
     uint32_t insert(const char*);
