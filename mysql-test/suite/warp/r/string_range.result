@@ -116,4 +116,24 @@ EXPLAIN
 
 Warnings:
 Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` between `test`.`w`.`c` and 'b')
+#
+# Equality of strings ignores the spaces at the end ('a' = 'a ')
+#
+SELECT COUNT(*) > 0 AS trailing_spaces_match FROM w WHERE v = 'a ';
+trailing_spaces_match
+1
+SELECT COUNT(*) = (SELECT COUNT(*) FROM w WHERE v = 'a') AS same_as_without_space FROM w WHERE v = 'a  ';
+same_as_without_space
+1
+# Another collation is not pushed down and gives MySQL's result
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE v COLLATE utf8mb4_0900_ai_ci = 'A') AS ci_matches_innodb FROM w WHERE v COLLATE utf8mb4_0900_ai_ci = 'A';
+ci_matches_innodb
+1
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v = 'a ';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` = 'a ')
 DROP TABLE w, i, pool;

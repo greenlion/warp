@@ -313,4 +313,38 @@ EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v COLLATE utf8mb4_0900_ai_ci BE
 --replace_regex /\(cost=[^)]*\)//
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v BETWEEN c AND 'b';
 
+--echo #
+--echo # Equality of strings ignores the spaces at the end ('a' = 'a ')
+--echo #
+let $v = 0;
+while ($v < 31)
+{
+  inc $v;
+  let $lit_sql = `SELECT QUOTE(s) FROM pool WHERE k = $v`;
+  let $w_eq = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE v = $lit_sql`;
+  let $i_eq = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE v = $lit_sql`;
+  let $w_ceq = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $lit_sql = c`;
+  let $i_ceq = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $lit_sql = c`;
+  let $w_neq = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE n <=> $lit_sql OR v = $lit_sql AND p < 50`;
+  let $i_neq = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE n <=> $lit_sql OR v = $lit_sql AND p < 50`;
+  if ($w_eq != $i_eq)
+  {
+    --echo MISMATCH v = $lit_sql: WARP $w_eq, InnoDB $i_eq
+  }
+  if ($w_ceq != $i_ceq)
+  {
+    --echo MISMATCH $lit_sql = c: WARP $w_ceq, InnoDB $i_ceq
+  }
+  if ($w_neq != $i_neq)
+  {
+    --echo MISMATCH null-safe or mixed with $lit_sql: WARP $w_neq, InnoDB $i_neq
+  }
+}
+SELECT COUNT(*) > 0 AS trailing_spaces_match FROM w WHERE v = 'a ';
+SELECT COUNT(*) = (SELECT COUNT(*) FROM w WHERE v = 'a') AS same_as_without_space FROM w WHERE v = 'a  ';
+--echo # Another collation is not pushed down and gives MySQL's result
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE v COLLATE utf8mb4_0900_ai_ci = 'A') AS ci_matches_innodb FROM w WHERE v COLLATE utf8mb4_0900_ai_ci = 'A';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v = 'a ';
+
 DROP TABLE w, i, pool;
