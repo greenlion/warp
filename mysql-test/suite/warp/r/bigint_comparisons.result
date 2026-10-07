@@ -44,37 +44,27 @@ EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
-Warnings:
-Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`b` = 9007199254740993)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE u IN (0, 18446744073709551615);
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
-Warnings:
-Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`u` in (0,18446744073709551615))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b > 9007199254740993;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
-Warnings:
-Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`b` > 9007199254740993)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE u BETWEEN 9223372036854775807 AND 18446744073709551614;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
-Warnings:
-Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`u` between 9223372036854775807 and 18446744073709551614)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b NOT IN (1, 2);
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.b not in (1,2))  
         -> Table scan on w  
 
-Warnings:
-Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`b` not in (1,2))
 DROP TABLE w, i;
 # Many rows clustered around values that are equal as doubles
 SET SESSION cte_max_recursion_depth = 100000;

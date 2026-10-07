@@ -56,13 +56,9 @@ EXPLAIN
             -> Aggregate: max(r.v)  
                 -> Table scan on r  
 
-Warnings:
-Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`k` = (/* select#2 */ select max(`test`.`r`.`v`) from `test`.`r`))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE k = 30;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
-Warnings:
-Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`k` = 30)
 DROP TABLE w, i, r;
