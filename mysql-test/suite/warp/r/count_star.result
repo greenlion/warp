@@ -1,0 +1,94 @@
+#
+# SELECT COUNT(*) without a condition does not fetch the rows, it counts
+# the visible rows from the transaction id and row id columns.  The count
+# must be what a scan of the table returns (the condition id >= 0 makes
+# the scan: it is pushed down and the handler's rows are fetched), in every
+# transaction state, and the same as InnoDB's.
+#
+SET SESSION cte_max_recursion_depth = 1000000;
+CREATE TABLE w (id INT, v INT) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 150000)
+SELECT x, x % 7 FROM s;
+INSERT INTO i SELECT * FROM w;
+# the table after the load
+count(*) = 150000, same as the scan
+# The rows are not fetched: no row is read from the handler
+FLUSH STATUS;
+SELECT COUNT(*) FROM w;
+COUNT(*)
+150000
+SELECT VARIABLE_VALUE = 0 AS no_rows_fetched FROM performance_schema.session_status WHERE VARIABLE_NAME = 'Handler_read_rnd_next';
+no_rows_fetched
+1
+FLUSH STATUS;
+SELECT COUNT(*) FROM w WHERE id >= 0;
+COUNT(*)
+150000
+SELECT VARIABLE_VALUE > 0 AS rows_fetched FROM performance_schema.session_status WHERE VARIABLE_NAME = 'Handler_read_rnd_next';
+rows_fetched
+1
+DELETE FROM w WHERE v = 3;
+DELETE FROM i WHERE v = 3;
+# after DELETE
+count(*) = 128571, same as the scan
+UPDATE w SET v = 100 WHERE id % 10 = 0;
+UPDATE i SET v = 100 WHERE id % 10 = 0;
+# after UPDATE
+count(*) = 128571, same as the scan
+INSERT INTO w SELECT id + 1000000, v FROM w WHERE id <= 1000;
+INSERT INTO i SELECT id + 1000000, v FROM i WHERE id <= 1000;
+# after INSERT ... SELECT
+count(*) = 129428, same as the scan
+# A transaction sees its own rows, a rollback removes them
+BEGIN;
+INSERT INTO w VALUES (2000001, 1), (2000002, 1), (2000003, 1);
+# inside the transaction, with 3 new rows
+count(*) = 129431, same as the scan
+ROLLBACK;
+# after ROLLBACK
+count(*) = 129428, same as the scan
+# Another connection does not see uncommitted rows or deletes
+BEGIN;
+INSERT INTO w SELECT id + 3000000, v FROM w WHERE id <= 500;
+DELETE FROM w WHERE id BETWEEN 5000 AND 5100;
+# other connection, changes not committed
+count(*) = 129428, same as the scan
+COMMIT;
+# after the other connection committed
+count(*) = 129770, same as the scan
+# A repeatable read transaction keeps its snapshot
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+INSERT INTO w SELECT id + 4000000, v FROM w WHERE id <= 700;
+DELETE FROM w WHERE id BETWEEN 9000 AND 9200;
+# snapshot of the other transaction
+count(*) = 129770, same as the scan
+the snapshot did not change
+COMMIT;
+# after the snapshot ended
+count(*) = 130197, same as the scan
+# A locking read scans the table (it takes the row locks)
+BEGIN;
+FLUSH STATUS;
+locking count(*) = scan
+COMMIT;
+# Empty tables
+CREATE TABLE e (id INT) ENGINE=WARP;
+SELECT COUNT(*) FROM e;
+COUNT(*)
+0
+INSERT INTO e VALUES (1), (2);
+SELECT COUNT(*) FROM e;
+COUNT(*)
+2
+DELETE FROM e;
+SELECT COUNT(*) FROM e;
+COUNT(*)
+0
+TRUNCATE TABLE e;
+SELECT COUNT(*) FROM e;
+COUNT(*)
+0
+DROP TABLE w, i, e;
