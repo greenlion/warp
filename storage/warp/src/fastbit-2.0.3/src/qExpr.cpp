@@ -1828,11 +1828,23 @@ bool ibis::qContinuousRange::overlap(double lo, double hi) const {
 /// the second argument.  It attempts to remove the back slashes before
 /// passing the second argument to later operations.
 ibis::qString::qString(const char* ls, const char* rs) :
-    qExpr(ibis::qExpr::STRING), lstr(ibis::util::strnewdup(ls)) {
-    // attempt to remove the back slash as escape characters
-    rstr = new char[1+std::strlen(rs)];
+    qExpr(ibis::qExpr::STRING), lstr(ibis::util::strnewdup(ls)),
+    rstr(unescape(rs)), ustr(0), cmp_(STR_EQ) {}
+
+ibis::qString::qString(const char* ls, COMPARE op, const char* rs) :
+    qExpr(ibis::qExpr::STRING), lstr(ibis::util::strnewdup(ls)),
+    rstr(unescape(rs)), ustr(0), cmp_(op) {}
+
+ibis::qString::qString(const char* ls, const char* lo, const char* hi) :
+    qExpr(ibis::qExpr::STRING), lstr(ibis::util::strnewdup(ls)),
+    rstr(unescape(lo)), ustr(unescape(hi)), cmp_(STR_BETWEEN) {}
+
+/// Returns a copy of the string without the back slashes that are used as
+/// escape characters.
+char* ibis::qString::unescape(const char* rs) {
+    char* res = new char[1+std::strlen(rs)];
     const char* cptr = rs;
-    char* dptr = rstr;
+    char* dptr = res;
     while (*cptr != 0) {
         if (*cptr != '\\') {
             *dptr = *cptr;
@@ -1840,15 +1852,39 @@ ibis::qString::qString(const char* ls, const char* rs) :
         else {
             ++cptr;
             *dptr = *cptr;
+            if (*cptr == 0) break; // a back slash at the end
         }
         ++cptr; ++dptr;
     }
-    *dptr = 0; // terminate rstr with the NULL character
+    *dptr = 0; // terminate with the NULL character
+    return res;
 }
 
 void ibis::qString::print(std::ostream& out) const {
-    if (lstr && rstr)
-        out << lstr << " == \"" << rstr << "\"";
+    if (lstr && rstr) {
+        switch (cmp_) {
+        default:
+        case STR_EQ:
+            out << lstr << " == \"" << rstr << "\"";
+            break;
+        case STR_LT:
+            out << lstr << " < \"" << rstr << "\"";
+            break;
+        case STR_LE:
+            out << lstr << " <= \"" << rstr << "\"";
+            break;
+        case STR_GT:
+            out << lstr << " > \"" << rstr << "\"";
+            break;
+        case STR_GE:
+            out << lstr << " >= \"" << rstr << "\"";
+            break;
+        case STR_BETWEEN:
+            out << lstr << " BETWEEN \"" << rstr << "\" AND \""
+                << (ustr ? ustr : "") << "\"";
+            break;
+        }
+    }
 }
 
 void ibis::qString::getTableNames(std::set<std::string>& plist) const {

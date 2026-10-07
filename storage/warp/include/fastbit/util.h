@@ -697,6 +697,13 @@ namespace ibis {
             ThreadLease& operator=(const ThreadLease&);
         };
 
+        /// Compare two strings the way MySQL compares utf8mb4_bin strings
+        /// (PAD SPACE): byte by byte as unsigned values, and the spaces at
+        /// the end of a string do not matter.  Returns a negative, zero or
+        /// positive value if a is less than, equal to or greater than b.
+        FASTBIT_CXX_DLLSPEC int padSpaceCompare(const char* a, size_t alen,
+                                                const char* b, size_t blen);
+
         /// The number of threads (the calling thread included) that the
         /// statement of the calling thread may use for building the
         /// missing indexes of a query.  1 means one after another.

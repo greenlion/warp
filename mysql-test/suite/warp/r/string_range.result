@@ -1,0 +1,119 @@
+#
+# Comparisons of string columns with string constants (<, <=, >, >= and
+# BETWEEN) are evaluated by FastBit.  MySQL compares utf8mb4_bin strings byte
+# by byte and ignores the spaces at the end of a string (PAD SPACE), FastBit
+# must give the same results.  Every condition is also run against an
+# identical InnoDB table and the results must match.
+#
+# Regression test: BETWEEN and the other comparisons of strings were not
+# pushed down, MySQL evaluated them for every row (SSB query 2.2).
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE pool (k INT, s VARCHAR(20)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO pool VALUES
+(1, ''),
+(2, ' '),
+(3, 'a'),
+(4, 'a '),
+(5, 'a  '),
+(6, 'a	'),
+(7, 'a	b'),
+(8, 'A'),
+(9, 'ab'),
+(10, 'abc'),
+(11, 'abc '),
+(12, 'abd'),
+(13, 'b'),
+(14, 'b '),
+(15, 'B'),
+(16, 'MFGR#2221'),
+(17, 'MFGR#2222'),
+(18, 'MFGR#2228'),
+(19, 'MFGR#2229'),
+(20, 'MFGR#22'),
+(21, 'MFGR#2230'),
+(22, 'é'),
+(23, 'été'),
+(24, '中'),
+(25, 'z'),
+(26, 'zz'),
+(27, 'a b'),
+(28, 'a  b'),
+(29, 'a!'),
+(30, '~'),
+(31, '!'),
+(32, 'a\''),
+  (33, 'a\\');
+CREATE TABLE w (id INT, v VARCHAR(20), c CHAR(10), n VARCHAR(20) NULL, p INT)
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO w WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 6000)
+SELECT x, pool.s, pool.s, IF(x % 5 = 0, NULL, pool.s), x % 100
+FROM seq JOIN pool ON pool.k = 1 + (x * 7) % 33;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO i SELECT * FROM w;
+SELECT COUNT(*), COUNT(n), COUNT(DISTINCT v) FROM w;
+COUNT(*)	COUNT(n)	COUNT(DISTINCT v)
+6000	4800	28
+221 conditions checked, 0 mismatches
+# The conditions that FastBit evaluates have no Filter in the plan, the others do
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v BETWEEN 'a' AND 'b';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` between 'a' and 'b')
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v < 'abc';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` < 'abc')
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE n >= 'a';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`n` >= 'a')
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE 'abc' < c;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ('abc' < `test`.`w`.`c`)
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE c BETWEEN 'MFGR#2221' AND 'MFGR#2228' AND p < 10;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`test`.`w`.`c` between 'MFGR#2221' and 'MFGR#2228') and (`test`.`w`.`p` < 10))
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v NOT BETWEEN 'a' AND 'b';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.v not between 'a' and 'b')  
+        -> Table scan on w  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` not between 'a' and 'b')
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v COLLATE utf8mb4_0900_ai_ci BETWEEN 'a' AND 'b';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: ((w.v collate utf8mb4_0900_ai_ci) between 'a' and 'b')  
+        -> Table scan on w  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`test`.`w`.`v` collate utf8mb4_0900_ai_ci) between 'a' and 'b')
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v BETWEEN c AND 'b';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.v between w.c and 'b')  
+        -> Table scan on w  
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` between `test`.`w`.`c` and 'b')
+DROP TABLE w, i, pool;

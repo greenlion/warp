@@ -921,6 +921,26 @@ void ibis::util::ThreadBudget::release(unsigned n) {
     avail_.fetch_add(n);
 }
 
+int ibis::util::padSpaceCompare(const char* a, size_t alen,
+                                const char* b, size_t blen) {
+    const size_t n = (alen < blen ? alen : blen);
+    const int c = (n > 0 ? std::memcmp(a, b, n) : 0);
+    if (c != 0)
+        return (c < 0 ? -1 : 1);
+    if (alen == blen)
+        return 0;
+    // the longer string goes on, compare the rest with spaces
+    const unsigned char* rest = reinterpret_cast<const unsigned char*>
+        (alen > blen ? a + n : b + n);
+    const size_t len = (alen > blen ? alen - n : blen - n);
+    const int sign = (alen > blen ? 1 : -1);
+    for (size_t i = 0; i < len; ++ i) {
+        if (rest[i] != ' ')
+            return (rest[i] < ' ' ? -sign : sign);
+    }
+    return 0;
+} // ibis::util::padSpaceCompare
+
 unsigned ibis::util::getIndexBuildThreads() {
     return (fbThreadBudget ? fbThreadBudget->capacity() + 1 : 1);
 }

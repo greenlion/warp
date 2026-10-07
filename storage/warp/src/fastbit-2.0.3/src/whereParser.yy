@@ -108,6 +108,31 @@
 
 #undef yylex
 #define yylex driver.lexer->lex
+
+/* Builds the comparison of a column with string literals, "name op 'lo'" or
+   "name between 'lo' and 'hi'".  The expression on the left has to be the
+   name of a column.  It and the strings are deleted. */
+static ibis::qExpr* stringCompare(ibis::qExpr *left,
+                                  ibis::qString::COMPARE op,
+                                  std::string *lo, std::string *hi) {
+    ibis::math::variable *var = dynamic_cast<ibis::math::variable*>(left);
+    if (var == 0) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "whereParser.yy: a string can only be compared with a column "
+            "name, not with " << *left;
+        delete hi;
+        delete lo;
+        delete left;
+        throw "A string can only be compared with a column name";
+    }
+    ibis::qExpr *ret = (hi != 0 ?
+        new ibis::qString(var->variableName(), lo->c_str(), hi->c_str()) :
+        new ibis::qString(var->variableName(), op, lo->c_str()));
+    delete hi;
+    delete lo;
+    delete var;
+    return ret;
+}
 %}
 
 %% /* Grammar rules */
@@ -964,6 +989,21 @@ mathExpr LTOP INT64 {
 // 	    "variable name on the left-hand side";
 //     }
 // }
+| mathExpr LTOP STRLIT {
+    $$ = stringCompare($1, ibis::qString::STR_LT, $3, 0);
+}
+| mathExpr LEOP STRLIT {
+    $$ = stringCompare($1, ibis::qString::STR_LE, $3, 0);
+}
+| mathExpr GTOP STRLIT {
+    $$ = stringCompare($1, ibis::qString::STR_GT, $3, 0);
+}
+| mathExpr GEOP STRLIT {
+    $$ = stringCompare($1, ibis::qString::STR_GE, $3, 0);
+}
+| mathExpr BETWEENOP STRLIT ANDOP STRLIT {
+    $$ = stringCompare($1, ibis::qString::STR_BETWEEN, $3, $5);
+}
 ;
 
 compRange3:

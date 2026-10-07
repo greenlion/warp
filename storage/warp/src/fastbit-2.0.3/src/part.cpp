@@ -3333,6 +3333,49 @@ long ibis::part::stringSearch(const ibis::qString &cmp,
         return 0;
     }
 
+    if (cmp.isRange()) {
+        // <, <=, >, >= and BETWEEN: the column is the left side
+        const ibis::column* col = getColumn(cmp.leftString());
+        if (col == 0 || (col->type() != ibis::TEXT &&
+                         col->type() != ibis::CATEGORY)) {
+            low.set(0, nEvents);
+            return -1; // no hit, and not a string column
+        }
+        const char* lo = 0;
+        const char* hi = 0;
+        bool loIncl = false;
+        bool hiIncl = false;
+        switch (cmp.comparison()) {
+        case ibis::qString::STR_LT:
+            hi = cmp.rightString();
+            break;
+        case ibis::qString::STR_LE:
+            hi = cmp.rightString();
+            hiIncl = true;
+            break;
+        case ibis::qString::STR_GT:
+            lo = cmp.rightString();
+            break;
+        case ibis::qString::STR_GE:
+            lo = cmp.rightString();
+            loIncl = true;
+            break;
+        default: // STR_BETWEEN
+            lo = cmp.rightString();
+            loIncl = true;
+            hi = cmp.upperString();
+            hiIncl = true;
+            break;
+        }
+        const long ierr = col->stringRangeSearch(lo, loIncl, hi, hiIncl, low);
+        if (ierr > 0) { // the null values do not match
+            ibis::bitvector mskc;
+            col->getNullMask(mskc);
+            low &= mskc;
+        }
+        return ierr;
+    }
+
     long ierr = -1;
     // try leftString()
     const ibis::column* col = getColumn(cmp.leftString());
@@ -3364,6 +3407,8 @@ long ibis::part::stringSearch(const ibis::qString &cmp) const {
         return ret;
     if (cmp.leftString() == 0)
         return ret;
+    if (cmp.isRange()) // any row may be in the range
+        return static_cast<long>(nEvents);
 
     // try leftString()
     const ibis::column* col = getColumn(cmp.leftString());
