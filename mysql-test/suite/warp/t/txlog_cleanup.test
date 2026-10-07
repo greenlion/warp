@@ -1,0 +1,86 @@
+--echo #
+--echo # Every WARP transaction has a log file in the data directory, named after
+--echo # the transaction id (for example 1184.txlog).  The file must be removed
+--echo # when the transaction ends, whatever way it ends, and the logs left by a
+--echo # crash must be removed when the server starts.
+--echo #
+--echo # Regression test: only transactions that changed data removed their log,
+--echo # and the removal of the old logs at startup never found a file.
+--echo #
+
+CREATE TABLE w (id INT, v INT) ENGINE=WARP;
+INSERT INTO w VALUES (1, 1), (2, 2), (3, 3);
+
+--echo # No transaction log is left by read only statements
+SELECT COUNT(*) FROM w;
+SELECT * FROM w WHERE id = 2;
+BEGIN;
+SELECT COUNT(*) FROM w;
+COMMIT;
+BEGIN;
+SELECT * FROM w;
+ROLLBACK;
+--list_files $MYSQLTEST_VARDIR/mysqld.1/data *.txlog
+
+--echo # ... nor by statements and transactions that change data
+INSERT INTO w VALUES (4, 4);
+UPDATE w SET v = v + 1 WHERE id = 1;
+DELETE FROM w WHERE id = 3;
+BEGIN;
+INSERT INTO w VALUES (5, 5);
+DELETE FROM w WHERE id = 2;
+COMMIT;
+BEGIN;
+INSERT INTO w VALUES (6, 6);
+ROLLBACK;
+BEGIN;
+INSERT INTO w VALUES (7, 7);
+UPDATE w SET v = 0 WHERE id = 4;
+ROLLBACK;
+--list_files $MYSQLTEST_VARDIR/mysqld.1/data *.txlog
+
+--echo # A statement that fails
+--error ER_BAD_FIELD_ERROR
+INSERT INTO w (id, nosuchcolumn) VALUES (8, 8);
+--error ER_BAD_FIELD_ERROR
+UPDATE w SET nosuchcolumn = 1;
+--list_files $MYSQLTEST_VARDIR/mysqld.1/data *.txlog
+
+--echo # Connections that end with an open transaction
+connect (con1, localhost, root,,);
+connection con1;
+BEGIN;
+SELECT COUNT(*) FROM w;
+connect (con2, localhost, root,,);
+connection con2;
+BEGIN;
+INSERT INTO w VALUES (9, 9);
+connection default;
+disconnect con1;
+disconnect con2;
+--let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist
+--source include/wait_condition.inc
+--list_files $MYSQLTEST_VARDIR/mysqld.1/data *.txlog
+
+--echo # The data is what the committed transactions wrote
+SELECT id, v FROM w ORDER BY id;
+
+--echo # The logs of crashed transactions are removed at startup, the bitmap and
+--echo # other files that look similar are not
+--write_file $MYSQLTEST_VARDIR/mysqld.1/data/123.txlog
+log of a crashed transaction
+EOF
+--write_file $MYSQLTEST_VARDIR/mysqld.1/data/9876543210.txlog
+another one
+EOF
+--write_file $MYSQLTEST_VARDIR/mysqld.1/data/notatrx.txlog
+not a transaction log
+EOF
+--list_files $MYSQLTEST_VARDIR/mysqld.1/data *.txlog
+--source include/restart_mysqld.inc
+--echo # after the restart
+--list_files $MYSQLTEST_VARDIR/mysqld.1/data *.txlog
+SELECT id, v FROM w ORDER BY id;
+--remove_file $MYSQLTEST_VARDIR/mysqld.1/data/notatrx.txlog
+
+DROP TABLE w;

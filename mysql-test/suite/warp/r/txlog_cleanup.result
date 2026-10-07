@@ -1,0 +1,78 @@
+#
+# Every WARP transaction has a log file in the data directory, named after
+# the transaction id (for example 1184.txlog).  The file must be removed
+# when the transaction ends, whatever way it ends, and the logs left by a
+# crash must be removed when the server starts.
+#
+# Regression test: only transactions that changed data removed their log,
+# and the removal of the old logs at startup never found a file.
+#
+CREATE TABLE w (id INT, v INT) ENGINE=WARP;
+INSERT INTO w VALUES (1, 1), (2, 2), (3, 3);
+# No transaction log is left by read only statements
+SELECT COUNT(*) FROM w;
+COUNT(*)
+3
+SELECT * FROM w WHERE id = 2;
+id	v
+2	2
+BEGIN;
+SELECT COUNT(*) FROM w;
+COUNT(*)
+3
+COMMIT;
+BEGIN;
+SELECT * FROM w;
+id	v
+1	1
+2	2
+3	3
+ROLLBACK;
+# ... nor by statements and transactions that change data
+INSERT INTO w VALUES (4, 4);
+UPDATE w SET v = v + 1 WHERE id = 1;
+DELETE FROM w WHERE id = 3;
+BEGIN;
+INSERT INTO w VALUES (5, 5);
+DELETE FROM w WHERE id = 2;
+COMMIT;
+BEGIN;
+INSERT INTO w VALUES (6, 6);
+ROLLBACK;
+BEGIN;
+INSERT INTO w VALUES (7, 7);
+UPDATE w SET v = 0 WHERE id = 4;
+ROLLBACK;
+# A statement that fails
+INSERT INTO w (id, nosuchcolumn) VALUES (8, 8);
+ERROR 42S22: Unknown column 'nosuchcolumn' in 'field list'
+UPDATE w SET nosuchcolumn = 1;
+ERROR 42S22: Unknown column 'nosuchcolumn' in 'field list'
+# Connections that end with an open transaction
+BEGIN;
+SELECT COUNT(*) FROM w;
+COUNT(*)
+3
+BEGIN;
+INSERT INTO w VALUES (9, 9);
+Timeout in wait_condition.inc for SELECT COUNT(*) = 1 FROM information_schema.processlist
+# The data is what the committed transactions wrote
+SELECT id, v FROM w ORDER BY id;
+id	v
+1	2
+4	4
+5	5
+# The logs of crashed transactions are removed at startup, the bitmap and
+# other files that look similar are not
+123.txlog
+9876543210.txlog
+notatrx.txlog
+# restart
+# after the restart
+notatrx.txlog
+SELECT id, v FROM w ORDER BY id;
+id	v
+1	2
+4	4
+5	5
+DROP TABLE w;

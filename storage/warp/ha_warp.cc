@@ -73,6 +73,7 @@
   derivative works thereof, in binary and source code form.
 */
 #define WARP_BITMAP_DEBUG
+#include <errno.h>
 #include <optional>
 #include "ha_warp.h"
 #ifdef WARP_USE_SIMD_INTERSECTION
@@ -4393,6 +4394,19 @@ void warp_trx::open_log() {
   }
 }
 
+void warp_trx::close_log() {
+  if(log != NULL) {
+    fclose(log);
+    log = NULL;
+  }
+  if(!log_filename.empty()) {
+    if(unlink(log_filename.c_str()) != 0 && errno != ENOENT) {
+      sql_print_error("Could not remove transaction log %s", log_filename.c_str());
+    }
+    log_filename.clear();
+  }
+}
+
 void warp_trx::write_insert_log_rowid(uint64_t rowid) {
   int sz = 0;
   sz = fwrite(&insert_marker, sizeof(insert_marker), 1, log);
@@ -4559,9 +4573,7 @@ void warp_trx::commit() {
     
     
   }
-  if(log) fclose(log);
-  log = NULL;
-  unlink(log_filename.c_str());
+  close_log();
   
   commit_mtx.unlock();
 }
@@ -4653,9 +4665,7 @@ void warp_trx::rollback(bool all) {
     /* TRX rollback removes the trx from the commit list */
 
     commit_it->second = WARP_ROLLED_BACK_TRX;
-    fclose(log);
-    log = NULL;
-    unlink(log_filename.c_str());
+    close_log();
   } 
 
   commit_mtx.unlock();
@@ -4896,6 +4906,40 @@ int warp_upgrade_tables(uint16_t version) {
   return 0;
 }
 
+/* The name of the log of a transaction is its transaction id and ".txlog" in
+   the data directory, for example 1184.txlog.  The logs of the delete bitmap
+   (deletes.warp.txlog) and the savepoint logs have other names. */
+static bool is_trx_log_name(const char *name) {
+  const char *ptr = name;
+  if(*ptr < '0' || *ptr > '9') {
+    return false;
+  }
+  while(*ptr >= '0' && *ptr <= '9') {
+    ++ptr;
+  }
+  return strcmp(ptr, ".txlog") == 0;
+}
+
+/* Removes the transaction logs from the data directory, which is the current
+   directory of the server. */
+static void remove_stale_trx_logs() {
+  DIR *dir = opendir(".");
+  if(dir == NULL) {
+    sql_print_error("Could not open the data directory to remove transaction logs");
+    return;
+  }
+  struct dirent *ent;
+  while((ent = readdir(dir)) != NULL) {
+    if(!is_trx_log_name(ent->d_name)) {
+      continue;
+    }
+    if(unlink(ent->d_name) != 0 && errno != ENOENT) {
+      sql_print_error("Could not remove transaction log %s", ent->d_name);
+    }
+  }
+  closedir(dir);
+}
+
 warp_global_data::warp_global_data() {
   uint64_t on_disk_version = 0;
   bool shutdown_ok = false;
@@ -4920,45 +4964,16 @@ warp_global_data::warp_global_data() {
     shutdown_ok = was_shutdown_clean();
   }  
   
+  /* No transaction is active when the server starts, so every transaction
+     log is a leftover of a crash (or of a transaction that did not remove its
+     log).  There is no need to roll back the insertions the logs describe, the
+     transactions associated with them will not be in the commit list and any
+     deletions associated with those transactions will be rolled back
+     automatically when the bitmaps are opened (the logs of the bitmaps have
+     other names and are used for that). */
+  remove_stale_trx_logs();
+
   if(!shutdown_ok) {
-    DIR *dir = opendir(".");
-    struct dirent* ent;
-    const char trxlog_file_extension[7] = ".txlog";
-    if(dir == NULL) {
-      sql_print_error("Could not open directory entry for data directory");
-      assert(false);
-    }
-    // find any insertion logs and remove them - there is no need to roll
-    // back the insertions, the transactions associated with them will
-    // not be in the commit bitmap and any deletions associated with
-    // those transactions will be rolled back automatically when the
-    // bitmaps are opened
-    while((ent = readdir(dir)) != NULL) {
-      // skip the deleted and commit bitmaps
-      if(ent->d_name[0] == 'c' || ent->d_name[0] == 'd') {
-        char* ext_at = ent->d_name;
-        int filename_len = strlen(ent->d_name);
-        bool found = false;
-        for(int i = 0; i< filename_len; ++i) {
-          if(*(ext_at + i) == '.') {
-            found = true;
-            break;
-          }
-        }
-        if(!found) {
-            continue;
-        }
-
-        if(strncmp(trxlog_file_extension,ext_at, 6) == 0) {
-          // found a txlog to remove
-          if(unlink(ent->d_name) != 0) {
-            sql_print_error("Could not remove transaction log %s", ent->d_name);
-            assert(false);
-          }
-        }
-      }
-    }
-
     if(!repair_tables()) {
       assert("Table repair failed. Database could not be initialized");
     }
