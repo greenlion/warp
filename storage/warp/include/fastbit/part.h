@@ -645,6 +645,12 @@ public:
     /// Estimate the number of pages to be accessed.
     static uint32_t countPages(const ibis::bitvector &mask,
 			       unsigned elemsize=4);
+    /// Same as countPages, but stops counting once the count reaches
+    /// @c limit (the result is then >= limit, not exact).  For callers that
+    /// compare the number of pages with a known threshold: the walk over the
+    /// positions of a large mask is bounded by the threshold.
+    static uint32_t countPagesUpTo(const ibis::bitvector &mask,
+				   unsigned elemsize, uint32_t limit);
     /// Evaluate the strategy for accessing a data file.
     ibis::fileManager::ACCESS_PREFERENCE
     accessHint(const ibis::bitvector &mask, unsigned elemsize=4) const;

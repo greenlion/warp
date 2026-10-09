@@ -1402,12 +1402,20 @@ void index_builder(ibis::table* tbl, const char* cname, const char* comment) {
    already passed and fail with "out of memory" although most of the cache
    is idle.  Once a quarter of the cache is gone, the files of the
    partitions that were scanned are dropped. */
+/* The cache space that is kept free for what a scan allocates (the columns
+   selected from the partitions that are read, the partitions read ahead and
+   the join workers).  A quarter of the cache, or about 256 bytes for every
+   row of a partition if that is more: a small cache is then always flushed. */
+static uint64_t warp_cache_reserve() {
+  return std::max<uint64_t>(ibis::fileManager::currentCacheSize() / 4,
+                            (uint64_t)my_partition_max_rows * 256);
+}
+
 static void warp_release_partition(const char *partition_dir) {
   if (partition_dir == NULL) {
     return;
   }
-  const uint64_t cache = ibis::fileManager::currentCacheSize();
-  if (ibis::fileManager::bytesFree() < cache / 4) {
+  if (ibis::fileManager::bytesFree() < warp_cache_reserve()) {
     ibis::fileManager::instance().flushDir(partition_dir);
   }
 }
@@ -1460,8 +1468,9 @@ void ha_warp::maintain_indexes(const char *datadir) {
    needed). */
 bool ha_warp::start_prefetch(const std::string& datadir) {
   /* The partitions read ahead take cache space, so nothing is read ahead
-     when a good part of the cache is in use already. */
-  if(ibis::fileManager::bytesFree() < ibis::fileManager::currentCacheSize() / 2) {
+     when the cache is nearly full.  A quarter of the cache is kept free by
+     warp_release_partition, files of earlier queries stay in the rest. */
+  if(ibis::fileManager::bytesFree() < warp_cache_reserve()) {
     return false;
   }
   auto budget = ibis::util::ThreadBudget::current();
@@ -2397,7 +2406,7 @@ void exec_pushdown_join(
      here) and make later workers fail.  Nothing in this partition is
      needed in memory until it is scanned. */
   try {
-    ibis::fileManager::instance().flushDir((*part_it)->currentDataDir());
+    warp_release_partition((*part_it)->currentDataDir());
   } catch(...) {
     // the files are just not released
   }
@@ -2854,6 +2863,7 @@ fetch_again:
       const std::string finished_partition((*part_it)->currentDataDir());
       ++part_it;
       if(part_it == partitions->end()) {
+        warp_release_partition(finished_partition.c_str());
         DBUG_RETURN(HA_ERR_END_OF_FILE); 
       }
       delete cursor;
@@ -3068,10 +3078,12 @@ int ha_warp::end_scan(bool finish) {
   scan_uses_pushdown_tables = false;
 
   if(partitions) {
+    /* The partitions the scan went through were released one by one as it
+       left them.  Releasing them all here would empty the cache whenever it
+       is fairly full (the list holds the table directory too, which
+       contains all the partitions), and the next query would read and
+       decompress everything again. */
     for(auto it=partitions->begin();it!=partitions->end();++it) {
-      if(*it != NULL) {
-        warp_release_partition((*it)->currentDataDir());
-      }
       delete *it;
       *it=NULL;
     } 
@@ -3080,10 +3092,12 @@ int ha_warp::end_scan(bool finish) {
   
   int write_rc = 0;
   if(finish) {
-    if(writer != NULL) {
+    /* Only a statement that wrote rows changes the files on disk.  A scan
+       that only read must leave the files it cached for the next query. */
+    if(writer != NULL && writer->mRows() > 0) {
       write_rc = write_buffered_rows_to_disk();
+      ibis::fileManager::instance().flushDir(share->data_dir_name);
     }
-    ibis::fileManager::instance().flushDir(share->data_dir_name);
   }
   index_scan_open = false;
 

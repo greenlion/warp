@@ -6234,8 +6234,12 @@ long ibis::column::evaluateRange(const ibis::qContinuousRange& cmp,
                     // scan (scost).  Both costs are estimated based on the
                     // expected number of bytes to be accessed.
                     const double icost = idx->estimateCost(cmp);
+                    // only the comparison of icost and scost matters, so
+                    // the pages are not counted past icost
                     const double scost = ibis::fileManager::pageSize() *
-                        ibis::part::countPages(mask, elementSize()) +
+                        ibis::part::countPagesUpTo
+                        (mask, elementSize(),
+                         static_cast<uint32_t>(icost / ibis::fileManager::pageSize()) + 2) +
                         8.0 * mask.size() / ibis::fileManager::pageSize();
                     LOGGER(ibis::gVerbose > 2)
                         << evt << " -- estimated cost with index = "
@@ -6402,7 +6406,9 @@ long ibis::column::evaluateAndSelect(const ibis::qContinuousRange& cmp,
 
                 const double icost = idx->estimateCost(cmp);
                 const double scost = ibis::fileManager::pageSize() *
-                    ibis::part::countPages(mask, elementSize());
+                    ibis::part::countPagesUpTo
+                    (mask, elementSize(),
+                     static_cast<uint32_t>(icost / ibis::fileManager::pageSize()) + 2);
                 LOGGER(ibis::gVerbose > 2)
                     << evt << " -- estimated cost with index = "
                     << icost << ", with sequential scan = " << scost;
@@ -6528,7 +6534,9 @@ long ibis::column::evaluateRange(const ibis::qDiscreteRange& cmp,
                 }
             }
             if (ierr < 0 && idxcost <= ibis::fileManager::pageSize() *
-                ibis::part::countPages(mask, elem)) {
+                ibis::part::countPagesUpTo
+                (mask, elem,
+                 static_cast<uint32_t>(idxcost / ibis::fileManager::pageSize()) + 2)) {
                 // the normal indexing option
                 ierr = idx->evaluate(cmp, low);
                 if (ierr >= 0) {

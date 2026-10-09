@@ -2682,6 +2682,36 @@ uint32_t ibis::part::countPages(const ibis::bitvector &mask,
     return res;
 } // ibis::part::countPages
 
+/// Count the pages like countPages, but give up once @c limit pages have
+/// been counted.  The position walk is the same as in countPages.
+uint32_t ibis::part::countPagesUpTo(const ibis::bitvector &mask,
+                                    unsigned wordsize, uint32_t limit) {
+    uint32_t res = 0;
+    if (mask.cnt() == 0 || wordsize == 0)
+        return res;
+
+    const uint32_t wpp = ibis::fileManager::pageSize() / wordsize;
+    ibis::bitvector::indexSet ix = mask.firstIndexSet();
+    uint32_t last = *(ix.indices()); // the position of the last entry
+    while (ix.nIndices() > 0 && res < limit) {
+        const ibis::bitvector::word_t *ind = ix.indices();
+        const uint32_t p0 = *ind / wpp;
+        res += (last < p0*wpp); // last not on the current page
+        if (ix.isRange()) {
+            res += (ind[1] / wpp - p0);
+            last = ind[1];
+        }
+        else {
+            last = ind[ix.nIndices()-1];
+            res += (last / wpp > p0);
+        }
+        ++ ix;
+    }
+    if (res == 0)
+        res = 1;
+    return res;
+} // ibis::part::countPagesUpTo
+
 ibis::fileManager::ACCESS_PREFERENCE
 ibis::part::accessHint(const ibis::bitvector &mask, unsigned elem) const {
     ibis::fileManager::ACCESS_PREFERENCE hint =
