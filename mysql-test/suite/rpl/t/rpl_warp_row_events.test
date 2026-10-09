@@ -1,0 +1,66 @@
+--echo #
+--echo # A replica applies row events to WARP tables: the rows become visible,
+--echo # updates and deletes find their rows with a table scan or, when the
+--echo # table has a non-unique key, with lookups through that key.
+--echo #
+--source include/rpl/init_source_replica.inc
+--source include/have_binlog_format_row.inc
+
+CREATE TABLE t_scan (id INT, v INT, s VARCHAR(20))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE t_key (id INT, v INT, s VARCHAR(20), KEY id_idx (id))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO t_scan WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5000)
+  SELECT x, 0, CONCAT('row-', x) FROM n;
+INSERT INTO t_key WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5000)
+  SELECT x, 0, CONCAT('row-', x) FROM n;
+--source include/rpl/sync_to_replica.inc
+
+--echo # The inserted rows are visible on the replica
+SELECT COUNT(*), SUM(id) FROM t_scan;
+SELECT COUNT(*), SUM(id) FROM t_key;
+SELECT * FROM t_key WHERE id = 777;
+
+--source include/rpl/connection_source.inc
+--echo # One event with several rows
+UPDATE t_scan SET v = v + 1 WHERE id BETWEEN 100 AND 109;
+UPDATE t_key SET v = v + 1 WHERE id BETWEEN 100 AND 109;
+--echo # One event per row
+let $i = 200;
+while ($i < 210)
+{
+  eval UPDATE t_scan SET v = v + 1 WHERE id = $i;
+  eval UPDATE t_key SET v = v + 1 WHERE id = $i;
+  inc $i;
+}
+--echo # Update of the key column, deletes and a transaction
+UPDATE t_scan SET id = id + 100000 WHERE id BETWEEN 300 AND 304;
+UPDATE t_key SET id = id + 100000 WHERE id BETWEEN 300 AND 304;
+DELETE FROM t_scan WHERE id BETWEEN 400 AND 409;
+DELETE FROM t_key WHERE id BETWEEN 400 AND 409;
+BEGIN;
+UPDATE t_scan SET s = 'changed' WHERE id IN (500, 501);
+UPDATE t_key SET s = 'changed' WHERE id IN (500, 501);
+DELETE FROM t_scan WHERE id = 502;
+DELETE FROM t_key WHERE id = 502;
+COMMIT;
+BEGIN;
+UPDATE t_scan SET s = 'rolled back' WHERE id = 600;
+UPDATE t_key SET s = 'rolled back' WHERE id = 600;
+ROLLBACK;
+--source include/rpl/sync_to_replica.inc
+
+SELECT COUNT(*), SUM(v), SUM(id) FROM t_scan;
+SELECT COUNT(*), SUM(v), SUM(id) FROM t_key;
+SELECT id, v, s FROM t_key WHERE id IN (100, 205, 100300, 400, 500, 502, 600) ORDER BY id;
+
+--let $diff_tables = master:test.t_scan, slave:test.t_scan
+--source include/diff_tables.inc
+--let $diff_tables = master:test.t_key, slave:test.t_key
+--source include/diff_tables.inc
+
+--source include/rpl/connection_source.inc
+DROP TABLE t_scan, t_key;
+--source include/rpl/deinit.inc
