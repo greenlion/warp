@@ -1,7 +1,6 @@
 --echo #
 --echo # Indexes on date and time columns: lookups through a WARP index return
---echo # the same rows as InnoDB (TIMESTAMP values are in the time zone of the
---echo # session).
+--echo # the same rows as InnoDB.
 --echo #
 
 SET SESSION time_zone = '+05:00';

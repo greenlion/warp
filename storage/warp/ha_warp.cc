@@ -76,6 +76,7 @@
 #include <errno.h>
 #include <optional>
 #include "ha_warp.h"
+#include "sql/tztime.h"
 #ifdef WARP_USE_SIMD_INTERSECTION
 #include "include/lemire-sorted-simd/codecfactory.h"
 #include "include/lemire-sorted-simd/intersection.h"
@@ -128,6 +129,61 @@ static uint64_t warp_item_temporal_value(Item *item) {
     return warp_encode_time(time);
   }
   return item->val_date_temporal();
+}
+
+/* TIMESTAMP values are stored in UTC, as packed DATETIME values, like
+   MySQL stores them.  A TIMESTAMP that is zero ('0000-00-00 00:00:00') is
+   stored as 0. */
+static inline bool warp_is_timestamp_type(enum_field_types type) {
+  return type == MYSQL_TYPE_TIMESTAMP || type == MYSQL_TYPE_TIMESTAMP2;
+}
+
+static uint64_t warp_pack_utc(const my_timeval &tv) {
+  if (tv.m_tv_sec == 0 && tv.m_tv_usec == 0) return 0;
+  MYSQL_TIME utc;
+  my_tz_UTC->gmt_sec_to_TIME(&utc, tv);
+  return TIME_to_longlong_datetime_packed(utc);
+}
+
+static void warp_unpack_utc(uint64_t value, my_timeval *tv) {
+  tv->m_tv_sec = 0;
+  tv->m_tv_usec = 0;
+  if (value == 0) return;
+  MYSQL_TIME utc;
+  TIME_from_longlong_datetime_packed(&utc, value);
+  bool in_gap = false;
+  tv->m_tv_sec = my_tz_UTC->TIME_to_gmt_sec(&utc, &in_gap);
+  tv->m_tv_usec = utc.second_part;
+}
+
+/* The stored value of a TIMESTAMP field */
+static uint64_t warp_timestamp_field_value(const Field *field) {
+  my_timeval tv;
+  int warnings = 0;
+  if (field->get_timestamp(&tv, &warnings)) return 0;
+  return warp_pack_utc(tv);
+}
+
+/* The stored value that a temporal Item is compared with a TIMESTAMP column
+   as: the value of the Item is a time in the time zone of the session.
+   Returns false if the value is not a TIMESTAMP (it is out of the range). */
+static bool warp_item_timestamp_value(Item *item, THD *thd, uint64_t &out) {
+  const uint64_t local = item->val_date_temporal();
+  if (item->null_value) return false;
+  if (local == 0) {
+    out = 0;
+    return true;
+  }
+  MYSQL_TIME lt;
+  TIME_from_longlong_datetime_packed(&lt, local);
+  bool in_gap = false;
+  const my_time_t sec = thd->time_zone()->TIME_to_gmt_sec(&lt, &in_gap);
+  if (sec <= 0 || sec > 2147483647) return false;
+  my_timeval tv;
+  tv.m_tv_sec = sec;
+  tv.m_tv_usec = lt.second_part;
+  out = warp_pack_utc(tv);
+  return true;
 }
 
 /*****************************************************************************
@@ -435,6 +491,9 @@ int ha_warp::encode_quote(uchar *) {
           Time_val tmp_time;
           (*field)->val_time(&tmp_time);
           attribute.append(std::to_string(warp_encode_time(tmp_time)).c_str());
+        } else if (warp_is_timestamp_type((*field)->real_type())) {
+          attribute.append(
+              std::to_string(warp_timestamp_field_value(*field)).c_str());
         } else {
           Datetime_val tmp_dt;
           (*field)->val_datetime(&tmp_dt, TIME_DATETIME_ONLY);
@@ -792,6 +851,11 @@ int ha_warp::find_current_row(uchar *buf, ibis::table::cursor *cursor) {
           if (warp_is_time_type((*field)->real_type())) {
             rc = (*field)->store_time(warp_decode_time(tmp),
                                       (*field)->decimals());
+          } else if (warp_is_timestamp_type((*field)->real_type())) {
+            my_timeval tv;
+            warp_unpack_utc(tmp, &tv);
+            (*field)->store_timestamp(&tv);
+            rc = 0;
           } else {
             MYSQL_TIME ltime;
             TIME_from_longlong_datetime_packed(&ltime, tmp);
@@ -3206,7 +3270,7 @@ static bool warp_decode_key_part(TABLE *table, const KEY_PART_INFO *kp,
             warp_is_time_type(f->real_type())) {
     /* the same encoding as the one the rows are written with (see
        encode_quote): TIME as biased microseconds, the others as packed
-       DATETIME values; a TIMESTAMP is in the time zone of the session */
+       DATETIME values; a TIMESTAMP in UTC */
     if(warp_is_time_type(f->real_type())) {
       Time_val t;
       if(f->val_time(&t)) {
@@ -3214,6 +3278,8 @@ static bool warp_decode_key_part(TABLE *table, const KEY_PART_INFO *kp,
       } else {
         v.text = std::to_string(warp_encode_time(t));
       }
+    } else if(warp_is_timestamp_type(f->real_type())) {
+      v.text = std::to_string(warp_timestamp_field_value(f));
     } else {
       Datetime_val dt;
       if(f->val_datetime(&dt, TIME_DATETIME_ONLY)) {
@@ -4064,6 +4130,12 @@ int ha_warp::append_column_filter(const Item *cond,
       Item_field* f0 = (Item_field *)(arg[0]);
       Item_field* f1 = (Item_field *)(arg[1]);
 
+      /* a TIMESTAMP is stored in UTC, the other temporal types are not */
+      if(warp_is_timestamp_type(f0->field->real_type()) !=
+         warp_is_timestamp_type(f1->field->real_type())) {
+        return 0;
+      }
+
       // Get the pushdown information - something is quite broken if these are NULL
       auto f0_info = get_pushdown_info(table->in_use, f0->m_table_ref->alias);
       auto f1_info = get_pushdown_info(table->in_use, f1->m_table_ref->alias);
@@ -4163,6 +4235,16 @@ int ha_warp::append_column_filter(const Item *cond,
     /* Integer constants compared with a BIGINT column that can not be
        represented exactly as a double need FastBit's exact 64-bit integer
        syntax.  In an IN list or BETWEEN every value has to use it. */
+    /* a TIMESTAMP column is stored in UTC, the temporal constants are times
+       of the time zone of the session */
+    bool timestamp_col = false;
+    for (uint i = 0; i < tmp->arg_count; ++i) {
+      if(arg[i]->type() == Item::Type::FIELD_ITEM &&
+         warp_is_timestamp_type(
+             down_cast<Item_field *>(arg[i])->field->real_type())) {
+        timestamp_col = true;
+      }
+    }
     bool bigint_col = false;
     bool col_unsigned = false;
     bool needs_exact_syntax = false;
@@ -4280,7 +4362,12 @@ int ha_warp::append_column_filter(const Item *cond,
           strcasestr(str.c_ptr(), "interval ") != NULL ||
           strcasestr(str.c_ptr(), " as date") != NULL
           ) {
-          auto t=warp_item_temporal_value(*arg);
+          uint64_t t;
+          if(timestamp_col) {
+            if(!warp_item_timestamp_value(*arg, current_thd, t)) return 0;
+          } else {
+            t=warp_item_temporal_value(*arg);
+          }
           build_where_clause += std::to_string(t);
           continue;        
         }
@@ -4295,7 +4382,12 @@ int ha_warp::append_column_filter(const Item *cond,
           case Item_func::DATE_FUNC:
           case Item_func::ADDTIME_FUNC:
             {  
-            auto t=warp_item_temporal_value(*arg);
+            uint64_t t;
+            if(timestamp_col) {
+              if(!warp_item_timestamp_value(*arg, current_thd, t)) return 0;
+            } else {
+              t=warp_item_temporal_value(*arg);
+            }
             build_where_clause += std::to_string(t);
             }
             continue;

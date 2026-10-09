@@ -1,7 +1,6 @@
 #
 # Indexes on date and time columns: lookups through a WARP index return
-# the same rows as InnoDB (TIMESTAMP values are in the time zone of the
-# session).
+# the same rows as InnoDB.
 #
 SET SESSION time_zone = '+05:00';
 CREATE TABLE w (id INT NOT NULL, d DATE, dt DATETIME, dt3 DATETIME(3), ts TIMESTAMP NULL, t TIME, t3 TIME(3), y YEAR, KEY d_idx (d), KEY dt_idx (dt), KEY dt3_idx (dt3), KEY ts_idx (ts), KEY t_idx (t), KEY t3_idx (t3), KEY y_idx (y), KEY dd_idx (d, t)) ENGINE=WARP;
