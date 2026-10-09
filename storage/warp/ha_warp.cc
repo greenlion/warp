@@ -2039,6 +2039,12 @@ int ha_warp::rnd_init(bool) {
   discard_prefetched();
   fetch_count = 0;
   auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
+  if(pushdown_info == NULL) {
+    /* ::info creates the pushdown information while a statement is
+       optimized.  A replica applying row events looks up rows without it. */
+    pushdown_info = get_or_create_pushdown_info(table->in_use, table->alias, share->data_dir_name);
+    pushdown_info->fields = table->s->field;
+  }
   char* partition_filter = THDVAR(table->in_use, partition_filter);
   full_partition_scan = false;
   /* extract/use the partition filter if provided*/
@@ -4734,7 +4740,13 @@ int ha_warp::external_lock(THD *thd, int lock_type){
     }
 
     enum_sql_command sql_command = (enum_sql_command)thd_sql_command(thd);
-    if(sql_command == SQLCOM_UPDATE || sql_command == SQLCOM_UPDATE_MULTI ||
+    /* Row events applied by a replica or by a BINLOG statement have no data
+       modification command, but they do take a write lock. */
+    const bool applying_row_events =
+      lock_type == F_WRLCK &&
+      (thd->slave_thread || sql_command == SQLCOM_BINLOG_BASE64_EVENT);
+    if(applying_row_events ||
+      sql_command == SQLCOM_UPDATE || sql_command == SQLCOM_UPDATE_MULTI ||
       sql_command == SQLCOM_INSERT ||
       sql_command == SQLCOM_REPLACE ||
       sql_command == SQLCOM_DELETE || sql_command == SQLCOM_DELETE_MULTI ||

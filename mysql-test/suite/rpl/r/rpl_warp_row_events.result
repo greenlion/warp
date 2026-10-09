@@ -1,0 +1,89 @@
+#
+# A replica applies row events to WARP tables: the rows become visible,
+# updates and deletes find their rows with a table scan or, when the
+# table has a non-unique key, with lookups through that key.
+#
+include/rpl/init_source_replica.inc
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+[connection master]
+CREATE TABLE t_scan (id INT, v INT, s VARCHAR(20))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE t_key (id INT, v INT, s VARCHAR(20), KEY id_idx (id))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO t_scan WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5000)
+SELECT x, 0, CONCAT('row-', x) FROM n;
+INSERT INTO t_key WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5000)
+SELECT x, 0, CONCAT('row-', x) FROM n;
+include/rpl/sync_to_replica.inc
+# The inserted rows are visible on the replica
+SELECT COUNT(*), SUM(id) FROM t_scan;
+COUNT(*)	SUM(id)
+5000	12502500
+SELECT COUNT(*), SUM(id) FROM t_key;
+COUNT(*)	SUM(id)
+5000	12502500
+SELECT * FROM t_key WHERE id = 777;
+id	v	s
+777	0	row-777
+[connection master]
+# One event with several rows
+UPDATE t_scan SET v = v + 1 WHERE id BETWEEN 100 AND 109;
+UPDATE t_key SET v = v + 1 WHERE id BETWEEN 100 AND 109;
+# One event per row
+UPDATE t_scan SET v = v + 1 WHERE id = 200;
+UPDATE t_key SET v = v + 1 WHERE id = 200;
+UPDATE t_scan SET v = v + 1 WHERE id = 201;
+UPDATE t_key SET v = v + 1 WHERE id = 201;
+UPDATE t_scan SET v = v + 1 WHERE id = 202;
+UPDATE t_key SET v = v + 1 WHERE id = 202;
+UPDATE t_scan SET v = v + 1 WHERE id = 203;
+UPDATE t_key SET v = v + 1 WHERE id = 203;
+UPDATE t_scan SET v = v + 1 WHERE id = 204;
+UPDATE t_key SET v = v + 1 WHERE id = 204;
+UPDATE t_scan SET v = v + 1 WHERE id = 205;
+UPDATE t_key SET v = v + 1 WHERE id = 205;
+UPDATE t_scan SET v = v + 1 WHERE id = 206;
+UPDATE t_key SET v = v + 1 WHERE id = 206;
+UPDATE t_scan SET v = v + 1 WHERE id = 207;
+UPDATE t_key SET v = v + 1 WHERE id = 207;
+UPDATE t_scan SET v = v + 1 WHERE id = 208;
+UPDATE t_key SET v = v + 1 WHERE id = 208;
+UPDATE t_scan SET v = v + 1 WHERE id = 209;
+UPDATE t_key SET v = v + 1 WHERE id = 209;
+# Update of the key column, deletes and a transaction
+UPDATE t_scan SET id = id + 100000 WHERE id BETWEEN 300 AND 304;
+UPDATE t_key SET id = id + 100000 WHERE id BETWEEN 300 AND 304;
+DELETE FROM t_scan WHERE id BETWEEN 400 AND 409;
+DELETE FROM t_key WHERE id BETWEEN 400 AND 409;
+BEGIN;
+UPDATE t_scan SET s = 'changed' WHERE id IN (500, 501);
+UPDATE t_key SET s = 'changed' WHERE id IN (500, 501);
+DELETE FROM t_scan WHERE id = 502;
+DELETE FROM t_key WHERE id = 502;
+COMMIT;
+BEGIN;
+UPDATE t_scan SET s = 'rolled back' WHERE id = 600;
+UPDATE t_key SET s = 'rolled back' WHERE id = 600;
+ROLLBACK;
+include/rpl/sync_to_replica.inc
+SELECT COUNT(*), SUM(v), SUM(id) FROM t_scan;
+COUNT(*)	SUM(v)	SUM(id)
+4989	20	12997953
+SELECT COUNT(*), SUM(v), SUM(id) FROM t_key;
+COUNT(*)	SUM(v)	SUM(id)
+4989	20	12997953
+SELECT id, v, s FROM t_key WHERE id IN (100, 205, 100300, 400, 500, 502, 600) ORDER BY id;
+id	v	s
+100	1	row-100
+205	1	row-205
+500	0	changed
+600	0	row-600
+100300	0	row-300
+include/diff_tables.inc [master:test.t_scan, slave:test.t_scan]
+include/diff_tables.inc [master:test.t_key, slave:test.t_key]
+[connection master]
+DROP TABLE t_scan, t_key;
+include/rpl/deinit.inc
