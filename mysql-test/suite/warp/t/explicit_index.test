@@ -1,0 +1,159 @@
+--echo #
+--echo # Explicit indexes: KEY name (columns) in CREATE TABLE ... ENGINE=WARP.
+--echo # A lookup through an index is a scan with a condition made from the
+--echo # key, the results must be the same as InnoDB's.
+--echo #
+
+CREATE TABLE w (id INT NOT NULL, a INT, b BIGINT UNSIGNED, s VARCHAR(20), c CHAR(5),
+  KEY a_idx (a), KEY ab_idx (a, b), KEY s_idx (s), KEY c_idx (c), KEY b_idx (b))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i (id INT NOT NULL, a INT, b BIGINT UNSIGNED, s VARCHAR(20), c CHAR(5),
+  KEY a_idx (a), KEY ab_idx (a, b), KEY s_idx (s), KEY c_idx (c), KEY b_idx (b))
+  ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+SHOW CREATE TABLE w;
+
+INSERT INTO w VALUES
+ (1,1,1,'a','x'),(2,1,2,'a ','y'),(3,2,NULL,'b','x'),(4,NULL,5,NULL,NULL),
+ (5,2,2,'',''),(6,3,18446744073709551615,'a\\b','x'),(7,-5,7,'it''s','z'),
+ (8,2,3,'B','x '),(9,NULL,NULL,'a','x'),(10,3,3,'zz','zz');
+INSERT INTO i SELECT * FROM w;
+
+let $q = 0;
+while ($q < 19)
+{
+  inc $q;
+  if ($q == 1)
+  {
+    let $where = a = 2;
+  }
+  if ($q == 2)
+  {
+    let $where = a IS NULL;
+  }
+  if ($q == 3)
+  {
+    let $where = a <=> NULL;
+  }
+  if ($q == 4)
+  {
+    let $where = a > 1;
+  }
+  if ($q == 5)
+  {
+    let $where = a >= 2 AND a < 3;
+  }
+  if ($q == 6)
+  {
+    let $where = a < 2;
+  }
+  if ($q == 7)
+  {
+    let $where = a BETWEEN -5 AND 2;
+  }
+  if ($q == 8)
+  {
+    let $where = a = 2 AND b = 3;
+  }
+  if ($q == 9)
+  {
+    let $where = a = 2 AND b > 2;
+  }
+  if ($q == 10)
+  {
+    let $where = a >= 2 AND b > 2;
+  }
+  if ($q == 11)
+  {
+    let $where = b = 18446744073709551615;
+  }
+  if ($q == 12)
+  {
+    let $where = b IS NULL;
+  }
+  if ($q == 13)
+  {
+    let $where = s = 'a';
+  }
+  if ($q == 14)
+  {
+    let $where = s = 'zz';
+  }
+  if ($q == 15)
+  {
+    let $where = s > 'a' AND s < 'zz';
+  }
+  if ($q == 16)
+  {
+    let $where = c = 'x';
+  }
+  if ($q == 17)
+  {
+    let $where = a IN (1, 3);
+  }
+  if ($q == 18)
+  {
+    let $where = a = 2 OR a = 3;
+  }
+  if ($q == 19)
+  {
+    let $where = a = 2 AND s = 'B';
+  }
+  let $got = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '') FROM w FORCE INDEX (a_idx, ab_idx, s_idx, c_idx, b_idx) WHERE $where`;
+  let $want = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '') FROM i IGNORE INDEX (a_idx, ab_idx, s_idx, c_idx, b_idx) WHERE $where`;
+  if ($got != $want)
+  {
+    --echo MISMATCH for $where: WARP $got, InnoDB $want
+  }
+}
+--echo # the lookups were compared
+
+--echo # the plan can use the indexes
+--replace_column 10 #
+EXPLAIN SELECT id FROM w FORCE INDEX (a_idx) WHERE a = 2;
+--replace_column 10 #
+EXPLAIN SELECT id FROM w FORCE INDEX (s_idx) WHERE s = 'a';
+
+--echo # the condition of the statement is kept with the key
+SELECT id FROM w WHERE a = 2 AND id > 3 ORDER BY id;
+SELECT id FROM w WHERE a = 2 AND (id = 3 OR s = 'B') ORDER BY id;
+
+--echo # joins that look rows up through the index
+CREATE TABLE d (k INT, v INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO d VALUES (1,10),(2,20),(3,30),(NULL,40),(9,90);
+SELECT d.v, GROUP_CONCAT(w.id ORDER BY w.id) FROM d JOIN w FORCE INDEX (a_idx) ON w.a = d.k
+  GROUP BY d.v ORDER BY d.v;
+SELECT d.v, (SELECT GROUP_CONCAT(id ORDER BY id) FROM w FORCE INDEX (a_idx) WHERE w.a = d.k) AS ids
+  FROM d ORDER BY d.v;
+
+--echo # DML through an index
+UPDATE w FORCE INDEX (a_idx) SET b = 100 WHERE a = 1;
+SELECT id, b FROM w WHERE a = 1 ORDER BY id;
+UPDATE w FORCE INDEX (a_idx) SET a = a + 10 WHERE a IN (1, 2, 3);
+SELECT id, a FROM w ORDER BY id;
+DELETE FROM w WHERE a = 12;
+SELECT id, a FROM w ORDER BY id;
+
+--echo # rows of a transaction
+BEGIN;
+INSERT INTO w VALUES (20, 99, 1, 'n', 'n');
+SELECT id FROM w FORCE INDEX (a_idx) WHERE a = 99;
+ROLLBACK;
+SELECT id FROM w FORCE INDEX (a_idx) WHERE a = 99;
+
+--echo # indexes that WARP can not use
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE bad1 (a INT, UNIQUE KEY (a)) ENGINE=WARP;
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE bad2 (a INT, PRIMARY KEY (a)) ENGINE=WARP;
+--error ER_WRONG_KEY_COLUMN
+CREATE TABLE bad3 (a DOUBLE, KEY (a)) ENGINE=WARP;
+--error ER_WRONG_KEY_COLUMN
+CREATE TABLE bad4 (a VARCHAR(20), KEY (a(5))) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+--echo # ALTER TABLE
+ALTER TABLE d ADD KEY k_idx (k);
+SELECT v FROM d FORCE INDEX (k_idx) WHERE k = 2;
+ALTER TABLE d DROP KEY k_idx;
+
+DROP TABLE w, i, d;

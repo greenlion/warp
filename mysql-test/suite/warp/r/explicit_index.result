@@ -1,0 +1,122 @@
+#
+# Explicit indexes: KEY name (columns) in CREATE TABLE ... ENGINE=WARP.
+# A lookup through an index is a scan with a condition made from the
+# key, the results must be the same as InnoDB's.
+#
+CREATE TABLE w (id INT NOT NULL, a INT, b BIGINT UNSIGNED, s VARCHAR(20), c CHAR(5),
+KEY a_idx (a), KEY ab_idx (a, b), KEY s_idx (s), KEY c_idx (c), KEY b_idx (b))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i (id INT NOT NULL, a INT, b BIGINT UNSIGNED, s VARCHAR(20), c CHAR(5),
+KEY a_idx (a), KEY ab_idx (a, b), KEY s_idx (s), KEY c_idx (c), KEY b_idx (b))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+SHOW CREATE TABLE w;
+Table	Create Table
+w	CREATE TABLE `w` (
+  `id` int NOT NULL,
+  `a` int DEFAULT NULL,
+  `b` bigint unsigned DEFAULT NULL,
+  `s` varchar(20) COLLATE utf8mb4_bin DEFAULT NULL,
+  `c` char(5) COLLATE utf8mb4_bin DEFAULT NULL,
+  KEY `a_idx` (`a`),
+  KEY `ab_idx` (`a`,`b`),
+  KEY `s_idx` (`s`),
+  KEY `c_idx` (`c`),
+  KEY `b_idx` (`b`)
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+INSERT INTO w VALUES
+(1,1,1,'a','x'),(2,1,2,'a ','y'),(3,2,NULL,'b','x'),(4,NULL,5,NULL,NULL),
+(5,2,2,'',''),(6,3,18446744073709551615,'a\\b','x'),(7,-5,7,'it''s','z'),
+(8,2,3,'B','x '),(9,NULL,NULL,'a','x'),(10,3,3,'zz','zz');
+INSERT INTO i SELECT * FROM w;
+# the lookups were compared
+# the plan can use the indexes
+EXPLAIN SELECT id FROM w FORCE INDEX (a_idx) WHERE a = 2;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	w	NULL	ref	a_idx	a_idx	5	const	#	100.00	NULL
+Warnings:
+Note	1003	/* select#1 */ select `test`.`w`.`id` AS `id` from `test`.`w` FORCE INDEX (`a_idx`) where (`test`.`w`.`a` = 2)
+EXPLAIN SELECT id FROM w FORCE INDEX (s_idx) WHERE s = 'a';
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	w	NULL	ref	s_idx	s_idx	83	const	#	100.00	NULL
+Warnings:
+Note	1003	/* select#1 */ select `test`.`w`.`id` AS `id` from `test`.`w` FORCE INDEX (`s_idx`) where (`test`.`w`.`s` = 'a')
+# the condition of the statement is kept with the key
+SELECT id FROM w WHERE a = 2 AND id > 3 ORDER BY id;
+id
+5
+8
+SELECT id FROM w WHERE a = 2 AND (id = 3 OR s = 'B') ORDER BY id;
+id
+3
+8
+# joins that look rows up through the index
+CREATE TABLE d (k INT, v INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO d VALUES (1,10),(2,20),(3,30),(NULL,40),(9,90);
+SELECT d.v, GROUP_CONCAT(w.id ORDER BY w.id) FROM d JOIN w FORCE INDEX (a_idx) ON w.a = d.k
+GROUP BY d.v ORDER BY d.v;
+v	GROUP_CONCAT(w.id ORDER BY w.id)
+10	1,2
+20	3,5,8
+30	6,10
+SELECT d.v, (SELECT GROUP_CONCAT(id ORDER BY id) FROM w FORCE INDEX (a_idx) WHERE w.a = d.k) AS ids
+FROM d ORDER BY d.v;
+v	ids
+10	1,2
+20	3,5,8
+30	6,10
+40	NULL
+90	NULL
+# DML through an index
+UPDATE w FORCE INDEX (a_idx) SET b = 100 WHERE a = 1;
+SELECT id, b FROM w WHERE a = 1 ORDER BY id;
+id	b
+1	100
+2	100
+UPDATE w FORCE INDEX (a_idx) SET a = a + 10 WHERE a IN (1, 2, 3);
+SELECT id, a FROM w ORDER BY id;
+id	a
+1	11
+2	11
+3	12
+4	NULL
+5	12
+6	13
+7	-5
+8	12
+9	NULL
+10	13
+DELETE FROM w WHERE a = 12;
+SELECT id, a FROM w ORDER BY id;
+id	a
+1	11
+2	11
+4	NULL
+6	13
+7	-5
+9	NULL
+10	13
+# rows of a transaction
+BEGIN;
+INSERT INTO w VALUES (20, 99, 1, 'n', 'n');
+SELECT id FROM w FORCE INDEX (a_idx) WHERE a = 99;
+id
+20
+ROLLBACK;
+SELECT id FROM w FORCE INDEX (a_idx) WHERE a = 99;
+id
+# indexes that WARP can not use
+CREATE TABLE bad1 (a INT, UNIQUE KEY (a)) ENGINE=WARP;
+ERROR HY000: Table storage engine 'WARP' does not support the create option 'UNIQUE or PRIMARY KEY'
+CREATE TABLE bad2 (a INT, PRIMARY KEY (a)) ENGINE=WARP;
+ERROR HY000: Table storage engine 'WARP' does not support the create option 'UNIQUE or PRIMARY KEY'
+CREATE TABLE bad3 (a DOUBLE, KEY (a)) ENGINE=WARP;
+ERROR 42000: The used storage engine can't index column 'a'
+CREATE TABLE bad4 (a VARCHAR(20), KEY (a(5))) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+ERROR 42000: The used storage engine can't index column 'a'
+# ALTER TABLE
+ALTER TABLE d ADD KEY k_idx (k);
+SELECT v FROM d FORCE INDEX (k_idx) WHERE k = 2;
+v
+20
+ALTER TABLE d DROP KEY k_idx;
+DROP TABLE w, i, d;

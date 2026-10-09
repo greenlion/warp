@@ -770,6 +770,18 @@ class ha_warp : public handler {
   int write_row_impl(uchar *buf);
   void foreground_write();
   int append_column_filter(const Item* cond, std::string& push_where_clause); 
+
+  /* Index lookups.  An index of a WARP table is only declared: a lookup
+     restarts the scan of the table with the condition of the statement
+     (push_where_clause) and a condition made from the key. */
+  bool make_key_condition(const key_range *start_key, const key_range *end_key,
+                          bool eq_range, std::string &condition);
+  int start_index_scan(const std::string &key_condition);
+  int end_scan(bool finish);
+  /* the condition of the statement, saved by index_init */
+  std::string index_base_where = "";
+  bool index_scan_open = false;
+  bool index_scan_mode = false;
   void maintain_indexes(const char* datadir);
 
   /* Look ahead: while the connection thread returns the rows of one
@@ -916,18 +928,21 @@ class ha_warp : public handler {
  
   ulonglong table_flags() const {
     // return (HA_NO_TRANSACTIONS | HA_NO_AUTO_INCREMENT | HA_BINLOG_ROW_CAPABLE | HA_CAN_REPAIR);
-    return (HA_BINLOG_ROW_CAPABLE | HA_NO_AUTO_INCREMENT | HA_CAN_REPAIR);
+    return (HA_BINLOG_ROW_CAPABLE | HA_NO_AUTO_INCREMENT | HA_CAN_REPAIR |
+            HA_NULL_IN_KEY);
   }
  
   uint max_record_length() const { return 0; }
-  uint max_keys() const { return 0; }
-  uint max_key_parts() const { return 0; }
-  uint max_key_length() const { return 0; }
-  uint max_supported_keys() const { return 0; }
-  uint max_supported_key_length() const { return 0; }
+  /* the indexes of a WARP table are declarations: a lookup through one
+     is a scan with a condition made from the key, see ha_warp::index_read_map */
+  uint max_keys() const { return 64; }
+  uint max_key_parts() const { return 16; }
+  uint max_key_length() const { return 3072; }
+  uint max_supported_keys() const { return 64; }
+  uint max_supported_key_length() const { return 3072; }
   uint max_supported_key_part_length(
       HA_CREATE_INFO *create_info MY_ATTRIBUTE((unused))) const {
-    return 0;
+    return 3072;
   }
 
   /*
@@ -994,30 +1009,27 @@ class ha_warp : public handler {
   */
   void get_status();
   void update_status();
+  /* the rows of an index lookup are not in the order of the key */
   ulong index_flags(uint, uint, bool) const {
-    return 0;
-  };
+    return HA_READ_NEXT | HA_READ_RANGE;
+  }
   
   // Functions to support indexing
-  /*
-  
-  ha_rows records_in_range(uint idxno, key_range *, key_range *); 
+  ha_rows records_in_range(uint idxno, key_range *min_key, key_range *max_key);
   int index_init(uint idxno, bool sorted);
-  int index_init(uint idxno);
-  int index_next(uchar * buf);
-  int index_first(uchar * buf);
+  int index_next(uchar *buf);
+  int index_next_same(uchar *buf, const uchar *key, uint keylen);
+  int index_first(uchar *buf);
   int index_end();
-  int index_read_map (uchar *buf, const uchar *key, key_part_map keypart_map, enum ha_rkey_function find_flag);
-  int index_read_idx_map (uchar *buf, uint idxno, const uchar *key, key_part_map keypart_map, enum ha_rkey_function find_flag);
-  int make_where_clause(const uchar *key, key_part_map keypart_map, enum ha_rkey_function find_flag);
-  void get_auto_increment	(	
-    ulonglong 	offset,
-    ulonglong 	increment,
-    ulonglong 	nb_desired_values,
-    ulonglong * 	first_value,
-    ulonglong * 	nb_reserved_values 
-  );
-  */
+  int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
+                     enum ha_rkey_function find_flag);
+  int index_read_idx_map(uchar *buf, uint idxno, const uchar *key,
+                         key_part_map keypart_map,
+                         enum ha_rkey_function find_flag);
+  int read_range_first(const key_range *start_key, const key_range *end_key,
+                       bool eq_range, bool sorted);
+  int read_range_next();
+
 
   // Functions to support engine condition pushdown (ECP)
   //int engine_push(AQP::Table_access *table_aqp);
