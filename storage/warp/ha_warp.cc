@@ -899,6 +899,9 @@ int ha_warp::open(const char *name, int, uint, const dd::Table *) {
 */
 int ha_warp::close(void) {
   DBUG_ENTER("ha_warp::close");
+  if(index_scan_open) {
+    end_scan(true);
+  }
   discard_prefetched();
   if(writer) {
     writer->clearData();
@@ -1528,6 +1531,10 @@ int ha_warp::extra(enum ha_extra_function xtra) {
 }
 
 void ha_warp::cleanup_pushdown_info() {
+  if(index_scan_open) {
+    end_scan(true);
+  }
+  index_base_where = "";
   // free up memory used for pushdown filters
   auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
   
@@ -1821,10 +1828,29 @@ int ha_warp::create_writer(TABLE *table_arg) {
   in the MySQL table.
 */
 // int ha_warp::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *info,
+static bool warp_key_part_supported(const KEY_PART_INFO *kp);
+
 int ha_warp::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
                     dd::Table *) {
   DBUG_ENTER("ha_warp::create");
   int rc = 0;
+  /* the indexes are declarations, see ha_warp::make_key_condition */
+  for(uint k = 0; k < table_arg->s->keys; ++k) {
+    const KEY *key = &table_arg->key_info[k];
+    if(key->flags & (HA_NOSAME | HA_FULLTEXT | HA_SPATIAL)) {
+      my_error(ER_ILLEGAL_HA_CREATE_OPTION, MYF(0), "WARP",
+               (key->flags & HA_NOSAME)  ? "UNIQUE or PRIMARY KEY"
+               : (key->flags & HA_FULLTEXT) ? "FULLTEXT index"
+                                            : "SPATIAL index");
+      DBUG_RETURN(-1);
+    }
+    for(uint p = 0; p < key->user_defined_key_parts; ++p) {
+      if(!warp_key_part_supported(&key->key_part[p])) {
+        my_error(ER_WRONG_KEY_COLUMN, MYF(0), key->key_part[p].field->field_name);
+        DBUG_RETURN(-1);
+      }
+    }
+  }
   if(!(share = get_share(name, table))) DBUG_RETURN(HA_ERR_OUT_OF_MEM);
   /* create the writer object from the list of columns in the table 
      if non-zero is returned return error 1030 - unsupported option*/
@@ -1942,6 +1968,10 @@ bool ha_warp::check_if_incompatible_data(HA_CREATE_INFO *, uint) {
 */
 int ha_warp::rnd_init(bool) {
   DBUG_ENTER("ha_warp::rnd_init");
+  if(!index_scan_mode && index_scan_open) {
+    /* the scan of an index lookup that the statement left open */
+    end_scan(false);
+  }
   discard_prefetched();
   fetch_count = 0;
   auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
@@ -1996,7 +2026,7 @@ int ha_warp::rnd_init(bool) {
     push_where_clause = "1=1";
   }
   
-  if(pushdown_info->base_table != NULL) {
+  if(!index_scan_mode && pushdown_info->base_table != NULL) {
     partitions = NULL;
     /* these objects belong to the pushdown information */
     scan_uses_pushdown_tables = true;
@@ -2943,6 +2973,13 @@ int ha_warp::records(ha_rows *num_rows) {
 */
 int ha_warp::rnd_end() {
   DBUG_ENTER("ha_warp::rnd_end");
+  DBUG_RETURN(end_scan(true));
+}
+
+/* Ends a scan.  An index lookup that is followed by another one ends its
+   scan without finishing: what the statement wrote stays in the writer. */
+int ha_warp::end_scan(bool finish) {
+  DBUG_ENTER("ha_warp::end_scan");
 
   /* workers use members of this handler (and the part objects freed below) */
   wait_for_join_threads();
@@ -2972,10 +3009,13 @@ int ha_warp::rnd_end() {
   }
   
   int write_rc = 0;
-  if(writer != NULL) {
-    write_rc = write_buffered_rows_to_disk();
+  if(finish) {
+    if(writer != NULL) {
+      write_rc = write_buffered_rows_to_disk();
+    }
+    ibis::fileManager::instance().flushDir(share->data_dir_name);
   }
-  ibis::fileManager::instance().flushDir(share->data_dir_name);
+  index_scan_open = false;
 
   base_table = NULL;
   filtered_table = NULL;
@@ -3054,337 +3094,438 @@ int ha_warp::rnd_pos(uchar *buf, uchar *pos) {
 
 
 
-/*
-ulong ha_warp::index_flags(uint, uint, bool) const {
-  // return(HA_READ_NEXT | HA_READ_RANGE | HA_KEYREAD_ONLY |
-  // HA_DO_INDEX_COND_PUSHDOWN);
-  //return (HA_READ_NEXT | HA_READ_RANGE | HA_KEYREAD_ONLY);
-  return (HA_READ_NEXT | HA_READ_RANGE | HA_KEYREAD_ONLY);
+/* ---------------------------------------------------------------------
+   Indexes
+
+   An index of a WARP table is a declaration, the data has no structure for
+   it (FastBit builds its bitmap indexes of the columns itself).  A lookup
+   through an index is a scan of the table with a condition that is made from
+   the key.  The condition is added to the one that ECP pushed
+   for the statement (push_where_clause), and FastBit evaluates it with its
+   bitmap indexes.  The scan is the normal one (partitions, row
+   visibility, locks, read ahead), so the rows are not returned in the order
+   of the key and the indexes do not claim HA_READ_ORDER.
+   --------------------------------------------------------------------- */
+
+/* The column types that can be used in an index: the ones for which a key
+   can be turned into an exact FastBit condition. */
+static bool warp_key_part_supported(const KEY_PART_INFO *kp) {
+  const Field *f = kp->field;
+  if(f->is_virtual_gcol()) {
+    return false;
+  }
+  /* no prefix keys */
+  if(kp->key_part_flag & HA_PART_KEY_SEG) {
+    return false;
+  }
+  switch(f->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_YEAR:
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_NEWDATE:
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_DATETIME2:
+    case MYSQL_TYPE_TIMESTAMP:
+    case MYSQL_TYPE_TIMESTAMP2:
+    case MYSQL_TYPE_TIME:
+    case MYSQL_TYPE_TIME2:
+      return true;
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_STRING:
+      if(kp->length < f->field_length) {
+        return false;
+      }
+      /* utf8mb4_bin, which FastBit compares in the same way (PAD SPACE) */
+      return f->charset()->number == 46;
+    default:
+      return false;
+  }
 }
 
-ha_rows ha_warp::records_in_range(uint, key_range *, key_range *) {
-  close_in_extra = true;
-  auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
-  warp_table_read_lock data_lock(pushdown_info->datadir);
-  auto estimator = ibis::mensa::create(pushdown_info->datadir);
-  uint64_t min=0;
-  uint64_t max=0;
-  ha_rows cnt = 0;
+/* The value of a key part, as it is written in a FastBit condition */
+struct warp_key_value {
+  bool is_null = false;
+  std::string text;
+};
 
-  // always scan the fact table
-  if(pushdown_info->is_fact_table == true) {
-    cnt = -1ULL;
-  } else {
-    if(pushdown_info->filter == "") {
-      cnt = estimator->nRows();  
-    } else {
-      estimator->estimate(pushdown_info->filter.c_str(), min, max);
+/* @param ptr the key part in the key buffer (with the NULL byte if any) */
+static bool warp_decode_key_part(TABLE *table, const KEY_PART_INFO *kp,
+                                 const uchar *ptr, warp_key_value &v) {
+  Field *f = kp->field;
+  v.is_null = false;
+  v.text.clear();
+  if(kp->null_bit) {
+    v.is_null = *ptr != 0;
+    ++ptr;
+    if(v.is_null) {
+      return true;
     }
   }
-  delete estimator;
-  return cnt > 0 ? cnt : max - min;
+  /* the key image is read through the field, in a record of its own so that
+     the row buffers of the table are not touched */
+  std::vector<uchar> scratch(table->s->reclength + 8, 0);
+  const ptrdiff_t diff = scratch.data() - table->record[0];
+  my_bitmap_map *org_bitmap = dbug_tmp_use_all_columns(table, table->read_set);
+  f->move_field_offset(diff);
+  f->set_key_image(ptr, kp->length);
+  bool ok = true;
+  if(f->real_type() == MYSQL_TYPE_VARCHAR ||
+     f->real_type() == MYSQL_TYPE_STRING) {
+    String tmp;
+    String *val = f->val_str(&tmp);
+    if(val == NULL) {
+      ok = false;
+    } else {
+      std::string escaped;
+      for(size_t i = 0; ok && i < val->length(); ++i) {
+        const char c = val->ptr()[i];
+        if(c == 0) {
+          ok = false; /* FastBit strings end at a NUL */
+        } else if(c == '\'') {
+          escaped += "\\'";
+        } else if(c == '\\') {
+          escaped += "\\\\";
+        } else {
+          escaped += c;
+        }
+      }
+      v.text = "'" + escaped + "'";
+    }
+  } else if(f->real_type() == MYSQL_TYPE_YEAR) {
+    v.text = std::to_string(f->val_int());
+  } else if(f->real_type() == MYSQL_TYPE_DATE ||
+            f->real_type() == MYSQL_TYPE_NEWDATE ||
+            f->real_type() == MYSQL_TYPE_DATETIME ||
+            f->real_type() == MYSQL_TYPE_DATETIME2 ||
+            f->real_type() == MYSQL_TYPE_TIMESTAMP ||
+            f->real_type() == MYSQL_TYPE_TIMESTAMP2 ||
+            warp_is_time_type(f->real_type())) {
+    /* the same encoding as the one the rows are written with (see
+       encode_quote): TIME as biased microseconds, the others as packed
+       DATETIME values; a TIMESTAMP is in the time zone of the session */
+    if(warp_is_time_type(f->real_type())) {
+      Time_val t;
+      if(f->val_time(&t)) {
+        ok = false;
+      } else {
+        v.text = std::to_string(warp_encode_time(t));
+      }
+    } else {
+      Datetime_val dt;
+      if(f->val_datetime(&dt, TIME_DATETIME_ONLY)) {
+        ok = false;
+      } else {
+        v.text = std::to_string(TIME_to_longlong_datetime_packed(dt));
+      }
+    }
+  } else {
+    const longlong n = f->val_int();
+    const bool is_unsigned = f->all_flags() & UNSIGNED_FLAG;
+    if(f->real_type() == MYSQL_TYPE_LONGLONG) {
+      /* exact for the values that a double can not represent */
+      v.text = is_unsigned ? std::to_string((ulonglong)n) + "U"
+                           : std::to_string(n) + "L";
+    } else {
+      v.text = std::to_string(n);
+    }
+  }
+  f->move_field_offset(-diff);
+  dbug_tmp_restore_column_map(table->read_set, org_bitmap);
+  return ok;
+}
+
+/* The condition "column op value" for a part of a key.  NULL sorts before
+   every value, like in the indexes of MySQL.  The columns are named by the
+   position of the column in the table, the NULL markers of nullable columns
+   are the columns n<position>. */
+static std::string warp_key_part_condition(const Field *f,
+                                           const warp_key_value &v,
+                                           const std::string &op) {
+  const std::string pos = std::to_string(f->field_index());
+  const std::string null_marker = "n" + pos;
+  if(v.is_null) {
+    if(op == "=" || op == "<=") return null_marker + " = 1";
+    if(op == ">=") return "1=1";
+    if(op == ">") return null_marker + " = 0";
+    return "1=0"; /* nothing is smaller than NULL */
+  }
+  const std::string cmp = "c" + pos + " " + op + " " + v.text;
+  if(!f->is_nullable()) {
+    return "(" + cmp + ")";
+  }
+  if(op == "<" || op == "<=") {
+    return "(" + null_marker + " = 1 OR (" + null_marker + " = 0 AND " + cmp +
+           "))";
+  }
+  return "(" + null_marker + " = 0 AND " + cmp + ")";
+}
+
+/* The rows that are after (lower) or before (not lower) a key, in the order
+   of the key parts: the rows with a bigger first part, or with the same first
+   part and a bigger second part and so on.  A key with fewer parts than the
+   index is a prefix, the rest of the parts are not compared. */
+static std::string warp_key_bound(const KEY *key,
+                                  const std::vector<warp_key_value> &values,
+                                  size_t part, bool lower, bool inclusive) {
+  const Field *f = key->key_part[part].field;
+  const std::string strict = lower ? ">" : "<";
+  const std::string loose = lower ? ">=" : "<=";
+  if(part + 1 == values.size()) {
+    return warp_key_part_condition(f, values[part], inclusive ? loose : strict);
+  }
+  return "(" + warp_key_part_condition(f, values[part], strict) + " OR (" +
+         warp_key_part_condition(f, values[part], "=") + " AND " +
+         warp_key_bound(key, values, part + 1, lower, inclusive) + "))";
+}
+
+static bool warp_decode_key(TABLE *table, uint idx, const key_range *range,
+                            std::vector<warp_key_value> &values) {
+  const KEY *key = &table->key_info[idx];
+  const uchar *ptr = range->key;
+  values.clear();
+  for(uint i = 0; i < key->user_defined_key_parts &&
+                  (range->keypart_map & (key_part_map(1) << i)); ++i) {
+    const KEY_PART_INFO *kp = &key->key_part[i];
+    warp_key_value v;
+    if(!warp_decode_key_part(table, kp, ptr, v)) {
+      return false;
+    }
+    values.push_back(v);
+    ptr += kp->store_length;
+  }
+  return !values.empty();
+}
+
+/* The condition for a lookup or for a range of the index.  An empty
+   condition is every row.  Returns false for a lookup that can not be
+   made (the search of the previous row or the last one of a key, for
+   example). */
+bool ha_warp::make_key_condition(const key_range *start_key,
+                                 const key_range *end_key, bool eq_range,
+                                 std::string &condition) {
+  const KEY *key = &table->key_info[active_index];
+  std::vector<warp_key_value> values;
+  condition = "";
+
+  if(start_key != NULL && start_key->flag == HA_READ_KEY_EXACT &&
+     (end_key == NULL ? true : eq_range)) {
+    /* the rows with this key (or this prefix of the key) */
+    if(!warp_decode_key(table, active_index, start_key, values)) {
+      return false;
+    }
+    for(size_t i = 0; i < values.size(); ++i) {
+      if(i > 0) condition += " AND ";
+      condition += warp_key_part_condition(key->key_part[i].field, values[i],
+                                           "=");
+    }
+    return true;
+  }
+
+  if(start_key != NULL) {
+    if(start_key->flag != HA_READ_KEY_EXACT &&
+       start_key->flag != HA_READ_KEY_OR_NEXT &&
+       start_key->flag != HA_READ_AFTER_KEY) {
+      return false;
+    }
+    if(!warp_decode_key(table, active_index, start_key, values)) {
+      return false;
+    }
+    condition = warp_key_bound(key, values, 0, true,
+                               start_key->flag != HA_READ_AFTER_KEY);
+  }
+  if(end_key != NULL) {
+    if(end_key->flag != HA_READ_AFTER_KEY &&
+       end_key->flag != HA_READ_BEFORE_KEY &&
+       end_key->flag != HA_READ_KEY_EXACT) {
+      return false;
+    }
+    if(!warp_decode_key(table, active_index, end_key, values)) {
+      return false;
+    }
+    if(condition != "") condition += " AND ";
+    condition += warp_key_bound(key, values, 0, false,
+                                end_key->flag != HA_READ_BEFORE_KEY);
+  }
+  return true;
+}
+
+/* Starts the scan for a lookup.  The scan of an earlier lookup is ended
+   first, but the rows that this statement wrote stay in the buffer of the
+   writer until the statement ends: they must not be found by its own scans. */
+int ha_warp::start_index_scan(const std::string &key_condition) {
+  if(index_scan_open) {
+    end_scan(false);
+  }
+  std::string where = index_base_where;
+  if(key_condition != "") {
+    where = where == "" ? key_condition
+                        : "(" + where + ") AND (" + key_condition + ")";
+  }
+  push_where_clause = where;
+  index_scan_mode = true;
+  int rc = rnd_init(true);
+  index_scan_mode = false;
+  /* the rows of the lookup are not joined with the filters of other tables */
+  full_partition_scan = true;
+  if(rc == 0) {
+    index_scan_open = true;
+  }
+  return rc;
 }
 
 int ha_warp::index_init(uint idxno, bool) {
   DBUG_ENTER("ha_warp::index_init");
-  // just prevents unused variable warning
-  //if(sorted) sorted = sorted;
-
-  //FIXME: bitmap indexes are not sorted so figure out what the sorted arg
-  //means..
-  //assert(!sorted);
-
-  //DBUG_PRINT("ha_warp::index_init", ("Key #%d, sorted:%d", idxno, sorted));
-  DBUG_RETURN(index_init(idxno));
-}
-
-
-int ha_warp::index_init(uint idxno) {
-  warp_index_build_scope index_build_scope(ha_thd(), thread_budget);
+  /* the condition that ECP pushed for the statement */
+  index_base_where = push_where_clause == "1=1" ? "" : push_where_clause;
+  if(index_scan_open) {
+    end_scan(false);
+  }
   active_index = idxno;
-  last_trx_id = 0;
-  current_trx = NULL;
-
-  if(column_set == "") {
-    set_column_set();
-  }
-
-  auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
-  if(pushdown_info->base_table != NULL) {
-    base_table = pushdown_info->base_table;
-    idx_filtered_table = pushdown_info->filtered_table;
-    if(idx_filtered_table != NULL && pushdown_info->cursor != NULL) {
-      idx_cursor = pushdown_info->cursor;
-    } else {
-      if(idx_filtered_table != NULL) {
-        idx_cursor = idx_filtered_table->createCursor();
-        pushdown_info->cursor=idx_cursor; 
-      }
-    }
-  } else {
-    if(base_table == NULL) {
-      warp_table_read_lock data_lock(share->data_dir_name);
-      base_table = new ibis::mensa(share->data_dir_name);
-      idx_filtered_table =
-        base_table->select(column_set.c_str(), push_where_clause.c_str());
-      if(idx_filtered_table != NULL) {
-        // Allocate a cursor for any queries that actually fetch columns 
-        idx_cursor = idx_filtered_table->createCursor();
-      }
-      pushdown_info->base_table = base_table; // freed with the pushdown info
-      pushdown_info->filtered_table = idx_filtered_table;
-      pushdown_info->cursor = idx_cursor;
-      if(idx_filtered_table == NULL) {
-        warp_report_select_failure(share->data_dir_name);
-        return HA_ERR_OUT_OF_MEM;
-      }
-    }
-  }
-    
-  //idx_filtered_table_with_pushdown =
-  //   base_table->select(column_set.c_str(), push_where_clause.c_str());
-  return (0);
-}
-
-int ha_warp::index_next(uchar *buf) {
-  DBUG_ENTER("ha_warp::index_next");
-  uint64_t row_trx_id;
-  
-fetch_again:
-  ha_statistic_increment(&System_status_var::ha_read_next_count);
-  if(idx_cursor->fetch() != 0) {
-    DBUG_RETURN(HA_ERR_END_OF_FILE);
-  }
-  idx_cursor->getColumnAsULong("t", row_trx_id);
-  if(!is_trx_visible_to_read(row_trx_id)) {
-    goto fetch_again;
-  }
-
-  idx_cursor->getColumnAsULong("r", current_rowid);
-  if(!is_row_visible_to_read(current_rowid)) {
-    goto fetch_again;
-  }   
-  find_current_row(buf, idx_cursor);
-  DBUG_RETURN(0);
-}
-
-int ha_warp::index_first(uchar *buf) {
-  DBUG_ENTER("ha_warp::index_first");
-  ha_statistic_increment(&System_status_var::ha_read_first_count);
-  uint64_t row_trx_id;
-  last_trx_id = 0;
-  current_trx = NULL;
-  
-  set_column_set();
-  std::string where_clause;
-
-  if(idx_filtered_table == NULL) {
-    DBUG_RETURN(HA_ERR_END_OF_FILE);
-  }
-
-fetch_again:
-  if(idx_cursor->fetch() != 0) {
-    DBUG_RETURN(HA_ERR_END_OF_FILE);
-  }
-  idx_cursor->getColumnAsULong("t", row_trx_id);
-  if(!is_trx_visible_to_read(row_trx_id)) {
-    goto fetch_again;
-  }
-  
-  idx_cursor->getColumnAsULong("r", current_rowid);
-  if(!is_row_visible_to_read(current_rowid)) {
-    goto fetch_again;
-  } 
-  find_current_row(buf, idx_cursor);
-
   DBUG_RETURN(0);
 }
 
 int ha_warp::index_end() {
   DBUG_ENTER("ha_warp::index_end");
-  idx_cursor = NULL;
-  idx_filtered_table = NULL;
-  base_table = NULL;
-  idx_where_clause = "";
-  push_where_clause = "";
-  DBUG_RETURN(0);
-}
-
-
-uint64_t ha_warp::lookup_in_hash_index(const uchar *key, key_part_map keypart_map,
-                               enum ha_rkey_function find_flag) {
-  DBUG_ENTER("ha_warp::lookup_in_hash_index");
-  Field *f = table->key_info[active_index].key_part[0].field;
-  
-  uint64_t uintval = 0;
-  int64_t intval = 0;
-  double dblval = 0;
-  std::string strval;
-
-  bool is_unsigned = f->all_flags() & UNSIGNED_FLAG;
-  bool is_int = false;
-  bool is_uint = false;
-  bool is_double = false;
-  bool is_string = false;
-
-  switch(f->real_type()) {
-    case MYSQL_TYPE_TINY:
-    case MYSQL_TYPE_SHORT:
-    case MYSQL_TYPE_LONG:
-    case MYSQL_TYPE_LONGLONG:
-    case MYSQL_TYPE_INT24:
-      if(is_unsigned) {
-        is_uint = true;
-        uintval = f->val_int();
-      } else {
-        is_int = true;
-        intval = f->val_int();
-      }
-    break;
-
-    case MYSQL_TYPE_FLOAT:
-    case MYSQL_TYPE_DOUBLE:
-      is_double = true;
-      dblval = f->val_real();
-    break;
-
-    case MYSQL_TYPE_DATE:
-    case MYSQL_TYPE_TIME:
-    case MYSQL_TYPE_TIMESTAMP:
-    case MYSQL_TYPE_DATETIME:
-    case MYSQL_TYPE_YEAR:
-    case MYSQL_TYPE_NEWDATE:
-    case MYSQL_TYPE_TIMESTAMP2:
-    case MYSQL_TYPE_DATETIME2:
-    case MYSQL_TYPE_TIME2: 
-      is_unsigned = true;
-      uintval = f->val_int();
-    break;
-
-    case MYSQL_TYPE_VAR_STRING:
-    case MYSQL_TYPE_VARCHAR:
-    case MYSQL_TYPE_STRING:
-    case MYSQL_TYPE_TINY_BLOB:
-    case MYSQL_TYPE_MEDIUM_BLOB:
-    case MYSQL_TYPE_LONG_BLOB:
-    case MYSQL_TYPE_BLOB:
-    case MYSQL_TYPE_JSON:
-    case MYSQL_TYPE_ENUM:
-    case MYSQL_TYPE_SET: 
-    case MYSQL_TYPE_DECIMAL:
-    case MYSQL_TYPE_NEWDECIMAL:
-    case MYSQL_TYPE_BIT:
-    case MYSQL_TYPE_NULL:
-    case MYSQL_TYPE_GEOMETRY:
-    {
-      is_string = true;
-      // for strings, the key buffer is fixed width, and there is a two byte
-      // prefix which lists the string length
-      String tmpval;
-      tmpval.reserve(8192);
-      f->val_str(&tmpval, &tmpval);
-      std::string strval;
-      strval.assign(tmpval.ptr(), tmpval.length());
-    }
-    break;
-    default:
-    break;
+  int rc = 0;
+  if(index_scan_open || writer != NULL) {
+    rc = end_scan(true);
   }
-
-  auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
-  
-  if(is_uint) {
-    auto it = pushdown_info->uint_to_row_map.find(uintval);
-    if(it !=  pushdown_info->uint_to_row_map.end()) {
-      return it->second;
-    }
-  } 
-
-  if(is_int) {
-    auto it=pushdown_info->int_to_row_map.find(intval);
-    if(it !=  pushdown_info->int_to_row_map.end()) {
-      return it->second;
-    }
-  } 
-
-  if(is_double) {
-    auto it=pushdown_info->double_to_row_map.find(dblval);
-    if(it !=  pushdown_info->double_to_row_map.end()) {
-      return it->second;
-    }
-  } 
-
-  if(is_string) {
-    auto it=pushdown_info->string_to_row_map.find(strval);
-    if(it !=  pushdown_info->string_to_row_map.end()) {
-      return it->second;
-    }
-  }
-
-  // not found returns maximum ulonglong
-  return -1ULL;
-
-  DBUG_RETURN(0);
+  /* the next index_init of the statement needs it again */
+  push_where_clause = index_base_where;
+  DBUG_RETURN(rc);
 }
-
 
 int ha_warp::index_read_map(uchar *buf, const uchar *key,
                             key_part_map keypart_map,
                             enum ha_rkey_function find_flag) {
   DBUG_ENTER("ha_warp::index_read_map");
   ha_statistic_increment(&System_status_var::ha_read_key_count);
-  // DBUG_RETURN(HA_ERR_WRONG_COMMAND);
-  
-  uint64_t row_trx_id;
-  last_trx_id = 0;
-  current_trx = NULL;
-  auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
-  if(!idx_cursor) {
-    base_table = pushdown_info->base_table;
-    idx_filtered_table = pushdown_info->filtered_table;
+  key_range start = {key, 0, keypart_map, find_flag};
+  std::string condition;
+  if(find_flag != HA_READ_KEY_EXACT && find_flag != HA_READ_KEY_OR_NEXT &&
+     find_flag != HA_READ_AFTER_KEY) {
+    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
   }
-  if(idx_filtered_table == NULL) {
-    DBUG_RETURN(HA_ERR_END_OF_FILE);
+  if(!make_key_condition(&start, NULL, false, condition)) {
+    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
   }
-  
-  if(pushdown_info->cursor) {
-    idx_cursor = pushdown_info->cursor;
-  } else {
-    idx_cursor = idx_filtered_table->createCursor();
-  }  
-  assert(idx_cursor != NULL);
-
-  
-fetch_again:
-  if(idx_cursor->fetch() != 0) {
-      DBUG_RETURN(HA_ERR_END_OF_FILE);
-    }
- 
-  idx_cursor->getColumnAsULong("t", row_trx_id);
-  if(!is_trx_visible_to_read(row_trx_id)) {
-    goto fetch_again;
+  int rc = start_index_scan(condition);
+  if(rc != 0) {
+    DBUG_RETURN(rc);
   }
-  
-  idx_cursor->getColumnAsULong("r", current_rowid);
-  if(!is_row_visible_to_read(current_rowid)) {
-    goto fetch_again;
-  } 
-
-  find_current_row(buf, idx_cursor);
-   DBUG_RETURN(0);
+  DBUG_RETURN(rnd_next(buf));
 }
 
+/* Used for the tables that the optimizer reads once (constants), without
+   index_init and index_end.  The scan stays open until the next one starts or
+   the statement ends, the row may use memory of the scan. */
 int ha_warp::index_read_idx_map(uchar *buf, uint idxno, const uchar *key,
                                 key_part_map keypart_map,
                                 enum ha_rkey_function find_flag) {
   DBUG_ENTER("ha_warp::index_read_idx_map");
-  auto save_idx = active_index;
+  const std::string saved = push_where_clause;
+  const std::string saved_base = index_base_where;
+  const uint saved_idx = active_index;
+  if(index_scan_open) {
+    end_scan(false);
+  }
   active_index = idxno;
+  index_base_where = saved == "1=1" ? "" : saved;
   int rc = index_read_map(buf, key, keypart_map, find_flag);
-  active_index = save_idx;
+  push_where_clause = saved;
+  index_base_where = saved_base;
+  active_index = saved_idx;
   DBUG_RETURN(rc);
 }
-*/
+
+int ha_warp::index_next(uchar *buf) {
+  DBUG_ENTER("ha_warp::index_next");
+  ha_statistic_increment(&System_status_var::ha_read_next_count);
+  if(!index_scan_open) {
+    DBUG_RETURN(HA_ERR_END_OF_FILE);
+  }
+  DBUG_RETURN(rnd_next(buf));
+}
+
+/* every row of the scan has the key */
+int ha_warp::index_next_same(uchar *buf, const uchar *, uint) {
+  return index_next(buf);
+}
+
+int ha_warp::index_first(uchar *buf) {
+  DBUG_ENTER("ha_warp::index_first");
+  ha_statistic_increment(&System_status_var::ha_read_first_count);
+  int rc = start_index_scan("");
+  if(rc != 0) {
+    DBUG_RETURN(rc);
+  }
+  DBUG_RETURN(rnd_next(buf));
+}
+
+/* The rows of a range are found by one scan, which is not in the order of the
+   key: the end of the range is part of its condition. */
+int ha_warp::read_range_first(const key_range *start_key,
+                              const key_range *end_key, bool eq_range, bool) {
+  DBUG_ENTER("ha_warp::read_range_first");
+  std::string condition;
+  if(!make_key_condition(start_key, end_key, eq_range, condition)) {
+    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  }
+  ha_statistic_increment(&System_status_var::ha_read_key_count);
+  int rc = start_index_scan(condition);
+  if(rc != 0) {
+    DBUG_RETURN(rc);
+  }
+  rc = rnd_next(table->record[0]);
+  DBUG_RETURN(rc == HA_ERR_KEY_NOT_FOUND ? HA_ERR_END_OF_FILE : rc);
+}
+
+int ha_warp::read_range_next() {
+  DBUG_ENTER("ha_warp::read_range_next");
+  DBUG_RETURN(index_next(table->record[0]));
+}
+
+/* The number of rows of a range, as FastBit estimates it with the bitmap
+   indexes (the upper bound, the rows in the delete bitmap and of
+   transactions that are not visible are not known). */
+ha_rows ha_warp::records_in_range(uint idxno, key_range *min_key,
+                                  key_range *max_key) {
+  const uint saved_idx = active_index;
+  active_index = idxno;
+  std::string condition;
+  const bool ok = make_key_condition(
+      min_key, max_key,
+      min_key != NULL && max_key != NULL && min_key->flag == HA_READ_KEY_EXACT &&
+          max_key->flag == HA_READ_AFTER_KEY,
+      condition);
+  active_index = saved_idx;
+  if(!ok) {
+    return HA_POS_ERROR;
+  }
+  std::string where = push_where_clause == "1=1" ? "" : push_where_clause;
+  if(condition != "") {
+    where = where == "" ? condition
+                        : "(" + where + ") AND (" + condition + ")";
+  }
+  try {
+    warp_table_read_lock data_lock(share->data_dir_name);
+    std::unique_ptr<ibis::mensa> estimator(
+        new ibis::mensa(share->data_dir_name));
+    uint64_t rows = estimator->nRows();
+    if(where != "") {
+      uint64_t min = 0, max = 0;
+      estimator->estimate(where.c_str(), min, max);
+      rows = max;
+    }
+    return rows > 0 ? rows : 1;
+  } catch(...) {
+    return HA_POS_ERROR;
+  }
+}
 
 /**
  * Push conditions to a single WARP table.
@@ -3426,7 +3567,8 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
     ha->push_where_clause = "";
     ha->cond_push(join->where_cond);
   }
-  if (ha->push_where_clause != "") {
+  /* either part may be empty: nothing of it was pushed */
+  if (ha->push_where_clause != "" && save_where != "") {
     ha->push_where_clause += " AND ";
   }
   ha->push_where_clause += save_where;
@@ -3608,6 +3750,14 @@ const Item *ha_warp::cond_push(const Item *cond) {
     }
     
     where_clause += ")";
+  } else {
+    /* Any other item (a column used as a condition, a constant, a
+       subquery...) is not pushed: the clause must stay valid and MySQL has to
+       evaluate the item */
+    condition_count++;
+    unpushed_condition_count++;
+    where_clause += "1=1";
+    return cond;
   }
   
   // only push a where clause if there were condtiions that were actually pushed
@@ -4165,6 +4315,10 @@ int ha_warp::append_column_filter(const Item *cond,
       }
 
       if((*arg)->type() == Item::Type::NULL_ITEM) {
+        /* x <=> NULL is true for the rows where x is NULL */
+        if(tmp->functype() == Item_func::Functype::EQUAL_FUNC) {
+          return 0;
+        }
         build_where_clause += " NULL ";
         continue;
       }
