@@ -109,10 +109,12 @@ while ($q < 19)
 --echo # the lookups were compared
 
 --echo # the plan can use the indexes
+--disable_warnings
 --replace_column 10 #
 EXPLAIN SELECT id FROM w FORCE INDEX (a_idx) WHERE a = 2;
 --replace_column 10 #
 EXPLAIN SELECT id FROM w FORCE INDEX (s_idx) WHERE s = 'a';
+--enable_warnings
 
 --echo # the condition of the statement is kept with the key
 SELECT id FROM w WHERE a = 2 AND id > 3 ORDER BY id;
