@@ -1,0 +1,67 @@
+--echo #
+--echo # A replica finds the rows of an update with the non-unique key of a WARP
+--echo # table instead of scanning the table once per row event.  Ten single row
+--echo # updates of a table of one million rows must take the replica clearly
+--echo # less time with a key than without one.
+--echo #
+--source include/rpl/init_source_replica.inc
+--source include/have_binlog_format_row.inc
+
+CREATE TABLE t_scan (id INT, v INT, s VARCHAR(20))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE t_key (id INT, v INT, s VARCHAR(20), KEY id_idx (id))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+SET SESSION cte_max_recursion_depth = 2000000;
+INSERT INTO t_scan WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000)
+  SELECT x, 0, CONCAT('row-', x) FROM n;
+INSERT INTO t_key WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000)
+  SELECT x, 0, CONCAT('row-', x) FROM n;
+--source include/rpl/sync_to_replica.inc
+
+--echo # Both tables are complete on the replica
+SELECT COUNT(*), SUM(id) FROM t_scan;
+SELECT COUNT(*), SUM(id) FROM t_key;
+
+--source include/rpl/connection_source.inc
+let $t0 = `SELECT UNIX_TIMESTAMP(NOW(6))`;
+let $i = 600000;
+while ($i < 600010)
+{
+  eval UPDATE t_scan SET v = v + 1 WHERE id = $i;
+  inc $i;
+}
+--source include/rpl/sync_to_replica.inc
+let $scan_time = `SELECT UNIX_TIMESTAMP(NOW(6)) - $t0`;
+
+--source include/rpl/connection_source.inc
+let $t0 = `SELECT UNIX_TIMESTAMP(NOW(6))`;
+let $i = 600000;
+while ($i < 600010)
+{
+  eval UPDATE t_key SET v = v + 1 WHERE id = $i;
+  inc $i;
+}
+--source include/rpl/sync_to_replica.inc
+let $key_time = `SELECT UNIX_TIMESTAMP(NOW(6)) - $t0`;
+
+--echo # The replica used the key: the updates were much faster than with a scan
+if (`SELECT $scan_time > 2 * $key_time`)
+{
+  --echo key lookups are faster
+}
+if (`SELECT $scan_time <= 2 * $key_time`)
+{
+  --echo MISMATCH: scan $scan_time seconds, key $key_time seconds
+}
+
+SELECT COUNT(*), SUM(v) FROM t_scan WHERE v > 0;
+SELECT COUNT(*), SUM(v) FROM t_key WHERE v > 0;
+--let $diff_tables = master:test.t_scan, slave:test.t_scan
+--source include/diff_tables.inc
+--let $diff_tables = master:test.t_key, slave:test.t_key
+--source include/diff_tables.inc
+
+--source include/rpl/connection_source.inc
+DROP TABLE t_scan, t_key;
+--source include/rpl/deinit.inc

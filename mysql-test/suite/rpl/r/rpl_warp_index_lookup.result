@@ -1,0 +1,65 @@
+#
+# A replica finds the rows of an update with the non-unique key of a WARP
+# table instead of scanning the table once per row event.  Ten single row
+# updates of a table of one million rows must take the replica clearly
+# less time with a key than without one.
+#
+include/rpl/init_source_replica.inc
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+[connection master]
+CREATE TABLE t_scan (id INT, v INT, s VARCHAR(20))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE t_key (id INT, v INT, s VARCHAR(20), KEY id_idx (id))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+SET SESSION cte_max_recursion_depth = 2000000;
+INSERT INTO t_scan WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000)
+SELECT x, 0, CONCAT('row-', x) FROM n;
+INSERT INTO t_key WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000)
+SELECT x, 0, CONCAT('row-', x) FROM n;
+include/rpl/sync_to_replica.inc
+# Both tables are complete on the replica
+SELECT COUNT(*), SUM(id) FROM t_scan;
+COUNT(*)	SUM(id)
+1000000	500000500000
+SELECT COUNT(*), SUM(id) FROM t_key;
+COUNT(*)	SUM(id)
+1000000	500000500000
+[connection master]
+UPDATE t_scan SET v = v + 1 WHERE id = 600000;
+UPDATE t_scan SET v = v + 1 WHERE id = 600001;
+UPDATE t_scan SET v = v + 1 WHERE id = 600002;
+UPDATE t_scan SET v = v + 1 WHERE id = 600003;
+UPDATE t_scan SET v = v + 1 WHERE id = 600004;
+UPDATE t_scan SET v = v + 1 WHERE id = 600005;
+UPDATE t_scan SET v = v + 1 WHERE id = 600006;
+UPDATE t_scan SET v = v + 1 WHERE id = 600007;
+UPDATE t_scan SET v = v + 1 WHERE id = 600008;
+UPDATE t_scan SET v = v + 1 WHERE id = 600009;
+include/rpl/sync_to_replica.inc
+[connection master]
+UPDATE t_key SET v = v + 1 WHERE id = 600000;
+UPDATE t_key SET v = v + 1 WHERE id = 600001;
+UPDATE t_key SET v = v + 1 WHERE id = 600002;
+UPDATE t_key SET v = v + 1 WHERE id = 600003;
+UPDATE t_key SET v = v + 1 WHERE id = 600004;
+UPDATE t_key SET v = v + 1 WHERE id = 600005;
+UPDATE t_key SET v = v + 1 WHERE id = 600006;
+UPDATE t_key SET v = v + 1 WHERE id = 600007;
+UPDATE t_key SET v = v + 1 WHERE id = 600008;
+UPDATE t_key SET v = v + 1 WHERE id = 600009;
+include/rpl/sync_to_replica.inc
+# The replica used the key: the updates were much faster than with a scan
+key lookups are faster
+SELECT COUNT(*), SUM(v) FROM t_scan WHERE v > 0;
+COUNT(*)	SUM(v)
+10	10
+SELECT COUNT(*), SUM(v) FROM t_key WHERE v > 0;
+COUNT(*)	SUM(v)
+10	10
+include/diff_tables.inc [master:test.t_scan, slave:test.t_scan]
+include/diff_tables.inc [master:test.t_key, slave:test.t_key]
+[connection master]
+DROP TABLE t_scan, t_key;
+include/rpl/deinit.inc
