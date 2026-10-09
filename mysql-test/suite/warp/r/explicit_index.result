@@ -33,13 +33,9 @@ INSERT INTO i SELECT * FROM w;
 EXPLAIN SELECT id FROM w FORCE INDEX (a_idx) WHERE a = 2;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	w	NULL	ref	a_idx	a_idx	5	const	#	100.00	NULL
-Warnings:
-Note	1003	/* select#1 */ select `test`.`w`.`id` AS `id` from `test`.`w` FORCE INDEX (`a_idx`) where (`test`.`w`.`a` = 2)
 EXPLAIN SELECT id FROM w FORCE INDEX (s_idx) WHERE s = 'a';
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	w	NULL	ref	s_idx	s_idx	83	const	#	100.00	NULL
-Warnings:
-Note	1003	/* select#1 */ select `test`.`w`.`id` AS `id` from `test`.`w` FORCE INDEX (`s_idx`) where (`test`.`w`.`s` = 'a')
 # the condition of the statement is kept with the key
 SELECT id FROM w WHERE a = 2 AND id > 3 ORDER BY id;
 id
