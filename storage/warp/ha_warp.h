@@ -336,8 +336,17 @@ struct WARP_SHARE {
   std::string table_name;
   uint table_name_length, use_count;
   char data_dir_name[FN_REFLEN];
-  uint64_t next_rowid = 0;  
+  uint64_t next_rowid = 0;
   uint64_t rowids_generated = 0;
+  /* The partitions of the table (p0, p1, ...) and the number of rows in
+     each, read from disk the first time rows are written so that writing
+     the buffered rows does not read the metadata of every partition.
+     Protected by mutex. */
+  bool partitions_loaded = false;
+  std::map<uint64_t, uint64_t> partition_rows;
+  /* the partitions that rows are being written to right now */
+  std::set<uint64_t> partitions_writing;
+  uint64_t next_partition = 0;
   mysql_mutex_t mutex;
   THR_LOCK lock;
 };
@@ -771,7 +780,8 @@ class ha_warp : public handler {
   //int set_column_set(uint32_t idxno);
   int find_current_row(uchar *buf, ibis::table::cursor* cursor);
   int create_writer(TABLE *table_arg);
-  std::string get_writer_partition();
+  void load_partition_rows();
+  uint64_t claim_writer_partition();
   int write_buffered_rows_to_disk();
   /* write_row does its work in write_row_impl so that exceptions thrown by
      FastBit are turned into handler errors */
@@ -835,7 +845,6 @@ class ha_warp : public handler {
   void cleanup_pushdown_info();
 
   bool close_in_extra = false;
-  std::mutex write_mutex;
 
   /* These objects are used to access the FastBit tables for tuple reads.*/ 
   ibis::table*         base_table         = NULL; 
