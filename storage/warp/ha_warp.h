@@ -1008,6 +1008,11 @@ class ha_warp : public handler {
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
              dd::Table *table_def);
   bool check_if_incompatible_data(HA_CREATE_INFO *info, uint table_changes);
+  /* Adding, dropping and renaming indexes only changes the definition of the
+     table: the indexes are declarations (see ha_warp::make_key_condition) and
+     the data is not touched. */
+  enum_alter_inplace_result check_if_supported_inplace_alter(
+      TABLE *altered_table, Alter_inplace_info *ha_alter_info) override;
   int delete_table(const char *table_name, const dd::Table *);
   warp_trx* create_trx(THD* thd);
   int external_lock(THD *thd, int lock_type);
