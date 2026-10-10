@@ -1424,6 +1424,11 @@ static bool warp_star_execute(warp_star_agg &plan, std::string *error) {
         if(k >= work.size() || failed.load()) {
           break;
         }
+        /* a statement that is killed stops at the next partition */
+        if(thd_killed(thd)) {
+          failed = true;
+          break;
+        }
         std::string message;
         if(!warp_star_partition(plan, work[k], snap, &accs[id], &message)) {
           std::lock_guard<std::mutex> guard(error_mutex);
@@ -1464,6 +1469,10 @@ static bool warp_star_execute(warp_star_agg &plan, std::string *error) {
   for(auto &part : parts) {
     delete part;
     part = nullptr;
+  }
+  if(thd_killed(thd)) {
+    *error = "interrupted";
+    return false;
   }
 
   for(size_t id = 0; id < workers; ++id) {
@@ -1566,6 +1575,10 @@ bool ha_warp::star_agg_run() {
   std::string error;
   try {
     if(!warp_star_execute(plan, &error)) {
+      if(thd_killed(plan.thd)) {
+        plan.thd->send_kill_message();
+        return true;
+      }
       sql_print_error("WARP: aggregation of %s failed: %s", share->data_dir_name, error.c_str());
       if(error.compare(0, 6, "BIGINT") == 0) {
         my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "BIGINT", error.c_str());
