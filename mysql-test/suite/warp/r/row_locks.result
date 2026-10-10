@@ -1,0 +1,99 @@
+#
+# Row locks of reads: a transaction that holds a lock on a row and asks for
+# another kind of lock on it keeps the stronger one (it used to crash the
+# server), the locks of other transactions still conflict.
+#
+call mtr.add_suppression("lock wait timeout");
+CREATE TABLE t1 (id INT NOT NULL, v INT) ENGINE=WARP;
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+# FOR UPDATE, then LOCK IN SHARE MODE on the same rows
+BEGIN;
+SELECT * FROM t1 WHERE id <= 2 ORDER BY id FOR UPDATE;
+id	v
+1	10
+2	20
+SELECT * FROM t1 WHERE id <= 2 ORDER BY id LOCK IN SHARE MODE;
+id	v
+1	10
+2	20
+SELECT * FROM t1 WHERE id <= 2 ORDER BY id FOR UPDATE;
+id	v
+1	10
+2	20
+COMMIT;
+# LOCK IN SHARE MODE, then FOR UPDATE, then LOCK IN SHARE MODE
+BEGIN;
+SELECT * FROM t1 WHERE id >= 3 ORDER BY id LOCK IN SHARE MODE;
+id	v
+3	30
+4	40
+SELECT * FROM t1 WHERE id >= 3 ORDER BY id FOR UPDATE;
+id	v
+3	30
+4	40
+SELECT * FROM t1 WHERE id >= 3 ORDER BY id LOCK IN SHARE MODE;
+id	v
+3	30
+4	40
+COMMIT;
+# the same row is read twice by one statement
+BEGIN;
+SELECT a.id, b.id FROM t1 a JOIN t1 b ON a.id = b.id WHERE a.id = 1 FOR UPDATE;
+id	id
+1	1
+COMMIT;
+# a locked row can be updated and deleted by the transaction
+BEGIN;
+SELECT * FROM t1 WHERE id = 1 FOR UPDATE;
+id	v
+1	10
+SELECT * FROM t1 WHERE id = 1 LOCK IN SHARE MODE;
+id	v
+1	10
+UPDATE t1 SET v = 11 WHERE id = 1;
+SELECT * FROM t1 WHERE id = 2 LOCK IN SHARE MODE;
+id	v
+2	20
+DELETE FROM t1 WHERE id = 2;
+COMMIT;
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	11
+3	30
+4	40
+# Locks of other transactions
+BEGIN;
+SELECT * FROM t1 WHERE id = 3 FOR UPDATE;
+id	v
+3	30
+SET SESSION warp_lock_wait_timeout = 1;
+# a row that is locked by the first transaction
+SELECT * FROM t1 WHERE id = 3 FOR UPDATE;
+ERROR HY000: Got error 1205 - 'Unknown error 1205' from storage engine
+SELECT * FROM t1 WHERE id = 3 LOCK IN SHARE MODE;
+ERROR HY000: Got error 1205 - 'Unknown error 1205' from storage engine
+# other rows are not locked
+SELECT * FROM t1 WHERE id = 4 FOR UPDATE;
+id	v
+4	40
+SELECT * FROM t1 WHERE id = 1 LOCK IN SHARE MODE;
+id	v
+1	11
+COMMIT;
+# the lock is gone with the transaction
+SELECT * FROM t1 WHERE id = 3 FOR UPDATE;
+id	v
+3	30
+COMMIT;
+# shared locks of two transactions do not conflict
+BEGIN;
+SELECT * FROM t1 WHERE id = 4 LOCK IN SHARE MODE;
+id	v
+4	40
+BEGIN;
+SELECT * FROM t1 WHERE id = 4 LOCK IN SHARE MODE;
+id	v
+4	40
+COMMIT;
+COMMIT;
+DROP TABLE t1;
