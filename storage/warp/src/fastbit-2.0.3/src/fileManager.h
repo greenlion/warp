@@ -231,6 +231,14 @@ private:
     static uint32_t pagesize;
 
     int unload(size_t size);	// try to unload size bytes
+    /// Reads (and decompresses) a file into the storage object while the
+    /// mutex of the file manager is released, so that the threads that need
+    /// other files do not wait for the read.  The file is on the list of
+    /// the files being read (the caller put it there), the other threads that
+    /// need it wait for the condition readCond.  The mutex must be held
+    /// when it is called, and is held again when it returns, also when the
+    /// reading throws.
+    void readNoLock(roFile *file, const char *name);
     void invokeCleaners() const;// invoke external cleaners
     //inline void gainWriteAccess(const char* m) const;
 

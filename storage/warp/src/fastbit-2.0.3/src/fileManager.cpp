@@ -880,6 +880,16 @@ void ibis::fileManager::unrecordFile(ibis::fileManager::roFile *st) {
 /// Upon successful completion of the task, it returns zero; otherwise, it
 /// returns a non-zero value to indicate an error and it does not modify the
 /// content of storage object.
+void ibis::fileManager::readNoLock(roFile *file, const char *name) {
+    struct relock {
+        pthread_mutex_t *m;
+        ~relock() {pthread_mutex_lock(m);}
+    };
+    pthread_mutex_unlock(&mutex);
+    relock guard = {&mutex};
+    file->doRead(name);
+} // ibis::fileManager::readNoLock
+
 int ibis::fileManager::getFile(const char* name, storage **st,
                                ACCESS_PREFERENCE pref) {
     if (name == 0 || *name == 0 || st == 0) return -100;
@@ -1037,7 +1047,7 @@ int ibis::fileManager::getFile(const char* name, storage **st,
                 throw;
             }
             // read the file into memory
-            tmp->doRead(name);
+            readNoLock(tmp, name);
         }
     }
     else {
@@ -1058,7 +1068,7 @@ int ibis::fileManager::getFile(const char* name, storage **st,
             throw;
         }
         // read the file into memory
-        tmp->doRead(name);
+        readNoLock(tmp, name);
     }
 #else
     try {
@@ -1077,7 +1087,7 @@ int ibis::fileManager::getFile(const char* name, storage **st,
         // simply rethrow
         throw;
     }
-    tmp->doRead(name);
+    readNoLock(tmp, name);
 #endif
     if (tmp->size() == bytes) {
         recordFile(tmp);
@@ -1241,7 +1251,7 @@ int ibis::fileManager::tryGetFile(const char* name, storage **st,
                 throw;
             }
             // read the file into memory
-            tmp->doRead(name);
+            readNoLock(tmp, name);
         }
     }
     else {
@@ -1262,7 +1272,7 @@ int ibis::fileManager::tryGetFile(const char* name, storage **st,
             throw;
         }
         // read the file into memory
-        tmp->doRead(name);
+        readNoLock(tmp, name);
     }
 #else
     try {
@@ -1281,7 +1291,7 @@ int ibis::fileManager::tryGetFile(const char* name, storage **st,
         // simply rethrow
         throw;
     }
-    tmp->doRead(name);
+    readNoLock(tmp, name);
 #endif
     if (tmp->size() == bytes) {
         recordFile(tmp);

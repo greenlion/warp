@@ -239,6 +239,11 @@ static MYSQL_THDVAR_BOOL(adjust_table_stats_for_joins, PLUGIN_VAR_NOCMDARG,
                           "Sets the largest table in a query to have a row count of 2.  Can cause problems with some MySQL subquery optimizations.",
                           nullptr, nullptr, true);
 
+static MYSQL_THDVAR_BOOL(star_aggregation, PLUGIN_VAR_NOCMDARG,
+                          "Evaluate star schema queries that join one fact table to dimension tables and "
+                          "aggregate (SUM ... GROUP BY) inside the engine, in parallel by partition",
+                          nullptr, nullptr, false);
+
 static MYSQL_THDVAR_ULONG(parallel_min_rows, PLUGIN_VAR_RQCMDARG,
                           "Smallest number of rows of a piece of a partition that is processed by a thread of its own "
                           "(see warp_max_degree_of_parallelism).",
@@ -285,6 +290,7 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(lock_wait_timeout),
   MYSQL_SYSVAR(partition_filter),
   MYSQL_SYSVAR(adjust_table_stats_for_joins),
+  MYSQL_SYSVAR(star_aggregation),
   MYSQL_SYSVAR(max_degree_of_parallelism),
   MYSQL_SYSVAR(parallel_min_rows),
   NULL
@@ -730,6 +736,8 @@ warp_trx* warp_get_trx(handlerton* hton, THD* thd);
 //This is the handler where the majority of the work is done.  Handles
 //creating and dropping tables, TRUNCATE table, reading from indexes,
 //scanning tables, inserts, updates, deletes, engine condition pushdown
+struct warp_star_agg;  /* warp_star_agg.h */
+
 class ha_warp : public handler {
   /* MySQL lock - Fastbit has its own internal mutex implementation.  This is used to protect the share.*/
   THR_LOCK_DATA lock; 
@@ -967,6 +975,17 @@ class ha_warp : public handler {
   int update_row(const uchar *old_data, uchar *new_data);
   int delete_row(const uchar *buf);
   int rnd_init(bool scan = 1);
+  /* aggregation inside the engine, see warp_star_agg.h.  The plan is made in
+     push_to_engine, the result is computed by rnd_init and returned one
+     group per row by rnd_next. */
+  std::shared_ptr<warp_star_agg> star_agg;
+  /* An error that the engine has reported itself (my_error) is not replaced
+     by the generic message of the handler. */
+  void print_error(int error, myf errflag) override;
+  /* a read that locks rows (FOR UPDATE, LOCK IN SHARE MODE) */
+  bool locks_rows_on_read() const { return lock_in_share_mode || lock_for_update; }
+  bool star_agg_run();
+  int star_agg_next(uchar *buf);
   int rnd_next(uchar *buf);
   int rnd_pos(uchar *buf, uchar *pos);
   bool check_and_repair(THD *thd);

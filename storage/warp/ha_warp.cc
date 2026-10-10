@@ -1604,6 +1604,7 @@ int ha_warp::extra(enum ha_extra_function xtra) {
 }
 
 void ha_warp::cleanup_pushdown_info() {
+  star_agg.reset();
   if(index_scan_open) {
     end_scan(true);
   }
@@ -2041,6 +2042,10 @@ bool ha_warp::check_if_incompatible_data(HA_CREATE_INFO *, uint) {
 */
 int ha_warp::rnd_init(bool) {
   DBUG_ENTER("ha_warp::rnd_init");
+  if(star_agg) {
+    /* the query is aggregated by the engine, the rows are the groups */
+    DBUG_RETURN(star_agg_run() ? HA_ERR_INTERNAL_ERROR : 0);
+  }
   if(!index_scan_mode && index_scan_open) {
     /* the scan of an index lookup that the statement left open */
     end_scan(false);
@@ -2105,7 +2110,11 @@ int ha_warp::rnd_init(bool) {
     push_where_clause = "1=1";
   }
   
-  if(!index_scan_mode && pushdown_info->base_table != NULL) {
+  /* The dimension tables of a star join are read from the pushdown
+     information only if the join of the fact table has made its filters;
+     without them the table is scanned as usual (MySQL does the join). */
+  if(!index_scan_mode && pushdown_info->base_table != NULL &&
+     pushdown_info->fact_table_filters != NULL) {
     partitions = NULL;
     /* these objects belong to the pushdown information */
     scan_uses_pushdown_tables = true;
@@ -2448,6 +2457,9 @@ void ha_warp::wait_for_join_threads() {
    escape into the server, which would terminate it. */
 int ha_warp::rnd_next(uchar *buf) {
   DBUG_ENTER("ha_warp::rnd_next");
+  if(star_agg) {
+    DBUG_RETURN(star_agg_next(buf));
+  }
   const char* what = NULL;
   std::string detail;
   try {
@@ -3634,6 +3646,7 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
      an earlier statement whose scan did not finish (an error, for example)
      must not be applied to a statement that has no condition. */
   ha->push_where_clause = "";
+  ha->star_agg.reset();
 
   const Item *cond = (filter != nullptr) ? filter->filter().condition : nullptr;
   if (cond == nullptr && join->where_cond == nullptr) return;
@@ -3731,6 +3744,8 @@ static bool warp_has_inner_nested_loop_table(AccessPath *root_path,
   return found;
 }
 
+#include "warp_star_agg.h"
+
 /**
  * handlerton::push_to_engine implementation.  Walks the AccessPath tree and
  * offers the condition of each FILTER sitting on top of a WARP table access
@@ -3761,6 +3776,8 @@ int warp_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
   WalkAccessPaths(root_path, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
                   func);
   warp_inner_nested_loop_table = false;
+  /* the star joins that the engine can evaluate and aggregate itself */
+  warp_try_star_aggregation(thd, root_path, join);
   return 0;
 }
 
@@ -4120,6 +4137,14 @@ int ha_warp::append_column_filter(const Item *cond,
         if(std::string(table->alias) != alias) {
           return 0;
         }
+      }
+    }
+    /* IS NULL and IS NOT NULL have one argument, which the loop above does
+       not look at: a column of another table is not a condition of this one */
+    if(tmp->arg_count == 1 && arg[0]->type() == Item::Type::FIELD_ITEM) {
+      Field *field = down_cast<Item_field *>(arg[0])->field;
+      if(field != nullptr && field->table != table) {
+        return 0;
       }
     }
     /* JOIN PUSHDOWN

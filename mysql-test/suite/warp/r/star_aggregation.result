@@ -1,0 +1,169 @@
+#
+# Star queries that the engine joins and aggregates itself
+# (warp_star_aggregation): the results must be the ones of InnoDB.
+#
+call mtr.add_suppression("WARP: aggregation of");
+SET SESSION cte_max_recursion_depth = 1000000;
+CREATE TABLE f (id INT NOT NULL, k1 INT NOT NULL, k2 INT NOT NULL, k3 INT NOT NULL,
+a INT NOT NULL, b INT, c BIGINT NOT NULL, t TINYINT NOT NULL)
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d1 (k INT, g1 VARCHAR(8), n1 INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d2 (k INT, g2 VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d3 (k INT, g3 INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 140000)
+SELECT x, 1 + x % 50, 1 + x % 30, x % 7, x % 100, IF(x % 11 = 0, NULL, x % 37 - 10),
+x * 1000003, x % 5 FROM s;
+INSERT INTO d1 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 45)
+SELECT x, CONCAT('G', x % 6), x % 4 FROM s;
+INSERT INTO d2 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 30)
+SELECT x, IF(x % 7 = 0, NULL, CONCAT('H', x % 5)) FROM s;
+INSERT INTO d2 VALUES (NULL, 'never');
+INSERT INTO d3 VALUES (0,10),(1,11),(2,12),(3,13),(3,14),(4,15),(5,16),(5,16),(6,17);
+CREATE TABLE fi ENGINE=InnoDB SELECT * FROM f;
+CREATE TABLE d1i ENGINE=InnoDB SELECT * FROM d1;
+CREATE TABLE d2i ENGINE=InnoDB SELECT * FROM d2;
+CREATE TABLE d3i ENGINE=InnoDB SELECT * FROM d3;
+SET SESSION warp_star_aggregation = ON;
+# The join and the aggregation are done by the engine
+EXPLAIN FORMAT=TREE SELECT g1, g2, SUM(a), SUM(c - a)
+FROM f JOIN d1 ON f.k1 = d1.k JOIN d2 ON f.k2 = d2.k WHERE n1 < 3 GROUP BY g1, g2;
+EXPLAIN
+-> Table scan on <temporary>
+    -> Aggregate using temporary table
+        -> Table scan on f
+
+one dimension, one group column: 6 rows
+no group by, conditions on both tables: 1 rows
+two dimensions, two groups, two sums, constants: 33 rows
+NULL group values and a NULL key in the dimension: 6 rows
+a key that has several rows in the dimension: 8 rows
+several rows per key without a group by: 1 rows
+no row passes (one row with NULL): 1 rows
+no row passes with a group by: 0 rows
+a sum of values that are all NULL is NULL: 6 rows
+conditions with OR, IN and BETWEEN: 3 rows
+string condition on a dimension: 4 rows
+HAVING: 6 rows
+# ORDER BY and LIMIT
+SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 ORDER BY s DESC, g1 LIMIT 3;
+g1	s
+G3	1075200
+G2	1052800
+G1	1030400
+SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 ORDER BY s DESC, g1 LIMIT 3;
+g1	s
+G3	1075200
+G2	1052800
+G1	1030400
+# The sum of BIGINT values is exact (more than a BIGINT)
+SELECT SUM(c * 1000), SUM(c) FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 < 3;
+SUM(c * 1000)	SUM(c)
+6663874391563200000	6663874391563200
+SELECT SUM(c * 1000), SUM(c) FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 < 3;
+SUM(c * 1000)	SUM(c)
+6663874391563200000	6663874391563200
+# A product that does not fit a BIGINT is an error, as in InnoDB
+SELECT SUM(c * c) FROM f JOIN d1 ON f.k1 = d1.k;
+ERROR 22003: BIGINT value is out of range in 'BIGINT value is out of range in '(`test`.`f`.`c` * `test`.`f`.`c`)''
+SELECT SUM(c * c) FROM fi JOIN d1i ON fi.k1 = d1i.k;
+ERROR 22003: BIGINT value is out of range in '(`test`.`fi`.`c` * `test`.`fi`.`c`)'
+# Rows deleted and updated
+DELETE FROM f WHERE id % 13 = 0;
+DELETE FROM fi WHERE id % 13 = 0;
+UPDATE d1 SET g1 = 'XX' WHERE k IN (2, 9);
+UPDATE d1i SET g1 = 'XX' WHERE k IN (2, 9);
+after the deletes and the updates: 38 rows
+# A transaction sees its own changes, the others do not
+BEGIN;
+DELETE FROM f WHERE id % 2 = 0;
+DELETE FROM fi WHERE id % 2 = 0;
+Warnings:
+Warning	6414	Combining the storage engines InnoDB and WARP is deprecated, but the statement or transaction updates both the InnoDB table test.fi and the WARP table test.f.
+SET SESSION warp_star_aggregation = ON;
+# WARP, then InnoDB: the transaction that deleted
+SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 ORDER BY g1;
+g1	s
+G0	868427
+G2	904650
+G4	832220
+XX	67185
+SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 ORDER BY g1;
+g1	s
+G0	868427
+G2	904650
+G4	832220
+XX	67185
+SET SESSION warp_star_aggregation = ON;
+# WARP, then InnoDB: another connection
+SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 ORDER BY g1;
+g1	s
+G0	868427
+G1	951194
+G2	904650
+G3	907200
+G4	832220
+G5	850274
+XX	152457
+SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 ORDER BY g1;
+g1	s
+G0	868427
+G1	951194
+G2	904650
+G3	907200
+G4	832220
+G5	850274
+XX	152457
+ROLLBACK;
+after the rollback: 7 rows
+# Reads that lock rows and queries the engine does not take over give the same results
+# FOR UPDATE: WARP, then InnoDB
+BEGIN;
+SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 ORDER BY g1 FOR UPDATE;
+g1	s
+G0	868427
+G1	951194
+G2	904650
+G3	907200
+G4	832220
+G5	850274
+XX	152457
+COMMIT;
+BEGIN;
+SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 ORDER BY g1 FOR UPDATE;
+g1	s
+G0	868427
+G1	951194
+G2	904650
+G3	907200
+G4	832220
+G5	850274
+XX	152457
+COMMIT;
+# LOCK IN SHARE MODE: WARP, then InnoDB
+BEGIN;
+SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 ORDER BY g1 LOCK IN SHARE MODE;
+g1	s
+G0	868427
+G1	951194
+G2	904650
+G3	907200
+G4	832220
+G5	850274
+XX	152457
+COMMIT;
+BEGIN;
+SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 ORDER BY g1 LOCK IN SHARE MODE;
+g1	s
+G0	868427
+G1	951194
+G2	904650
+G3	907200
+G4	832220
+G5	850274
+XX	152457
+COMMIT;
+COUNT and MIN are not taken over: 7 rows
+a condition on two tables: 7 rows
+LEFT JOIN: 8 rows
+SET SESSION warp_star_aggregation = OFF;
+DROP TABLE f, d1, d2, d3, fi, d1i, d2i, d3i;
