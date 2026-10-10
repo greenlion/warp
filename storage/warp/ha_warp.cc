@@ -2638,6 +2638,10 @@ int ha_warp::rnd_next_impl(uchar *buf) {
   // transaction id of the current row
   uint64_t row_trx_id = 0;
 fetch_again:  
+  /* a statement that is killed stops at the next row */
+  if(thd_killed(ha_thd())) {
+    DBUG_RETURN(HA_ERR_QUERY_INTERRUPTED);
+  }
   
   if( !full_partition_scan && partitions != NULL && bitmap_merge_join_executed == false ) {
     use_thread_budget();
@@ -2647,6 +2651,11 @@ fetch_again:
     }
   
     while( part_it != partitions->end() ) {        
+      /* a statement that is killed schedules no more joins, the running
+         ones are waited for below */
+      if(thd_killed(ha_thd())) {
+        break;
+      }
       /* the list of partitions also contains the (empty) top level
          directory of the table.  There is nothing to evaluate or join
          in a partition without rows. */
@@ -2720,7 +2729,7 @@ fetch_again:
               ibis::util::ThreadBudget::current();
 
           while(1) {
-            if( join_error.load() != 0 ) {
+            if( join_error.load() != 0 || thd_killed(ha_thd()) ) {
               break;
             }
             parallel_join_mutex.lock();
@@ -2826,6 +2835,11 @@ fetch_again:
 
   /* the workers are done with the files */
   join_read_lock.reset();
+
+  /* the joins of a killed statement were not all scheduled */
+  if(thd_killed(ha_thd())) {
+    DBUG_RETURN(HA_ERR_QUERY_INTERRUPTED);
+  }
 
   /* A failed worker or merge means some partitions were not (completely)
      filtered.  Returning rows from here would give wrong results. */
@@ -3131,6 +3145,11 @@ bool ha_warp::count_visible_rows(ha_rows *num_rows) {
   ha_rows total = 0;
   bool ok = true;
   for(auto it = parts.begin(); it != parts.end() && ok; ++it) {
+    /* a statement that is killed stops at the next partition */
+    if(thd_killed(ha_thd())) {
+      ok = false;
+      break;
+    }
     ibis::part *part = *it;
     if(part == NULL || part->nRows() == 0 ||
        std::string(part->currentDataDir()) == std::string(share->data_dir_name)) {
@@ -3193,6 +3212,9 @@ int ha_warp::records(ha_rows *num_rows) {
     }
   } catch(...) {
     /* out of memory in FastBit, the scan reports it the usual way */
+  }
+  if(thd_killed(ha_thd())) {
+    return HA_ERR_QUERY_INTERRUPTED;
   }
   return handler::records(num_rows);
 }
