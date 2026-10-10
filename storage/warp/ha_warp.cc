@@ -419,9 +419,18 @@ const char **ha_warp::bas_ext() const {
 
 int ha_warp::rename_table(const char * from, const char * to, const dd::Table* , dd::Table* ) {
   DBUG_ENTER("ha_example::rename_table ");
+  /* The FastBit cache is keyed by file name.  The files of both names are
+     dropped from it, otherwise a table that is created later with one of the
+     names would read the content of the old files. */
+  const std::string from_dir = std::string(from) + ".data";
+  const std::string to_dir = std::string(to) + ".data";
+  ibis::fileManager::instance().flushDir(from_dir.c_str());
+  ibis::fileManager::instance().flushDir(to_dir.c_str());
   std::string cmd = "mv " + std::string(from) + ".data/ " + std::string(to) + ".data/";
   
   __attribute__((unused))int retval = system(cmd.c_str()); 
+  ibis::fileManager::instance().flushDir(from_dir.c_str());
+  ibis::fileManager::instance().flushDir(to_dir.c_str());
   DBUG_RETURN(0);
 }
 
@@ -1246,9 +1255,14 @@ int ha_warp::delete_table(const char *table_name, const dd::Table *) {
   DBUG_ENTER("ha_warp::delete_table");
 
   // FIXME: this needs to be safer
+  /* the files of the table are removed from the FastBit cache too, a table
+     that is created with the same name must not read them */
+  const std::string data_dir = std::string(table_name) + ".data";
+  ibis::fileManager::instance().flushDir(data_dir.c_str());
   std::string cmdline =
       std::string("rm -rf ") + std::string(table_name) + ".data/";
   int rc = system(cmdline.c_str());
+  ibis::fileManager::instance().flushDir(data_dir.c_str());
   ha_statistic_increment(&System_status_var::ha_delete_count);
   DBUG_RETURN(rc != 0);
 
