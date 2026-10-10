@@ -35,8 +35,11 @@ ExternalProject_Add(
   #  URL https://codeforge.lbl.gov/frs/download.php/file/426/fastbit-2.0.3.tar.gz
   #GIT_REPOSITORY https://github.com/greenlion/fastbit
   SOURCE_DIR=fastbit-2.0.3
-  CONFIGURE_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/src/fastbit-2.0.3/configure --prefix=${CMAKE_CURRENT_SOURCE_DIR} CPPFLAGS=${FASTBIT_ZSTD_CPPFLAGS} LIBS=${FASTBIT_ZSTD_LIBS}
+  # FastBit is linked statically into the server, so only the (position
+  # independent) static library is built
+  CONFIGURE_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/src/fastbit-2.0.3/configure --prefix=${CMAKE_CURRENT_SOURCE_DIR} --with-pic --disable-shared CPPFLAGS=${FASTBIT_ZSTD_CPPFLAGS} LIBS=${FASTBIT_ZSTD_LIBS}
   PREFIX ${CMAKE_CURRENT_SOURCE_DIR}/
+  BUILD_BYPRODUCTS ${CMAKE_CURRENT_SOURCE_DIR}/lib/libfastbit.a
   #PATCH_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/patch_fastbit.sh ${CMAKE_CURRENT_SOURCE_DIR}
   
   BUILD_COMMAND make -j6
@@ -66,14 +69,15 @@ SET(WARP_PLUGIN_STATIC  "warp")
 SET(WARP_PLUGIN_MANDATORY TRUE)
 
 SET(WARP_SOURCES ha_warp.cc ha_warp.h)
-SET(FASTBIT_LIBS ${CMAKE_CURRENT_SOURCE_DIR}/lib/libfastbit.so  ${CMAKE_CURRENT_SOURCE_DIR}/lib/libfastbit.so.1  ${CMAKE_CURRENT_SOURCE_DIR}/lib/libfastbit.so.1.0.0)
 
 MYSQL_ADD_PLUGIN(warp ${WARP_SOURCES} STORAGE_ENGINE MANDATORY
   LINK_LIBRARIES extra::rapidjson)
-add_library(fastbit SHARED IMPORTED)
-set_property(TARGET fastbit PROPERTY IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/lib/libfastbit.so)
+# The static FastBit library does not contain the libraries it uses, they
+# are linked after it
+add_library(fastbit STATIC IMPORTED)
+set_property(TARGET fastbit PROPERTY IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/lib/libfastbit.a)
+set_property(TARGET fastbit PROPERTY INTERFACE_LINK_LIBRARIES ext::zstd rt)
 add_dependencies(warp fastbit-2.0.3)
-link_directories(${CMAKE_CURRENT_SOURCE_DIR}/lib)
 
 #add_library(libSIMDCompressionAndIntersection STATIC IMPORTED)
 #set_property(TARGET libSIMDCompressionAndIntersection PROPERTY IMPORTED_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/libSIMDCompressionAndIntersection-external-prefix/src/libSIMDCompressionAndIntersection-external/libSIMDCompressionAndIntersection.a)
