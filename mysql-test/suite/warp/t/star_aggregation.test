@@ -249,6 +249,13 @@ UPDATE d1i SET g1 = 'XX' WHERE k IN (2, 9);
 --let $q_i = SELECT g1, g2, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k JOIN d2i ON fi.k2 = d2i.k GROUP BY g1, g2
 --source suite/warp/include/star_check.inc
 
+--echo # The join MySQL does with the filters of the dimensions finds the new versions of updated rows
+SET SESSION warp_star_aggregation = OFF;
+--let $label = updated dimension rows, MySQL joins
+--let $q_w = SELECT g1, AVG(a) av, COUNT(*) cs FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 < 3 GROUP BY g1
+--let $q_i = SELECT g1, AVG(a) av, COUNT(*) cs FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 < 3 GROUP BY g1
+--source suite/warp/include/star_check.inc
+SET SESSION warp_star_aggregation = ON;
 --let $label = count min max after the deletes and the updates
 --let $q_w = SELECT g1, COUNT(*) cs, COUNT(b) cb, MIN(a) mi, MAX(c) ma FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
 --let $q_i = SELECT g1, COUNT(*) cs, COUNT(b) cb, MIN(a) mi, MAX(c) ma FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1

@@ -135,6 +135,10 @@ DELETE FROM fi WHERE id % 13 = 0;
 UPDATE d1 SET g1 = 'XX' WHERE k IN (2, 9);
 UPDATE d1i SET g1 = 'XX' WHERE k IN (2, 9);
 after the deletes and the updates: 38 rows
+# The join MySQL does with the filters of the dimensions finds the new versions of updated rows
+SET SESSION warp_star_aggregation = OFF;
+updated dimension rows, MySQL joins: 7 rows
+SET SESSION warp_star_aggregation = ON;
 count min max after the deletes and the updates: 7 rows
 count distinct after the deletes and the updates: 7 rows
 # A transaction sees its own changes, the others do not
