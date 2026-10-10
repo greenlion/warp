@@ -1,0 +1,80 @@
+#
+# The FastBit cache keeps the files of a table that was scanned between
+# statements.  A table that is created with the name of a table that was
+# dropped, renamed, truncated or rebuilt must not see the old files.
+#
+# DROP and CREATE with the same name
+CREATE TABLE t1 (k INT, v VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t1 VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+SELECT COUNT(*), SUM(k) FROM t1;
+COUNT(*)	SUM(k)
+5	15
+DROP TABLE t1;
+CREATE TABLE t1 (k INT, v VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t1 VALUES (10,'x'),(20,'y');
+SELECT COUNT(*), SUM(k) FROM t1;
+COUNT(*)	SUM(k)
+2	30
+SELECT * FROM t1 ORDER BY k;
+k	v
+10	x
+20	y
+DROP TABLE t1;
+# TRUNCATE
+CREATE TABLE t1 (k INT, v VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t1 VALUES (1,'a'),(2,'b'),(3,'c');
+SELECT COUNT(*), SUM(k) FROM t1;
+COUNT(*)	SUM(k)
+3	6
+TRUNCATE TABLE t1;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+0
+INSERT INTO t1 VALUES (7,'z');
+SELECT COUNT(*), SUM(k) FROM t1;
+COUNT(*)	SUM(k)
+1	7
+DROP TABLE t1;
+# RENAME: the old name is reused by another table
+CREATE TABLE t1 (k INT) ENGINE=WARP;
+INSERT INTO t1 VALUES (1),(2),(3),(4);
+SELECT COUNT(*), SUM(k) FROM t1;
+COUNT(*)	SUM(k)
+4	10
+RENAME TABLE t1 TO t2;
+CREATE TABLE t1 (k INT) ENGINE=WARP;
+INSERT INTO t1 VALUES (100);
+SELECT COUNT(*), SUM(k) FROM t1;
+COUNT(*)	SUM(k)
+1	100
+SELECT COUNT(*), SUM(k) FROM t2;
+COUNT(*)	SUM(k)
+4	10
+DROP TABLE t1, t2;
+# ALTER TABLE after rows were deleted and updated
+CREATE TABLE t1 (k INT, v VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t1 VALUES (1,'A'),(2,'B'),(3,'C'),(9,'D');
+UPDATE t1 SET v = 'XX' WHERE k IN (2, 9);
+DELETE FROM t1 WHERE k = 3;
+SELECT * FROM t1 ORDER BY k;
+k	v
+1	A
+2	XX
+9	XX
+ALTER TABLE t1 ADD KEY k_t1 (k);
+SELECT * FROM t1 ORDER BY k;
+k	v
+1	A
+2	XX
+9	XX
+ALTER TABLE t1 ADD COLUMN extra INT;
+SELECT * FROM t1 ORDER BY k;
+k	v	extra
+1	A	NULL
+2	XX	NULL
+9	XX	NULL
+ALTER TABLE t1 DROP KEY k_t1;
+SELECT COUNT(*), SUM(k) FROM t1;
+COUNT(*)	SUM(k)
+3	12
+DROP TABLE t1;
