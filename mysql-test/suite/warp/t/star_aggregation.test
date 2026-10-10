@@ -31,6 +31,9 @@ CREATE TABLE d3i ENGINE=InnoDB SELECT * FROM d3;
 
 # 140000 rows are in three partitions of at most 64000 rows
 
+--echo # It is on by default
+SELECT @@global.warp_star_aggregation, @@session.warp_star_aggregation;
+
 SET SESSION warp_star_aggregation = ON;
 
 --echo # The join and the aggregation are done by the engine
