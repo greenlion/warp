@@ -176,5 +176,52 @@ COMMIT;
 --let $q_i = SELECT g1, SUM(a) s FROM fi LEFT JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
 --source suite/warp/include/star_check.inc
 
+--echo #
+--echo # Keys on the join columns of the dimension tables: MySQL then joins them
+--echo # with an index lookup for every row of the fact table, the engine still
+--echo # takes the query over and reads the dimension tables itself.
+--echo #
+ALTER TABLE d1 ADD KEY k_d1 (k);
+ALTER TABLE d2 ADD KEY k_d2 (k);
+ALTER TABLE d3 ADD KEY k_d3 (k);
+
+SET SESSION warp_star_aggregation = OFF;
+--echo # the plan of MySQL: an index lookup in every dimension table
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, g2, SUM(a)
+  FROM f JOIN d1 FORCE INDEX (k_d1) ON f.k1 = d1.k JOIN d2 FORCE INDEX (k_d2) ON f.k2 = d2.k
+ WHERE n1 < 3 GROUP BY g1, g2;
+SET SESSION warp_star_aggregation = ON;
+--echo # the engine does the join and the aggregation
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, g2, SUM(a)
+  FROM f JOIN d1 FORCE INDEX (k_d1) ON f.k1 = d1.k JOIN d2 FORCE INDEX (k_d2) ON f.k2 = d2.k
+ WHERE n1 < 3 GROUP BY g1, g2;
+
+--let $label = keys: two dimensions, conditions on a dimension
+--let $q_w = SELECT g1, g2, SUM(a + b * 2) s1, SUM(c - a) s2 FROM f JOIN d1 FORCE INDEX (k_d1) ON f.k1 = d1.k JOIN d2 FORCE INDEX (k_d2) ON f.k2 = d2.k WHERE n1 < 3 GROUP BY g1, g2
+--let $q_i = SELECT g1, g2, SUM(a + b * 2) s1, SUM(c - a) s2 FROM fi JOIN d1i ON fi.k1 = d1i.k JOIN d2i ON fi.k2 = d2i.k WHERE n1 < 3 GROUP BY g1, g2
+--source suite/warp/include/star_check.inc
+
+--let $label = keys: no group by
+--let $q_w = SELECT SUM(a * b) s FROM f JOIN d1 FORCE INDEX (k_d1) ON f.k1 = d1.k WHERE n1 = 2 AND a > 10
+--let $q_i = SELECT SUM(a * b) s FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 = 2 AND a > 10
+--source suite/warp/include/star_check.inc
+
+--let $label = keys: a key that has several rows in the dimension
+--let $q_w = SELECT g3, SUM(a) s, SUM(t) st FROM f JOIN d3 FORCE INDEX (k_d3) ON f.k3 = d3.k GROUP BY g3
+--let $q_i = SELECT g3, SUM(a) s, SUM(t) st FROM fi JOIN d3i ON fi.k3 = d3i.k GROUP BY g3
+--source suite/warp/include/star_check.inc
+
+--let $label = keys: NULL group values and a NULL key in the dimension
+--let $q_w = SELECT g2, SUM(a) s FROM f JOIN d2 FORCE INDEX (k_d2) ON f.k2 = d2.k GROUP BY g2
+--let $q_i = SELECT g2, SUM(a) s FROM fi JOIN d2i ON fi.k2 = d2i.k GROUP BY g2
+--source suite/warp/include/star_check.inc
+
+--let $label = keys: no row passes
+--let $q_w = SELECT SUM(a) s FROM f JOIN d1 FORCE INDEX (k_d1) ON f.k1 = d1.k WHERE n1 = 99
+--let $q_i = SELECT SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 = 99
+--source suite/warp/include/star_check.inc
+
 SET SESSION warp_star_aggregation = OFF;
 DROP TABLE f, d1, d2, d3, fi, d1i, d2i, d3i;

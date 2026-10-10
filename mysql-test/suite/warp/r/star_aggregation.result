@@ -169,5 +169,42 @@ COMMIT;
 COUNT and MIN are not taken over: 7 rows
 a condition on two tables: 7 rows
 LEFT JOIN: 8 rows
+#
+# Keys on the join columns of the dimension tables: MySQL then joins them
+# with an index lookup for every row of the fact table, the engine still
+# takes the query over and reads the dimension tables itself.
+#
+ALTER TABLE d1 ADD KEY k_d1 (k);
+ALTER TABLE d2 ADD KEY k_d2 (k);
+ALTER TABLE d3 ADD KEY k_d3 (k);
+SET SESSION warp_star_aggregation = OFF;
+# the plan of MySQL: an index lookup in every dimension table
+EXPLAIN FORMAT=TREE SELECT g1, g2, SUM(a)
+FROM f JOIN d1 FORCE INDEX (k_d1) ON f.k1 = d1.k JOIN d2 FORCE INDEX (k_d2) ON f.k2 = d2.k
+WHERE n1 < 3 GROUP BY g1, g2;
+EXPLAIN
+-> Table scan on <temporary>
+    -> Aggregate using temporary table
+        -> Nested loop inner join
+            -> Nested loop inner join
+                -> Table scan on f
+                -> Index lookup on d1 using k_d1 (k = f.k1)
+            -> Index lookup on d2 using k_d2 (k = f.k2)
+
+SET SESSION warp_star_aggregation = ON;
+# the engine does the join and the aggregation
+EXPLAIN FORMAT=TREE SELECT g1, g2, SUM(a)
+FROM f JOIN d1 FORCE INDEX (k_d1) ON f.k1 = d1.k JOIN d2 FORCE INDEX (k_d2) ON f.k2 = d2.k
+WHERE n1 < 3 GROUP BY g1, g2;
+EXPLAIN
+-> Table scan on <temporary>
+    -> Aggregate using temporary table
+        -> Table scan on f
+
+keys: two dimensions, conditions on a dimension: 34 rows
+keys: no group by: 1 rows
+keys: a key that has several rows in the dimension: 8 rows
+keys: NULL group values and a NULL key in the dimension: 6 rows
+keys: no row passes: 1 rows
 SET SESSION warp_star_aggregation = OFF;
 DROP TABLE f, d1, d2, d3, fi, d1i, d2i, d3i;
