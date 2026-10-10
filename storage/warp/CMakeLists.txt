@@ -70,7 +70,8 @@ SET(WARP_PLUGIN_MANDATORY TRUE)
 
 SET(WARP_SOURCES ha_warp.cc ha_warp.h)
 
-MYSQL_ADD_PLUGIN(warp ${WARP_SOURCES} STORAGE_ENGINE MANDATORY)
+MYSQL_ADD_PLUGIN(warp ${WARP_SOURCES} STORAGE_ENGINE MANDATORY
+  LINK_LIBRARIES extra::rapidjson)
 # The static FastBit library does not contain the libraries it uses, they
 # are linked after it
 add_library(fastbit STATIC IMPORTED)
