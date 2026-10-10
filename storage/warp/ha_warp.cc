@@ -2033,6 +2033,46 @@ bool ha_warp::check_if_incompatible_data(HA_CREATE_INFO *, uint) {
   return COMPATIBLE_DATA_YES;
 }
 
+/* An index of a WARP table is a declaration, there is no index structure to
+   build or to drop.  An ALTER TABLE that only adds, drops or renames
+   non-unique indexes, or changes their comment or visibility, is a change of
+   the definition of the table in the data dictionary and does not touch the
+   data.  Everything else is done by copying the table, which is also where
+   keys that WARP does not support are refused (see ha_warp::create). */
+enum_alter_inplace_result ha_warp::check_if_supported_inplace_alter(
+    TABLE *altered_table, Alter_inplace_info *ha_alter_info) {
+  DBUG_ENTER("ha_warp::check_if_supported_inplace_alter");
+  static const Alter_inplace_info::HA_ALTER_FLAGS index_changes =
+      Alter_inplace_info::ADD_INDEX | Alter_inplace_info::DROP_INDEX |
+      Alter_inplace_info::RENAME_INDEX | Alter_inplace_info::ALTER_INDEX_COMMENT;
+  const Alter_inplace_info::HA_ALTER_FLAGS flags = ha_alter_info->handler_flags;
+
+  /* only index changes, and at least one */
+  if((flags & ~index_changes) != 0 || (flags & index_changes) == 0) {
+    DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
+  }
+  /* every index of the new definition must be one that WARP accepts (the
+     ones that stay were checked when the table was created) */
+  for(uint k = 0; k < altered_table->s->keys; ++k) {
+    const KEY *key = &altered_table->key_info[k];
+    if(key->flags & (HA_NOSAME | HA_FULLTEXT | HA_SPATIAL)) {
+      DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
+    }
+    for(uint p = 0; p < key->user_defined_key_parts; ++p) {
+      if(key->key_part[p].field == nullptr || !warp_key_part_supported(&key->key_part[p])) {
+        DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
+      }
+    }
+  }
+  /* The server must be told "in place" if the statement asks for ALGORITHM=INPLACE;
+     "instant" otherwise.  Nothing is locked: no data is read or written. */
+  if(ha_alter_info->alter_info->requested_algorithm ==
+     Alter_info::ALTER_TABLE_ALGORITHM_INPLACE) {
+    DBUG_RETURN(HA_ALTER_INPLACE_NO_LOCK);
+  }
+  DBUG_RETURN(HA_ALTER_INPLACE_INSTANT);
+}
+
 /* This is where table scans happen.  While most storage engines
    scan ALL rows in this function, the WARP engine supports
    engine condition pushdown.  This means that the WHERE clause in
