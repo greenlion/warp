@@ -5626,8 +5626,9 @@ retry_lock:
     lock_mtx.unlock();
     return lock_type;
   } else {
-    // row is already locked
-    for(auto it2 = it;it2 != row_locks.end();++it2) {
+    // row is already locked.  Only the locks of this row are looked at.
+    auto row_range = row_locks.equal_range(rowid);
+    for(auto it2 = row_range.first; it2 != row_range.second; ++it2) {
       warp_lock test_lock = it2->second;
 
       // this lock will be released because of deadlock
@@ -5637,7 +5638,6 @@ retry_lock:
       // released as the transaction closes
       if(test_lock.lock_type == LOCK_DEADLOCK) {
         lock_mtx.unlock();
-        it2 = it;
         goto sleep;
       }
 
@@ -5657,40 +5657,31 @@ retry_lock:
             goto sleep;
           }
           new_lock.waiting_on = 0;
-          row_locks.erase(it);
-          row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
-          lock_mtx.unlock();
-          return lock_type;
-        }
-       
-        if(test_lock.lock_type == WRITE_INTENTION && lock_type == LOCK_EX && test_lock.holder == trx->trx_id) {
-          // upgrade intention lock to EX_LOCK
           row_locks.erase(it2);
           row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
           lock_mtx.unlock();
           return lock_type;
-        } else {
-          // if LOCK_SH is requested and LOCK_EX has been granted return the EX_LOCK
-          // this should generally never happen unless an update produced a unique
-          // key violation and the row is being updated again.  If LOCK_SH is requested
-          // and trx already had LOCK_SH then the existing lock is reused
-          if(test_lock.lock_type >= lock_type && lock_type >= 0) {
-            // this transaction already has a strong enough lock on this row
-            // no need to insert the new lock and just return the lock 
-            lock_mtx.unlock();
-            return lock_type; 
-          } 
-
-          if(test_lock.lock_type == LOCK_SH && (lock_type == WRITE_INTENTION || lock_type == LOCK_EX)) {
-            it2->second.lock_type = lock_type;
-            lock_mtx.unlock();
-            return lock_type;
-          }
         }
-        
-        row_locks.erase(it);
-        it2 = it;
-        continue;
+
+        // This transaction has a lock on the row.  A lock is never made
+        // weaker: SH < WRITE_INTENTION (SELECT ... FOR UPDATE) < EX.
+        // Asking for what is held already, or for less, keeps the lock
+        // (a LOCK IN SHARE MODE read after a FOR UPDATE read, for example),
+        // asking for more upgrades the lock that is held.  The lock is
+        // changed in place: nothing is erased while the locks are walked.
+        auto strength = [](int type) {
+          switch(type) {
+            case LOCK_SH: return 1;
+            case WRITE_INTENTION: return 2;
+            case LOCK_EX: return 3;
+            default: return 0;
+          }
+        };
+        if(strength(test_lock.lock_type) < strength(lock_type)) {
+          it2->second.lock_type = lock_type;
+        }
+        lock_mtx.unlock();
+        return lock_type;
       }
       
       // this lock is a shared lock by somebody else
