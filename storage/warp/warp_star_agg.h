@@ -327,10 +327,33 @@ static bool warp_star_compile(Item *item, TABLE *fact, std::vector<uint> *cols,
   return warp_star_no(__LINE__);
 }
 
-/* The tables and the join conditions below an aggregation.  Only inner hash
-   joins whose conditions are equalities of two columns are accepted. */
+/* An equality of two columns of two tables: a join condition. */
+typedef std::pair<Field *, Field *> warp_star_join_pair;
+
+static bool warp_star_add_condition(Item_eq_base *condition,
+                                    std::vector<warp_star_join_pair> *pairs) {
+  Item *left = condition->get_arg(0)->real_item();
+  Item *right = condition->get_arg(1)->real_item();
+  if(left->type() != Item::FIELD_ITEM || right->type() != Item::FIELD_ITEM) {
+    return warp_star_no(__LINE__);
+  }
+  Field *lf = down_cast<Item_field *>(left)->field;
+  Field *rf = down_cast<Item_field *>(right)->field;
+  if(lf == nullptr || rf == nullptr) {
+    return warp_star_no(__LINE__);
+  }
+  pairs->push_back(warp_star_join_pair(lf, rf));
+  return true;
+}
+
+/* The tables and the join conditions below an aggregation.  Accepted are
+   inner joins: a hash join whose conditions are equalities of two columns,
+   and a nested loop join whose inner table is read with an index lookup on
+   one column (that is how MySQL joins a table that has an index on the join
+   column).  The engine reads the dimension tables with their own conditions
+   and does not use the index. */
 static bool warp_star_collect(AccessPath *path, std::vector<TABLE *> *tables,
-                              std::vector<Item_eq_base *> *conditions) {
+                              std::vector<warp_star_join_pair> *pairs) {
   switch(path->type) {
     case AccessPath::TABLE_SCAN: {
       TABLE *table = path->table_scan().table;
@@ -339,6 +362,46 @@ static bool warp_star_collect(AccessPath *path, std::vector<TABLE *> *tables,
       }
       tables->push_back(table);
       return true;
+    }
+    case AccessPath::REF:
+    case AccessPath::EQ_REF: {
+      TABLE *table = path->type == AccessPath::REF ? path->ref().table : path->eq_ref().table;
+      Index_lookup *ref = path->type == AccessPath::REF ? path->ref().ref : path->eq_ref().ref;
+      if(table == nullptr || ref == nullptr || ref->key_parts != 1 ||
+         dynamic_cast<ha_warp *>(table->file) == nullptr) {
+        return warp_star_no(__LINE__);
+      }
+      Item *value = ref->items[0]->real_item();
+      if(value->type() != Item::FIELD_ITEM) {
+        return warp_star_no(__LINE__);
+      }
+      Field *outer_field = down_cast<Item_field *>(value)->field;
+      Field *key_field = table->key_info[ref->key].key_part[0].field;
+      if(outer_field == nullptr || key_field == nullptr) {
+        return warp_star_no(__LINE__);
+      }
+      tables->push_back(table);
+      pairs->push_back(warp_star_join_pair(outer_field, key_field));
+      return true;
+    }
+    case AccessPath::NESTED_LOOP_JOIN: {
+      const auto &join = path->nested_loop_join();
+      if(join.join_type != JoinType::INNER) {
+        return warp_star_no(__LINE__);
+      }
+      if(join.join_predicate != nullptr && join.join_predicate->expr != nullptr) {
+        const RelationalExpression *expr = join.join_predicate->expr;
+        if(!expr->join_conditions.empty()) {
+          return warp_star_no(__LINE__);
+        }
+        for(Item_eq_base *condition : expr->equijoin_conditions) {
+          if(!warp_star_add_condition(condition, pairs)) {
+            return false;
+          }
+        }
+      }
+      return warp_star_collect(join.outer, tables, pairs) &&
+             warp_star_collect(join.inner, tables, pairs);
     }
     case AccessPath::HASH_JOIN: {
       const JoinPredicate *predicate = path->hash_join().join_predicate;
@@ -349,10 +412,12 @@ static bool warp_star_collect(AccessPath *path, std::vector<TABLE *> *tables,
         return warp_star_no(__LINE__);
       }
       for(Item_eq_base *condition : predicate->expr->equijoin_conditions) {
-        conditions->push_back(condition);
+        if(!warp_star_add_condition(condition, pairs)) {
+          return false;
+        }
       }
-      return warp_star_collect(path->hash_join().outer, tables, conditions) &&
-             warp_star_collect(path->hash_join().inner, tables, conditions);
+      return warp_star_collect(path->hash_join().outer, tables, pairs) &&
+             warp_star_collect(path->hash_join().inner, tables, pairs);
     }
     default:
       /* a FILTER is a condition that the engine did not take over */
@@ -385,7 +450,7 @@ static std::shared_ptr<warp_star_agg> warp_star_make_plan(THD *thd, AccessPath *
   std::shared_ptr<warp_star_agg> none;
 
   std::vector<TABLE *> tables;
-  std::vector<Item_eq_base *> conditions;
+  std::vector<warp_star_join_pair> conditions;
   if(!warp_star_collect(*child_slot, &tables, &conditions)) {
     return (warp_star_no(__LINE__), none);
   }
@@ -436,17 +501,9 @@ static std::shared_ptr<warp_star_agg> warp_star_make_plan(THD *thd, AccessPath *
     dim.table = table;
     dim.handler = dynamic_cast<ha_warp *>(table->file);
     bool found = false;
-    for(Item_eq_base *condition : conditions) {
-      Item *left = condition->get_arg(0)->real_item();
-      Item *right = condition->get_arg(1)->real_item();
-      if(left->type() != Item::FIELD_ITEM || right->type() != Item::FIELD_ITEM) {
-        return (warp_star_no(__LINE__), none);
-      }
-      Field *lf = down_cast<Item_field *>(left)->field;
-      Field *rf = down_cast<Item_field *>(right)->field;
-      if(lf == nullptr || rf == nullptr) {
-        return (warp_star_no(__LINE__), none);
-      }
+    for(const warp_star_join_pair &condition : conditions) {
+      Field *lf = condition.first;
+      Field *rf = condition.second;
       Field *fact_field = nullptr, *dim_field = nullptr;
       if(lf->table == fact && rf->table == table) {
         fact_field = lf;
@@ -473,9 +530,9 @@ static std::shared_ptr<warp_star_agg> warp_star_make_plan(THD *thd, AccessPath *
     plan->dims.push_back(std::move(dim));
   }
   /* every condition joins the fact table to a dimension */
-  for(Item_eq_base *condition : conditions) {
-    Field *lf = down_cast<Item_field *>(condition->get_arg(0)->real_item())->field;
-    Field *rf = down_cast<Item_field *>(condition->get_arg(1)->real_item())->field;
+  for(const warp_star_join_pair &condition : conditions) {
+    Field *lf = condition.first;
+    Field *rf = condition.second;
     if(lf->table != fact && rf->table != fact) {
       return (warp_star_no(__LINE__), none);
     }
