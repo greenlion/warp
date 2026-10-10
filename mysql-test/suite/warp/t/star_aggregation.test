@@ -1,0 +1,177 @@
+--echo #
+--echo # Star queries that the engine joins and aggregates itself
+--echo # (warp_star_aggregation): the results must be the ones of InnoDB.
+--echo #
+
+call mtr.add_suppression("WARP: aggregation of");
+SET SESSION cte_max_recursion_depth = 1000000;
+
+CREATE TABLE f (id INT NOT NULL, k1 INT NOT NULL, k2 INT NOT NULL, k3 INT NOT NULL,
+                a INT NOT NULL, b INT, c BIGINT NOT NULL, t TINYINT NOT NULL)
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d1 (k INT, g1 VARCHAR(8), n1 INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d2 (k INT, g2 VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d3 (k INT, g3 INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+INSERT INTO f WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 140000)
+  SELECT x, 1 + x % 50, 1 + x % 30, x % 7, x % 100, IF(x % 11 = 0, NULL, x % 37 - 10),
+         x * 1000003, x % 5 FROM s;
+INSERT INTO d1 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 45)
+  SELECT x, CONCAT('G', x % 6), x % 4 FROM s;
+INSERT INTO d2 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 30)
+  SELECT x, IF(x % 7 = 0, NULL, CONCAT('H', x % 5)) FROM s;
+INSERT INTO d2 VALUES (NULL, 'never');
+# the keys 3 and 5 have two rows, the rows of key 5 are the same group
+INSERT INTO d3 VALUES (0,10),(1,11),(2,12),(3,13),(3,14),(4,15),(5,16),(5,16),(6,17);
+
+CREATE TABLE fi ENGINE=InnoDB SELECT * FROM f;
+CREATE TABLE d1i ENGINE=InnoDB SELECT * FROM d1;
+CREATE TABLE d2i ENGINE=InnoDB SELECT * FROM d2;
+CREATE TABLE d3i ENGINE=InnoDB SELECT * FROM d3;
+
+# 140000 rows are in three partitions of at most 64000 rows
+
+SET SESSION warp_star_aggregation = ON;
+
+--echo # The join and the aggregation are done by the engine
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, g2, SUM(a), SUM(c - a)
+  FROM f JOIN d1 ON f.k1 = d1.k JOIN d2 ON f.k2 = d2.k WHERE n1 < 3 GROUP BY g1, g2;
+
+--let $label = one dimension, one group column
+--let $q_w = SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+--let $label = no group by, conditions on both tables
+--let $q_w = SELECT SUM(a * b) s FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 = 2 AND a > 10
+--let $q_i = SELECT SUM(a * b) s FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 = 2 AND a > 10
+--source suite/warp/include/star_check.inc
+
+--let $label = two dimensions, two groups, two sums, constants
+--let $q_w = SELECT g1, g2, SUM(a + b * 2) s1, SUM(c - a) s2 FROM f JOIN d1 ON f.k1 = d1.k JOIN d2 ON f.k2 = d2.k WHERE n1 < 3 GROUP BY g1, g2
+--let $q_i = SELECT g1, g2, SUM(a + b * 2) s1, SUM(c - a) s2 FROM fi JOIN d1i ON fi.k1 = d1i.k JOIN d2i ON fi.k2 = d2i.k WHERE n1 < 3 GROUP BY g1, g2
+--source suite/warp/include/star_check.inc
+
+--let $label = NULL group values and a NULL key in the dimension
+--let $q_w = SELECT g2, SUM(a) s FROM f JOIN d2 ON f.k2 = d2.k GROUP BY g2
+--let $q_i = SELECT g2, SUM(a) s FROM fi JOIN d2i ON fi.k2 = d2i.k GROUP BY g2
+--source suite/warp/include/star_check.inc
+
+--let $label = a key that has several rows in the dimension
+--let $q_w = SELECT g3, SUM(a) s, SUM(t) st FROM f JOIN d3 ON f.k3 = d3.k GROUP BY g3
+--let $q_i = SELECT g3, SUM(a) s, SUM(t) st FROM fi JOIN d3i ON fi.k3 = d3i.k GROUP BY g3
+--source suite/warp/include/star_check.inc
+
+--let $label = several rows per key without a group by
+--let $q_w = SELECT SUM(a) s, SUM(1) n FROM f JOIN d3 ON f.k3 = d3.k
+--let $q_i = SELECT SUM(a) s, SUM(1) n FROM fi JOIN d3i ON fi.k3 = d3i.k
+--source suite/warp/include/star_check.inc
+
+--let $label = no row passes (one row with NULL)
+--let $q_w = SELECT SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 = 99
+--let $q_i = SELECT SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 = 99
+--source suite/warp/include/star_check.inc
+
+--let $label = no row passes with a group by
+--let $q_w = SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 = 99 GROUP BY g1
+--let $q_i = SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 = 99 GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+--let $label = a sum of values that are all NULL is NULL
+--let $q_w = SELECT g1, SUM(b) s, SUM(a) sa FROM f JOIN d1 ON f.k1 = d1.k WHERE b IS NULL GROUP BY g1
+--let $q_i = SELECT g1, SUM(b) s, SUM(a) sa FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE b IS NULL GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+--let $label = conditions with OR, IN and BETWEEN
+--let $q_w = SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k WHERE (n1 = 1 OR n1 = 3) AND a BETWEEN 5 AND 60 AND t IN (1, 2, 4) GROUP BY g1
+--let $q_i = SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE (n1 = 1 OR n1 = 3) AND a BETWEEN 5 AND 60 AND t IN (1, 2, 4) GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+--let $label = string condition on a dimension
+--let $q_w = SELECT n1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k WHERE g1 BETWEEN 'G1' AND 'G3' GROUP BY n1
+--let $q_i = SELECT n1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE g1 BETWEEN 'G1' AND 'G3' GROUP BY n1
+--source suite/warp/include/star_check.inc
+
+--let $label = HAVING
+--let $q_w = SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 HAVING SUM(a) > 50000
+--let $q_i = SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 HAVING SUM(a) > 50000
+--source suite/warp/include/star_check.inc
+
+--echo # ORDER BY and LIMIT
+SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 ORDER BY s DESC, g1 LIMIT 3;
+SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 ORDER BY s DESC, g1 LIMIT 3;
+
+--echo # The sum of BIGINT values is exact (more than a BIGINT)
+SELECT SUM(c * 1000), SUM(c) FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 < 3;
+SELECT SUM(c * 1000), SUM(c) FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 < 3;
+
+--echo # A product that does not fit a BIGINT is an error, as in InnoDB
+--error ER_DATA_OUT_OF_RANGE
+SELECT SUM(c * c) FROM f JOIN d1 ON f.k1 = d1.k;
+--error ER_DATA_OUT_OF_RANGE
+SELECT SUM(c * c) FROM fi JOIN d1i ON fi.k1 = d1i.k;
+
+--echo # Rows deleted and updated
+DELETE FROM f WHERE id % 13 = 0;
+DELETE FROM fi WHERE id % 13 = 0;
+UPDATE d1 SET g1 = 'XX' WHERE k IN (2, 9);
+UPDATE d1i SET g1 = 'XX' WHERE k IN (2, 9);
+--let $label = after the deletes and the updates
+--let $q_w = SELECT g1, g2, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k JOIN d2 ON f.k2 = d2.k GROUP BY g1, g2
+--let $q_i = SELECT g1, g2, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k JOIN d2i ON fi.k2 = d2i.k GROUP BY g1, g2
+--source suite/warp/include/star_check.inc
+
+--echo # A transaction sees its own changes, the others do not
+connect (other, localhost, root,,);
+connection default;
+BEGIN;
+DELETE FROM f WHERE id % 2 = 0;
+DELETE FROM fi WHERE id % 2 = 0;
+SET SESSION warp_star_aggregation = ON;
+--echo # WARP, then InnoDB: the transaction that deleted
+SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 ORDER BY g1;
+SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 ORDER BY g1;
+connection other;
+SET SESSION warp_star_aggregation = ON;
+--echo # WARP, then InnoDB: another connection
+SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 ORDER BY g1;
+SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 ORDER BY g1;
+connection default;
+ROLLBACK;
+--let $label = after the rollback
+--let $q_w = SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+disconnect other;
+
+--echo # Reads that lock rows and queries the engine does not take over give the same results
+--echo # FOR UPDATE: WARP, then InnoDB
+BEGIN;
+SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 ORDER BY g1 FOR UPDATE;
+COMMIT;
+BEGIN;
+SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 ORDER BY g1 FOR UPDATE;
+COMMIT;
+--echo # LOCK IN SHARE MODE: WARP, then InnoDB
+BEGIN;
+SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1 ORDER BY g1 LOCK IN SHARE MODE;
+COMMIT;
+BEGIN;
+SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1 ORDER BY g1 LOCK IN SHARE MODE;
+COMMIT;
+--let $label = COUNT and MIN are not taken over
+--let $q_w = SELECT g1, COUNT(*) n, MIN(a) m, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, COUNT(*) n, MIN(a) m, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+--let $label = a condition on two tables
+--let $q_w = SELECT g1, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k WHERE f.a > d1.n1 * 10 GROUP BY g1
+--let $q_i = SELECT g1, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE fi.a > d1i.n1 * 10 GROUP BY g1
+--source suite/warp/include/star_check.inc
+--let $label = LEFT JOIN
+--let $q_w = SELECT g1, SUM(a) s FROM f LEFT JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, SUM(a) s FROM fi LEFT JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+SET SESSION warp_star_aggregation = OFF;
+DROP TABLE f, d1, d2, d3, fi, d1i, d2i, d3i;
