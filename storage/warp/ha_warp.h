@@ -242,7 +242,7 @@ static MYSQL_THDVAR_BOOL(adjust_table_stats_for_joins, PLUGIN_VAR_NOCMDARG,
 static MYSQL_THDVAR_BOOL(star_aggregation, PLUGIN_VAR_NOCMDARG,
                           "Evaluate star schema queries that join one fact table to dimension tables and "
                           "aggregate (SUM ... GROUP BY) inside the engine, in parallel by partition",
-                          nullptr, nullptr, false);
+                          nullptr, nullptr, true);
 
 static MYSQL_THDVAR_ULONG(parallel_min_rows, PLUGIN_VAR_RQCMDARG,
                           "Smallest number of rows of a piece of a partition that is processed by a thread of its own "

@@ -23,6 +23,10 @@ CREATE TABLE fi ENGINE=InnoDB SELECT * FROM f;
 CREATE TABLE d1i ENGINE=InnoDB SELECT * FROM d1;
 CREATE TABLE d2i ENGINE=InnoDB SELECT * FROM d2;
 CREATE TABLE d3i ENGINE=InnoDB SELECT * FROM d3;
+# It is on by default
+SELECT @@global.warp_star_aggregation, @@session.warp_star_aggregation;
+@@global.warp_star_aggregation	@@session.warp_star_aggregation
+1	1
 SET SESSION warp_star_aggregation = ON;
 # The join and the aggregation are done by the engine
 EXPLAIN FORMAT=TREE SELECT g1, g2, SUM(a), SUM(c - a)
