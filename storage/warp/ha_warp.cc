@@ -84,6 +84,7 @@ using namespace SIMDCompressionLib;
 #endif
 
 int warp_push_to_engine(THD *, AccessPath *, JOIN *);
+static void forget_partitions(const char *table_name);
 // Stuff for shares */
 mysql_mutex_t warp_mutex;
 static std::unique_ptr<collation_unordered_multimap<std::string, WARP_SHARE *>>
@@ -428,9 +429,11 @@ int ha_warp::rename_table(const char * from, const char * to, const dd::Table* ,
   ibis::fileManager::instance().flushDir(to_dir.c_str());
   std::string cmd = "mv " + std::string(from) + ".data/ " + std::string(to) + ".data/";
   
-  __attribute__((unused))int retval = system(cmd.c_str()); 
+  __attribute__((unused))int retval = system(cmd.c_str());
   ibis::fileManager::instance().flushDir(from_dir.c_str());
   ibis::fileManager::instance().flushDir(to_dir.c_str());
+  forget_partitions(from);
+  forget_partitions(to);
   DBUG_RETURN(0);
 }
 
@@ -598,6 +601,8 @@ static WARP_SHARE *get_share(const char *table_name, TABLE *) {
       mysql_mutex_unlock(&warp_mutex);
       return NULL;
     }
+    /* the memory is not a WARP_SHARE until its members are constructed */
+    new (share) WARP_SHARE();
 
     share->use_count = 0;
     share->table_name.assign(table_name, length);
@@ -649,11 +654,26 @@ static int free_share(WARP_SHARE *share) {
     warp_open_tables->erase(share->table_name.c_str());
     thr_lock_delete(&share->lock);
     mysql_mutex_destroy(&share->mutex);
+    share->~WARP_SHARE();
     my_free(share);
   }
   mysql_mutex_unlock(&warp_mutex);
-  
+
   DBUG_RETURN(result_code);
+}
+
+/* The partitions of a table that is dropped, renamed, truncated or created
+   are read from disk again by the next write.  A share can outlive the
+   table that it was opened for. */
+static void forget_partitions(const char *table_name) {
+  mysql_mutex_lock(&warp_mutex);
+  const auto range = warp_open_tables->equal_range(table_name);
+  for(auto it = range.first; it != range.second; ++it) {
+    mysql_mutex_lock(&it->second->mutex);
+    it->second->partitions_loaded = false;
+    mysql_mutex_unlock(&it->second->mutex);
+  }
+  mysql_mutex_unlock(&warp_mutex);
 }
 
 
@@ -1003,59 +1023,98 @@ int ha_warp::end_bulk_insert() {
   return 0;
 }
 
-std::string ha_warp::get_writer_partition() {
-  auto parts = new ibis::partList ;
-  int partition_count = ibis::util::gatherParts(*parts, share->data_dir_name);
-  std::string retval;
-  write_mutex.lock();
-  // if there is only one partition, the table is empty and a new p0 must be created
-  if(partition_count == 1) {
-    retval =  std::string(share->data_dir_name) + std::string("/p0");
-    goto done;
-  }
-  
-  for (auto it = parts->begin(); it < parts->end(); ++it) {
-    // skip the top level partition
-    if(std::string((*it)->currentDataDir()) == std::string(share->data_dir_name)) {
-      continue;
+int file_exists(const char *file_name);
+
+/* Reads the partitions of the table and the number of rows in each from
+   disk, unless they are already in the share.  Called with share->mutex
+   held. */
+void ha_warp::load_partition_rows() {
+  if(share->partitions_loaded) return;
+  share->partition_rows.clear();
+  share->next_partition = 0;
+  ibis::partList parts;
+  ibis::util::gatherParts(parts, share->data_dir_name);
+  for(auto part : parts) {
+    const char *dir = part->currentDataDir();
+    const char *name = dir == NULL ? NULL : strrchr(dir, '/');
+    char *end = NULL;
+    /* the top level directory is not a partition */
+    if(name != NULL && name[1] == 'p' && isdigit((unsigned char)name[2]) &&
+       strcmp(dir, share->data_dir_name) != 0) {
+      const uint64_t number = strtoull(name + 2, &end, 10);
+      if(*end == 0) {
+        share->partition_rows[number] = part->nRows();
+        share->next_partition = std::max(share->next_partition, number + 1);
+      }
     }
-    // find the partition with the least number of rows (top level partition is excluded above)
-    if(writer->mRows() + (*it)->nRows() <= my_partition_max_rows) {
-      retval = std::string((*it)->currentDataDir());
-      goto done;
-    }
-  }   
-  
-  retval = std::string(share->data_dir_name) + std::string("/p") + (std::to_string(parts->size()-1));
-  done:
-  write_mutex.unlock();
-  
-  for(auto it=parts->begin();it!=parts->end();++it) {
-    delete *it;
-    *it=NULL;
+    delete part;
   }
-  delete parts;
-  return retval;
+  /* a partition that another connection is creating may not be on disk yet */
+  if(!share->partitions_writing.empty()) {
+    share->next_partition = std::max(share->next_partition,
+                                     *share->partitions_writing.rbegin() + 1);
+  }
+  share->partitions_loaded = true;
+}
+
+/* Chooses the partition that the buffered rows are written to and reserves
+   it, so that no other connection writes to it at the same time: the first
+   partition with room for the rows, or a new partition.  Returns the number
+   of the partition.  Called with share->mutex held. */
+uint64_t ha_warp::claim_writer_partition() {
+  load_partition_rows();
+  const uint64_t rows = writer->mRows();
+  for(const auto &partition : share->partition_rows) {
+    if(partition.second + rows <= my_partition_max_rows &&
+       share->partitions_writing.count(partition.first) == 0) {
+      share->partitions_writing.insert(partition.first);
+      return partition.first;
+    }
+  }
+  uint64_t number;
+  do {
+    number = share->next_partition++;
+  } while(file_exists((std::string(share->data_dir_name) + "/p" +
+                       std::to_string(number)).c_str()));
+  share->partition_rows[number] = 0;
+  share->partitions_writing.insert(number);
+  return number;
 }
 
 /* Write the buffered rows to disk and empty the buffer.  Returns 0 or a
    handler error code.  FastBit reports a lack of memory (typically a
    FastBit cache that is too small) by throwing exceptions, which must not
-   reach the server. */
+   reach the server.  share->mutex is only held while a partition is chosen,
+   so the other connections that write to the table keep buffering rows
+   while the columns are written. */
 int ha_warp::write_buffered_rows_to_disk() {
   int rc = 0;
+  bool claimed = false;
+  bool written_ok = false;
+  uint64_t part_number = 0;
+  const uint64_t rows = writer->mRows();
+
   mysql_mutex_lock(&share->mutex);
+  try {
+    part_number = claim_writer_partition();
+    claimed = true;
+  } catch(...) {
+  }
+  mysql_mutex_unlock(&share->mutex);
 
   try {
+    if(!claimed) throw std::bad_alloc();
+    const std::string part_name = "p" + std::to_string(part_number);
+    const std::string part_dir = std::string(share->data_dir_name) + "/" + part_name;
     /* no scan reads the partition while it is written */
     warp_table_write_lock data_lock(share->data_dir_name);
-    std::string part_dir = get_writer_partition();
-    std::string part_name = part_dir.substr(part_dir.find_last_of('/') + 1);
     int written = writer->write(part_dir.c_str(), part_name.c_str());
     if(written < 0) {
       sql_print_error("WARP: could not write the buffered rows to %s (error %d)",
                       part_dir.c_str(), written);
       rc = HA_ERR_INTERNAL_ERROR;
+    } else {
+      written_ok = true;
     }
     /* The rows were appended to the column files.  A copy of a file that is in
        the FastBit cache is shorter than the file now, and the scans that
@@ -1067,17 +1126,23 @@ int ha_warp::write_buffered_rows_to_disk() {
                     share->data_dir_name, (unsigned long long)my_cache_size);
     rc = HA_ERR_OUT_OF_MEM;
   }
+
+  mysql_mutex_lock(&share->mutex);
+  if(claimed) {
+    share->partitions_writing.erase(part_number);
+    if(written_ok) {
+      share->partition_rows[part_number] += rows;
+    } else {
+      /* the rows on disk are not known, they are read again */
+      share->partitions_loaded = false;
+    }
+  }
+  mysql_mutex_unlock(&share->mutex);
+
   try {
     writer->clearData();
   } catch(...) {
   }
-  /*if(update_indexes) { 
-    maintain_indexes(part_dir.c_str());
-  }*/
-  //delete writer;
-  //writer = NULL;
-  
-  mysql_mutex_unlock(&share->mutex);
   return rc;
 }
 
@@ -1263,6 +1328,7 @@ int ha_warp::delete_table(const char *table_name, const dd::Table *) {
       std::string("rm -rf ") + std::string(table_name) + ".data/";
   int rc = system(cmdline.c_str());
   ibis::fileManager::instance().flushDir(data_dir.c_str());
+  forget_partitions(table_name);
   ha_statistic_increment(&System_status_var::ha_delete_count);
   DBUG_RETURN(rc != 0);
 
@@ -1969,6 +2035,7 @@ int ha_warp::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
     }
     rc = -1;
   }
+  forget_partitions(name);
 
   DBUG_RETURN(rc);
 }
@@ -1990,6 +2057,8 @@ int ha_warp::optimize(THD *, HA_CHECK_OPT *) {
   int rc = HA_ADMIN_OK;
   const bool compress = ibis::zfile::level() > 0;
   mysql_mutex_lock(&share->mutex);
+  /* the column files are not rewritten while rows are written to them */
+  warp_table_write_lock data_lock(share->data_dir_name);
   ibis::partList parts;
   ibis::util::gatherParts(parts, share->data_dir_name, true);
   for (auto part : parts) {
