@@ -4673,9 +4673,21 @@ int ha_warp::bitmap_merge_join() {
     
     auto matches = new std::unordered_map<uint64_t, uint64_t>;
     uint64_t rownum = 0;
+    last_trx_id = 0;
     while(dim_cursor->fetch() == 0) {
       
       ++rownum;   
+
+      /* Only the rows that the transaction can see have a key.  The rows of
+         an updated row are all in the table, and the key of the old version
+         must not take the place of the new one. */
+      uint64_t dim_rowid = 0, dim_trx_id = 0;
+      dim_cursor->getColumnAsULong("r", dim_rowid);
+      dim_cursor->getColumnAsULong("t", dim_trx_id);
+      current_rowid = dim_rowid;
+      if(!is_trx_visible_to_read(dim_trx_id) || !is_row_visible_to_read(dim_rowid)) {
+        continue;
+      }
   
       bool is_unsigned = fact_field->is_unsigned();
       int rc=0;
@@ -4774,6 +4786,7 @@ int ha_warp::bitmap_merge_join() {
         return -1;
       }
     } // end of fetch loop
+    last_trx_id = 0;
     delete dim_cursor;
     if( matches->size() > 0 ) {
       auto filter_info = new warp_filter_info(fact_colname, dim_alias, dim_colname);
