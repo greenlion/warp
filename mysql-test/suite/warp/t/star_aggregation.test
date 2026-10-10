@@ -115,6 +115,130 @@ SELECT SUM(c * c) FROM f JOIN d1 ON f.k1 = d1.k;
 --error ER_DATA_OUT_OF_RANGE
 SELECT SUM(c * c) FROM fi JOIN d1i ON fi.k1 = d1i.k;
 
+--echo #
+--echo # AVG, COUNT, MIN and MAX
+--echo #
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, COUNT(*), COUNT(b), MIN(c), MAX(a - b)
+  FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1;
+--echo # An average with groups stays with MySQL
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, AVG(a) FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1;
+
+--let $label = count min max, one dimension
+--let $q_w = SELECT g1, COUNT(*) cs, COUNT(b) cb, COUNT(a) ca, MIN(c) mc, MAX(c) xc, MIN(b) mb, MAX(a - b) xd FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, COUNT(*) cs, COUNT(b) cb, COUNT(a) ca, MIN(c) mc, MAX(c) xc, MIN(b) mb, MAX(a - b) xd FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+--let $label = count min max, two dimensions with sums and conditions
+--let $q_w = SELECT g1, g2, COUNT(*) cs, SUM(b) sb, MIN(a) mi, MAX(a * t) ma FROM f JOIN d1 ON f.k1 = d1.k JOIN d2 ON f.k2 = d2.k WHERE n1 < 3 AND a > 5 GROUP BY g1, g2
+--let $q_i = SELECT g1, g2, COUNT(*) cs, SUM(b) sb, MIN(a) mi, MAX(a * t) ma FROM fi JOIN d1i ON fi.k1 = d1i.k JOIN d2i ON fi.k2 = d2i.k WHERE n1 < 3 AND a > 5 GROUP BY g1, g2
+--source suite/warp/include/star_check.inc
+
+--let $label = avg count min max, one dimension (the average is not taken over)
+--let $q_w = SELECT g1, AVG(a) av, AVG(b) ab, COUNT(*) cs, COUNT(b) cb, COUNT(a) ca, MIN(c) mc, MAX(c) xc, MIN(b) mb, MAX(a - b) xd FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, AVG(a) av, AVG(b) ab, COUNT(*) cs, COUNT(b) cb, COUNT(a) ca, MIN(c) mc, MAX(c) xc, MIN(b) mb, MAX(a - b) xd FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+--let $label = avg count min max, two dimensions with sums and conditions
+--let $q_w = SELECT g1, g2, AVG(a * t) av, COUNT(*) cs, SUM(b) sb, MIN(a) mi, MAX(a) ma FROM f JOIN d1 ON f.k1 = d1.k JOIN d2 ON f.k2 = d2.k WHERE n1 < 3 AND a > 5 GROUP BY g1, g2
+--let $q_i = SELECT g1, g2, AVG(a * t) av, COUNT(*) cs, SUM(b) sb, MIN(a) mi, MAX(a) ma FROM fi JOIN d1i ON fi.k1 = d1i.k JOIN d2i ON fi.k2 = d2i.k WHERE n1 < 3 AND a > 5 GROUP BY g1, g2
+--source suite/warp/include/star_check.inc
+
+--let $label = avg count min max without group by
+--let $q_w = SELECT AVG(a) av, COUNT(*) cs, COUNT(b) cb, MIN(b) mb, MAX(b) xb FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 = 2
+--let $q_i = SELECT AVG(a) av, COUNT(*) cs, COUNT(b) cb, MIN(b) mb, MAX(b) xb FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 = 2
+--source suite/warp/include/star_check.inc
+
+--let $label = avg count min max, no row passes
+--let $q_w = SELECT AVG(a) av, COUNT(*) cs, COUNT(b) cb, MIN(b) mb, MAX(b) xb, SUM(a) sa FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 = 99
+--let $q_i = SELECT AVG(a) av, COUNT(*) cs, COUNT(b) cb, MIN(b) mb, MAX(b) xb, SUM(a) sa FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 = 99
+--source suite/warp/include/star_check.inc
+
+--let $label = avg count min max, NULL group values and a key with several rows
+--let $q_w = SELECT g3, AVG(a) av, COUNT(*) cs, COUNT(b) cb, MIN(b) mb, MAX(t) xt FROM f JOIN d3 ON f.k3 = d3.k GROUP BY g3
+--let $q_i = SELECT g3, AVG(a) av, COUNT(*) cs, COUNT(b) cb, MIN(b) mb, MAX(t) xt FROM fi JOIN d3i ON fi.k3 = d3i.k GROUP BY g3
+--source suite/warp/include/star_check.inc
+
+--let $label = avg and count with having and order by
+--let $q_w = SELECT g2, AVG(a) av, COUNT(*) cs FROM f JOIN d2 ON f.k2 = d2.k GROUP BY g2 HAVING COUNT(*) > 4000 ORDER BY av
+--let $q_i = SELECT g2, AVG(a) av, COUNT(*) cs FROM fi JOIN d2i ON fi.k2 = d2i.k GROUP BY g2 HAVING COUNT(*) > 4000 ORDER BY av
+--source suite/warp/include/star_check.inc
+
+--let $label = avg and count of distinct split groups
+--let $q_w = SELECT g1, COUNT(DISTINCT a) cd, COUNT(*) cs, MIN(c) mc, AVG(a) av FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, COUNT(DISTINCT a) cd, COUNT(*) cs, MIN(c) mc, AVG(a) av FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+--let $label = count distinct and count without group by
+--let $q_w = SELECT COUNT(DISTINCT a) cd, COUNT(*) cs, MAX(c) mx, SUM(a) sa FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 < 3
+--let $q_i = SELECT COUNT(DISTINCT a) cd, COUNT(*) cs, MAX(c) mx, SUM(a) sa FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 < 3
+--source suite/warp/include/star_check.inc
+
+--echo # Groups that are equal under the collation (trailing spaces) are one group
+CREATE TABLE d4 (k INT, g4 VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d4i (k INT, g4 VARCHAR(8)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO d4 VALUES (0,'x'),(1,'x '),(2,'y'),(3,'y  '),(4,'z'),(5,'x');
+INSERT INTO d4i SELECT * FROM d4;
+--let $label = avg count of groups that differ in trailing spaces
+--let $q_w = SELECT g4, AVG(a) av, COUNT(*) cs, SUM(a) sa FROM f JOIN d4 ON f.k3 = d4.k GROUP BY g4
+--let $q_i = SELECT g4, AVG(a) av, COUNT(*) cs, SUM(a) sa FROM fi JOIN d4i ON fi.k3 = d4i.k GROUP BY g4
+--source suite/warp/include/star_check.inc
+DROP TABLE d4, d4i;
+
+--echo #
+--echo # COUNT(DISTINCT): the engine splits the groups by the distinct values and
+--echo # MySQL counts them.  With a sum in the same query MySQL sorts the rows
+--echo # before it aggregates them, the query is not taken over.
+--echo #
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, COUNT(DISTINCT a) FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1;
+
+--let $label = distinct fact column
+--let $q_w = SELECT g1, COUNT(DISTINCT a) c FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, COUNT(DISTINCT a) c FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+--let $label = distinct nullable fact column with sums
+--let $q_w = SELECT g1, g2, COUNT(DISTINCT b) c, SUM(a) s, SUM(b) sb FROM f JOIN d1 ON f.k1 = d1.k JOIN d2 ON f.k2 = d2.k GROUP BY g1, g2
+--let $q_i = SELECT g1, g2, COUNT(DISTINCT b) c, SUM(a) s, SUM(b) sb FROM fi JOIN d1i ON fi.k1 = d1i.k JOIN d2i ON fi.k2 = d2i.k GROUP BY g1, g2
+--source suite/warp/include/star_check.inc
+
+--let $label = distinct of an expression and of two columns
+--let $q_w = SELECT g1, COUNT(DISTINCT a + t) c1, COUNT(DISTINCT a, b) c2, COUNT(DISTINCT t) c3 FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, COUNT(DISTINCT a + t) c1, COUNT(DISTINCT a, b) c2, COUNT(DISTINCT t) c3 FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+--let $label = distinct dimension column, distinct join column
+--let $q_w = SELECT g1, COUNT(DISTINCT g2) c, COUNT(DISTINCT k2) ck, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k JOIN d2 ON f.k2 = d2.k GROUP BY g1
+--let $q_i = SELECT g1, COUNT(DISTINCT g2) c, COUNT(DISTINCT k2) ck, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k JOIN d2i ON fi.k2 = d2i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+
+--let $label = distinct without group by, with a condition
+--let $q_w = SELECT COUNT(DISTINCT a) c, COUNT(DISTINCT k1) ck FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 < 2 AND a > 10
+--let $q_i = SELECT COUNT(DISTINCT a) c, COUNT(DISTINCT k1) ck FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 < 2 AND a > 10
+--source suite/warp/include/star_check.inc
+
+--let $label = distinct with a dimension key that has several rows
+--let $q_w = SELECT g3, COUNT(DISTINCT a) c, SUM(t) st FROM f JOIN d3 ON f.k3 = d3.k GROUP BY g3
+--let $q_i = SELECT g3, COUNT(DISTINCT a) c, SUM(t) st FROM fi JOIN d3i ON fi.k3 = d3i.k GROUP BY g3
+--source suite/warp/include/star_check.inc
+
+--let $label = distinct and sums without group by
+--let $q_w = SELECT COUNT(DISTINCT a) c, SUM(c) s, SUM(b) sb FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 < 3
+--let $q_i = SELECT COUNT(DISTINCT a) c, SUM(c) s, SUM(b) sb FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 < 3
+--source suite/warp/include/star_check.inc
+
+--let $label = distinct with order by and a condition on the fact table
+--let $q_w = SELECT g2, COUNT(DISTINCT b) c FROM f JOIN d2 ON f.k2 = d2.k WHERE a > 20 GROUP BY g2 ORDER BY g2 DESC
+--let $q_i = SELECT g2, COUNT(DISTINCT b) c FROM fi JOIN d2i ON fi.k2 = d2i.k WHERE a > 20 GROUP BY g2 ORDER BY g2 DESC
+--source suite/warp/include/star_check.inc
+
+--let $label = distinct, no row passes
+--let $q_w = SELECT COUNT(DISTINCT a) c FROM f JOIN d1 ON f.k1 = d1.k WHERE n1 = 99
+--let $q_i = SELECT COUNT(DISTINCT a) c FROM fi JOIN d1i ON fi.k1 = d1i.k WHERE n1 = 99
+--source suite/warp/include/star_check.inc
+
 --echo # Rows deleted and updated
 DELETE FROM f WHERE id % 13 = 0;
 DELETE FROM fi WHERE id % 13 = 0;
@@ -123,6 +247,15 @@ UPDATE d1i SET g1 = 'XX' WHERE k IN (2, 9);
 --let $label = after the deletes and the updates
 --let $q_w = SELECT g1, g2, SUM(a) s FROM f JOIN d1 ON f.k1 = d1.k JOIN d2 ON f.k2 = d2.k GROUP BY g1, g2
 --let $q_i = SELECT g1, g2, SUM(a) s FROM fi JOIN d1i ON fi.k1 = d1i.k JOIN d2i ON fi.k2 = d2i.k GROUP BY g1, g2
+--source suite/warp/include/star_check.inc
+
+--let $label = count min max after the deletes and the updates
+--let $q_w = SELECT g1, COUNT(*) cs, COUNT(b) cb, MIN(a) mi, MAX(c) ma FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, COUNT(*) cs, COUNT(b) cb, MIN(a) mi, MAX(c) ma FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
+--source suite/warp/include/star_check.inc
+--let $label = count distinct after the deletes and the updates
+--let $q_w = SELECT g1, COUNT(DISTINCT a) cd FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1
+--let $q_i = SELECT g1, COUNT(DISTINCT a) cd FROM fi JOIN d1i ON fi.k1 = d1i.k GROUP BY g1
 --source suite/warp/include/star_check.inc
 
 --echo # A transaction sees its own changes, the others do not

@@ -71,12 +71,72 @@ SELECT SUM(c * c) FROM f JOIN d1 ON f.k1 = d1.k;
 ERROR 22003: BIGINT value is out of range in 'BIGINT value is out of range in '(`test`.`f`.`c` * `test`.`f`.`c`)''
 SELECT SUM(c * c) FROM fi JOIN d1i ON fi.k1 = d1i.k;
 ERROR 22003: BIGINT value is out of range in '(`test`.`fi`.`c` * `test`.`fi`.`c`)'
+#
+# AVG, COUNT, MIN and MAX
+#
+EXPLAIN FORMAT=TREE SELECT g1, COUNT(*), COUNT(b), MIN(c), MAX(a - b)
+FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1;
+EXPLAIN
+-> Table scan on <temporary>
+    -> Aggregate using temporary table
+        -> Table scan on f
+
+# An average with groups stays with MySQL
+EXPLAIN FORMAT=TREE SELECT g1, AVG(a) FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1;
+EXPLAIN
+-> Table scan on <temporary>
+    -> Aggregate using temporary table
+        -> Inner hash join (d1.k = f.k1)
+            -> Table scan on d1
+            -> Hash
+                -> Table scan on f
+
+count min max, one dimension: 6 rows
+count min max, two dimensions with sums and conditions: 33 rows
+avg count min max, one dimension (the average is not taken over): 6 rows
+avg count min max, two dimensions with sums and conditions: 33 rows
+avg count min max without group by: 1 rows
+avg count min max, no row passes: 1 rows
+avg count min max, NULL group values and a key with several rows: 8 rows
+avg and count with having and order by: 6 rows
+avg and count of distinct split groups: 6 rows
+count distinct and count without group by: 1 rows
+# Groups that are equal under the collation (trailing spaces) are one group
+CREATE TABLE d4 (k INT, g4 VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d4i (k INT, g4 VARCHAR(8)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO d4 VALUES (0,'x'),(1,'x '),(2,'y'),(3,'y  '),(4,'z'),(5,'x');
+INSERT INTO d4i SELECT * FROM d4;
+avg count of groups that differ in trailing spaces: 3 rows
+DROP TABLE d4, d4i;
+#
+# COUNT(DISTINCT): the engine splits the groups by the distinct values and
+# MySQL counts them.  With a sum in the same query MySQL sorts the rows
+# before it aggregates them, the query is not taken over.
+#
+EXPLAIN FORMAT=TREE SELECT g1, COUNT(DISTINCT a) FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1;
+EXPLAIN
+-> Group aggregate: count(distinct f.a)
+    -> Sort: d1.g1
+        -> Stream results
+            -> Table scan on f
+
+distinct fact column: 6 rows
+distinct nullable fact column with sums: 36 rows
+distinct of an expression and of two columns: 6 rows
+distinct dimension column, distinct join column: 6 rows
+distinct without group by, with a condition: 1 rows
+distinct with a dimension key that has several rows: 8 rows
+distinct and sums without group by: 1 rows
+distinct with order by and a condition on the fact table: 6 rows
+distinct, no row passes: 1 rows
 # Rows deleted and updated
 DELETE FROM f WHERE id % 13 = 0;
 DELETE FROM fi WHERE id % 13 = 0;
 UPDATE d1 SET g1 = 'XX' WHERE k IN (2, 9);
 UPDATE d1i SET g1 = 'XX' WHERE k IN (2, 9);
 after the deletes and the updates: 38 rows
+count min max after the deletes and the updates: 7 rows
+count distinct after the deletes and the updates: 7 rows
 # A transaction sees its own changes, the others do not
 BEGIN;
 DELETE FROM f WHERE id % 2 = 0;

@@ -101,8 +101,10 @@ struct warp_star_op {
 };
 
 struct warp_star_sum {
-  Item_sum_sum *item = nullptr;
-  Item_decimal *holder = nullptr;   // replaces the argument of the SUM
+  enum Kind { SUM, AVG, COUNT, MIN, MAX } kind = SUM;
+  Item_sum *item = nullptr;
+  Item_decimal *holder = nullptr;   // replaces the argument of the SUM and AVG
+  Item_int *int_holder = nullptr;   // replaces the argument of MIN and MAX
   std::vector<warp_star_op> ops;
   std::vector<int> null_slots;      // the NULL markers that make the argument NULL
   std::string text;                 // for error messages
@@ -151,6 +153,30 @@ struct warp_star_col {
   }
 };
 
+/* The columns of the fact table that COUNT(DISTINCT) reads are part of the key
+   of a group: the group is split by the values of these columns (MySQL then
+   counts the distinct values and adds the partial sums). */
+static const size_t WARP_STAR_MAX_DCOLS = 4;
+struct warp_star_dkey {
+  uint64_t gid = 0;
+  uint32_t nulls = 0;
+  int64_t value[WARP_STAR_MAX_DCOLS] = {0, 0, 0, 0};
+  bool operator==(const warp_star_dkey &o) const {
+    return gid == o.gid && nulls == o.nulls &&
+           memcmp(value, o.value, sizeof(value)) == 0;
+  }
+};
+struct warp_star_dkey_hash {
+  size_t operator()(const warp_star_dkey &k) const {
+    uint64_t h = k.gid * 0x9E3779B97F4A7C15ULL + k.nulls;
+    for(size_t i = 0; i < WARP_STAR_MAX_DCOLS; ++i) {
+      h = (h ^ (uint64_t)k.value[i]) * 0xFF51AFD7ED558CCDULL;
+      h ^= h >> 32;
+    }
+    return (size_t)h;
+  }
+};
+
 /* Sums per group; a flat array for few groups, a hash table for many.  The
    block of a group is: the sums, the number of values that were not NULL
    for every sum, the number of rows. */
@@ -160,14 +186,34 @@ struct warp_star_acc {
   bool flat = true;
   std::vector<warp_i128> block;                                  // flat
   std::unordered_map<uint64_t, std::vector<warp_i128>> hash;     // not flat
+  std::vector<int> extreme;      // per sum: 0 adds, 1 keeps the minimum, 2 the maximum
+  bool distinct = false;                                         // keyed by warp_star_dkey
+  std::unordered_map<warp_star_dkey, std::vector<warp_i128>, warp_star_dkey_hash> dhash;
   bool overflow = false;
   size_t overflow_sum = 0;
 
   inline size_t width() const { return 2 * nsums + 1; }
-  void init(size_t nsums_arg, uint64_t groups_arg) {
+  /* adds the block of another accumulator */
+  void add_block(warp_i128 *dst, const warp_i128 *src) const {
+    for(size_t m = 0; m < nsums; ++m) {
+      if(extreme[m] == 0) {
+        dst[m] += src[m];
+      } else if(src[nsums + m] != 0) {
+        if(dst[nsums + m] == 0 || (extreme[m] == 1 ? src[m] < dst[m] : src[m] > dst[m])) {
+          dst[m] = src[m];
+        }
+      }
+      dst[nsums + m] += src[nsums + m];
+    }
+    dst[2 * nsums] += src[2 * nsums];
+  }
+  void init(size_t nsums_arg, uint64_t groups_arg, bool distinct_arg,
+            const std::vector<int> &extreme_arg) {
     nsums = nsums_arg;
+    extreme = extreme_arg;
     groups = groups_arg;
-    flat = groups_arg * (2 * nsums_arg + 1) <= (1ULL << 20);
+    distinct = distinct_arg;
+    flat = !distinct && groups_arg * (2 * nsums_arg + 1) <= (1ULL << 20);
     if(flat) {
       block.assign(groups * width(), 0);
     }
@@ -187,14 +233,30 @@ struct warp_star_acc {
     b[2 * nsums] += 1;
     return b;
   }
+  inline warp_i128 *row(const warp_star_dkey &key) {
+    auto &v = dhash[key];
+    if(v.empty()) {
+      v.assign(width(), 0);
+    }
+    v[2 * nsums] += 1;
+    return v.data();
+  }
   void merge(warp_star_acc &other) {
     if(other.overflow) {
       overflow = true;
       overflow_sum = other.overflow_sum;
     }
-    if(flat) {
-      for(size_t i = 0; i < block.size(); ++i) {
-        block[i] += other.block[i];
+    if(distinct) {
+      for(auto &entry : other.dhash) {
+        auto &v = dhash[entry.first];
+        if(v.empty()) {
+          v.assign(width(), 0);
+        }
+        add_block(v.data(), entry.second.data());
+      }
+    } else if(flat) {
+      for(size_t g = 0; g * width() < block.size(); ++g) {
+        add_block(&block[g * width()], &other.block[g * width()]);
       }
     } else {
       for(auto &entry : other.hash) {
@@ -202,9 +264,7 @@ struct warp_star_acc {
         if(v.empty()) {
           v.assign(width(), 0);
         }
-        for(size_t i = 0; i < width(); ++i) {
-          v[i] += entry.second[i];
-        }
+        add_block(v.data(), entry.second.data());
       }
     }
   }
@@ -220,7 +280,10 @@ struct warp_star_snapshot {
 struct warp_star_result_row {
   std::vector<uint32_t> codes;    // group code of every dimension
   std::vector<warp_i128> sums;
+  std::vector<warp_i128> counts;  // values that were not NULL, per sum
+  warp_i128 rows = 0;             // rows of the group
   std::vector<uint8_t> is_null;   // the sum is NULL: all its values were NULL
+  warp_star_dkey dkey;            // values of the COUNT(DISTINCT) columns
 };
 
 struct warp_star_agg {
@@ -229,6 +292,10 @@ struct warp_star_agg {
   ha_warp *fact_handler = nullptr;
   std::vector<warp_star_dim> dims;
   std::vector<warp_star_sum> sums;
+  std::vector<int> extreme;           // per sum: 0 adds, 1 MIN, 2 MAX
+  std::vector<uint> dcols;            // fact table fields that the dargs read (the key of the split)
+  std::vector<int> dcol_slot;         // their position in fact_cols
+  std::vector<int> dcol_null_slot;    // and in null_cols, -1 if not nullable
   std::vector<uint> fact_cols;    // fields of the fact table read from every partition
   std::vector<uint> null_cols;    // fields whose NULL markers are read
   std::vector<int> key_slot;      // position of the join column of every dimension in fact_cols
@@ -239,7 +306,89 @@ struct warp_star_agg {
   std::vector<warp_star_result_row> rows;
   size_t pos = 0;
   bool computed = false;
+
+  ~warp_star_agg();
 };
+
+/* The row of the engine that MySQL is aggregating, for warp_star_count. */
+static thread_local warp_star_agg *warp_star_now_plan = nullptr;
+static thread_local const warp_star_result_row *warp_star_now_row = nullptr;
+
+inline warp_star_agg::~warp_star_agg() {
+  if(warp_star_now_plan == this) {
+    warp_star_now_plan = nullptr;
+    warp_star_now_row = nullptr;
+  }
+}
+
+static bool warp_star_count_of(const Item *item, longlong *count) {
+  if(warp_star_now_plan == nullptr || warp_star_now_row == nullptr) {
+    return false;
+  }
+  for(size_t m = 0; m < warp_star_now_plan->sums.size(); ++m) {
+    if(warp_star_now_plan->sums[m].item == item) {
+      *count = (longlong)warp_star_now_row->counts[m];
+      return true;
+    }
+  }
+  return false;
+}
+
+/* COUNT of a row of the engine: the row stands for many rows, MySQL adds the
+   number of them.  The class of a COUNT that the engine takes over is changed
+   to this one (warp_star_adopt_count); it has no members of its own, so the
+   object is the same but for the virtual table. */
+/* Item_sum_count::count is private; the pointer to it is taken through the
+   explicit instantiation of a template, which the language allows. */
+struct warp_star_count_tag {
+  typedef longlong Item_sum_count::*type;
+  friend type warp_star_count_member(warp_star_count_tag);
+};
+template <typename Tag, typename Tag::type Member>
+struct warp_star_count_rob {
+  friend typename Tag::type warp_star_count_member(Tag) { return Member; }
+};
+template struct warp_star_count_rob<warp_star_count_tag, &Item_sum_count::count>;
+
+class warp_star_count final : public Item_sum_count {
+ public:
+  warp_star_count(THD *thd, Item_sum_count *item) : Item_sum_count(thd, item) {}
+
+ protected:
+  bool add() override {
+    longlong n;
+    if(!warp_star_count_of(this, &n)) {
+      n = 1;
+    }
+    this->*warp_star_count_member(warp_star_count_tag()) += n;
+    return false;
+  }
+  void reset_field() override {
+    longlong n;
+    if(!warp_star_count_of(this, &n)) {
+      Item_sum_count::reset_field();
+      return;
+    }
+    int8store(result_field->field_ptr(), n);
+  }
+  void update_field() override {
+    longlong n;
+    if(!warp_star_count_of(this, &n)) {
+      Item_sum_count::update_field();
+      return;
+    }
+    uchar *res = result_field->field_ptr();
+    int8store(res, sint8korr(res) + n);
+  }
+};
+static_assert(sizeof(warp_star_count) == sizeof(Item_sum_count),
+              "warp_star_count must not add members");
+
+static void warp_star_adopt_count(THD *thd, Item_sum *item) {
+  warp_star_count *spare =
+      new (thd->mem_root) warp_star_count(thd, down_cast<Item_sum_count *>(item));
+  memcpy((void *)item, (const void *)spare, sizeof(void *));  // the virtual table
+}
 
 /* ---------------------------------------------------------------------- */
 /* the part of the work that does not depend on the data                  */
@@ -444,9 +593,43 @@ static bool warp_star_int_key(Field *field, bool may_be_null) {
 
 /* Is the query below the aggregation a star join that the engine can
    evaluate?  If so, the plan is made and returned. */
+/* The item above a STREAM path reads a column of the temporary table of the
+   stream; the item that fills the column is what the engine has to know. */
+static Item *warp_star_resolve(THD *thd, Item *item, AccessPath *stream) {
+  if(stream == nullptr || item == nullptr) {
+    return item;
+  }
+  Item *real = item->real_item();
+  if(real->type() != Item::FIELD_ITEM) {
+    return item;
+  }
+  Field *field = down_cast<Item_field *>(real)->field;
+  if(field == nullptr || field->table != stream->stream().table) {
+    return item;
+  }
+  Temp_table_param *param = stream->stream().temp_table_param;
+  if(param->items_to_copy != nullptr) {
+    for(const Func_ptr &fp : *param->items_to_copy) {
+      if(fp.result_field() == field) {
+        return fp.func();
+      }
+    }
+  }
+  for(const Copy_field &cf : param->copy_fields) {
+    if(cf.to_field() == field) {
+      return new (thd->mem_root) Item_field(cf.from_field());
+    }
+  }
+  return nullptr;
+}
+
+/* agg_path is the aggregation, child_slot points to the join below it; stream
+   is the STREAM path between them if there is one, sorted tells that a SORT is
+   above the stream (the groups arrive sorted from it). */
 static std::shared_ptr<warp_star_agg> warp_star_make_plan(THD *thd, AccessPath *agg_path,
                                                           AccessPath **child_slot,
-                                                          JOIN *join) {
+                                                          JOIN *join, AccessPath *stream,
+                                                          bool sorted) {
   std::shared_ptr<warp_star_agg> none;
 
   std::vector<TABLE *> tables;
@@ -546,20 +729,28 @@ static std::shared_ptr<warp_star_agg> warp_star_make_plan(THD *thd, AccessPath *
       return (warp_star_no(__LINE__), none);
     }
   } else {
-    if(join->group_list.order != nullptr || agg_path->aggregate().olap != UNSPECIFIED_OLAP_TYPE) {
+    if(agg_path->aggregate().olap != UNSPECIFIED_OLAP_TYPE) {
+      return (warp_star_no(__LINE__), none);
+    }
+    group = join->group_list.order;
+    if(group != nullptr && !sorted) {
       return (warp_star_no(__LINE__), none);
     }
   }
-  for(; group != nullptr; group = group->next) {
-    Item *item = (*group->item)->real_item();
+  /* a column of a dimension table that is grouped by, or counted distinct */
+  auto add_dim_field = [&](Item *item) -> bool {
+    item = warp_star_resolve(thd, item, stream);
+    if(item == nullptr) {
+      return warp_star_no(__LINE__);
+    }
+    item = item->real_item();
     if(item->type() != Item::FIELD_ITEM) {
-      return (warp_star_no(__LINE__), none);
+      return warp_star_no(__LINE__);
     }
     Field *field = down_cast<Item_field *>(item)->field;
     if(field == nullptr || field->table == fact) {
-      return (warp_star_no(__LINE__), none);
+      return warp_star_no(__LINE__);
     }
-    bool placed = false;
     for(auto &dim : plan->dims) {
       if(dim.table == field->table) {
         switch(field->type()) {
@@ -569,16 +760,22 @@ static std::shared_ptr<warp_star_agg> warp_star_make_plan(THD *thd, AccessPath *
           case MYSQL_TYPE_LONG_BLOB:
           case MYSQL_TYPE_JSON:
           case MYSQL_TYPE_GEOMETRY:
-            return (warp_star_no(__LINE__), none);
+            return warp_star_no(__LINE__);
           default:
             break;
         }
-        dim.group_fields.push_back(field->field_index());
-        placed = true;
-        break;
+        if(std::find(dim.group_fields.begin(), dim.group_fields.end(), field->field_index()) ==
+           dim.group_fields.end()) {
+          dim.group_fields.push_back(field->field_index());
+        }
+        return true;
       }
     }
-    if(!placed) {
+    return warp_star_no(__LINE__);
+  };
+  for(; group != nullptr; group = group->next) {
+    Item *item = warp_star_resolve(thd, *group->item, stream);
+    if(item == nullptr || item->real_item()->type() != Item::FIELD_ITEM || !add_dim_field(item)) {
       return (warp_star_no(__LINE__), none);
     }
   }
@@ -589,13 +786,77 @@ static std::shared_ptr<warp_star_agg> warp_star_make_plan(THD *thd, AccessPath *
   }
   for(Item_sum **it = join->sum_funcs; *it != nullptr; ++it) {
     Item_sum *sum = *it;
-    if(sum->sum_func() != Item_sum::SUM_FUNC || sum->has_with_distinct() ||
-       sum->argument_count() != 1 || sum->result_type() != DECIMAL_RESULT) {
-      return (warp_star_no(__LINE__), none);
+    if(sum->sum_func() == Item_sum::COUNT_DISTINCT_FUNC) {
+      /* The group is split by the columns that are counted: the engine
+         returns a row for every distinct combination, with the sums of its
+         rows, and MySQL counts the distinct values and adds the sums.  The
+         columns of the dimensions are group columns, the columns of the
+         fact table are set in the record of the fact table. */
+      for(uint i = 0; i < sum->argument_count(); ++i) {
+        Item *arg = warp_star_resolve(thd, sum->get_arg(i), stream);
+        if(arg == nullptr) {
+          return (warp_star_no(__LINE__), none);
+        }
+        if(arg->real_item()->type() == Item::FIELD_ITEM &&
+           down_cast<Item_field *>(arg->real_item())->field != nullptr &&
+           down_cast<Item_field *>(arg->real_item())->field->table != fact) {
+          if(!add_dim_field(arg)) {
+            return (warp_star_no(__LINE__), none);
+          }
+          continue;
+        }
+        std::vector<warp_star_op> ops;
+        if(!warp_star_compile(arg, fact, &plan->fact_cols, &plan->null_cols, &ops)) {
+          return (warp_star_no(__LINE__), none);
+        }
+        for(const auto &op : ops) {
+          if(op.kind != warp_star_op::COLUMN) {
+            continue;
+          }
+          const uint index = plan->fact_cols[op.slot];
+          if(std::find(plan->dcols.begin(), plan->dcols.end(), index) == plan->dcols.end()) {
+            plan->dcols.push_back(index);
+          }
+        }
+      }
+      if(plan->dcols.size() > WARP_STAR_MAX_DCOLS) {
+        return (warp_star_no(__LINE__), none);
+      }
+      continue;
     }
     warp_star_sum entry;
-    entry.item = down_cast<Item_sum_sum *>(sum);
-    if(!warp_star_compile(sum->get_arg(0), fact, &plan->fact_cols, &plan->null_cols, &entry.ops)) {
+    int extreme = 0;
+    switch(sum->sum_func()) {
+      case Item_sum::SUM_FUNC:
+        entry.kind = warp_star_sum::SUM;
+        break;
+      case Item_sum::AVG_FUNC:
+        entry.kind = warp_star_sum::AVG;
+        break;
+      case Item_sum::COUNT_FUNC:
+        entry.kind = warp_star_sum::COUNT;
+        break;
+      case Item_sum::MIN_FUNC:
+        entry.kind = warp_star_sum::MIN;
+        extreme = 1;
+        break;
+      case Item_sum::MAX_FUNC:
+        entry.kind = warp_star_sum::MAX;
+        extreme = 2;
+        break;
+      default:
+        return (warp_star_no(__LINE__), none);
+    }
+    const Item_result expected = entry.kind == warp_star_sum::COUNT || extreme != 0
+                                     ? INT_RESULT : DECIMAL_RESULT;
+    if(sum->has_with_distinct() || sum->argument_count() != 1 || sum->result_type() != expected) {
+      return (warp_star_no(__LINE__), none);
+    }
+    plan->extreme.push_back(extreme);
+    entry.item = sum;
+    Item *sum_arg = warp_star_resolve(thd, sum->get_arg(0), stream);
+    if(sum_arg == nullptr ||
+       !warp_star_compile(sum_arg, fact, &plan->fact_cols, &plan->null_cols, &entry.ops)) {
       return (warp_star_no(__LINE__), none);
     }
     for(const auto &op : entry.ops) {
@@ -605,9 +866,33 @@ static std::shared_ptr<warp_star_agg> warp_star_make_plan(THD *thd, AccessPath *
       }
     }
     String text;
-    sum->get_arg(0)->print(thd, &text, QT_ORDINARY);
+    sum_arg->print(thd, &text, QT_ORDINARY);
     entry.text.assign(text.ptr(), text.length());
     plan->sums.push_back(std::move(entry));
+  }
+
+  /* The sums are read from the holders when the row arrives.  A SORT between
+     the engine and the aggregation delays the read, the sums would be the ones
+     of the last row. */
+  if(sorted && !plan->sums.empty()) {
+    return (warp_star_no(__LINE__), none);
+  }
+
+  /* An average is not the sum of the averages of the rows of the engine, and
+     MySQL keeps the sum of a group with the scale of the argument, which an
+     average does not have: the engine takes an average over only if its
+     result is one row and MySQL does not keep the sums in a temporary table. */
+  for(const auto &sum : plan->sums) {
+    if(sum.kind != warp_star_sum::AVG) {
+      continue;
+    }
+    bool grouped = !plan->dcols.empty() || agg_path->type != AccessPath::AGGREGATE;
+    for(const auto &dim : plan->dims) {
+      grouped = grouped || !dim.group_fields.empty();
+    }
+    if(grouped) {
+      return (warp_star_no(__LINE__), none);
+    }
   }
 
   /* the join columns of the fact table are read first */
@@ -639,6 +924,29 @@ static std::shared_ptr<warp_star_agg> warp_star_make_plan(THD *thd, AccessPath *
       }
       op.slot = (int)slot;
     }
+  }
+  /* the columns that are counted distinct */
+  for(uint index : plan->dcols) {
+    size_t slot = 0;
+    while(slot < plan->fact_cols.size() && plan->fact_cols[slot] != index) {
+      ++slot;
+    }
+    if(slot == plan->fact_cols.size()) {
+      plan->fact_cols.push_back(index);
+    }
+    plan->dcol_slot.push_back((int)slot);
+    int null_slot = -1;
+    if(fact->field[index]->is_nullable()) {
+      size_t n = 0;
+      while(n < plan->null_cols.size() && plan->null_cols[n] != index) {
+        ++n;
+      }
+      if(n == plan->null_cols.size()) {
+        plan->null_cols.push_back(index);
+      }
+      null_slot = (int)n;
+    }
+    plan->dcol_null_slot.push_back(null_slot);
   }
   return plan;
 }
@@ -925,8 +1233,23 @@ static bool warp_star_partition(warp_star_agg &plan, ibis::part *part,
   /* adds the row to the groups; a key with several dimension rows makes
      several groups */
   std::vector<std::vector<uint32_t>> choices(ndims);
+  const size_t ndcols = plan.dcols.size();
   auto add_row = [&](size_t row, uint64_t gid) -> bool {
-    warp_i128 *block = acc->row(gid);
+    warp_i128 *block;
+    if(ndcols == 0) {
+      block = acc->row(gid);
+    } else {
+      warp_star_dkey key;
+      key.gid = gid;
+      for(size_t k = 0; k < ndcols; ++k) {
+        if(plan.dcol_null_slot[k] >= 0 && nulls[plan.dcol_null_slot[k]].get(row) != 0) {
+          key.nulls |= 1U << k;
+        } else {
+          key.value[k] = cols[plan.dcol_slot[k]].get(row);
+        }
+      }
+      block = acc->row(key);
+    }
     for(size_t m = 0; m < nsums; ++m) {
       /* a NULL makes the argument NULL, SUM does not add it */
       bool is_null = false;
@@ -939,13 +1262,22 @@ static bool warp_star_partition(warp_star_agg &plan, ibis::part *part,
       if(is_null) {
         continue;
       }
+      if(plan.sums[m].kind == warp_star_sum::COUNT) {
+        block[nsums + m] += 1;
+        continue;
+      }
       int64_t value;
       if(!warp_star_eval(plan.sums[m], cols, row, &value)) {
         acc->overflow = true;
         acc->overflow_sum = m;
         return false;
       }
-      block[m] += value;
+      if(plan.extreme[m] == 0) {
+        block[m] += value;
+      } else if(block[nsums + m] == 0 ||
+                (plan.extreme[m] == 1 ? value < block[m] : value > block[m])) {
+        block[m] = value;
+      }
       block[nsums + m] += 1;
     }
     return true;
@@ -1078,7 +1410,7 @@ static bool warp_star_execute(warp_star_agg &plan, std::string *error) {
 
   std::vector<warp_star_acc> accs(workers);
   for(auto &acc : accs) {
-    acc.init(plan.sums.size(), groups);
+    acc.init(plan.sums.size(), groups, !plan.dcols.empty(), plan.extreme);
   }
   std::atomic<size_t> next(0);
   std::atomic<bool> failed(false);
@@ -1160,13 +1492,20 @@ static bool warp_star_execute(warp_star_agg &plan, std::string *error) {
       row.codes[d] = (uint32_t)((gid / plan.dims[d].stride) % plan.dims[d].ncodes);
     }
     row.sums.assign(block, block + nsums);
+    row.counts.assign(block + nsums, block + 2 * nsums);
+    row.rows = block[2 * nsums];
     row.is_null.resize(nsums);
     for(size_t m = 0; m < nsums; ++m) {
-      row.is_null[m] = block[nsums + m] == 0;
+      row.is_null[m] = block[nsums + m] == 0 && plan.sums[m].kind != warp_star_sum::COUNT;
     }
     plan.rows.push_back(std::move(row));
   };
-  if(accs[0].flat) {
+  if(accs[0].distinct) {
+    for(auto &entry : accs[0].dhash) {
+      emit(entry.first.gid, entry.second.data());
+      plan.rows.back().dkey = entry.first;
+    }
+  } else if(accs[0].flat) {
     for(uint64_t g = 0; g < groups; ++g) {
       const warp_i128 *block = &accs[0].block[g * accs[0].width()];
       if(block[2 * nsums] != 0) {
@@ -1181,8 +1520,8 @@ static bool warp_star_execute(warp_star_agg &plan, std::string *error) {
   return true;
 }
 
-static void warp_star_set_decimal(Item_decimal *holder, warp_i128 value) {
-  my_decimal decimal;
+static void warp_star_to_decimal(my_decimal *decimal_out, warp_i128 value) {
+  my_decimal &decimal = *decimal_out;
   if(value >= INT64_MIN && value <= INT64_MAX) {
     int2my_decimal(E_DEC_FATAL_ERROR, (longlong)value, false, &decimal);
   } else {
@@ -1202,6 +1541,11 @@ static void warp_star_set_decimal(Item_decimal *holder, warp_i128 value) {
     const char *parsed_end;
     str2my_decimal(E_DEC_FATAL_ERROR, at, &decimal, &parsed_end);
   }
+}
+
+static void warp_star_set_decimal(Item_decimal *holder, warp_i128 value) {
+  my_decimal decimal;
+  warp_star_to_decimal(&decimal, value);
   holder->set_decimal_value(&decimal);
 }
 
@@ -1243,6 +1587,8 @@ bool ha_warp::star_agg_run() {
 int ha_warp::star_agg_next(uchar *) {
   warp_star_agg &plan = *star_agg;
   if(plan.pos >= plan.rows.size()) {
+    warp_star_now_plan = nullptr;
+    warp_star_now_row = nullptr;
     return HA_ERR_END_OF_FILE;
   }
   const warp_star_result_row &row = plan.rows[plan.pos++];
@@ -1252,10 +1598,54 @@ int ha_warp::star_agg_next(uchar *) {
       memcpy(dim.table->record[0], dim.images[row.codes[d]].data(), dim.table->s->reclength);
     }
   }
-  for(size_t m = 0; m < plan.sums.size(); ++m) {
-    warp_star_set_decimal(plan.sums[m].holder, row.is_null[m] ? 0 : row.sums[m]);
-    plan.sums[m].holder->null_value = row.is_null[m] != 0;
+  /* the columns that are counted distinct are read from the record of the fact table */
+  if(!plan.dcols.empty()) {
+    TABLE *fact = plan.fact_table;
+    my_bitmap_map *old_write = tmp_use_all_columns(fact, fact->write_set);
+    for(size_t k = 0; k < plan.dcols.size(); ++k) {
+      Field *field = fact->field[plan.dcols[k]];
+      if(row.dkey.nulls & (1U << k)) {
+        field->set_null();
+      } else {
+        field->set_notnull();
+        field->store((longlong)row.dkey.value[k], field->is_flag_set(UNSIGNED_FLAG));
+      }
+    }
+    tmp_restore_column_map(fact->write_set, old_write);
   }
+  for(size_t m = 0; m < plan.sums.size(); ++m) {
+    warp_star_sum &sum = plan.sums[m];
+    switch(sum.kind) {
+      case warp_star_sum::SUM:
+        warp_star_set_decimal(sum.holder, row.is_null[m] ? 0 : row.sums[m]);
+        sum.holder->null_value = row.is_null[m] != 0;
+        break;
+      case warp_star_sum::AVG: {
+        if(row.is_null[m]) {
+          warp_star_set_decimal(sum.holder, 0);
+        } else {
+          /* the division of Item_sum_avg::val_decimal */
+          my_decimal total, count, average;
+          warp_star_to_decimal(&total, row.sums[m]);
+          warp_star_to_decimal(&count, row.counts[m]);
+          my_decimal_div(E_DEC_FATAL_ERROR, &average, &total, &count,
+                         plan.thd->variables.div_precincrement);
+          sum.holder->set_decimal_value(&average);
+        }
+        sum.holder->null_value = row.is_null[m] != 0;
+        break;
+      }
+      case warp_star_sum::MIN:
+      case warp_star_sum::MAX:
+        sum.int_holder->value = row.is_null[m] ? 0 : (longlong)row.sums[m];
+        sum.int_holder->null_value = row.is_null[m] != 0;
+        break;
+      case warp_star_sum::COUNT:
+        break;  // warp_star_count adds the count of the row
+    }
+  }
+  warp_star_now_plan = &plan;
+  warp_star_now_row = &row;
   return 0;
 }
 
@@ -1279,15 +1669,17 @@ static void warp_try_star_aggregation(THD *thd, AccessPath *root, JOIN *join) {
   AccessPath *agg = nullptr;
   int aggregations = 0;
   bool other_blocks = false;
+  int streams = 0;
   WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
                   [&](AccessPath *path, const JOIN *) {
                     if(path->type == AccessPath::AGGREGATE ||
                        path->type == AccessPath::TEMPTABLE_AGGREGATE) {
                       agg = path;
                       ++aggregations;
+                    } else if(path->type == AccessPath::STREAM) {
+                      ++streams;
                     } else if(path->type == AccessPath::MATERIALIZE ||
-                              path->type == AccessPath::WINDOW ||
-                              path->type == AccessPath::STREAM) {
+                              path->type == AccessPath::WINDOW) {
                       other_blocks = true;
                     }
                     return false;
@@ -1299,7 +1691,26 @@ static void warp_try_star_aggregation(THD *thd, AccessPath *root, JOIN *join) {
   AccessPath **slot = agg->type == AccessPath::AGGREGATE
                           ? &agg->aggregate().child
                           : &agg->temptable_aggregate().subquery_path;
-  std::shared_ptr<warp_star_agg> plan = warp_star_make_plan(thd, agg, slot, join);
+  /* COUNT(DISTINCT) is aggregated over sorted rows that a STREAM path copies
+     into a temporary table: the engine takes the place of the join below */
+  AccessPath *stream = nullptr;
+  bool sorted = false;
+  int chain_streams = 0;
+  while((*slot)->type == AccessPath::SORT || (*slot)->type == AccessPath::STREAM) {
+    if((*slot)->type == AccessPath::SORT) {
+      sorted = true;
+      slot = &(*slot)->sort().child;
+    } else {
+      stream = *slot;
+      ++chain_streams;
+      slot = &(*slot)->stream().child;
+    }
+  }
+  if(chain_streams != streams || chain_streams > 1) {
+    warp_star_no(__LINE__);
+    return;
+  }
+  std::shared_ptr<warp_star_agg> plan = warp_star_make_plan(thd, agg, slot, join, stream, sorted);
   if(!plan) {
     return;
   }
@@ -1310,6 +1721,9 @@ static void warp_try_star_aggregation(THD *thd, AccessPath *root, JOIN *join) {
     for(uint f : dim.group_fields) {
       bitmap_set_bit(dim.table->read_set, f);
     }
+  }
+  for(uint f : plan->dcols) {
+    bitmap_set_bit(plan->fact_table->read_set, f);
   }
   plan->fact_where = plan->fact_handler->push_where_clause;
   /* the columns in the condition, "c<N>" */
@@ -1331,8 +1745,22 @@ static void warp_try_star_aggregation(THD *thd, AccessPath *root, JOIN *join) {
   /* SUM(a) becomes the sum of the sums of the groups: the argument is a
      constant that the handler sets to the sum of the group */
   for(auto &sum : plan->sums) {
-    sum.holder = new (thd->mem_root) Item_decimal((longlong)0, false);
-    sum.item->set_arg(thd, 0, sum.holder);
+    switch(sum.kind) {
+      case warp_star_sum::SUM:
+      case warp_star_sum::AVG:
+        sum.holder = new (thd->mem_root) Item_decimal((longlong)0, false);
+        sum.item->set_arg(thd, 0, sum.holder);
+        break;
+      case warp_star_sum::MIN:
+      case warp_star_sum::MAX:
+        sum.int_holder = new (thd->mem_root) Item_int((longlong)0);
+        sum.int_holder->unsigned_flag = sum.item->get_arg(0)->unsigned_flag;
+        sum.item->set_arg(thd, 0, sum.int_holder);
+        break;
+      case warp_star_sum::COUNT:
+        warp_star_adopt_count(thd, sum.item);
+        break;
+    }
   }
 
   AccessPath *scan = NewTableScanAccessPath(thd, plan->fact_table, false);
