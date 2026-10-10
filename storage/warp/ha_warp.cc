@@ -1081,6 +1081,23 @@ uint64_t ha_warp::claim_writer_partition() {
   return number;
 }
 
+/* The number of rows in the partitions of the table, the deleted rows
+   included.  The partitions are read from disk the first time. */
+uint64_t ha_warp::table_row_count() {
+  uint64_t rows = 0;
+  mysql_mutex_lock(&share->mutex);
+  try {
+    load_partition_rows();
+    for(const auto &partition : share->partition_rows) {
+      rows += partition.second;
+    }
+  } catch(...) {
+    /* out of memory reading the partitions: the table counts as empty */
+  }
+  mysql_mutex_unlock(&share->mutex);
+  return rows;
+}
+
 /* Write the buffered rows to disk and empty the buffer.  Returns 0 or a
    handler error code.  FastBit reports a lack of memory (typically a
    FastBit cache that is too small) by throwing exceptions, which must not
@@ -1351,35 +1368,35 @@ WARP_SHARE* ha_warp::get_warp_share() {
 */
 int ha_warp::info(uint) {
   DBUG_ENTER("ha_warp::info");
-  std::unordered_map<std::string, bool> query_tables;
   close_in_extra = true;
-  
-  auto table_counts = get_table_counts_in_schema(share->data_dir_name);
 
-  auto thd = current_thd;
-  auto cur_table = thd->open_tables;
-  
-  while(cur_table != NULL) {
-    auto handler = (ha_warp*)(cur_table->file);
-    auto other_share = handler->get_warp_share();
-    query_tables.emplace(std::make_pair(other_share->data_dir_name, true));
-    cur_table=cur_table->next;
-  }
-  
-  const char* table_with_most_rows = get_table_with_most_rows(&table_counts, query_tables);
-  uint64_t least_row_count = get_least_row_count(&table_counts);
-  assert(table_with_most_rows != NULL);
-  bool is_fact_table = false;
-
-  // list the tables in the query
-  // if this is the fact table (largest table in schema) set the records to the smallest possible value
-  // which is 2 (otherwise const evaluation will be used)
-  if(strstr(share->data_dir_name, table_with_most_rows) != NULL) {
-    is_fact_table = true;
-    if(THDVAR(table->in_use, adjust_table_stats_for_joins)) {
-      stats.records = least_row_count+2;
+  /* The fact table is the WARP table of the statement with the most rows
+     (the one with the first data directory if several have as many).  The
+     other tables of the statement are the ones it has open; a table that is
+     not a WARP table is not a candidate. */
+  const uint64_t own_rows = table_row_count();
+  uint64_t least_row_count = own_rows;
+  bool is_fact_table = true;
+  for(TABLE *cur_table = table->in_use->open_tables; cur_table != NULL;
+      cur_table = cur_table->next) {
+    ha_warp *other = dynamic_cast<ha_warp *>(cur_table->file);
+    if(other == NULL || other->share == NULL || other->share == share) {
+      continue;
     }
-  } 
+    const uint64_t rows = other->table_row_count();
+    least_row_count = std::min(least_row_count, rows);
+    if(rows > own_rows ||
+       (rows == own_rows && strcmp(other->share->data_dir_name, share->data_dir_name) < 0)) {
+      is_fact_table = false;
+    }
+  }
+
+  // if this is the fact table set the records to the smallest possible value,
+  // the number of rows of the smallest table of the statement plus 2
+  // (otherwise const evaluation will be used)
+  if(is_fact_table && THDVAR(table->in_use, adjust_table_stats_for_joins)) {
+    stats.records = least_row_count+2;
+  }
 
   stats.mean_rec_length = 0;
   for (Field **field = table->s->field; *field; field++) {
@@ -1451,10 +1468,7 @@ int ha_warp::info(uint) {
   set_column_set();
 
   pushdown_info->column_set = column_set;
-
-  if(is_fact_table) {
-    pushdown_info->is_fact_table = true;
-  }
+  pushdown_info->is_fact_table = is_fact_table;
 
   DBUG_RETURN(0);
 }
@@ -6151,75 +6165,6 @@ std::string ha_warp::explain_extra() const {
     return ", with pushed condition: " + ItemToString(pushed_cond);
   }
   return "";
-}
-
-// get the number of rows in all the tables in the current schema
-std::unordered_map<const char*, uint64_t> get_table_counts_in_schema(char* table_dir) {
-  /* the counts are kept for the next call, by all the connections */
-  static std::mutex table_counts_mtx;
-  std::lock_guard<std::mutex> table_counts_guard(table_counts_mtx);
-  static std::unordered_map<const char*, uint64_t> table_counts;
-  ibis::partList parts;
-  if(!table_counts.empty()) return table_counts;
-
-  char* schema_dir = strdup(table_dir);
-  schema_dir = dirname(schema_dir);
-  ibis::util::gatherParts(parts, schema_dir, true);
-  for(auto part_it = parts.begin(); part_it < parts.end(); ++part_it) {
-    ibis::part* part = *part_it;
-    // the top-level partition ends in .data, the other partitions are ./data/pXXX
-    if(strstr(part->currentDataDir(), ".data/") == NULL) {
-      ibis::table* tbl = ibis::mensa::create(part->currentDataDir());
-      if(!tbl) {
-        table_counts.emplace(part->currentDataDir(), 0);
-        continue;
-      }
-      table_counts.emplace(part->currentDataDir(), tbl->nRows());
-      delete tbl;
-    }
-    
-  }
-  
-  free(schema_dir);
-  
-  return table_counts;
-}
-
-// return the path to the table with the most rows in the database
-const char* get_table_with_most_rows(std::unordered_map<const char*, uint64_t>* table_counts, std::unordered_map<std::string, bool> query_tables) {
-  uint64_t max_cnt = 0;
-  static const char* table_with_max_cnt = NULL;
-  if(table_with_max_cnt != NULL) return table_with_max_cnt;
-
-  for(auto it = table_counts->begin(); it != table_counts->end(); it++) {
-    auto it2=query_tables.find(std::string(it->first));
-    if(it2 == query_tables.end()) {
-      continue;
-    }
-      
-    if(it->second >= max_cnt) {
-      max_cnt = it->second;
-      table_with_max_cnt = it->first;
-    }
-  }
-  return table_with_max_cnt;
-}
-
-// return the path to the table with the most rows in the database
-uint64_t get_least_row_count(std::unordered_map<const char*, uint64_t>* table_counts) {
-  static std::mutex least_row_count_mtx;
-  std::lock_guard<std::mutex> least_row_count_guard(least_row_count_mtx);
-  static uint64_t min_cnt = -1ULL;
-  if(min_cnt < -1ULL) {
-    return min_cnt;
-  }
-  
-  for(auto it = table_counts->begin(); it != table_counts->end(); it++) {
-    if(it->second <= min_cnt) {
-      min_cnt = it->second;
-    }
-  }
-  return min_cnt;
 }
 
 uint64_t get_pushdown_info_count(THD* thd) {

@@ -736,9 +736,6 @@ int warp_upgrade_tables(uint16_t version);
 // and for REPEATABLE READ during scans
 bool warp_is_trx_open(uint64_t trx_id);
 
-std::unordered_map<const char*, uint64_t> get_table_counts_in_schema(char* table_dir);
-const char* get_table_with_most_rows(std::unordered_map<const char*, uint64_t>* table_counts, std::unordered_map<std::string, bool> query_tables = {});
-uint64_t get_least_row_count(std::unordered_map<const char*, uint64_t>* table_counts);
 bool has_empty_table(std::unordered_map<const char*, uint64_t>* table_counts);
 warp_trx* warp_get_trx(handlerton* hton, THD* thd);
 
@@ -782,6 +779,7 @@ class ha_warp : public handler {
   int create_writer(TABLE *table_arg);
   void load_partition_rows();
   uint64_t claim_writer_partition();
+  uint64_t table_row_count();
   int write_buffered_rows_to_disk();
   /* write_row does its work in write_row_impl so that exceptions thrown by
      FastBit are turned into handler errors */
