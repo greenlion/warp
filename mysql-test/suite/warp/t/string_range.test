@@ -418,4 +418,45 @@ EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v IN ('a', NULL);
 --replace_regex /\(cost=[^)]*\)//
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v IN ('a', c);
 
+--echo #
+--echo # Equality of strings is pushed down only when MySQL compares them as
+--echo # utf8mb4_bin strings
+--echo #
+let $checked = 0;
+let $wrong = 0;
+let $k = 0;
+while ($k < 12)
+{
+  inc $k;
+  if ($k == 1) { let $cond = v COLLATE utf8mb4_0900_ai_ci = 'A'; }
+  if ($k == 2) { let $cond = v = 'A' COLLATE utf8mb4_0900_ai_ci; }
+  if ($k == 3) { let $cond = 'a' COLLATE utf8mb4_general_ci = c; }
+  if ($k == 4) { let $cond = n = 'ab' COLLATE utf8mb4_0900_ai_ci; }
+  if ($k == 5) { let $cond = v = x'61'; }
+  if ($k == 6) { let $cond = v = _latin1 'a' COLLATE latin1_swedish_ci; }
+  if ($k == 7) { let $cond = p = '5'; }
+  if ($k == 8) { let $cond = p = ' 5'; }
+  if ($k == 9) { let $cond = v <=> 'a' COLLATE utf8mb4_0900_ai_ci; }
+  if ($k == 10) { let $cond = v = 'a'; }
+  if ($k == 11) { let $cond = c = 'b '; }
+  if ($k == 12) { let $cond = n <=> 'é'; }
+  let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $cond`;
+  let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $cond`;
+  inc $checked;
+  if ($w != $i)
+  {
+    inc $wrong;
+    --echo MISMATCH for WHERE $cond: WARP $w, InnoDB $i
+  }
+}
+--echo $checked equalities checked, $wrong mismatches
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v COLLATE utf8mb4_0900_ai_ci = 'A';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v = x'61';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE p = '5';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE c = 'b';
+
 DROP TABLE w, i, pool;

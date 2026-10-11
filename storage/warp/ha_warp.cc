@@ -4208,6 +4208,46 @@ static bool warp_push_string_range(Item_func *func, bool is_between,
   return true;
 }
 
+/* Can the equality of a column with a string constant be evaluated by
+   FastBit?  FastBit compares the bytes of the strings, with the spaces at
+   the end not counting, which is how MySQL compares utf8mb4_bin strings.
+   MySQL compares the column and the constant in the collation of the
+   comparison, which has to be utf8mb4_bin too: with another collation
+   ('A' = 'a') or for a column that is not a string, MySQL has to do it.
+   Binary strings and strings with a NUL character are left to MySQL too. */
+static bool warp_string_eq_pushable(Item_func *func) {
+  if(func->arg_count != 2) {
+    return false;
+  }
+  Item **args = func->arguments();
+  const Item_field *col_item = NULL;
+  const Item *constant = NULL;
+  if(args[0]->type() == Item::Type::FIELD_ITEM) {
+    col_item = down_cast<Item_field *>(args[0]);
+    constant = args[1];
+  } else if(args[1]->type() == Item::Type::FIELD_ITEM) {
+    col_item = down_cast<Item_field *>(args[1]);
+    constant = args[0];
+  } else {
+    return false;
+  }
+  const Field *fld = col_item->field;
+  const enum_field_types rt = fld->real_type();
+  if(rt != MYSQL_TYPE_VARCHAR && rt != MYSQL_TYPE_STRING &&
+     rt != MYSQL_TYPE_VAR_STRING && rt != MYSQL_TYPE_ENUM) {
+    return false;
+  }
+  if(fld->charset()->number != 46) {
+    return false;
+  }
+  const CHARSET_INFO *cmp_cs = func->compare_collation();
+  if(cmp_cs == NULL || cmp_cs->number != 46) {
+    return false;
+  }
+  std::string quoted;
+  return warp_quote_string_const(constant, quoted);
+}
+
 /* Pushes IN (...) of a string column with string constants down to FastBit.
    The same conditions as for the comparisons of warp_push_string_range
    hold.  Returns true and appends the FastBit condition to out if the
@@ -4835,7 +4875,7 @@ int ha_warp::append_column_filter(const Item *cond,
       if((*arg)->type() == Item::Type::STRING_ITEM ||
          (*arg)->type() == Item::Type::HEX_BIN_ITEM) 
       {
-        if(!is_eq) {
+        if(!is_eq || !warp_string_eq_pushable(tmp)) {
           return 0;
         }
         String s;
