@@ -162,4 +162,31 @@ EXPLAIN
     -> Filter: (w.v in ('a',w.c))  
         -> Table scan on w  
 
+#
+# Equality of strings is pushed down only when MySQL compares them as
+# utf8mb4_bin strings
+#
+12 equalities checked, 0 mismatches
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v COLLATE utf8mb4_0900_ai_ci = 'A';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: ((w.v collate utf8mb4_0900_ai_ci) = 'A')  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v = x'61';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.v = 0x61)  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE p = '5';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE c = 'b';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
 DROP TABLE w, i, pool;
