@@ -490,6 +490,12 @@ int ha_warp::encode_quote(uchar *) {
         no_quote = true;
         break;
 
+      case MYSQL_TYPE_BIT:
+        attribute.append(std::to_string(
+            static_cast<ulonglong>((*field)->val_int())).c_str());
+        no_quote = true;
+        break;
+
       case MYSQL_TYPE_DATE:
       case MYSQL_TYPE_TIME:
       case MYSQL_TYPE_TIMESTAMP:
@@ -891,11 +897,17 @@ int ha_warp::find_current_row(uchar *buf, ibis::table::cursor *cursor) {
             rc = (*field)->store_time(&ltime, (*field)->decimals());
           }
         } break;
+        /* a BIT is stored as the unsigned integer that it holds */
+        case MYSQL_TYPE_BIT: {
+          uint64_t tmp = 0;
+          rc = cursor->getColumnAsULong(cname.c_str(), tmp);
+          rc = (*field)->store(static_cast<longlong>(tmp), true);
+        } break;
+
         /* the following are stored as strings in Fastbit */
         case MYSQL_TYPE_DECIMAL:
         case MYSQL_TYPE_NEWDECIMAL:
         case MYSQL_TYPE_NULL:
-        case MYSQL_TYPE_BIT:
         case MYSQL_TYPE_ENUM:
         case MYSQL_TYPE_SET:
         case MYSQL_TYPE_GEOMETRY: {
@@ -1919,6 +1931,11 @@ int ha_warp::create_writer(TABLE *table_arg) {
         break;
 
       case MYSQL_TYPE_BIT:
+        /* up to 64 bits, stored as the unsigned integer that it holds */
+        index_spec="<binning none/><encoding binary/>";
+        datatype = ibis::ULONG;
+        break;
+
       case MYSQL_TYPE_NULL:
       case MYSQL_TYPE_SET:
       case MYSQL_TYPE_GEOMETRY:
@@ -4673,7 +4690,7 @@ int ha_warp::append_column_filter(const Item *cond,
 
     /* FastBit evaluates the conditions on the columns of the types that it
        stores as numbers, as dates or as strings of the same order as MySQL's.
-       The other types are stored as text of some other kind (BIT, SET, JSON,
+       The other types are stored as text of some other kind (SET, JSON,
        the bytes of a TEXT or BLOB) or are not supported (GEOMETRY): MySQL
        compares them, only IS NULL and IS NOT NULL (not for GEOMETRY) are
        left to the null markers. */
@@ -4689,6 +4706,7 @@ int ha_warp::append_column_filter(const Item *cond,
         case MYSQL_TYPE_INT24:
         case MYSQL_TYPE_LONG:
         case MYSQL_TYPE_LONGLONG:
+        case MYSQL_TYPE_BIT:
         case MYSQL_TYPE_FLOAT:
         case MYSQL_TYPE_DOUBLE:
         case MYSQL_TYPE_DECIMAL:
@@ -4813,6 +4831,10 @@ int ha_warp::append_column_filter(const Item *cond,
         if(fld->real_type() == MYSQL_TYPE_LONGLONG) {
           bigint_col = true;
           col_unsigned = fld->all_flags() & UNSIGNED_FLAG;
+        } else if(fld->real_type() == MYSQL_TYPE_BIT) {
+          /* up to 64 bits, unsigned */
+          bigint_col = true;
+          col_unsigned = true;
         }
       }
     }
