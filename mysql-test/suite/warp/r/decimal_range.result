@@ -1,0 +1,86 @@
+#
+# Comparisons of DECIMAL columns with constants.  WARP stores a DECIMAL
+# as text, so the order of the text is not the order of the numbers
+# ('10.50' < '9.00', negative values).  Every comparison is also run
+# against an InnoDB table and the results must match.
+#
+CREATE TABLE w (id INT, a DECIMAL(10,2) NOT NULL, b DECIMAL(10,2) NULL,
+c DECIMAL(30,10) NULL, d DECIMAL(5,0) NOT NULL, e DECIMAL(10,4) NOT NULL) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w VALUES
+(1, 9.00, 9.00, 9.0000000001, 9, 9.5),
+(2, 10.50, 10.50, 10.5, 10, 10.5),
+(3, -5.25, -5.25, -5.25, -5, 0),
+(4, 100.00, 100.00, 100, 100, 100.0001),
+(5, 1.00, NULL, NULL, 1, 1),
+(6, 0.00, 0.00, 0, 0, 0),
+(7, -0.01, -0.01, -0.0000000001, 0, 0.0001),
+(8, -100.00, -100.00, -99999999999999999999.9999999999, -100, 5),
+(9, 99999999.99, 99999999.99, 99999999999999999999.9999999999, 99999, 999999.9999),
+(10, 5.00, 5.00, 5, 5, 5), (11, 20.00, 20.00, 20, 20, 20);
+INSERT INTO i SELECT * FROM w;
+comparisons checked: 1440, mismatches: 0
+# combined with other conditions, NULL tests and OR
+SELECT id FROM w WHERE b > 5 AND a < 100 AND d <> 10 ORDER BY id;
+id
+1
+11
+SELECT id FROM i WHERE b > 5 AND a < 100 AND d <> 10 ORDER BY id;
+id
+1
+11
+SELECT id FROM w WHERE b IS NULL OR c BETWEEN -6 AND 6 ORDER BY id;
+id
+3
+5
+6
+7
+10
+SELECT id FROM i WHERE b IS NULL OR c BETWEEN -6 AND 6 ORDER BY id;
+id
+3
+5
+6
+7
+10
+SELECT id FROM w WHERE b IS NOT NULL AND b >= 9 ORDER BY id;
+id
+1
+2
+4
+9
+11
+SELECT id FROM i WHERE b IS NOT NULL AND b >= 9 ORDER BY id;
+id
+1
+2
+4
+9
+11
+# after an update
+UPDATE w SET a = 7.77, c = 7.7 WHERE id IN (2, 4);
+UPDATE i SET a = 7.77, c = 7.7 WHERE id IN (2, 4);
+DELETE FROM w WHERE id = 11;
+DELETE FROM i WHERE id = 11;
+SELECT id FROM w WHERE a BETWEEN 5 AND 9 ORDER BY id;
+id
+1
+2
+4
+10
+SELECT id FROM i WHERE a BETWEEN 5 AND 9 ORDER BY id;
+id
+1
+2
+4
+10
+SELECT id FROM w WHERE c > 7.7 ORDER BY id;
+id
+1
+9
+SELECT id FROM i WHERE c > 7.7 ORDER BY id;
+id
+1
+9
+DROP TABLE w, i;
