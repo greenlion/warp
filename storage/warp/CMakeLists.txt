@@ -35,7 +35,7 @@ ExternalProject_Add(
   #  URL https://codeforge.lbl.gov/frs/download.php/file/426/fastbit-2.0.3.tar.gz
   #GIT_REPOSITORY https://github.com/greenlion/fastbit
   SOURCE_DIR=fastbit-2.0.3
-  # FastBit is linked statically into the server, so only the (position
+  # FastBit is linked statically into ha_warp.so, so only the (position
   # independent) static library is built
   CONFIGURE_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/src/fastbit-2.0.3/configure --prefix=${CMAKE_CURRENT_SOURCE_DIR} --with-pic --disable-shared CPPFLAGS=${FASTBIT_ZSTD_CPPFLAGS} LIBS=${FASTBIT_ZSTD_LIBS}
   PREFIX ${CMAKE_CURRENT_SOURCE_DIR}/
@@ -64,13 +64,11 @@ ENDIF()
 #)
 #ADD_SUBDIRECTORY(lemire_sorted_simd)
 
-SET(WARP_PLUGIN_STATIC  "warp")
-#SET(WARP_PLUGIN_SHARED  "warp_udf")
-SET(WARP_PLUGIN_MANDATORY TRUE)
-
 SET(WARP_SOURCES ha_warp.cc ha_warp.h)
 
-MYSQL_ADD_PLUGIN(warp ${WARP_SOURCES} STORAGE_ENGINE MANDATORY
+# WARP is built as a loadable plugin, ha_warp.so, which contains FastBit, so
+# that it can be distributed apart from the server
+MYSQL_ADD_PLUGIN(warp ${WARP_SOURCES} STORAGE_ENGINE MODULE_ONLY
   LINK_LIBRARIES extra::rapidjson)
 # The static FastBit library does not contain the libraries it uses, they
 # are linked after it

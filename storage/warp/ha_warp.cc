@@ -5565,7 +5565,7 @@ warp_global_data::warp_global_data() {
   fp = fopen(warp_state_file.c_str(), "rb+");
   //if fp == NULL then the database is being initialized for the first time
   if(fp == NULL) {
-    sql_print_error("First time startup - initializing new WARP database.");
+    sql_print_information("First time startup - initializing new WARP database.");
     next_rowid = 1;
     next_trx_id = 1;
     fp = fopen(warp_state_file.c_str(), "w+"); 
