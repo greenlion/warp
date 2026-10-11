@@ -1,0 +1,81 @@
+--echo #
+--echo # ENUM columns.  Every query is also run against an InnoDB table and the
+--echo # results must match.
+--echo #
+--echo # Regression test: reading an ENUM column crashed the server, or gave the
+--echo # wrong values, because the result of a scan kept a pointer to the
+--echo # dictionary of a table that was already closed.
+--echo #
+
+--let $collations = utf8mb4_bin
+--let $clist = $collations,
+while ($clist != '')
+{
+  --let $coll = `SELECT SUBSTRING_INDEX('$clist', ',', 1)`
+  --let $clist = `SELECT SUBSTRING('$clist', LENGTH('$coll') + 2)`
+  --echo # collation $coll
+  --disable_query_log
+  eval CREATE TABLE w (id INT, e ENUM('a', 'B', 'c', 'dd') NOT NULL, f ENUM('x', 'y') NULL, g VARCHAR(5)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=$coll;
+  CREATE TABLE i LIKE w;
+  ALTER TABLE i ENGINE=InnoDB;
+  INSERT INTO w VALUES (1, 'a', 'x', 'p'), (2, 'B', NULL, 'q'), (3, 'c', 'y', 'r'), (4, 'a', 'y', NULL),
+    (5, 'dd', 'x', 's'), (6, 'B', 'x', 't'), (7, 'c', NULL, 'u'), (8, 'dd', 'y', 'v');
+  INSERT INTO i SELECT * FROM w;
+  --enable_query_log
+
+  --let $checked = 0
+  --let $wrong = 0
+  --let $k = 0
+  while ($k < 16)
+  {
+    inc $k;
+    --let $q = SELECT 1
+    if ($k == 1) { let $q = SELECT id, e, f, g FROM TBL ORDER BY id; }
+    if ($k == 2) { let $q = SELECT id FROM TBL WHERE e = 'a' ORDER BY id; }
+    if ($k == 3) { let $q = SELECT id FROM TBL WHERE e = 'b' ORDER BY id; }
+    if ($k == 4) { let $q = SELECT id FROM TBL WHERE e = 'B' ORDER BY id; }
+    if ($k == 5) { let $q = SELECT id FROM TBL WHERE f = 'x' ORDER BY id; }
+    if ($k == 6) { let $q = SELECT id FROM TBL WHERE f IS NULL ORDER BY id; }
+    if ($k == 7) { let $q = SELECT id FROM TBL WHERE e IN ('a', 'dd') ORDER BY id; }
+    if ($k == 8) { let $q = SELECT e, COUNT(*) FROM TBL GROUP BY e ORDER BY e; }
+    if ($k == 9) { let $q = SELECT f, COUNT(*), MIN(id), MAX(id) FROM TBL GROUP BY f ORDER BY f; }
+    if ($k == 10) { let $q = SELECT id FROM TBL WHERE e > 'a' ORDER BY id; }
+    if ($k == 11) { let $q = SELECT id FROM TBL WHERE e = 2 ORDER BY id; }
+    if ($k == 12) { let $q = SELECT id FROM TBL WHERE e = f ORDER BY id; }
+    if ($k == 13) { let $q = SELECT id FROM TBL WHERE e = 'a' OR f = 'y' ORDER BY id; }
+    if ($k == 14) { let $q = SELECT id, e + 0 FROM TBL WHERE e <> 'c' ORDER BY id; }
+    if ($k == 15) { let $q = SELECT COUNT(DISTINCT e), COUNT(DISTINCT f) FROM TBL; }
+    if ($k == 16) { let $q = SELECT e, g FROM TBL WHERE g > 'q' ORDER BY g; }
+    --let $wq = `SELECT REPLACE("$q", 'TBL', 'w')`
+    --let $iq = `SELECT REPLACE("$q", 'TBL', 'i')`
+    --disable_query_log
+    --disable_result_log
+    eval CREATE TABLE r_w AS $wq;
+    eval CREATE TABLE r_i AS $iq;
+    --enable_result_log
+    --let $diff = `SELECT (SELECT COUNT(*) FROM (SELECT * FROM r_w EXCEPT ALL SELECT * FROM r_i) a) + (SELECT COUNT(*) FROM (SELECT * FROM r_i EXCEPT ALL SELECT * FROM r_w) b)`
+    --let $rows = `SELECT COUNT(*) FROM r_i`
+    DROP TABLE r_w, r_i;
+    --enable_query_log
+    inc $checked;
+    if ($diff)
+    {
+      inc $wrong;
+      --echo MISMATCH of $iq: $diff rows differ
+    }
+  }
+  --echo $checked queries checked, $wrong mismatches
+
+  --echo # changes
+  UPDATE w SET e = 'c' WHERE id IN (1, 2);
+  UPDATE i SET e = 'c' WHERE id IN (1, 2);
+  DELETE FROM w WHERE id = 5;
+  DELETE FROM i WHERE id = 5;
+  INSERT INTO w VALUES (9, 'dd', 'y', 'w');
+  INSERT INTO i VALUES (9, 'dd', 'y', 'w');
+  SELECT id, e, f FROM w ORDER BY id;
+  SELECT id, e, f FROM i ORDER BY id;
+  SELECT e, COUNT(*) FROM w GROUP BY e ORDER BY e;
+  SELECT e, COUNT(*) FROM i GROUP BY e ORDER BY e;
+  DROP TABLE w, i;
+}

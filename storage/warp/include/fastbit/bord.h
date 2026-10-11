@@ -9,6 +9,7 @@
 #include "part.h"	// ibis::part
 #include "selectClause.h"// ibis::selectClause
 #include "dictionary.h"	// ibis::dictionary
+#include <memory>
 
 ///@file
 /// Defines ibis::bord.  This is an in-memory data table, with a single
@@ -610,8 +611,19 @@ public:
     /// associated with the column originally stored as ibis::category, but
     /// has been converted to be an integer column of type ibis::UINT.
     virtual const ibis::dictionary* getDictionary() const {return dic;}
-    /// Assign the dictionary to use.
-    void setDictionary(const ibis::dictionary* d) {dic = d;}
+    /// Assign the dictionary to use.  The column keeps a copy of it,
+    /// because the dictionary that is given belongs to a column of a data
+    /// partition that may be gone before this column is.
+    void setDictionary(const ibis::dictionary* d) {
+        if (d == 0) {
+            dicOwner.reset();
+            dic = 0;
+        }
+        else if (d != dic) {
+            dicOwner = std::make_shared<const ibis::dictionary>(*d);
+            dic = dicOwner.get();
+        }
+    }
 
     const ibis::array_t<uint64_t>& getMeshShape() const {return shape;}
     int setMeshShape(uint64_t*, uint64_t);
@@ -628,6 +640,8 @@ protected:
     /// A dictionary.  It may be used with a column of type ibis::UINT or
     /// ibis::CATEGORY.  Normally, it is a nil pointer.
     const ibis::dictionary *dic;
+    /// The copy of the dictionary that dic points to, if there is one.
+    std::shared_ptr<const ibis::dictionary> dicOwner;
     /// Shape of the mesh for the data.  If it is empty, the data is
     /// assumed to be 1-Dimensional.  If the shape array is provided, it is
     /// assumed that the data values are in the typical C order, where the
@@ -1399,7 +1413,7 @@ ibis::bord::cursor::dumpIJ(std::ostream &out, uint32_t i,
 	if (buffer[j].dic == 0) {
 	    out << (*vals)[i];
 	}
-	else if (buffer[j].dic->size() >= (*vals)[i]) {
+	else if (buffer[j].dic->operator[]((*vals)[i]) != 0) {
 	    out << buffer[j].dic->operator[]((*vals)[i]);
 	}
 	else {
