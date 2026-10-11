@@ -4072,6 +4072,51 @@ static bool warp_format_int(const Item *item, bool exact_syntax,
   return true;
 }
 
+/* Writes a string constant as a quoted FastBit string literal.  Returns false
+   if the constant is not a plain string that FastBit compares like MySQL:
+   a constant that is not a string, a NULL, a string with a NUL character
+   (FastBit strings end at a NUL) and a string of another character set that
+   is not ASCII. */
+static bool warp_quote_string_const(const Item *item, std::string &quoted) {
+  if(item->type() != Item::Type::STRING_ITEM) {
+    return false;
+  }
+  Item *citem = const_cast<Item *>(item);
+  String s;
+  String *val = citem->val_str(&s);
+  if(val == NULL) {
+    return false;
+  }
+  const char *ptr = val->ptr();
+  bool ascii = true;
+  for(size_t j = 0; j < val->length(); ++j) {
+    const char c = ptr[j];
+    if(c == 0) {
+      return false;
+    }
+    if(static_cast<unsigned char>(c) >= 0x80) {
+      ascii = false;
+    }
+  }
+  /* a constant in another character set would have to be converted */
+  if(!ascii && strncmp(citem->collation.collation->csname, "utf8mb4", 7)) {
+    return false;
+  }
+  std::string escaped;
+  for(size_t j = 0; j < val->length(); ++j) {
+    const char c = ptr[j];
+    if(c == '\'') {
+      escaped += "\\'";
+    } else if(c == '\\') {
+      escaped += "\\\\";
+    } else {
+      escaped += c;
+    }
+  }
+  quoted = "'" + escaped + "'";
+  return true;
+}
+
 /* Pushes a comparison of a string column with string constants (<, <=, >, >=
    and BETWEEN) down to FastBit.  The result must be the same as MySQL's:
    WARP strings are utf8mb4_bin, which MySQL compares byte by byte with the
@@ -4140,42 +4185,9 @@ static bool warp_push_string_range(Item_func *func, bool is_between,
 
   std::string values[2];
   for(uint i = 0; i < nconsts; ++i) {
-    if(consts[i]->type() != Item::Type::STRING_ITEM) {
+    if(!warp_quote_string_const(consts[i], values[i])) {
       return false;
     }
-    Item *citem = const_cast<Item *>(consts[i]);
-    String s;
-    String *val = citem->val_str(&s);
-    if(val == NULL) {
-      return false;
-    }
-    const char *ptr = val->ptr();
-    bool ascii = true;
-    for(size_t j = 0; j < val->length(); ++j) {
-      const char c = ptr[j];
-      if(c == 0) {
-        return false; /* FastBit strings end at a NUL */
-      }
-      if(static_cast<unsigned char>(c) >= 0x80) {
-        ascii = false;
-      }
-    }
-    /* a constant in another character set would have to be converted */
-    if(!ascii && strncmp(citem->collation.collation->csname, "utf8mb4", 7)) {
-      return false;
-    }
-    std::string escaped;
-    for(size_t j = 0; j < val->length(); ++j) {
-      const char c = ptr[j];
-      if(c == '\'') {
-        escaped += "\\'";
-      } else if(c == '\\') {
-        escaped += "\\\\";
-      } else {
-        escaped += c;
-      }
-    }
-    values[i] = "'" + escaped + "'";
   }
 
   const std::string field_index = std::to_string(fld->field_index());
@@ -4189,6 +4201,53 @@ static bool warp_push_string_range(Item_func *func, bool is_between,
   } else {
     cond += fb_op + values[0];
   }
+  if(fld->is_nullable()) {
+    cond += ")";
+  }
+  out += cond;
+  return true;
+}
+
+/* Pushes IN (...) of a string column with string constants down to FastBit.
+   The same conditions as for the comparisons of warp_push_string_range
+   hold.  Returns true and appends the FastBit condition to out if the
+   condition was pushed. */
+static bool warp_push_string_in(Item_func *func, std::string &out) {
+  Item **args = func->arguments();
+  const uint nargs = func->arg_count;
+  if(nargs < 2 || args[0]->type() != Item::Type::FIELD_ITEM) {
+    return false;
+  }
+  const Field *fld = down_cast<Item_field *>(args[0])->field;
+  const enum_field_types rt = fld->real_type();
+  if(rt != MYSQL_TYPE_VARCHAR && rt != MYSQL_TYPE_STRING &&
+     rt != MYSQL_TYPE_VAR_STRING) {
+    return false;
+  }
+  if(fld->charset()->number != 46) {
+    return false;
+  }
+  const CHARSET_INFO *cmp_cs = func->compare_collation();
+  if(cmp_cs == NULL || cmp_cs->number != 46) {
+    return false;
+  }
+  const std::string field_index = std::to_string(fld->field_index());
+  std::string cond;
+  if(fld->is_nullable()) {
+    cond = "(n" + field_index + " = 0 AND ";
+  }
+  cond += "c" + field_index + " IN (";
+  for(uint i = 1; i < nargs; ++i) {
+    std::string quoted;
+    if(!warp_quote_string_const(args[i], quoted)) {
+      return false;
+    }
+    if(i > 1) {
+      cond += ", ";
+    }
+    cond += quoted;
+  }
+  cond += ")";
   if(fld->is_nullable()) {
     cond += ")";
   }
@@ -4562,6 +4621,15 @@ int ha_warp::append_column_filter(const Item *cond,
        op == " >= ") {
       std::string string_condition;
       if(warp_push_string_range(tmp, is_between, op, string_condition)) {
+        where_clause += string_condition;
+        return 1;
+      }
+    }
+
+    /* Strings in an IN list */
+    if(is_in) {
+      std::string string_condition;
+      if(warp_push_string_in(tmp, string_condition)) {
         where_clause += string_condition;
         return 1;
       }

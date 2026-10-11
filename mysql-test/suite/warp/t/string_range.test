@@ -347,4 +347,75 @@ SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE v COLLATE utf8mb4_0900_ai_ci = '
 --replace_regex /\(cost=[^)]*\)//
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v = 'a ';
 
+--echo #
+--echo # IN lists of strings are evaluated by FastBit in one pass.  Lists of
+--echo # 1 to 6 values of the pool (quotes, back slashes, spaces, the empty
+--echo # string, tabs and multi-byte characters included) on every column.
+--echo #
+let $checked = 0;
+let $wrong = 0;
+let $a = 0;
+while ($a < 31)
+{
+  inc $a;
+  let $b = `SELECT 1 + ($a * 5) % 31`;
+  let $c = `SELECT 1 + ($a * 11) % 31`;
+  let $d = `SELECT 1 + ($a * 17) % 31`;
+  let $e = `SELECT 1 + ($a * 23) % 31`;
+  let $f = `SELECT 1 + ($a * 29) % 31`;
+  let $k = 0;
+  while ($k < 15)
+  {
+    inc $k;
+    let $set = $a;
+    let $pre = v IN (;
+    let $post = );
+    if ($k == 2) { let $set = $a, $b; }
+    if ($k == 3) { let $set = $a, $b, $c; }
+    if ($k == 4) { let $set = $a, $b, $c, $d; }
+    if ($k == 5) { let $set = $a, $b, $c, $d, $e, $f; }
+    if ($k == 6) { let $set = $a, $b; let $pre = c IN (; }
+    if ($k == 7) { let $set = $a, $b, $c, $d, $e, $f; let $pre = c IN (; }
+    if ($k == 8) { let $set = $a, $b; let $pre = n IN (; }
+    if ($k == 9) { let $set = $a, $b, $c, $d, $e, $f; let $pre = n IN (; }
+    if ($k == 10) { let $set = $a, $b, $c; let $pre = n IN (; let $post = ) OR p < 3; }
+    if ($k == 11) { let $set = $a, $b, $c; let $post = ) AND p < 50; }
+    if ($k == 12) { let $set = $a, $b, $c; let $pre = v NOT IN (; }
+    if ($k == 13) { let $set = $a, $b; let $pre = n NOT IN (; }
+    if ($k == 14) { let $set = $a, $b; let $post = , NULL); }
+    if ($k == 15) { let $set = $a, $b; let $pre = v COLLATE utf8mb4_0900_ai_ci IN (; }
+    let $cond = `SELECT CONCAT('$pre', GROUP_CONCAT(QUOTE(s) ORDER BY k), '$post') FROM pool WHERE k IN ($set)`;
+    let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $cond`;
+    let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $cond`;
+    inc $checked;
+    if ($w != $i)
+    {
+      inc $wrong;
+      --echo MISMATCH for WHERE $cond: WARP $w, InnoDB $i
+    }
+  }
+}
+--echo $checked IN conditions checked, $wrong mismatches
+--echo # A long list, and values with a quote, a back slash and a space
+let $cond = `SELECT CONCAT('v IN (', GROUP_CONCAT(QUOTE(s) ORDER BY k), ')') FROM pool WHERE k % 2 = 1 AND k < 32`;
+let $w = `SELECT CONCAT(COUNT(*), ':', SUM(id)) FROM w WHERE $cond`;
+let $i = `SELECT CONCAT(COUNT(*), ':', SUM(id)) FROM i WHERE $cond`;
+if ($w != $i)
+{
+  --echo MISMATCH of the long list: WARP $w, InnoDB $i
+}
+SELECT COUNT(*) > 0 AS quote_and_backslash FROM w WHERE v IN ('a\'', 'a\\');
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE v IN ('a\'', 'a\\')) AS same_as_innodb FROM w WHERE v IN ('a\'', 'a\\');
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE v IN ('', 'b')) AS empty_string FROM w WHERE v IN ('', 'b');
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v IN ('a', 'b ', 'c');
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE n IN ('a', 'b') AND p < 10;
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v NOT IN ('a', 'b');
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v IN ('a', NULL);
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v IN ('a', c);
+
 DROP TABLE w, i, pool;
