@@ -971,6 +971,7 @@ int ha_warp::open(const char *name, int, uint, const dd::Table *) {
 */
 int ha_warp::close(void) {
   DBUG_ENTER("ha_warp::close");
+  release_scan_lease();
   if(index_scan_open) {
     end_scan(true);
   }
@@ -1043,12 +1044,28 @@ void ha_warp::load_partition_rows() {
 uint64_t ha_warp::claim_writer_partition() {
   load_partition_rows();
   const uint64_t rows = writer->mRows();
+  /* Writing rows to a partition makes its indexes out of date, they are made
+     again by the next query, and for a large partition that takes long (a
+     second for a million rows).  A small batch of rows therefore goes to a
+     partition that is small itself, the tail of the table, unless the
+     partition that has room has no indexes: a table that is loaded in small
+     batches and not queried meanwhile is written to the first partition with
+     room, as a large batch is. */
+  const bool small_batch = my_tail_partition_rows > 0 && rows < my_tail_partition_rows;
+  const uint64_t tail_rows = std::min<uint64_t>(my_tail_partition_rows, my_partition_max_rows);
   for(const auto &partition : share->partition_rows) {
-    if(partition.second + rows <= my_partition_max_rows &&
-       share->partitions_writing.count(partition.first) == 0) {
-      share->partitions_writing.insert(partition.first);
-      return partition.first;
+    if(partition.second + rows > my_partition_max_rows ||
+       share->partitions_writing.count(partition.first) != 0 ||
+       warp_partition_reserved(share->data_dir_name, partition.first)) {
+      continue;
     }
+    if(small_batch && partition.second + rows > tail_rows &&
+       warp_partition_has_indexes(std::string(share->data_dir_name) + "/p" +
+                                  std::to_string(partition.first))) {
+      continue;
+    }
+    share->partitions_writing.insert(partition.first);
+    return partition.first;
   }
   uint64_t number;
   do {
@@ -1645,6 +1662,18 @@ bool ha_warp::take_prefetched(const std::string& datadir, ibis::table** base,
    so when another connection appends rows to the partition and its files are
    flushed from the cache, the old copy of an index (or of a column) stays,
    and the first statements that follow do not see the new rows. */
+void ha_warp::acquire_scan_lease() {
+  if(scan_lease) return;
+  scan_lease = warp_table_locks(share->data_dir_name);
+  warp_scan_enter(scan_lease);
+}
+
+void ha_warp::release_scan_lease() {
+  if(!scan_lease) return;
+  warp_scan_leave(scan_lease);
+  scan_lease.reset();
+}
+
 void ha_warp::release_scanned_table() {
   if(filtered_table != NULL) {
     delete base_table;
@@ -2064,6 +2093,12 @@ int ha_warp::optimize(THD *, HA_CHECK_OPT *) {
     sql_print_information("WARP: OPTIMIZE removed %llu rows of %s",
                           (unsigned long long)purged, share->data_dir_name);
   }
+  /* and the partitions that were written in small batches are merged */
+  const uint64_t merged = warp_merge_tail_partitions(share->data_dir_name);
+  if(merged > 0) {
+    sql_print_information("WARP: OPTIMIZE merged %llu partitions of %s",
+                          (unsigned long long)merged, share->data_dir_name);
+  }
   mysql_mutex_lock(&share->mutex);
   ibis::partList parts;
   ibis::util::gatherParts(parts, share->data_dir_name, true);
@@ -2276,6 +2311,8 @@ int ha_warp::rnd_init(bool) {
     
   } else {
     base_table = NULL;
+    /* the partitions that the scan lists are not merged until it ends */
+    acquire_scan_lease();
     /* The partitions are found by reading their metadata, which a writer that
        appends to a partition rewrites.  A partition whose metadata is read
        at that moment is not found, the scan then returns no rows at all. */
@@ -3262,10 +3299,16 @@ int ha_warp::end_scan(bool finish) {
        that only read must leave the files it cached for the next query. */
     if(writer != NULL && writer->mRows() > 0) {
       write_rc = write_buffered_rows_to_disk();
-      ibis::fileManager::instance().flushDir(share->data_dir_name);
+      /* write_buffered_rows_to_disk flushed the partition that was written.
+         The files of the other partitions did not change, flushing them
+         too makes the next query read and decompress them again (and
+         fails for the files that other queries use). */
+      ibis::fileManager::instance().flushFile(
+          (std::string(share->data_dir_name) + "/-part.txt").c_str());
     }
   }
   index_scan_open = false;
+  release_scan_lease();
 
   base_table = NULL;
   filtered_table = NULL;
@@ -4162,9 +4205,8 @@ static bool warp_quote_string_const(const Item *item, std::string &quoted) {
 
    op is the operator of the comparison (not used for BETWEEN).  Returns true
    and appends the FastBit condition to out if the condition was pushed. */
-static bool warp_push_string_range(Item_func *func, bool is_between,
+static bool warp_push_string_range(Item_func *func, Item **args, bool is_between,
                                    const std::string &op, std::string &out) {
-  Item **args = func->arguments();
   const uint nargs = func->arg_count;
   const Item_field *col_item = NULL;
   std::string fb_op = op;
@@ -4249,11 +4291,10 @@ static bool warp_push_string_range(Item_func *func, bool is_between,
    comparison, which has to be utf8mb4_bin too: with another collation
    ('A' = 'a') or for a column that is not a string, MySQL has to do it.
    Binary strings and strings with a NUL character are left to MySQL too. */
-static bool warp_string_eq_pushable(Item_func *func) {
+static bool warp_string_eq_pushable(Item_func *func, Item **args) {
   if(func->arg_count != 2) {
     return false;
   }
-  Item **args = func->arguments();
   const Item_field *col_item = NULL;
   const Item *constant = NULL;
   if(args[0]->type() == Item::Type::FIELD_ITEM) {
@@ -4286,8 +4327,7 @@ static bool warp_string_eq_pushable(Item_func *func) {
    The same conditions as for the comparisons of warp_push_string_range
    hold.  Returns true and appends the FastBit condition to out if the
    condition was pushed. */
-static bool warp_push_string_in(Item_func *func, std::string &out) {
-  Item **args = func->arguments();
+static bool warp_push_string_in(Item_func *func, Item **args, std::string &out) {
   const uint nargs = func->arg_count;
   if(nargs < 2 || args[0]->type() != Item::Type::FIELD_ITEM) {
     return false;
@@ -4336,9 +4376,8 @@ static bool warp_push_string_in(Item_func *func, std::string &out) {
    pushed: a constant that is a double (or a string) makes MySQL compare
    doubles.  Returns true and appends the FastBit condition to out if the
    condition was pushed. */
-static bool warp_push_decimal(Item_func *func, bool is_between,
+static bool warp_push_decimal(Item_func *func, Item **args, bool is_between,
                               const std::string &op, std::string &out) {
-  Item **args = func->arguments();
   const uint nargs = func->arg_count;
   const Item_field *col_item = NULL;
   std::string fb_op = op;
@@ -4510,7 +4549,22 @@ int ha_warp::append_column_filter(const Item *cond,
         return 0;
     }
 
-    Item **arg = tmp->arguments();
+    /* The parameters of a prepared statement (WHERE id = ?) are replaced by
+       the constants that they have for this execution, in a copy of the
+       arguments: the condition is shared with the next execution, which
+       has other values.  sysbench and most applications use prepared
+       statements. */
+    std::vector<Item *> condition_args(tmp->arguments(),
+                                       tmp->arguments() + tmp->arg_count);
+    for(Item *&condition_arg : condition_args) {
+      if(condition_arg->type() == Item::Type::PARAM_ITEM) {
+        Item *value = down_cast<Item_param *>(condition_arg)->clone_item();
+        if(value != nullptr) {
+          condition_arg = value;
+        }
+      }
+    }
+    Item **arg = condition_args.data();
     //This is a fix for queries that have CONST filters on more than one table conjoined in an AND or an OR
     //when this happens, the field item will have a different alias from the table we are currently working
     //on (table->alias).  
@@ -4741,7 +4795,7 @@ int ha_warp::append_column_filter(const Item *cond,
       }
       if(decimal_col) {
         std::string decimal_condition;
-        if(warp_push_decimal(tmp, is_between, op, decimal_condition)) {
+        if(warp_push_decimal(tmp, arg, is_between, op, decimal_condition)) {
           where_clause += decimal_condition;
           return 1;
         }
@@ -4753,7 +4807,7 @@ int ha_warp::append_column_filter(const Item *cond,
     if(is_between || op == " < " || op == " <= " || op == " > " ||
        op == " >= ") {
       std::string string_condition;
-      if(warp_push_string_range(tmp, is_between, op, string_condition)) {
+      if(warp_push_string_range(tmp, arg, is_between, op, string_condition)) {
         where_clause += string_condition;
         return 1;
       }
@@ -4762,7 +4816,7 @@ int ha_warp::append_column_filter(const Item *cond,
     /* Strings in an IN list */
     if(is_in) {
       std::string string_condition;
-      if(warp_push_string_in(tmp, string_condition)) {
+      if(warp_push_string_in(tmp, arg, string_condition)) {
         where_clause += string_condition;
         return 1;
       }
@@ -4960,7 +5014,7 @@ int ha_warp::append_column_filter(const Item *cond,
       if((*arg)->type() == Item::Type::STRING_ITEM ||
          (*arg)->type() == Item::Type::HEX_BIN_ITEM) 
       {
-        if(!is_eq || !warp_string_eq_pushable(tmp)) {
+        if(!is_eq || !warp_string_eq_pushable(tmp, condition_args.data())) {
           return 0;
         }
         String s;

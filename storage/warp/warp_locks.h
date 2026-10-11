@@ -32,15 +32,64 @@
 #define WARP_LOCKS_H
 
 #include <dirent.h>
+#include <chrono>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+/* The scans of a table that has partitions merged (see warp_purge.h) hold the
+   gate shared from their start to their end: a scan lists the partitions
+   once, and a merge that removes a partition under it would make it fail
+   or miss rows.  The merge takes the gate exclusive, waiting for the scans
+   that run to end for a while, and gives up if they do not.  While it
+   waits the scans that start wait for it, so it does not starve. */
+class warp_scan_gate {
+ public:
+  void enter() {
+    std::unique_lock<std::mutex> lock(mtx_);
+    cv_.wait(lock, [this] { return !writer_waiting_ && !writer_active_; });
+    ++readers_;
+  }
+  void leave() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if(--readers_ == 0) cv_.notify_all();
+  }
+  bool enter_exclusive(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    /* one merge at a time waits */
+    if(writer_waiting_ || writer_active_) return false;
+    writer_waiting_ = true;
+    const bool drained = cv_.wait_for(lock, timeout, [this] { return readers_ == 0; });
+    writer_waiting_ = false;
+    if(!drained) {
+      cv_.notify_all();
+      return false;
+    }
+    writer_active_ = true;
+    return true;
+  }
+  void leave_exclusive() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    writer_active_ = false;
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mtx_;
+  std::condition_variable cv_;
+  unsigned readers_ = 0;
+  bool writer_waiting_ = false;
+  bool writer_active_ = false;
+};
+
 struct warp_table_lock_set {
+  warp_scan_gate scans;
   std::shared_mutex structure;
   /* the locks of the partitions by partition number, protected by
      warp_lock_registry_mtx */
@@ -99,6 +148,34 @@ static std::shared_ptr<warp_table_lock_set> warp_table_locks(const std::string &
   return set;
 }
 
+/* The partitions that a merge is going to replace (see warp_purge.h).  The
+   writers do not choose them, a writer that has chosen a partition and waits
+   for its lock would write to the partition that took its place.  Protected
+   by its own mutex, taken while the mutex of a share is held. */
+static std::mutex warp_reserved_mtx;
+static std::set<std::pair<std::string, uint64_t>> warp_reserved_partitions;
+
+static bool warp_partition_reserved(const std::string &data_dir, uint64_t number) {
+  std::lock_guard<std::mutex> guard(warp_reserved_mtx);
+  return warp_reserved_partitions.count(std::make_pair(data_dir, number)) != 0;
+}
+
+/* does the partition have the index of a column? (the queries make them) */
+static bool warp_partition_has_indexes(const std::string &part_dir) {
+  DIR *dir = opendir(part_dir.c_str());
+  if(dir == nullptr) return false;
+  bool found = false;
+  while(struct dirent *entry = readdir(dir)) {
+    const size_t len = strlen(entry->d_name);
+    if(len > 4 && strcmp(entry->d_name + len - 4, ".idx") == 0) {
+      found = true;
+      break;
+    }
+  }
+  closedir(dir);
+  return found;
+}
+
 /* The locks of a table that is dropped or renamed (by another name) are not
    used again.  Code that still holds them keeps them. */
 static void warp_forget_table_locks(const std::string &data_dir) {
@@ -135,6 +212,22 @@ static void warp_release_read(const std::shared_ptr<std::shared_mutex> &m) {
   }
 }
 
+/* the scans of the tables that the current thread runs, to enter the gate of
+   a table once per thread */
+static thread_local std::unordered_map<const warp_table_lock_set *, int> warp_scans_held;
+
+static void warp_scan_enter(const std::shared_ptr<warp_table_lock_set> &set) {
+  if(warp_scans_held[set.get()]++ == 0) set->scans.enter();
+}
+
+static void warp_scan_leave(const std::shared_ptr<warp_table_lock_set> &set) {
+  auto it = warp_scans_held.find(set.get());
+  if(it != warp_scans_held.end() && --(it->second) == 0) {
+    warp_scans_held.erase(it);
+    set->scans.leave();
+  }
+}
+
 /* shared lock of the partitions of a table that exist */
 class warp_table_read_lock {
  public:
@@ -145,7 +238,11 @@ class warp_table_read_lock {
       nested_ = true;
       return;
     }
+    /* No partition is created while the table is read: the metadata of a
+       partition that is written is not read, and the partitions that are
+       found are the ones that are locked */
     set_->structure.lock_shared();
+    structure_locked_ = true;
     {
       std::lock_guard<std::mutex> guard(warp_lock_registry_mtx);
       for(const auto &partition : set_->partitions) {
@@ -153,10 +250,10 @@ class warp_table_read_lock {
       }
     }
     for(const auto &m : locks_) warp_acquire_read(m);
-    set_->structure.unlock_shared();
   }
   ~warp_table_read_lock() {
     for(auto it = locks_.rbegin(); it != locks_.rend(); ++it) warp_release_read(*it);
+    if(structure_locked_) set_->structure.unlock_shared();
     auto held = warp_table_reads_held.find(set_.get());
     if(--(held->second) == 0) warp_table_reads_held.erase(held);
   }
@@ -167,6 +264,7 @@ class warp_table_read_lock {
   std::shared_ptr<warp_table_lock_set> set_;
   std::vector<std::shared_ptr<std::shared_mutex>> locks_;
   bool nested_ = false;
+  bool structure_locked_ = false;
 };
 
 /* shared lock of one partition, for the code that reads one partition */
@@ -198,9 +296,14 @@ class warp_partition_write_lock {
     std::string data_dir;
     uint64_t number;
     if(!warp_split_partition_dir(part_dir, data_dir, number)) return;
-    auto set = warp_table_locks(data_dir);
-    if(creating) set->structure.lock();
-    lock_ = warp_partition_mutex(set, number);
+    set_ = warp_table_locks(data_dir);
+    /* A partition that is made is not found by a scan before it is written,
+       the table is not read until it is complete */
+    if(creating && warp_table_reads_held.find(set_.get()) == warp_table_reads_held.end()) {
+      set_->structure.lock();
+      structure_locked_ = true;
+    }
+    lock_ = warp_partition_mutex(set_, number);
     /* a thread that reads can not wait for the writers, it would wait
        for itself */
     if(warp_read_locks_held.find(lock_.get()) == warp_read_locks_held.end()) {
@@ -210,17 +313,19 @@ class warp_partition_write_lock {
       sql_print_warning("WARP: rows are written by a thread that is reading %s",
                         part_dir.c_str());
     }
-    if(creating) set->structure.unlock();
   }
   ~warp_partition_write_lock() {
     if(locked_) lock_->unlock();
+    if(structure_locked_) set_->structure.unlock();
   }
   warp_partition_write_lock(const warp_partition_write_lock &) = delete;
   warp_partition_write_lock &operator=(const warp_partition_write_lock &) = delete;
 
  private:
+  std::shared_ptr<warp_table_lock_set> set_;
   std::shared_ptr<std::shared_mutex> lock_;
   bool locked_ = false;
+  bool structure_locked_ = false;
 };
 
 /* exclusive lock of all the partitions of a table and of its structure: the
