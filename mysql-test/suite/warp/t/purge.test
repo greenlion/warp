@@ -1,0 +1,163 @@
+--echo #
+--echo # Background purge of the rows that nobody can see any more: the rows of
+--echo # deleted and updated rows and of rolled back transactions.  OPTIMIZE
+--echo # TABLE runs the purge of the table at once (any number of rows).  The
+--echo # content of the table must not change, it is compared with an InnoDB
+--echo # table.
+--echo #
+
+SET GLOBAL warp_purge_interval = 0;
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE t1 (id INT, v VARCHAR(20), n INT NULL, d DATE, e ENUM('a', 'b', 'c'), dc DECIMAL(10,2))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i1 LIKE t1;
+ALTER TABLE i1 ENGINE=InnoDB;
+
+INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000)
+  SELECT x, CONCAT('row ', x), IF(x % 7 = 0, NULL, x * 3), DATE_ADD('2000-01-01', INTERVAL x DAY),
+         ELT(1 + x % 3, 'a', 'b', 'c'), x / 4
+  FROM seq;
+INSERT INTO i1 SELECT * FROM t1;
+
+--let $datadir = $MYSQLTEST_VARDIR/mysqld.1/data/test
+--let $status_rows = SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_purged_rows'
+
+--echo # rows in the files of the partition
+--exec grep -h Number_of_rows $datadir/t1.data/p0/-part.txt
+
+--echo # deleted rows stay in the files
+DELETE FROM t1 WHERE id % 5 = 0;
+DELETE FROM i1 WHERE id % 5 = 0;
+--exec grep -h Number_of_rows $datadir/t1.data/p0/-part.txt
+SELECT COUNT(*) FROM t1;
+
+--echo # they are removed by the purge, nothing else changes
+--let $before = `$status_rows`
+OPTIMIZE TABLE t1;
+--let $after = `$status_rows`
+--let $removed = `SELECT $after - $before`
+--echo rows removed by the purge: $removed
+--exec grep -h Number_of_rows $datadir/t1.data/p0/-part.txt
+SELECT COUNT(*) FROM t1;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+
+--echo # nothing is left to remove
+--let $before = `$status_rows`
+OPTIMIZE TABLE t1;
+--let $after = `$status_rows`
+--let $removed = `SELECT $after - $before`
+--echo rows removed by the purge: $removed
+
+--echo # updated rows: the old versions are removed
+UPDATE t1 SET v = CONCAT('new ', id), n = n + 1 WHERE id % 3 = 0;
+UPDATE i1 SET v = CONCAT('new ', id), n = n + 1 WHERE id % 3 = 0;
+--exec grep -h Number_of_rows $datadir/t1.data/p0/-part.txt
+OPTIMIZE TABLE t1;
+--exec grep -h Number_of_rows $datadir/t1.data/p0/-part.txt
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+
+--echo # rolled back transactions: the rows that they inserted are removed
+BEGIN;
+INSERT INTO t1 SELECT id + 10000, v, n, d, e, dc FROM t1;
+ROLLBACK;
+--exec grep -h Number_of_rows $datadir/t1.data/p0/-part.txt
+SELECT COUNT(*) FROM t1;
+OPTIMIZE TABLE t1;
+--exec grep -h Number_of_rows $datadir/t1.data/p0/-part.txt
+SELECT COUNT(*) FROM t1;
+
+--echo # an old transaction still sees the deleted rows, they stay while it exists
+--echo # (the background purge is used, OPTIMIZE waits for the metadata lock of the transaction)
+connect (con1,localhost,root,,test);
+connection con1;
+START TRANSACTION WITH CONSISTENT SNAPSHOT;
+SELECT COUNT(*) AS seen_by_the_old_transaction FROM t1;
+connection default;
+DELETE FROM t1 WHERE id <= 100;
+--let $before = `$status_rows`
+SET GLOBAL warp_purge_threshold = 0;
+SET GLOBAL warp_purge_interval = 1;
+--sleep 4
+--let $after = `$status_rows`
+--let $removed = `SELECT $after - $before`
+--echo rows removed by the purge while the old transaction exists: $removed
+connection con1;
+SELECT COUNT(*) AS seen_by_the_old_transaction FROM t1;
+COMMIT;
+connection default;
+--echo # the rows are removed when no transaction needs them
+--let $tries = 40
+while ($tries)
+{
+  --let $now = `$status_rows`
+  if ($now > $before)
+  {
+    --let $tries = 1
+  }
+  --dec $tries
+  if ($tries)
+  {
+    --sleep 0.5
+  }
+}
+SET GLOBAL warp_purge_interval = 0;
+SET GLOBAL warp_purge_threshold = 10;
+--let $after = `$status_rows`
+--let $removed = `SELECT $after - $before`
+--echo rows removed by the purge after the transaction ended: $removed
+SELECT COUNT(*) FROM t1;
+--exec grep -h Number_of_rows $datadir/t1.data/p0/-part.txt
+disconnect con1;
+DELETE FROM i1 WHERE id <= 100;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+
+--echo # rows can be added after a purge, and the table is read the same way
+INSERT INTO t1 VALUES (5001, 'after', 5, '2020-01-01', 'b', 1.5);
+INSERT INTO i1 VALUES (5001, 'after', 5, '2020-01-01', 'b', 1.5);
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+SELECT COUNT(*) FROM t1 WHERE n > 100 AND d > '2001-01-01' AND e = 'b';
+SELECT COUNT(*) FROM i1 WHERE n > 100 AND d > '2001-01-01' AND e = 'b';
+
+--echo # leftovers of a purge that was interrupted are removed or put back
+--mkdir $datadir/t1.data.purge-p0
+--exec echo junk > $datadir/t1.data.purge-p0/junk
+OPTIMIZE TABLE t1;
+--error 2
+--exec ls $datadir/t1.data.purge-p0
+SELECT COUNT(*) FROM t1;
+
+--echo # the background purge
+DELETE FROM t1 WHERE id > 900 AND id < 5000;
+DELETE FROM i1 WHERE id > 900 AND id < 5000;
+SET GLOBAL warp_purge_threshold = 1;
+--let $before = `$status_rows`
+SET GLOBAL warp_purge_interval = 1;
+--let $tries = 60
+while ($tries)
+{
+  --let $now = `$status_rows`
+  if ($now > $before)
+  {
+    --let $tries = 1
+  }
+  --dec $tries
+  if ($tries)
+  {
+    --sleep 0.5
+  }
+}
+SET GLOBAL warp_purge_interval = 0;
+--let $after = `$status_rows`
+--let $removed = `SELECT $after > $before`
+--echo the background purge removed rows: $removed
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+SET GLOBAL warp_purge_threshold = 10;
+SET GLOBAL warp_purge_interval = 60;
+
+DROP TABLE t1, i1;

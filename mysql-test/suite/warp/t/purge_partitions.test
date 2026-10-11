@@ -1,0 +1,94 @@
+--echo #
+--echo # The purge rewrites one partition at a time and locks only that partition:
+--echo # the other partitions keep their files, and the table can be read and
+--echo # written while the background purge runs.  The content is compared with
+--echo # an InnoDB table.
+--echo #
+
+SET GLOBAL warp_purge_interval = 0;
+SET GLOBAL warp_purge_threshold = 0;
+SET GLOBAL warp_partition_max_rows = 64000;
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE t1 (id INT, v VARCHAR(20), n INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i1 LIKE t1;
+ALTER TABLE i1 ENGINE=InnoDB;
+
+--let $datadir = $MYSQLTEST_VARDIR/mysqld.1/data/test
+--let $status_rows = SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_purged_rows'
+--let $status_parts = SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_purged_partitions'
+
+--echo # four partitions of 60000 rows
+--let $batch = 0
+while ($batch < 4)
+{
+  --let $from = `SELECT $batch * 60000 + 1`
+  --let $to = `SELECT ($batch + 1) * 60000`
+  eval INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT $from UNION ALL SELECT x + 1 FROM seq WHERE x < $to) SELECT x, CONCAT('row ', x), x % 100 FROM seq;
+  --inc $batch
+}
+INSERT INTO i1 SELECT * FROM t1;
+--exec grep -h Number_of_rows $datadir/t1.data/p0/-part.txt $datadir/t1.data/p1/-part.txt $datadir/t1.data/p2/-part.txt $datadir/t1.data/p3/-part.txt
+
+--echo # the rows of one partition are deleted, only that partition is rewritten
+DELETE FROM t1 WHERE id BETWEEN 60001 AND 90000;
+DELETE FROM i1 WHERE id BETWEEN 60001 AND 90000;
+--let $parts_before = `$status_parts`
+--let $rows_before = `$status_rows`
+SET GLOBAL warp_purge_interval = 1;
+--let $tries = 60
+while ($tries)
+{
+  --let $now = `$status_rows`
+  if ($now > $rows_before)
+  {
+    --let $tries = 1
+  }
+  --dec $tries
+  if ($tries)
+  {
+    --sleep 0.5
+  }
+}
+SET GLOBAL warp_purge_interval = 0;
+--let $removed = `SELECT VARIABLE_VALUE - $rows_before FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_purged_rows'`
+--let $parts = `SELECT VARIABLE_VALUE - $parts_before FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_purged_partitions'`
+--echo rows removed: $removed, partitions rewritten: $parts
+--exec grep -h Number_of_rows $datadir/t1.data/p0/-part.txt $datadir/t1.data/p1/-part.txt $datadir/t1.data/p2/-part.txt $datadir/t1.data/p3/-part.txt
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+
+--echo # reads and writes while the purge runs every second
+SET GLOBAL warp_purge_interval = 1;
+--disable_query_log
+--let $i = 0
+while ($i < 40)
+{
+  --inc $i
+  --let $base = `SELECT 1000000 + $i * 100`
+  eval INSERT INTO t1 SELECT $base + seq.x, 'loop', $i FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5) seq;
+  eval INSERT INTO i1 SELECT $base + seq.x, 'loop', $i FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5) seq;
+  eval DELETE FROM t1 WHERE id BETWEEN $base + 1 AND $base + 3 OR (id < 120000 AND id % 1000 = $i);
+  eval DELETE FROM i1 WHERE id BETWEEN $base + 1 AND $base + 3 OR (id < 120000 AND id % 1000 = $i);
+  eval UPDATE t1 SET n = n + 1 WHERE id = $base + 4 OR (id > 150000 AND id % 997 = $i);
+  eval UPDATE i1 SET n = n + 1 WHERE id = $base + 4 OR (id > 150000 AND id % 997 = $i);
+  --let $a = `SELECT COUNT(*) FROM t1`
+  --let $b = `SELECT COUNT(*) FROM i1`
+  if ($a != $b)
+  {
+    --echo MISMATCH after $i loops: $a rows in WARP, $b in InnoDB
+  }
+  --sleep 0.1
+}
+--enable_query_log
+SET GLOBAL warp_purge_interval = 0;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+
+--let $purged = `SELECT VARIABLE_VALUE > $rows_before FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_purged_rows'`
+--echo the purge ran while the table was used: $purged
+
+SET GLOBAL warp_purge_threshold = 10;
+SET GLOBAL warp_purge_interval = 60;
+SET GLOBAL warp_partition_max_rows = 1000000;
+DROP TABLE t1, i1;
