@@ -21,6 +21,80 @@ INSERT INTO w VALUES
 (10, 5.00, 5.00, 5, 5, 5), (11, 20.00, 20.00, 20, 20, 20);
 INSERT INTO i SELECT * FROM w;
 comparisons checked: 1440, mismatches: 0
+# The conditions that FastBit evaluates have no Filter in the plan, the others do
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE a BETWEEN 5 AND 20.5;
+EXPLAIN
+-> Aggregate: count(0)  (cost=1.65 rows=1)
+    -> Table scan on w  (cost=1.32 rows=1.44)
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b > -5.25 AND c <> 10;
+EXPLAIN
+-> Aggregate: count(0)  (cost=2.22 rows=1)
+    -> Filter: ((w.b > <cache>(-(5.25))) and (w.c <> 10.0000000000))  (cost=1.32 rows=3.9)
+        -> Table scan on w  (cost=1.32 rows=13)
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE 5 < d;
+EXPLAIN
+-> Aggregate: count(0)  (cost=2.32 rows=1)
+    -> Table scan on w  (cost=1.32 rows=4.33)
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE a < 9.5e0;
+EXPLAIN
+-> Aggregate: count(0)  (cost=2.32 rows=1)
+    -> Table scan on w  (cost=1.32 rows=4.33)
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE a NOT BETWEEN 5 AND 20;
+EXPLAIN
+-> Aggregate: count(0)  (cost=3.98 rows=1)
+    -> Filter: (w.a not between 5 and 20)  (cost=1.32 rows=11.6)
+        -> Table scan on w  (cost=1.32 rows=13)
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE a IN (5, 10);
+EXPLAIN
+-> Aggregate: count(0)  (cost=1.92 rows=1)
+    -> Filter: (w.a in (5,10))  (cost=1.32 rows=2.6)
+        -> Table scan on w  (cost=1.32 rows=13)
+
+# a double constant makes MySQL compare doubles, not exact decimals
+CREATE TABLE wf (id INT, f DECIMAL(30,20) NOT NULL) ENGINE=WARP;
+CREATE TABLE inf LIKE wf;
+ALTER TABLE inf ENGINE=InnoDB;
+INSERT INTO wf VALUES (1, 0.1), (2, 0.10000000000000000001), (3, 0.2);
+INSERT INTO inf SELECT * FROM wf;
+SELECT id FROM wf WHERE f = 0.1e0 ORDER BY id;
+id
+1
+SELECT id FROM inf WHERE f = 0.1e0 ORDER BY id;
+id
+1
+SELECT id FROM wf WHERE f > 0.1e0 ORDER BY id;
+id
+2
+3
+SELECT id FROM inf WHERE f > 0.1e0 ORDER BY id;
+id
+2
+3
+SELECT id FROM wf WHERE f = 0.1 ORDER BY id;
+id
+1
+SELECT id FROM inf WHERE f = 0.1 ORDER BY id;
+id
+1
+SELECT id FROM wf WHERE f > 0.1 ORDER BY id;
+id
+2
+3
+SELECT id FROM inf WHERE f > 0.1 ORDER BY id;
+id
+2
+3
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM wf WHERE f > 0.1e0;
+EXPLAIN
+-> Aggregate: count(0)  (cost=0.934 rows=1)
+    -> Table scan on wf  (cost=0.55 rows=1.67)
+
+DROP TABLE wf, inf;
 # combined with other conditions, NULL tests and OR
 SELECT id FROM w WHERE b > 5 AND a < 100 AND d <> 10 ORDER BY id;
 id

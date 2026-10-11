@@ -3390,6 +3390,12 @@ long ibis::part::stringSearch(const ibis::qString &cmp,
             lo = cmp.rightString();
             loIncl = true;
             break;
+        case ibis::qString::STR_EQ: // decimal numbers only
+            lo = cmp.rightString();
+            loIncl = true;
+            hi = lo;
+            hiIncl = true;
+            break;
         default: // STR_BETWEEN
             lo = cmp.rightString();
             loIncl = true;
@@ -3397,7 +3403,9 @@ long ibis::part::stringSearch(const ibis::qString &cmp,
             hiIncl = true;
             break;
         }
-        const long ierr = col->stringRangeSearch(lo, loIncl, hi, hiIncl, low);
+        const long ierr = (cmp.isDecimal() ?
+            col->decimalRangeSearch(lo, loIncl, hi, hiIncl, low) :
+            col->stringRangeSearch(lo, loIncl, hi, hiIncl, low));
         if (ierr > 0) { // the null values do not match
             ibis::bitvector mskc;
             col->getNullMask(mskc);

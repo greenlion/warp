@@ -2012,6 +2012,23 @@ long ibis::text::stringSearch(const char* str, ibis::bitvector& hits) const {
 long ibis::text::stringRangeSearch(const char* lo, bool loIncl,
                                    const char* hi, bool hiIncl,
                                    ibis::bitvector& hits) const {
+    return scanRange(lo, loIncl, hi, hiIncl, false, hits);
+}
+
+/// Find the decimal numbers, stored as text, in the range between lo and
+/// hi.  The numbers are compared by value with ibis::util::decimalCompare.
+/// Otherwise like ibis::text::stringRangeSearch.
+long ibis::text::decimalRangeSearch(const char* lo, bool loIncl,
+                                    const char* hi, bool hiIncl,
+                                    ibis::bitvector& hits) const {
+    hits.clear();
+    if (m_type != ibis::TEXT) return -1L; // category is dictionary coded
+    return scanRange(lo, loIncl, hi, hiIncl, true, hits);
+}
+
+long ibis::text::scanRange(const char* lo, bool loIncl,
+                           const char* hi, bool hiIncl, bool decimal,
+                           ibis::bitvector& hits) const {
     hits.clear();
     if (thePart == 0 || thePart->currentDataDir() == 0) return -1L;
 
@@ -2021,7 +2038,7 @@ long ibis::text::stringRangeSearch(const char* lo, bool loIncl,
         evt += '.';
     }
     evt += m_name;
-    evt += "]::stringRangeSearch";
+    evt += (decimal ? "]::decimalRangeSearch" : "]::stringRangeSearch");
     ibis::util::timer mytimer(evt.c_str(), 4);
     const uint32_t nrows = thePart->nRows();
     std::string data = thePart->currentDataDir();
@@ -2095,12 +2112,16 @@ long ibis::text::stringRangeSearch(const char* lo, bool loIncl,
             const char* str = &buf[0] + (spos[r] - b0);
             const size_t len = static_cast<size_t>(spos[r+1] - spos[r]) - 1;
             if (lo != 0) {
-                const int c = ibis::util::padSpaceCompare(str, len, lo, llen);
+                const int c = (decimal ?
+                    ibis::util::decimalCompare(str, len, lo, llen) :
+                    ibis::util::padSpaceCompare(str, len, lo, llen));
                 if (c < 0 || (c == 0 && ! loIncl))
                     continue;
             }
             if (hi != 0) {
-                const int c = ibis::util::padSpaceCompare(str, len, hi, hlen);
+                const int c = (decimal ?
+                    ibis::util::decimalCompare(str, len, hi, hlen) :
+                    ibis::util::padSpaceCompare(str, len, hi, hlen));
                 if (c > 0 || (c == 0 && ! hiIncl))
                     continue;
             }

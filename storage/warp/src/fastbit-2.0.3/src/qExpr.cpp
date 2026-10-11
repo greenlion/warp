@@ -1829,15 +1829,16 @@ bool ibis::qContinuousRange::overlap(double lo, double hi) const {
 /// passing the second argument to later operations.
 ibis::qString::qString(const char* ls, const char* rs) :
     qExpr(ibis::qExpr::STRING), lstr(ibis::util::strnewdup(ls)),
-    rstr(unescape(rs)), ustr(0), cmp_(STR_EQ) {}
+    rstr(unescape(rs)), ustr(0), cmp_(STR_EQ), dec_(false) {}
 
-ibis::qString::qString(const char* ls, COMPARE op, const char* rs) :
+ibis::qString::qString(const char* ls, COMPARE op, const char* rs, bool dec) :
     qExpr(ibis::qExpr::STRING), lstr(ibis::util::strnewdup(ls)),
-    rstr(unescape(rs)), ustr(0), cmp_(op) {}
+    rstr(unescape(rs)), ustr(0), cmp_(op), dec_(dec) {}
 
-ibis::qString::qString(const char* ls, const char* lo, const char* hi) :
+ibis::qString::qString(const char* ls, const char* lo, const char* hi,
+                       bool dec) :
     qExpr(ibis::qExpr::STRING), lstr(ibis::util::strnewdup(ls)),
-    rstr(unescape(lo)), ustr(unescape(hi)), cmp_(STR_BETWEEN) {}
+    rstr(unescape(lo)), ustr(unescape(hi)), cmp_(STR_BETWEEN), dec_(dec) {}
 
 /// Returns a copy of the string without the back slashes that are used as
 /// escape characters.
@@ -1862,6 +1863,7 @@ char* ibis::qString::unescape(const char* rs) {
 
 void ibis::qString::print(std::ostream& out) const {
     if (lstr && rstr) {
+        if (dec_) out << "decimal_cmp ";
         switch (cmp_) {
         default:
         case STR_EQ:

@@ -93,6 +93,31 @@ while ($clist != '')
 }
 --echo comparisons checked: $checked, mismatches: $wrong
 
+--echo # The conditions that FastBit evaluates have no Filter in the plan, the others do
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE a BETWEEN 5 AND 20.5;
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b > -5.25 AND c <> 10;
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE 5 < d;
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE a < 9.5e0;
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE a NOT BETWEEN 5 AND 20;
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE a IN (5, 10);
+
+--echo # a double constant makes MySQL compare doubles, not exact decimals
+CREATE TABLE wf (id INT, f DECIMAL(30,20) NOT NULL) ENGINE=WARP;
+CREATE TABLE inf LIKE wf;
+ALTER TABLE inf ENGINE=InnoDB;
+INSERT INTO wf VALUES (1, 0.1), (2, 0.10000000000000000001), (3, 0.2);
+INSERT INTO inf SELECT * FROM wf;
+SELECT id FROM wf WHERE f = 0.1e0 ORDER BY id;
+SELECT id FROM inf WHERE f = 0.1e0 ORDER BY id;
+SELECT id FROM wf WHERE f > 0.1e0 ORDER BY id;
+SELECT id FROM inf WHERE f > 0.1e0 ORDER BY id;
+SELECT id FROM wf WHERE f = 0.1 ORDER BY id;
+SELECT id FROM inf WHERE f = 0.1 ORDER BY id;
+SELECT id FROM wf WHERE f > 0.1 ORDER BY id;
+SELECT id FROM inf WHERE f > 0.1 ORDER BY id;
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM wf WHERE f > 0.1e0;
+DROP TABLE wf, inf;
+
 --echo # combined with other conditions, NULL tests and OR
 SELECT id FROM w WHERE b > 5 AND a < 100 AND d <> 10 ORDER BY id;
 SELECT id FROM i WHERE b > 5 AND a < 100 AND d <> 10 ORDER BY id;

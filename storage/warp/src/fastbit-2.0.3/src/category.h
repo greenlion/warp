@@ -45,6 +45,9 @@ public:
     virtual long stringRangeSearch(const char* lo, bool loIncl,
                                    const char* hi, bool hiIncl,
                                    ibis::bitvector& hits) const;
+    virtual long decimalRangeSearch(const char* lo, bool loIncl,
+                                    const char* hi, bool hiIncl,
+                                    ibis::bitvector& hits) const;
 
     virtual long patternSearch(const char*, ibis::bitvector&) const;
     virtual long patternSearch(const char*) const;
@@ -99,6 +102,10 @@ public:
 
 protected:
 
+    /// Scan the strings for those in the range, compared as strings or as
+    /// decimal numbers.
+    long scanRange(const char* lo, bool loIncl, const char* hi, bool hiIncl,
+                   bool decimal, ibis::bitvector& hits) const;
     void startPositions(const char *dir, char *buf, uint32_t nbuf) const;
     int  readString(uint32_t i, std::string &val) const;
     int  readString(std::string&, int, long, long, char*, uint32_t,

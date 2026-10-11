@@ -941,6 +941,74 @@ int ibis::util::padSpaceCompare(const char* a, size_t alen,
     return 0;
 } // ibis::util::padSpaceCompare
 
+namespace {
+    // a decimal number split into the sign and the significant digits
+    struct DecimalParts {
+        bool neg;
+        const char* ip; size_t il; // integer digits, no leading zeros
+        const char* fp; size_t fl; // fraction digits, no trailing zeros
+    };
+
+    void splitDecimal(const char* s, size_t len, DecimalParts& d) {
+        const char* end = s + len;
+        d.neg = false;
+        if (s < end && (*s == '-' || *s == '+')) {
+            d.neg = (*s == '-');
+            ++ s;
+        }
+        while (s < end && *s == '0') ++ s;
+        d.ip = s;
+        while (s < end && *s >= '0' && *s <= '9') ++ s;
+        d.il = s - d.ip;
+        d.fp = s;
+        d.fl = 0;
+        if (s < end && *s == '.') {
+            ++ s;
+            d.fp = s;
+            while (s < end && *s >= '0' && *s <= '9') ++ s;
+            d.fl = s - d.fp;
+            while (d.fl > 0 && d.fp[d.fl-1] == '0') -- d.fl;
+        }
+        if (d.il == 0 && d.fl == 0) d.neg = false; // no negative zero
+    }
+}
+
+int ibis::util::decimalCompare(const char* a, size_t alen,
+                               const char* b, size_t blen) {
+    DecimalParts x, y;
+    splitDecimal(a, alen, x);
+    splitDecimal(b, blen, y);
+    if (x.neg != y.neg)
+        return (x.neg ? -1 : 1);
+    int c = 0;
+    if (x.il != y.il) {
+        c = (x.il < y.il ? -1 : 1);
+    }
+    else {
+        c = (x.il > 0 ? std::memcmp(x.ip, y.ip, x.il) : 0);
+        if (c == 0) {
+            const size_t n = (x.fl < y.fl ? x.fl : y.fl);
+            c = (n > 0 ? std::memcmp(x.fp, y.fp, n) : 0);
+            if (c == 0 && x.fl != y.fl)
+                c = (x.fl < y.fl ? -1 : 1);
+        }
+    }
+    if (c != 0) c = (c < 0 ? -1 : 1);
+    return (x.neg ? -c : c);
+} // ibis::util::decimalCompare
+
+bool ibis::util::isDecimalString(const char* s) {
+    if (s == 0) return false;
+    if (*s == '-' || *s == '+') ++ s;
+    size_t nd = 0;
+    while (*s >= '0' && *s <= '9') {++ s; ++ nd;}
+    if (*s == '.') {
+        ++ s;
+        while (*s >= '0' && *s <= '9') {++ s; ++ nd;}
+    }
+    return (nd > 0 && *s == 0);
+}
+
 unsigned ibis::util::getIndexBuildThreads() {
     return (fbThreadBudget ? fbThreadBudget->capacity() + 1 : 1);
 }

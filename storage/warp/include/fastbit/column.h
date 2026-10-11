@@ -239,6 +239,12 @@ public:
     virtual long stringRangeSearch(const char* lo, bool loIncl,
                                    const char* hi, bool hiIncl,
                                    ibis::bitvector& hits) const;
+    /// Find the decimal numbers, stored as text, in the range between lo
+    /// and hi, compared by value (ibis::util::decimalCompare).  A null
+    /// bound is no bound.  Only the text columns support it.
+    virtual long decimalRangeSearch(const char* lo, bool loIncl,
+                                    const char* hi, bool hiIncl,
+                                    ibis::bitvector& hits) const;
     virtual long stringSearch(const std::vector<std::string>&) const;
     virtual long keywordSearch(const char*, ibis::bitvector&) const;
     virtual long keywordSearch(const char*) const;
