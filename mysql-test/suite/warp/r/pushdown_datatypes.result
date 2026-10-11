@@ -1,0 +1,222 @@
+#
+# Conditions on every data type that WARP supports.  Every condition
+# (the six comparison operators and <=>, BETWEEN, IN, IS NULL, IS NOT
+# NULL, with the constant on either side) is also run against an
+# identical InnoDB table and the results must match, whether or not
+# the condition is pushed down to FastBit.  The EXPLAIN output shows
+# which ones are: a condition that FastBit evaluates has no Filter in
+# the plan.
+#
+CREATE TABLE w (
+id INT,
+ti TINYINT, uti TINYINT UNSIGNED, si SMALLINT, usi SMALLINT UNSIGNED,
+mi MEDIUMINT, umi MEDIUMINT UNSIGNED, i INT, ui INT UNSIGNED,
+bi BIGINT, ubi BIGINT UNSIGNED,
+f FLOAT, d DOUBLE, dc DECIMAL(12,3), dcb DECIMAL(40,10), y YEAR,
+dt DATE, tm TIME(3), dtm DATETIME(3), ts TIMESTAMP NULL,
+c CHAR(8), vc VARCHAR(20), tx TEXT, en ENUM('x', 'y', 'z'),
+st SET('a', 'b', 'c'), b BIT(8), js JSON
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w VALUES
+(1, -128, 0, -32768, 0, -8388608, 0, -2147483648, 0, -9223372036854775807, 0,
+-1.5, -2.25, -12345.678, -1234567890123456789012345678.1234567890, 1901,
+'1000-01-01', '-838:59:59.000', '1000-01-01 00:00:00.000', '1970-01-02 00:00:00',
+'', '', '', 'x', '', 1, '[]'),
+(2, 127, 255, 32767, 65535, 8388607, 16777215, 2147483647, 4294967295,
+9223372036854775807, 18446744073709551615,
+3.5, 1e100, 12345.678, 1234567890123456789012345678.1234567890, 2155,
+'9999-12-31', '838:59:59.000', '9999-12-31 23:59:59.999', '2038-01-19 03:14:07',
+'abcdefgh', 'abc def', 'long text', 'z', 'a,b,c', 255, '{"a": 1}'),
+(3, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 2000,
+'2000-01-01', '00:00:00.000', '2000-01-01 00:00:00.000', '2000-01-01 00:00:00',
+'a', 'a', 'a', 'y', 'a', 10, 'null'),
+(4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+(5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0.25, 0.125, 5.005, 5.5, 1999,
+'1999-12-31', '12:34:56.789', '1999-12-31 12:34:56.789', '1999-12-31 12:34:56',
+'a ', 'a ', 'a ', 'x', 'b', 5, '5'),
+(6, -5, 5, -5, 5, -5, 5, -5, 5, -5, 5, -0.25, -0.125, -5.005, -5.5, 2000,
+'2000-01-02', '-12:34:56.789', '2000-01-02 00:00:00.001', '2000-01-02 00:00:00',
+'b', 'B', 'B', 'y', 'a,c', 6, '"b"'),
+(7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2001,
+'2001-01-01', '01:00:00.000', '2001-01-01 01:00:00.000', '2001-01-01 01:00:00',
+'é', 'é✓', 'é✓', 'z', 'c', 1, '{"b": [1, 2]}');
+INSERT INTO i SELECT * FROM w;
+1196 conditions checked, 0 mismatches
+#
+# Which conditions are pushed down: the conditions that FastBit evaluates
+# have no Filter in the plan.  BIT, SET, JSON, TEXT and GEOMETRY values
+# are compared by MySQL.
+#
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ti > 1;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE uti BETWEEN 1 AND 5;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE si IN (1, 5);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE mi = 5;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ui >= 5;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE bi < 5;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ubi <> 5;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE f > 0.5;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d <= 3.5;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dc BETWEEN 1 AND 6.5;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dcb > 5.25;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE y = 2000;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dt >= '2000-01-01';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE tm < '01:00:00';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dtm BETWEEN '2000-01-01' AND '2001-01-01';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ts > '2000-01-01 00:00:00';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE c = 'a';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc BETWEEN 'a' AND 'b';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc IN ('a', 'B');
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE en = 'x';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE i IS NULL;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE tx = 'a';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.tx = 'a')  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE st = 'a';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.st = 'a')  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b = 5;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.b = 5)  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE js = CAST('5' AS JSON);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.js = <cache>(cast('5' as json)))  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE tx IS NULL;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE en = 1;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.en = 1)  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b > 1 AND i > 1;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: ((w.b > 1) and (w.i > 1))  
+        -> Table scan on w  
+
+#
+# GEOMETRY is not supported in a WARP table, nothing about it is pushed
+# down: the geometry values of other tables and the geometry functions
+# are evaluated by MySQL.
+#
+CREATE TABLE gw (id INT, p POINT) ENGINE=WARP;
+ERROR 42000: The storage engine for the table doesn't support GEOMETRY
+CREATE TABLE geo (id INT, p POINT) ENGINE=InnoDB;
+INSERT INTO geo VALUES (1, ST_GeomFromText('POINT(1 2)')), (2, ST_GeomFromText('POINT(0 0)')), (5, ST_GeomFromText('POINT(5 5)')), (7, NULL);
+8 geometry conditions checked, 0 mismatches
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc = ST_AsText(ST_GeomFromText('POINT(1 1)'));
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.vc = <cache>(st_astext(st_geomfromtext('POINT(1 1)'))))  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ST_X(ST_GeomFromText(CONCAT('POINT(', i, ' 1)'))) > 1;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (st_x(st_geomfromtext(concat('POINT(',w.i,' 1)'))) > 1)  
+        -> Table scan on w  
+
+DROP TABLE geo;
+DROP TABLE w, i;

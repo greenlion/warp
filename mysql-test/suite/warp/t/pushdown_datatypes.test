@@ -1,0 +1,258 @@
+--echo #
+--echo # Conditions on every data type that WARP supports.  Every condition
+--echo # (the six comparison operators and <=>, BETWEEN, IN, IS NULL, IS NOT
+--echo # NULL, with the constant on either side) is also run against an
+--echo # identical InnoDB table and the results must match, whether or not
+--echo # the condition is pushed down to FastBit.  The EXPLAIN output shows
+--echo # which ones are: a condition that FastBit evaluates has no Filter in
+--echo # the plan.
+--echo #
+
+CREATE TABLE w (
+  id INT,
+  ti TINYINT, uti TINYINT UNSIGNED, si SMALLINT, usi SMALLINT UNSIGNED,
+  mi MEDIUMINT, umi MEDIUMINT UNSIGNED, i INT, ui INT UNSIGNED,
+  bi BIGINT, ubi BIGINT UNSIGNED,
+  f FLOAT, d DOUBLE, dc DECIMAL(12,3), dcb DECIMAL(40,10), y YEAR,
+  dt DATE, tm TIME(3), dtm DATETIME(3), ts TIMESTAMP NULL,
+  c CHAR(8), vc VARCHAR(20), tx TEXT, en ENUM('x', 'y', 'z'),
+  st SET('a', 'b', 'c'), b BIT(8), js JSON
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+
+INSERT INTO w VALUES
+  (1, -128, 0, -32768, 0, -8388608, 0, -2147483648, 0, -9223372036854775807, 0,
+   -1.5, -2.25, -12345.678, -1234567890123456789012345678.1234567890, 1901,
+   '1000-01-01', '-838:59:59.000', '1000-01-01 00:00:00.000', '1970-01-02 00:00:00',
+   '', '', '', 'x', '', 1, '[]'),
+  (2, 127, 255, 32767, 65535, 8388607, 16777215, 2147483647, 4294967295,
+   9223372036854775807, 18446744073709551615,
+   3.5, 1e100, 12345.678, 1234567890123456789012345678.1234567890, 2155,
+   '9999-12-31', '838:59:59.000', '9999-12-31 23:59:59.999', '2038-01-19 03:14:07',
+   'abcdefgh', 'abc def', 'long text', 'z', 'a,b,c', 255, '{"a": 1}'),
+  (3, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 2000,
+   '2000-01-01', '00:00:00.000', '2000-01-01 00:00:00.000', '2000-01-01 00:00:00',
+   'a', 'a', 'a', 'y', 'a', 10, 'null'),
+  (4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+   NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+  (5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0.25, 0.125, 5.005, 5.5, 1999,
+   '1999-12-31', '12:34:56.789', '1999-12-31 12:34:56.789', '1999-12-31 12:34:56',
+   'a ', 'a ', 'a ', 'x', 'b', 5, '5'),
+  (6, -5, 5, -5, 5, -5, 5, -5, 5, -5, 5, -0.25, -0.125, -5.005, -5.5, 2000,
+   '2000-01-02', '-12:34:56.789', '2000-01-02 00:00:00.001', '2000-01-02 00:00:00',
+   'b', 'B', 'B', 'y', 'a,c', 6, '"b"'),
+  (7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2001,
+   '2001-01-01', '01:00:00.000', '2001-01-01 01:00:00.000', '2001-01-01 01:00:00',
+   'é', 'é✓', 'é✓', 'z', 'c', 1, '{"b": [1, 2]}');
+INSERT INTO i SELECT * FROM w;
+
+--let $checked = 0
+--let $wrong = 0
+--let $cols = ti|uti|si|usi|mi|umi|i|ui|bi|ubi|f|d|dc|dcb|y|dt|tm|dtm|ts|c|vc|tx|en|st|b|js
+--let $clist = $cols|
+while ($clist != '')
+{
+  --let $col = `SELECT SUBSTRING_INDEX('$clist', '|', 1)`
+  --let $clist = `SELECT SUBSTRING('$clist', LENGTH('$col') + 2)`
+  # three constants of the type of the column, the first is in the data
+  --let $v1 = 5
+  --let $v2 = -5
+  --let $v3 = 1
+  if ($col == uti) { let $v2 = 200; }
+  if ($col == usi) { let $v2 = 60000; }
+  if ($col == umi) { let $v2 = 16000000; }
+  if ($col == ui) { let $v2 = 4000000000; }
+  if ($col == ubi) { let $v2 = 18446744073709551615; }
+  if ($col == bi) { let $v2 = 9223372036854775807; }
+  if ($col == f) { let $v1 = 0.25; }
+  if ($col == f) { let $v2 = -1.5; }
+  if ($col == d) { let $v1 = 0.125; }
+  if ($col == d) { let $v2 = 1e100; }
+  if ($col == dc) { let $v1 = 5.005; }
+  if ($col == dc) { let $v2 = -12345.678; }
+  if ($col == dcb) { let $v1 = 5.5; }
+  if ($col == dcb) { let $v2 = 1234567890123456789012345678.1234567890; }
+  if ($col == y) { let $v1 = 1999; }
+  if ($col == y) { let $v2 = 2155; }
+  if ($col == y) { let $v3 = 2001; }
+  if ($col == dt) { let $v1 = '1999-12-31'; }
+  if ($col == dt) { let $v2 = '9999-12-31'; }
+  if ($col == dt) { let $v3 = '2000-01-01'; }
+  if ($col == tm) { let $v1 = '12:34:56.789'; }
+  if ($col == tm) { let $v2 = '-838:59:59'; }
+  if ($col == tm) { let $v3 = '00:00:00'; }
+  if ($col == dtm) { let $v1 = '1999-12-31 12:34:56.789'; }
+  if ($col == dtm) { let $v2 = '1000-01-01'; }
+  if ($col == dtm) { let $v3 = '2000-01-01 00:00:00'; }
+  if ($col == ts) { let $v1 = '1999-12-31 12:34:56'; }
+  if ($col == ts) { let $v2 = '2038-01-19 03:14:07'; }
+  if ($col == ts) { let $v3 = '2000-01-01'; }
+  if ($col == c) { let $v1 = 'a'; }
+  if ($col == c) { let $v2 = 'abcdefgh'; }
+  if ($col == c) { let $v3 = ''; }
+  if ($col == vc) { let $v1 = 'a'; }
+  if ($col == vc) { let $v2 = 'abc def'; }
+  if ($col == vc) { let $v3 = 'B'; }
+  if ($col == tx) { let $v1 = 'a'; }
+  if ($col == tx) { let $v2 = 'long text'; }
+  if ($col == tx) { let $v3 = ''; }
+  if ($col == en) { let $v1 = 'x'; }
+  if ($col == en) { let $v2 = 'z'; }
+  if ($col == en) { let $v3 = 'y'; }
+  if ($col == st) { let $v1 = 'a'; }
+  if ($col == st) { let $v2 = 'a,b,c'; }
+  if ($col == st) { let $v3 = 'c'; }
+  if ($col == b) { let $v1 = 5; }
+  if ($col == b) { let $v2 = 255; }
+  if ($col == b) { let $v3 = b'1'; }
+  if ($col == js) { let $v1 = CAST('5' AS JSON); }
+  if ($col == js) { let $v2 = CAST('{"a": 1}' AS JSON); }
+  if ($col == js) { let $v3 = CAST('[]' AS JSON); }
+
+  --let $k = 0
+  while ($k < 46)
+  {
+    inc $k;
+    --let $cond = 1
+    if ($k == 1) { let $cond = $col = $v1; }
+    if ($k == 2) { let $cond = $col = $v2; }
+    if ($k == 3) { let $cond = $col = $v3; }
+    if ($k == 4) { let $cond = $col <> $v1; }
+    if ($k == 5) { let $cond = $col <> $v2; }
+    if ($k == 6) { let $cond = $col < $v1; }
+    if ($k == 7) { let $cond = $col < $v2; }
+    if ($k == 8) { let $cond = $col <= $v1; }
+    if ($k == 9) { let $cond = $col <= $v3; }
+    if ($k == 10) { let $cond = $col > $v1; }
+    if ($k == 11) { let $cond = $col > $v2; }
+    if ($k == 12) { let $cond = $col >= $v1; }
+    if ($k == 13) { let $cond = $col >= $v3; }
+    if ($k == 14) { let $cond = $col <=> $v1; }
+    if ($k == 15) { let $cond = $col <=> NULL; }
+    if ($k == 16) { let $cond = $col IS NULL; }
+    if ($k == 17) { let $cond = $col IS NOT NULL; }
+    if ($k == 18) { let $cond = $col BETWEEN $v1 AND $v2; }
+    if ($k == 19) { let $cond = $col BETWEEN $v2 AND $v1; }
+    if ($k == 20) { let $cond = $col NOT BETWEEN $v1 AND $v2; }
+    if ($k == 21) { let $cond = $col IN ($v1, $v2); }
+    if ($k == 22) { let $cond = $col IN ($v1, $v2, $v3); }
+    if ($k == 23) { let $cond = $col NOT IN ($v1, $v3); }
+    if ($k == 24) { let $cond = $col IN ($v1); }
+    if ($k == 25) { let $cond = $v1 = $col; }
+    if ($k == 26) { let $cond = $v1 < $col; }
+    if ($k == 27) { let $cond = $v1 >= $col; }
+    if ($k == 28) { let $cond = $col = NULL; }
+    if ($k == 29) { let $cond = $col IN ($v1, NULL); }
+    if ($k == 30) { let $cond = $col < $v1 OR $col > $v2; }
+    if ($k == 31) { let $cond = $col >= $v3 AND $col <= $v1; }
+    if ($k == 32) { let $cond = NOT ($col = $v1); }
+    if ($k == 33) { let $cond = ($col = $v1 OR $col IS NULL) AND id > 2; }
+    if ($k == 34) { let $cond = $col <> $v1 AND $col IS NOT NULL; }
+    if ($k == 35) { let $cond = ISNULL($col); }
+    if ($k == 36) { let $cond = $col = $v1 XOR id = 3; }
+    if ($k == 37) { let $cond = IFNULL($col, $v1) = $v1; }
+    if ($k == 38) { let $cond = $col = $col; }
+    if ($k == 39) { let $cond = id < 4 AND $col <= $v2; }
+    if ($k == 40) { let $cond = $col > $v2 AND $col < $v1; }
+    if ($k == 41) { let $cond = $col > $v1 AND $col < $v2; }
+    if ($k == 42) { let $cond = $col <> $v2; }
+    if ($k == 43) { let $cond = $col >= $v2; }
+    if ($k == 44) { let $cond = $col <= $v2; }
+    if ($k == 45) { let $cond = $v2 <> $col; }
+    if ($k == 46) { let $cond = $col IN ($v3, $v2) AND id IN (2, 3, 7); }
+    --let $w = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM w WHERE $cond`
+    --let $r = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM i WHERE $cond`
+    inc $checked;
+    if ($w != $r)
+    {
+      inc $wrong;
+      --echo MISMATCH of WHERE $cond: WARP [$w] InnoDB [$r]
+    }
+  }
+}
+--echo $checked conditions checked, $wrong mismatches
+
+--echo #
+--echo # Which conditions are pushed down: the conditions that FastBit evaluates
+--echo # have no Filter in the plan.  BIT, SET, JSON, TEXT and GEOMETRY values
+--echo # are compared by MySQL.
+--echo #
+let $k = 0;
+while ($k < 28)
+{
+  inc $k;
+  if ($k == 1) { let $cond = ti > 1; }
+  if ($k == 2) { let $cond = uti BETWEEN 1 AND 5; }
+  if ($k == 3) { let $cond = si IN (1, 5); }
+  if ($k == 4) { let $cond = mi = 5; }
+  if ($k == 5) { let $cond = ui >= 5; }
+  if ($k == 6) { let $cond = bi < 5; }
+  if ($k == 7) { let $cond = ubi <> 5; }
+  if ($k == 8) { let $cond = f > 0.5; }
+  if ($k == 9) { let $cond = d <= 3.5; }
+  if ($k == 10) { let $cond = dc BETWEEN 1 AND 6.5; }
+  if ($k == 11) { let $cond = dcb > 5.25; }
+  if ($k == 12) { let $cond = y = 2000; }
+  if ($k == 13) { let $cond = dt >= '2000-01-01'; }
+  if ($k == 14) { let $cond = tm < '01:00:00'; }
+  if ($k == 15) { let $cond = dtm BETWEEN '2000-01-01' AND '2001-01-01'; }
+  if ($k == 16) { let $cond = ts > '2000-01-01 00:00:00'; }
+  if ($k == 17) { let $cond = c = 'a'; }
+  if ($k == 18) { let $cond = vc BETWEEN 'a' AND 'b'; }
+  if ($k == 19) { let $cond = vc IN ('a', 'B'); }
+  if ($k == 20) { let $cond = en = 'x'; }
+  if ($k == 21) { let $cond = i IS NULL; }
+  if ($k == 22) { let $cond = tx = 'a'; }
+  if ($k == 23) { let $cond = st = 'a'; }
+  if ($k == 24) { let $cond = b = 5; }
+  if ($k == 25) { let $cond = js = CAST('5' AS JSON); }
+  if ($k == 26) { let $cond = tx IS NULL; }
+  if ($k == 27) { let $cond = en = 1; }
+  if ($k == 28) { let $cond = b > 1 AND i > 1; }
+  --replace_regex /\(cost=[^)]*\)//
+  eval EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE $cond;
+}
+
+--echo #
+--echo # GEOMETRY is not supported in a WARP table, nothing about it is pushed
+--echo # down: the geometry values of other tables and the geometry functions
+--echo # are evaluated by MySQL.
+--echo #
+--error ER_CHECK_NOT_IMPLEMENTED
+CREATE TABLE gw (id INT, p POINT) ENGINE=WARP;
+CREATE TABLE geo (id INT, p POINT) ENGINE=InnoDB;
+INSERT INTO geo VALUES (1, ST_GeomFromText('POINT(1 2)')), (2, ST_GeomFromText('POINT(0 0)')), (5, ST_GeomFromText('POINT(5 5)')), (7, NULL);
+let $k = 0;
+let $checked = 0;
+let $wrong = 0;
+while ($k < 8)
+{
+  inc $k;
+  if ($k == 1) { let $q = FROM TBL JOIN geo ON TBL.i = geo.id WHERE ST_X(geo.p) > 0; }
+  if ($k == 2) { let $q = FROM TBL JOIN geo ON TBL.i = geo.id WHERE geo.p = ST_GeomFromText('POINT(5 5)'); }
+  if ($k == 3) { let $q = FROM TBL JOIN geo ON TBL.i = geo.id WHERE geo.p IS NULL; }
+  if ($k == 4) { let $q = FROM TBL JOIN geo ON TBL.vc = ST_AsText(geo.p); }
+  if ($k == 5) { let $q = FROM TBL WHERE i > ST_X(ST_GeomFromText('POINT(1 1)')); }
+  if ($k == 6) { let $q = FROM TBL WHERE vc = ST_AsText(ST_GeomFromText('POINT(1 1)')); }
+  if ($k == 7) { let $q = FROM TBL WHERE ST_Contains(ST_GeomFromText('POLYGON((0 0, 0 9, 9 9, 9 0, 0 0))'), ST_GeomFromText(CONCAT('POINT(', i, ' 1)'))); }
+  if ($k == 8) { let $q = FROM TBL WHERE i IN (SELECT id FROM geo WHERE ST_X(p) >= 1) AND ti > -10; }
+  let $wq = `SELECT REPLACE("$q", 'TBL', 'w')`;
+  let $iq = `SELECT REPLACE("$q", 'TBL', 'i')`;
+  let $wr = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(w.id), 0)) $wq`;
+  let $ir = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(i.id), 0)) $iq`;
+  inc $checked;
+  if ($wr != $ir)
+  {
+    inc $wrong;
+    --echo MISMATCH of $iq: WARP $wr, InnoDB $ir
+  }
+}
+--echo $checked geometry conditions checked, $wrong mismatches
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc = ST_AsText(ST_GeomFromText('POINT(1 1)'));
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ST_X(ST_GeomFromText(CONCAT('POINT(', i, ' 1)'))) > 1;
+DROP TABLE geo;
+
+DROP TABLE w, i;
