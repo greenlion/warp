@@ -1,0 +1,105 @@
+--echo #
+--echo # Constant temporal expressions compared with DATE, DATETIME, TIMESTAMP
+--echo # and TIME columns: DATE_SUB('1997-01-01', INTERVAL 30 DAY),
+--echo # '1997-01-01' - INTERVAL 30 DAY, STR_TO_DATE(...), MAKEDATE(...), ...
+--echo # are evaluated once and pushed down as the stored value.  Every
+--echo # condition is also run against an InnoDB table and the results must
+--echo # match, in several time zones.
+--echo #
+--echo # Regression test: only some of these were pushed down (the others were
+--echo # evaluated by MySQL for every row), a constant on the left of a
+--echo # comparison was pushed down with the operands in the wrong order, and
+--echo # a comparison with a NULL date compared with the date 0.
+--echo #
+
+CREATE TABLE w (id INT, d DATE, dt DATETIME(3), ts TIMESTAMP NULL, tm TIME) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w VALUES (1,'1996-12-01','1996-12-01 10:00:00.5','1996-12-01 10:00:00','10:00:00'),(2,'1997-01-01','1997-01-01 00:00:00','1997-01-01 00:00:00','-01:00:00'),(3,'1997-01-31','1997-01-31 23:59:59.999','1997-01-31 23:59:59','100:00:00'),(4,'1997-02-01','1997-02-01 12:00:00','1997-02-01 12:00:00',NULL);
+INSERT INTO i SELECT * FROM w;
+--let $zl = +03:00,-07:00,SYSTEM,
+--let $checked = 0
+--let $wrong = 0
+while ($zl != '')
+{
+--let $zone = `SELECT SUBSTRING_INDEX('$zl', ',', 1)`
+--let $zl = `SELECT SUBSTRING('$zl', LENGTH('$zone') + 2)`
+--disable_query_log
+eval SET time_zone = '$zone';
+let $i = 0;
+while ($i < 40)
+{
+  inc $i;
+  if ($i == 1) { let $c = d >= DATE_SUB('1997-01-01', INTERVAL 30 DAY); }
+  if ($i == 2) { let $c = d >= '1997-01-01' - INTERVAL 30 DAY; }
+  if ($i == 3) { let $c = d < DATE_ADD('1997-01-01', INTERVAL 1 MONTH); }
+  if ($i == 4) { let $c = d > '1997-01-01' + INTERVAL 1 YEAR; }
+  if ($i == 5) { let $c = d = DATE('1997-01-31 10:00'); }
+  if ($i == 6) { let $c = d >= CURDATE() - INTERVAL 10000 DAY; }
+  if ($i == 7) { let $c = dt >= DATE_SUB('1997-01-01 10:00:00', INTERVAL 2 HOUR); }
+  if ($i == 8) { let $c = d BETWEEN DATE_SUB('1997-01-01', INTERVAL 30 DAY) AND DATE_ADD('1997-01-01', INTERVAL 30 DAY); }
+  if ($i == 9) { let $c = d IN (DATE_ADD('1997-01-01', INTERVAL 30 DAY), '1997-02-01'); }
+  if ($i == 10) { let $c = d >= ADDDATE('1997-01-01', 30); }
+  if ($i == 11) { let $c = d >= SUBDATE('1997-02-01', INTERVAL 1 MONTH); }
+  if ($i == 12) { let $c = d >= '1997-01-01' + INTERVAL 1 DAY + INTERVAL 2 DAY; }
+  if ($i == 13) { let $c = d >= STR_TO_DATE('01/02/1997','%d/%m/%Y'); }
+  if ($i == 14) { let $c = d >= MAKEDATE(1997, 31); }
+  if ($i == 15) { let $c = d = LAST_DAY('1997-01-05'); }
+  if ($i == 16) { let $c = d >= '1997-01-01'; }
+  if ($i == 17) { let $c = ts >= DATE_SUB('1997-01-31 12:00:00', INTERVAL 1 DAY); }
+  if ($i == 18) { let $c = ts < '1997-02-01 00:00:00' - INTERVAL 1 HOUR; }
+  if ($i == 19) { let $c = tm >= SEC_TO_TIME(3600); }
+  if ($i == 20) { let $c = tm < ADDTIME('01:00:00', '02:00:00'); }
+  if ($i == 21) { let $c = dt <= DATE_ADD('1997-01-31', INTERVAL '23:59:59.999' HOUR_MICROSECOND); }
+  if ($i == 22) { let $c = d >= DATE_SUB(DATE_SUB('1997-03-01', INTERVAL 1 MONTH), INTERVAL 30 DAY); }
+  if ($i == 23) { let $c = DATE_SUB('1997-01-01', INTERVAL 30 DAY) <= d; }
+  if ($i == 24) { let $c = d >= DATE_ADD(DATE '1997-01-01', INTERVAL 1 DAY); }
+  if ($i == 25) { let $c = d >= CAST('1997-01-01' AS DATE) - INTERVAL 1 DAY; }
+  if ($i == 26) { let $c = d >= FROM_DAYS(TO_DAYS('1997-01-01') - 30); }
+  if ($i == 27) { let $c = d > DATE_SUB(NULL, INTERVAL 1 DAY); }
+  if ($i == 28) { let $c = d >= DATE_SUB('1997-01-01', INTERVAL 30 DAY) AND d <= DATE_ADD('1997-01-01', INTERVAL 45 DAY); }
+  if ($i == 29) { let $c = d = DATE_ADD('1997-01-01', INTERVAL 1 DAY) - INTERVAL 1 DAY; }
+  if ($i == 30) { let $c = dt >= TIMESTAMP('1997-01-01', '12:00:00'); }
+  if ($i == 31) { let $c = d <=> DATE_ADD('1997-01-01', INTERVAL 30 DAY); }
+  if ($i == 32) { let $c = d NOT BETWEEN DATE_SUB('1997-01-01', INTERVAL 30 DAY) AND '1997-01-31'; }
+  if ($i == 33) { let $c = ts = TIMESTAMP('1997-01-01 00:00:00') + INTERVAL 31 DAY; }
+  if ($i == 34) { let $c = tm BETWEEN SEC_TO_TIME(-3600) AND SEC_TO_TIME(7200); }
+  if ($i == 35) { let $c = d >= DATE_SUB('1997-01-01', INTERVAL 30 DAY) OR ts < '1997-01-01' - INTERVAL 1 YEAR; }
+  if ($i == 36) { let $c = DATE_ADD('1997-01-01', INTERVAL 30 DAY) > d AND d >= NOW() - INTERVAL 100 YEAR; }
+  if ($i == 37) { let $c = d > '1997-01-31' - INTERVAL 1 DAY AND dt < ADDDATE('1997-02-01', INTERVAL 13 HOUR); }
+  if ($i == 38) { let $c = d IN (DATE_SUB('1997-01-02', INTERVAL 1 DAY), DATE_ADD('1997-01-30', INTERVAL 1 DAY)); }
+  if ($i == 39) { let $c = d >= DATE_ADD('9999-12-31', INTERVAL 1 DAY); }
+  if ($i == 40) { let $c = tm = '10:00:00'; }
+  let $wr = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id),'-') FROM w WHERE $c`;
+  let $ir = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id),'-') FROM i WHERE $c`;
+  inc $checked;
+  if ($wr != $ir) { inc $wrong; echo MISMATCH [$zone] [$i] $c => WARP $wr InnoDB $ir; }
+}
+}
+--enable_query_log
+--echo $checked conditions checked, $wrong mismatches
+--echo # The conditions that FastBit evaluates have no Filter in the plan, the others do
+SET time_zone = '+03:00';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= DATE_SUB('1997-01-01', INTERVAL 30 DAY);
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= '1997-01-01' - INTERVAL 30 DAY;
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d BETWEEN DATE_SUB('1997-01-01', INTERVAL 30 DAY) AND DATE_ADD('1997-01-01', INTERVAL 30 DAY);
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d IN (DATE_ADD('1997-01-01', INTERVAL 30 DAY), '1997-02-01');
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE DATE_SUB('1997-01-01', INTERVAL 30 DAY) <= d;
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= STR_TO_DATE('01/02/1997','%d/%m/%Y');
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ts >= DATE_SUB('1997-01-31 12:00:00', INTERVAL 1 DAY);
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE tm >= SEC_TO_TIME(3600);
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d > DATE_SUB(NULL, INTERVAL 1 DAY);
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= (SELECT MAX(d) FROM i);
+
+DROP TABLE w, i;
+

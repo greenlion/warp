@@ -4072,6 +4072,45 @@ static bool warp_format_int(const Item *item, bool exact_syntax,
   return true;
 }
 
+/* The kind of the temporal columns that FastBit compares as numbers: 1 for
+   TIME, 2 for DATE, DATETIME and TIMESTAMP, 0 for the other types. */
+static int warp_temporal_kind(enum_field_types type) {
+  if (warp_is_time_type(type)) return 1;
+  switch (type) {
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_NEWDATE:
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_DATETIME2:
+    case MYSQL_TYPE_TIMESTAMP:
+    case MYSQL_TYPE_TIMESTAMP2:
+      return 2;
+    default:
+      return 0;
+  }
+}
+
+/* Is the Item a value that does not change while the statement is executed
+   (a literal, DATE_SUB('1997-01-01', INTERVAL 30 DAY),
+   '1997-01-01' - INTERVAL 30 DAY, STR_TO_DATE(...), CURDATE(), ...) of the
+   kind that MySQL compares with a temporal column of the given kind (see
+   warp_temporal_kind)?  A TIME is not compared with a DATE or a DATETIME,
+   and an expression with a subquery or a stored function is not evaluated
+   while the condition is pushed down. */
+static bool warp_is_temporal_const(Item *item, int kind) {
+  if (kind == 0 || item->type() == Item::Type::FIELD_ITEM) return false;
+  if (!item->const_for_execution() || item->has_subquery() ||
+      item->has_stored_program()) {
+    return false;
+  }
+  if (kind == 1) return warp_is_time_type(item->data_type());
+  /* MySQL compares a DATE, DATETIME or TIMESTAMP column as a date with a
+     value that is a date or time stamp or that is a string, which it
+     converts to a date (DATE_SUB of a string, for example, is a string) */
+  if (warp_is_time_type(item->data_type())) return false;
+  return item->is_temporal_with_date() ||
+         item->result_type() == STRING_RESULT;
+}
+
 /* Writes a string constant as a quoted FastBit string literal.  Returns false
    if the constant is not a plain string that FastBit compares like MySQL:
    a constant that is not a string, a NULL, a string with a NUL character
@@ -4698,12 +4737,31 @@ int ha_warp::append_column_filter(const Item *cond,
     /* a TIMESTAMP column is stored in UTC, the temporal constants are times
        of the time zone of the session */
     bool timestamp_col = false;
+    int temporal_kind = 0;
     for (uint i = 0; i < tmp->arg_count; ++i) {
-      if(arg[i]->type() == Item::Type::FIELD_ITEM &&
-         warp_is_timestamp_type(
-             down_cast<Item_field *>(arg[i])->field->real_type())) {
-        timestamp_col = true;
+      if(arg[i]->type() == Item::Type::FIELD_ITEM) {
+        const enum_field_types frt =
+            down_cast<Item_field *>(arg[i])->field->real_type();
+        if(warp_is_timestamp_type(frt)) {
+          timestamp_col = true;
+        }
+        temporal_kind = warp_temporal_kind(frt);
       }
+    }
+
+    /* A constant on the left of the comparison goes to the right, the
+       condition is written as column OP constant */
+    Item *swapped_args[2];
+    if(!is_between && !is_in && tmp->arg_count == 2 &&
+       arg[0]->type() != Item::Type::FIELD_ITEM &&
+       arg[1]->type() == Item::Type::FIELD_ITEM && op != " LIKE ") {
+      swapped_args[0] = arg[1];
+      swapped_args[1] = arg[0];
+      arg = swapped_args;
+      if(op == " < ") op = " > ";
+      else if(op == " <= ") op = " >= ";
+      else if(op == " > ") op = " < ";
+      else if(op == " >= ") op = " <= ";
     }
     bool bigint_col = false;
     bool col_unsigned = false;
@@ -4812,51 +4870,21 @@ int ha_warp::append_column_filter(const Item *cond,
          Special note: TEMPORAL values are passed down as an 
          Item_func::DATE_FUNC and the date is extracted from it.
       */
-      if((*arg)->type() == Item::Type::CACHE_ITEM) {
-        String str;
-        //fixme: max_packet_length?
-        str.reserve(1024*1024);
-        (*arg)->print(current_thd, &str, QT_ORDINARY);
-        if(
-          memcmp("date",str.c_ptr()+9,4) == 0 || 
-          strcasestr(str.c_ptr(), "interval ") != NULL ||
-          strcasestr(str.c_ptr(), " as date") != NULL
-          ) {
-          uint64_t t;
-          if(timestamp_col) {
-            if(!warp_item_timestamp_value(*arg, current_thd, t)) return 0;
-          } else {
-            t=warp_item_temporal_value(*arg);
-          }
-          build_where_clause += std::to_string(t);
-          continue;        
+      /* A constant temporal expression is evaluated here and compared as
+         the packed value that is stored in the column */
+      if(warp_is_temporal_const(*arg, temporal_kind)) {
+        uint64_t t;
+        if(timestamp_col) {
+          if(!warp_item_timestamp_value(*arg, current_thd, t)) return 0;
+        } else {
+          t=warp_item_temporal_value(*arg);
         }
-        // only date_sub date_add etc are supported right now
-        return 0;
-      }   
-
-      if((*arg)->type() == Item::Type::FUNC_ITEM) {
-        auto func_item = dynamic_cast<Item_func *>(*arg);
-        
-        switch(func_item->functype()) {
-          case Item_func::DATE_FUNC:
-          case Item_func::ADDTIME_FUNC:
-            {  
-            uint64_t t;
-            if(timestamp_col) {
-              if(!warp_item_timestamp_value(*arg, current_thd, t)) return 0;
-            } else {
-              t=warp_item_temporal_value(*arg);
-            }
-            build_where_clause += std::to_string(t);
-            }
-            continue;
-          break;
-          default:
-            return 0;
-        }
+        /* a comparison with NULL is never true, MySQL evaluates it */
+        if((*arg)->null_value) return 0;
+        build_where_clause += std::to_string(t);
+        continue;
       }
-      
+
       if((*arg)->type() == Item::Type::INT_ITEM) {
         std::string val;
         if(!warp_format_int(*arg, needs_exact_syntax, col_unsigned, val)) {
