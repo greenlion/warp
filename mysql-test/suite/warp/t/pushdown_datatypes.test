@@ -16,7 +16,7 @@ CREATE TABLE w (
   f FLOAT, d DOUBLE, dc DECIMAL(12,3), dcb DECIMAL(40,10), y YEAR,
   dt DATE, tm TIME(3), dtm DATETIME(3), ts TIMESTAMP NULL,
   c CHAR(8), vc VARCHAR(20), tx TEXT, en ENUM('x', 'y', 'z'),
-  st SET('a', 'b', 'c'), b BIT(8), js JSON
+  st SET('a', 'b', 'c'), b BIT(8), bw BIT(20), b64 BIT(64), js JSON
 ) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 CREATE TABLE i LIKE w;
 ALTER TABLE i ENGINE=InnoDB;
@@ -25,31 +25,35 @@ INSERT INTO w VALUES
   (1, -128, 0, -32768, 0, -8388608, 0, -2147483648, 0, -9223372036854775807, 0,
    -1.5, -2.25, -12345.678, -1234567890123456789012345678.1234567890, 1901,
    '1000-01-01', '-838:59:59.000', '1000-01-01 00:00:00.000', '1970-01-02 00:00:00',
-   '', '', '', 'x', '', 1, '[]'),
+   '', '', '', 'x', '', 1, 1000, 0, '[]'),
   (2, 127, 255, 32767, 65535, 8388607, 16777215, 2147483647, 4294967295,
    9223372036854775807, 18446744073709551615,
    3.5, 1e100, 12345.678, 1234567890123456789012345678.1234567890, 2155,
    '9999-12-31', '838:59:59.000', '9999-12-31 23:59:59.999', '2038-01-19 03:14:07',
-   'abcdefgh', 'abc def', 'long text', 'z', 'a,b,c', 255, '{"a": 1}'),
+   'abcdefgh', 'abc def', 'long text', 'z', 'a,b,c', 255, 1048575, 18446744073709551615, '{"a": 1}'),
   (3, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 2000,
    '2000-01-01', '00:00:00.000', '2000-01-01 00:00:00.000', '2000-01-01 00:00:00',
-   'a', 'a', 'a', 'y', 'a', 10, 'null'),
+   'a', 'a', 'a', 'y', 'a', 10, 65, 9223372036854775808, 'null'),
   (4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-   NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+   NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
   (5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0.25, 0.125, 5.005, 5.5, 1999,
    '1999-12-31', '12:34:56.789', '1999-12-31 12:34:56.789', '1999-12-31 12:34:56',
-   'a ', 'a ', 'a ', 'x', 'b', 5, '5'),
+   'a ', 'a ', 'a ', 'x', 'b', 5, 5, 9223372036854775807, '5'),
   (6, -5, 5, -5, 5, -5, 5, -5, 5, -5, 5, -0.25, -0.125, -5.005, -5.5, 2000,
    '2000-01-02', '-12:34:56.789', '2000-01-02 00:00:00.001', '2000-01-02 00:00:00',
-   'b', 'B', 'B', 'y', 'a,c', 6, '"b"'),
+   'b', 'B', 'B', 'y', 'a,c', 6, 0, 9007199254740993, '"b"'),
   (7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2001,
    '2001-01-01', '01:00:00.000', '2001-01-01 01:00:00.000', '2001-01-01 01:00:00',
-   'é', 'é✓', 'é✓', 'z', 'c', 1, '{"b": [1, 2]}');
+   'é', 'é✓', 'é✓', 'z', 'c', 1, 1, 9007199254740992, '{"b": [1, 2]}');
 INSERT INTO i SELECT * FROM w;
+
+--echo # BIT values of up to 64 bits are stored as they are, zero bytes included
+SELECT id, b+0, bw+0, b64+0 FROM w ORDER BY id;
+SELECT COUNT(*) AS bit_rows_differ FROM (SELECT id, b+0 x, bw+0 y, b64+0 z FROM w EXCEPT ALL SELECT id, b+0, bw+0, b64+0 FROM i) a;
 
 --let $checked = 0
 --let $wrong = 0
---let $cols = ti|uti|si|usi|mi|umi|i|ui|bi|ubi|f|d|dc|dcb|y|dt|tm|dtm|ts|c|vc|tx|en|st|b|js
+--let $cols = ti|uti|si|usi|mi|umi|i|ui|bi|ubi|f|d|dc|dcb|y|dt|tm|dtm|ts|c|vc|tx|en|st|b|bw|b64|js
 --let $clist = $cols|
 while ($clist != '')
 {
@@ -106,6 +110,12 @@ while ($clist != '')
   if ($col == b) { let $v1 = 5; }
   if ($col == b) { let $v2 = 255; }
   if ($col == b) { let $v3 = b'1'; }
+  if ($col == bw) { let $v1 = 1000; }
+  if ($col == bw) { let $v2 = 1048575; }
+  if ($col == bw) { let $v3 = 65; }
+  if ($col == b64) { let $v1 = 9007199254740993; }
+  if ($col == b64) { let $v2 = 18446744073709551615; }
+  if ($col == b64) { let $v3 = 9223372036854775808; }
   if ($col == js) { let $v1 = CAST('5' AS JSON); }
   if ($col == js) { let $v2 = CAST('{"a": 1}' AS JSON); }
   if ($col == js) { let $v3 = CAST('[]' AS JSON); }
@@ -175,11 +185,11 @@ while ($clist != '')
 
 --echo #
 --echo # Which conditions are pushed down: the conditions that FastBit evaluates
---echo # have no Filter in the plan.  BIT, SET, JSON, TEXT and GEOMETRY values
+--echo # have no Filter in the plan.  SET, JSON, TEXT and GEOMETRY values
 --echo # are compared by MySQL.
 --echo #
 let $k = 0;
-while ($k < 28)
+while ($k < 29)
 {
   inc $k;
   if ($k == 1) { let $cond = ti > 1; }
@@ -206,6 +216,7 @@ while ($k < 28)
   if ($k == 22) { let $cond = tx = 'a'; }
   if ($k == 23) { let $cond = st = 'a'; }
   if ($k == 24) { let $cond = b = 5; }
+  if ($k == 29) { let $cond = bw > 100 AND b64 <> 5; }
   if ($k == 25) { let $cond = js = CAST('5' AS JSON); }
   if ($k == 26) { let $cond = tx IS NULL; }
   if ($k == 27) { let $cond = en = 1; }
