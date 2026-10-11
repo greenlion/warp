@@ -226,6 +226,50 @@ static MYSQL_SYSVAR_ULONGLONG(
 );
 */
 
+/* background purge of the rows that nobody can see any more (see
+   warp_purge.h) */
+static unsigned long my_purge_interval = 60;
+static unsigned int my_purge_threshold = 10;
+
+/* wakes the thread of the purge, so that it reads the settings again */
+static void warp_purge_wake();
+
+static void warp_update_purge_interval(THD *, SYS_VAR *, void *var_ptr,
+                                       const void *save) {
+  *static_cast<unsigned long *>(var_ptr) = *static_cast<const unsigned long *>(save);
+  warp_purge_wake();
+}
+
+static MYSQL_SYSVAR_ULONG(
+  purge_interval,
+  my_purge_interval,
+  PLUGIN_VAR_RQCMDARG,
+  "Seconds between the runs of the background purge, which removes the rows "
+  "of deleted and updated rows and of rolled back transactions that no "
+  "transaction can see any more.  0 turns the purge off.",
+  NULL,
+  warp_update_purge_interval,
+  60,
+  0,
+  86400 * 365,
+  0
+);
+
+static MYSQL_SYSVAR_UINT(
+  purge_threshold,
+  my_purge_threshold,
+  PLUGIN_VAR_RQCMDARG,
+  "The percentage of the rows of a partition that the purge can remove for "
+  "the purge to rewrite the partition.  0 rewrites a partition that has any "
+  "row to remove.",
+  NULL,
+  NULL,
+  10,
+  0,
+  100,
+  0
+);
+
 static MYSQL_THDVAR_ULONG(lock_wait_timeout, PLUGIN_VAR_RQCMDARG,
                           "Timeout in seconds a WARP transaction may wait "
                           "for a lock before being rolled back.",
@@ -288,6 +332,8 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(compression),
   MYSQL_SYSVAR(compression_level),
   MYSQL_SYSVAR(lock_wait_timeout),
+  MYSQL_SYSVAR(purge_interval),
+  MYSQL_SYSVAR(purge_threshold),
   MYSQL_SYSVAR(partition_filter),
   MYSQL_SYSVAR(adjust_table_stats_for_joins),
   MYSQL_SYSVAR(star_aggregation),
@@ -700,6 +746,10 @@ class warp_global_data {
   uint64_t active_trx_total();
   uint64_t get_next_trx_id();
   bool is_transaction_open(uint64_t check_trx_id);
+  /* the transaction exists (read only ones too), see active_trx */
+  bool is_trx_active(uint64_t trx_id);
+  /* nobody can see the row any more, it is removed by the purge */
+  bool is_row_purgeable(uint64_t rowid, uint64_t trx_id);
   void mark_transaction_closed(uint64_t trx_id);
   void register_open_trx(uint64_t trx);
 

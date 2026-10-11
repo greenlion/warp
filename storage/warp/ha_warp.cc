@@ -228,79 +228,10 @@ static void init_warp_psi_keys(void) {
 struct st_mysql_storage_engine warp_storage_engine = { MYSQL_HANDLERTON_INTERFACE_VERSION };
 static int warp_init_func(void *p);
 static int warp_done_func(void *p);
+static void warp_purge_start();
+static void warp_purge_stop();
 
-/* The data files of a table: readers and writers.
-
-   A writer appends rows to the column files of a partition one column after
-   the other and updates the row count of the partition.  A scan that opens
-   the partition at that moment sees a row count that the column files do not
-   have yet (bord::append could only add 8005 of 8006 values, error -19) and
-   fails.  Scans and the other code that read the data files hold the lock of
-   the table shared while they do that, the writer holds it exclusive.  The
-   rows that a scan returns are in memory (a table that select made), so
-   the lock is not held while they are returned.
-
-   The locks are kept by the name of the data directory of the table, so
-   code that only has the name (the dimension table of a join) finds the same
-   lock.  A thread that holds a lock for reading does not take it again. */
-static std::shared_ptr<std::shared_mutex> warp_table_lock(const char *data_dir) {
-  static std::mutex registry_mtx;
-  static std::unordered_map<std::string, std::shared_ptr<std::shared_mutex>> registry;
-  std::lock_guard<std::mutex> guard(registry_mtx);
-  auto it = registry.find(data_dir);
-  if(it == registry.end()) {
-    it = registry.emplace(std::string(data_dir), std::make_shared<std::shared_mutex>()).first;
-  }
-  return it->second;
-}
-
-static thread_local std::unordered_map<const std::shared_mutex *, int> warp_read_locks_held;
-
-class warp_table_read_lock {
- public:
-  explicit warp_table_read_lock(const char *data_dir)
-      : lock_(warp_table_lock(data_dir)) {
-    if(warp_read_locks_held[lock_.get()]++ == 0) {
-      lock_->lock_shared();
-    }
-  }
-  ~warp_table_read_lock() {
-    auto it = warp_read_locks_held.find(lock_.get());
-    if(--(it->second) == 0) {
-      warp_read_locks_held.erase(it);
-      lock_->unlock_shared();
-    }
-  }
-  warp_table_read_lock(const warp_table_read_lock &) = delete;
-  warp_table_read_lock &operator=(const warp_table_read_lock &) = delete;
-
- private:
-  std::shared_ptr<std::shared_mutex> lock_;
-};
-
-class warp_table_write_lock {
- public:
-  explicit warp_table_write_lock(const char *data_dir)
-      : lock_(warp_table_lock(data_dir)) {
-    /* a thread that reads can not wait for the writers, it would wait
-       for itself */
-    if(warp_read_locks_held.find(lock_.get()) == warp_read_locks_held.end()) {
-      lock_->lock();
-      locked_ = true;
-    } else {
-      sql_print_warning("WARP: rows are written by a thread that is reading %s", data_dir);
-    }
-  }
-  ~warp_table_write_lock() {
-    if(locked_) lock_->unlock();
-  }
-  warp_table_write_lock(const warp_table_write_lock &) = delete;
-  warp_table_write_lock &operator=(const warp_table_write_lock &) = delete;
-
- private:
-  std::shared_ptr<std::shared_mutex> lock_;
-  bool locked_ = false;
-};
+#include "warp_locks.h"
 
 /* Status variables: Warp_history_locks is the number of history locks that
    exist (see warp_global_data::cleanup_history_locks), Warp_active_transactions
@@ -321,7 +252,14 @@ static int show_warp_active_transactions(MYSQL_THD, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
+static int show_warp_purged_rows(MYSQL_THD, SHOW_VAR *var, char *buff);
+static int show_warp_purged_partitions(MYSQL_THD, SHOW_VAR *var, char *buff);
+static int show_warp_purge_failures(MYSQL_THD, SHOW_VAR *var, char *buff);
+
 static SHOW_VAR warp_status_variables[] = {
+    {"Warp_purged_rows", (char *)&show_warp_purged_rows, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Warp_purged_partitions", (char *)&show_warp_purged_partitions, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Warp_purge_failures", (char *)&show_warp_purge_failures, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_history_locks", (char *)&show_warp_history_locks, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_active_transactions", (char *)&show_warp_active_transactions, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}};
@@ -386,12 +324,14 @@ static int warp_init_func(void *p) {
   warp_state = new warp_global_data();
   
   assert(warp_state != NULL);
+  warp_purge_start();
   sql_print_information("WARP storage engine initialization completed");
   DBUG_RETURN(0);
 }
 
 static int warp_done_func(void *) {
   sql_print_information("WARP storage engine shutdown started");
+  warp_purge_stop();
   warp_open_tables.reset();
 
   // destroying warp_state writes the state to disk
@@ -425,6 +365,8 @@ int ha_warp::rename_table(const char * from, const char * to, const dd::Table* ,
      names would read the content of the old files. */
   const std::string from_dir = std::string(from) + ".data";
   const std::string to_dir = std::string(to) + ".data";
+  /* no purge or scan of a partition is running while the directory moves */
+  warp_table_write_lock from_lock(from_dir.c_str());
   ibis::fileManager::instance().flushDir(from_dir.c_str());
   ibis::fileManager::instance().flushDir(to_dir.c_str());
   std::string cmd = "mv " + std::string(from) + ".data/ " + std::string(to) + ".data/";
@@ -434,6 +376,8 @@ int ha_warp::rename_table(const char * from, const char * to, const dd::Table* ,
   ibis::fileManager::instance().flushDir(to_dir.c_str());
   forget_partitions(from);
   forget_partitions(to);
+  warp_forget_table_locks(from_dir);
+  warp_forget_table_locks(to_dir);
   DBUG_RETURN(0);
 }
 
@@ -682,6 +626,29 @@ static void forget_partitions(const char *table_name) {
   mysql_mutex_unlock(&warp_mutex);
 }
 
+
+#include "warp_purge.h"
+
+static int show_warp_purged_rows(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) = (longlong)warp_purged_rows_total.load();
+  return 0;
+}
+
+static int show_warp_purged_partitions(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) = (longlong)warp_purged_partitions_total.load();
+  return 0;
+}
+
+static int show_warp_purge_failures(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) = (longlong)warp_purge_failures_total.load();
+  return 0;
+}
 
 int ha_warp::set_column_set() {
   DBUG_ENTER("ha_warp::set_column_set");
@@ -1136,7 +1103,7 @@ int ha_warp::write_buffered_rows_to_disk() {
     const std::string part_name = "p" + std::to_string(part_number);
     const std::string part_dir = std::string(share->data_dir_name) + "/" + part_name;
     /* no scan reads the partition while it is written */
-    warp_table_write_lock data_lock(share->data_dir_name);
+    warp_partition_write_lock data_lock(part_dir, !file_exists(part_dir.c_str()));
     int written = writer->write(part_dir.c_str(), part_name.c_str());
     if(written < 0) {
       sql_print_error("WARP: could not write the buffered rows to %s (error %d)",
@@ -1352,12 +1319,16 @@ int ha_warp::delete_table(const char *table_name, const dd::Table *) {
   /* the files of the table are removed from the FastBit cache too, a table
      that is created with the same name must not read them */
   const std::string data_dir = std::string(table_name) + ".data";
+  /* no purge or scan of a partition is running while the files are removed */
+  std::unique_ptr<warp_table_write_lock> data_lock(new warp_table_write_lock(data_dir.c_str()));
   ibis::fileManager::instance().flushDir(data_dir.c_str());
   std::string cmdline =
       std::string("rm -rf ") + std::string(table_name) + ".data/";
   int rc = system(cmdline.c_str());
   ibis::fileManager::instance().flushDir(data_dir.c_str());
   forget_partitions(table_name);
+  data_lock.reset();
+  warp_forget_table_locks(data_dir);
   ha_statistic_increment(&System_status_var::ha_delete_count);
   DBUG_RETURN(rc != 0);
 
@@ -2087,14 +2058,21 @@ int ha_warp::optimize(THD *, HA_CHECK_OPT *) {
   DBUG_ENTER("ha_warp::optimize");
   int rc = HA_ADMIN_OK;
   const bool compress = ibis::zfile::level() > 0;
+  /* the rows that nobody can see are removed first, whatever their number */
+  const uint64_t purged = warp_purge_table(share->data_dir_name, 0);
+  if(purged > 0) {
+    sql_print_information("WARP: OPTIMIZE removed %llu rows of %s",
+                          (unsigned long long)purged, share->data_dir_name);
+  }
   mysql_mutex_lock(&share->mutex);
-  /* the column files are not rewritten while rows are written to them */
-  warp_table_write_lock data_lock(share->data_dir_name);
   ibis::partList parts;
   ibis::util::gatherParts(parts, share->data_dir_name, true);
   for (auto part : parts) {
     const char *dir = part->currentDataDir();
     if (dir == nullptr || part->nRows() == 0) continue;
+    /* the column files of a partition are not rewritten while rows are
+       written to them or while they are read */
+    warp_partition_write_lock data_lock(dir);
     for (uint32_t i = 0; i < part->nColumns(); ++i) {
       const ibis::column *col = part->getColumn(i);
       if (col == nullptr || col->type() == ibis::BLOB) continue;
@@ -2912,7 +2890,7 @@ fetch_again:
           filtered_table == NULL ) {
         /* not read ahead, or the read ahead did not work (for example
            because the cache was busy): read it here */
-        warp_table_read_lock data_lock(share->data_dir_name);
+        warp_partition_read_lock data_lock(find_it->first);
         delete base_table;
         base_table = ibis::table::create(find_it->first.c_str());
         assert(base_table != NULL);
@@ -2951,7 +2929,7 @@ fetch_again:
       
       if( !take_prefetched(std::string((*part_it)->currentDataDir()), &base_table, &filtered_table) ||
           filtered_table == NULL ) {
-        warp_table_read_lock data_lock(share->data_dir_name);
+        warp_partition_read_lock data_lock((*part_it)->currentDataDir());
         delete base_table;
         base_table = ibis::table::create((*part_it)->currentDataDir());
         assert(base_table != NULL);

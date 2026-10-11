@@ -1,0 +1,143 @@
+#
+# Background purge of the rows that nobody can see any more: the rows of
+# deleted and updated rows and of rolled back transactions.  OPTIMIZE
+# TABLE runs the purge of the table at once (any number of rows).  The
+# content of the table must not change, it is compared with an InnoDB
+# table.
+#
+SET GLOBAL warp_purge_interval = 0;
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE t1 (id INT, v VARCHAR(20), n INT NULL, d DATE, e ENUM('a', 'b', 'c'), dc DECIMAL(10,2))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i1 LIKE t1;
+ALTER TABLE i1 ENGINE=InnoDB;
+INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000)
+SELECT x, CONCAT('row ', x), IF(x % 7 = 0, NULL, x * 3), DATE_ADD('2000-01-01', INTERVAL x DAY),
+ELT(1 + x % 3, 'a', 'b', 'c'), x / 4
+FROM seq;
+INSERT INTO i1 SELECT * FROM t1;
+# rows in the files of the partition
+Number_of_rows = 1000
+# deleted rows stay in the files
+DELETE FROM t1 WHERE id % 5 = 0;
+DELETE FROM i1 WHERE id % 5 = 0;
+Number_of_rows = 1000
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+800
+# they are removed by the purge, nothing else changes
+OPTIMIZE TABLE t1;
+Table	Op	Msg_type	Msg_text
+test.t1	optimize	status	OK
+rows removed by the purge: 200
+Number_of_rows = 800
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+800
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+# nothing is left to remove
+OPTIMIZE TABLE t1;
+Table	Op	Msg_type	Msg_text
+test.t1	optimize	status	OK
+rows removed by the purge: 0
+# updated rows: the old versions are removed
+UPDATE t1 SET v = CONCAT('new ', id), n = n + 1 WHERE id % 3 = 0;
+UPDATE i1 SET v = CONCAT('new ', id), n = n + 1 WHERE id % 3 = 0;
+Number_of_rows = 1067
+OPTIMIZE TABLE t1;
+Table	Op	Msg_type	Msg_text
+test.t1	optimize	status	OK
+Number_of_rows = 800
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+# rolled back transactions: the rows that they inserted are removed
+BEGIN;
+INSERT INTO t1 SELECT id + 10000, v, n, d, e, dc FROM t1;
+ROLLBACK;
+Number_of_rows = 1600
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+800
+OPTIMIZE TABLE t1;
+Table	Op	Msg_type	Msg_text
+test.t1	optimize	status	OK
+Number_of_rows = 800
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+800
+# an old transaction still sees the deleted rows, they stay while it exists
+# (the background purge is used, OPTIMIZE waits for the metadata lock of the transaction)
+START TRANSACTION WITH CONSISTENT SNAPSHOT;
+SELECT COUNT(*) AS seen_by_the_old_transaction FROM t1;
+seen_by_the_old_transaction
+800
+DELETE FROM t1 WHERE id <= 100;
+SET GLOBAL warp_purge_threshold = 0;
+SET GLOBAL warp_purge_interval = 1;
+rows removed by the purge while the old transaction exists: 0
+SELECT COUNT(*) AS seen_by_the_old_transaction FROM t1;
+seen_by_the_old_transaction
+800
+COMMIT;
+# the rows are removed when no transaction needs them
+SET GLOBAL warp_purge_interval = 0;
+SET GLOBAL warp_purge_threshold = 10;
+rows removed by the purge after the transaction ended: 80
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+720
+Number_of_rows = 720
+DELETE FROM i1 WHERE id <= 100;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+# rows can be added after a purge, and the table is read the same way
+INSERT INTO t1 VALUES (5001, 'after', 5, '2020-01-01', 'b', 1.5);
+INSERT INTO i1 VALUES (5001, 'after', 5, '2020-01-01', 'b', 1.5);
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+SELECT COUNT(*) FROM t1 WHERE n > 100 AND d > '2001-01-01' AND e = 'b';
+COUNT(*)
+145
+SELECT COUNT(*) FROM i1 WHERE n > 100 AND d > '2001-01-01' AND e = 'b';
+COUNT(*)
+145
+# leftovers of a purge that was interrupted are removed or put back
+OPTIMIZE TABLE t1;
+Table	Op	Msg_type	Msg_text
+test.t1	optimize	status	OK
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+721
+# the background purge
+DELETE FROM t1 WHERE id > 900 AND id < 5000;
+DELETE FROM i1 WHERE id > 900 AND id < 5000;
+SET GLOBAL warp_purge_threshold = 1;
+SET GLOBAL warp_purge_interval = 1;
+SET GLOBAL warp_purge_interval = 0;
+the background purge removed rows: 1
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+SET GLOBAL warp_purge_threshold = 10;
+SET GLOBAL warp_purge_interval = 60;
+DROP TABLE t1, i1;

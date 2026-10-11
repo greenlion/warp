@@ -1,0 +1,53 @@
+#
+# The purge rewrites one partition at a time and locks only that partition:
+# the other partitions keep their files, and the table can be read and
+# written while the background purge runs.  The content is compared with
+# an InnoDB table.
+#
+SET GLOBAL warp_purge_interval = 0;
+SET GLOBAL warp_purge_threshold = 0;
+SET GLOBAL warp_partition_max_rows = 64000;
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE t1 (id INT, v VARCHAR(20), n INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i1 LIKE t1;
+ALTER TABLE i1 ENGINE=InnoDB;
+# four partitions of 60000 rows
+INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 60000) SELECT x, CONCAT('row ', x), x % 100 FROM seq;
+INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT 60001 UNION ALL SELECT x + 1 FROM seq WHERE x < 120000) SELECT x, CONCAT('row ', x), x % 100 FROM seq;
+INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT 120001 UNION ALL SELECT x + 1 FROM seq WHERE x < 180000) SELECT x, CONCAT('row ', x), x % 100 FROM seq;
+INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT 180001 UNION ALL SELECT x + 1 FROM seq WHERE x < 240000) SELECT x, CONCAT('row ', x), x % 100 FROM seq;
+INSERT INTO i1 SELECT * FROM t1;
+Number_of_rows = 60000
+Number_of_rows = 60000
+Number_of_rows = 60000
+Number_of_rows = 60000
+# the rows of one partition are deleted, only that partition is rewritten
+DELETE FROM t1 WHERE id BETWEEN 60001 AND 90000;
+DELETE FROM i1 WHERE id BETWEEN 60001 AND 90000;
+SET GLOBAL warp_purge_interval = 1;
+SET GLOBAL warp_purge_interval = 0;
+rows removed: 30000, partitions rewritten: 1
+Number_of_rows = 60000
+Number_of_rows = 30000
+Number_of_rows = 60000
+Number_of_rows = 60000
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+# reads and writes while the purge runs every second
+SET GLOBAL warp_purge_interval = 1;
+SET GLOBAL warp_purge_interval = 0;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+the purge ran while the table was used: 1
+SET GLOBAL warp_purge_threshold = 10;
+SET GLOBAL warp_purge_interval = 60;
+SET GLOBAL warp_partition_max_rows = 1000000;
+DROP TABLE t1, i1;
