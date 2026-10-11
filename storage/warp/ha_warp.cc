@@ -4426,6 +4426,20 @@ int ha_warp::append_column_filter(const Item *cond,
       return 0;
     }
 
+    /* A DECIMAL column is stored as text, so FastBit can not compare it with
+       a number: leave these comparisons to MySQL */
+    if(!is_is_null && !is_isnot_null && op != " LIKE ") {
+      for (uint i = 0; i < tmp->arg_count; ++i) {
+        if(arg[i]->type() == Item::Type::FIELD_ITEM) {
+          const enum_field_types rt =
+              down_cast<Item_field *>(arg[i])->field->real_type();
+          if(rt == MYSQL_TYPE_DECIMAL || rt == MYSQL_TYPE_NEWDECIMAL) {
+            return 0;
+          }
+        }
+      }
+    }
+
     /* Strings compared with <, <=, >, >= and BETWEEN */
     if(is_between || op == " < " || op == " <= " || op == " > " ||
        op == " >= ") {

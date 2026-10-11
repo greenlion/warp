@@ -1,0 +1,114 @@
+--echo #
+--echo # Comparisons of DECIMAL columns with constants.  WARP stores a DECIMAL
+--echo # as text, so the order of the text is not the order of the numbers
+--echo # ('10.50' < '9.00', negative values).  Every comparison is also run
+--echo # against an InnoDB table and the results must match.
+--echo #
+
+CREATE TABLE w (id INT, a DECIMAL(10,2) NOT NULL, b DECIMAL(10,2) NULL,
+  c DECIMAL(30,10) NULL, d DECIMAL(5,0) NOT NULL, e DECIMAL(10,4) NOT NULL) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w VALUES
+  (1, 9.00, 9.00, 9.0000000001, 9, 9.5),
+  (2, 10.50, 10.50, 10.5, 10, 10.5),
+  (3, -5.25, -5.25, -5.25, -5, 0),
+  (4, 100.00, 100.00, 100, 100, 100.0001),
+  (5, 1.00, NULL, NULL, 1, 1),
+  (6, 0.00, 0.00, 0, 0, 0),
+  (7, -0.01, -0.01, -0.0000000001, 0, 0.0001),
+  (8, -100.00, -100.00, -99999999999999999999.9999999999, -100, 5),
+  (9, 99999999.99, 99999999.99, 99999999999999999999.9999999999, 99999, 999999.9999),
+  (10, 5.00, 5.00, 5, 5, 5), (11, 20.00, 20.00, 20, 20, 20);
+INSERT INTO i SELECT * FROM w;
+
+--let $cols = a,b,c,d,e
+--let $values = 0,5,9,9.5,10,10.5,10.50,20,-5,-5.25,-0.01,100,99999999.99,1e1,9.5e0,-1,0.005,100.0000001
+--let $ops = =,<>,<,<=,>,>=,<=>
+
+--let $checked = 0
+--let $wrong = 0
+--let $clist = $cols,
+while ($clist != '')
+{
+  --let $col = `SELECT SUBSTRING_INDEX('$clist', ',', 1)`
+  --let $clist = `SELECT SUBSTRING('$clist', LENGTH('$col') + 2)`
+  --let $vlist = $values,
+  while ($vlist != '')
+  {
+    --let $v = `SELECT SUBSTRING_INDEX('$vlist', ',', 1)`
+    --let $vlist = `SELECT SUBSTRING('$vlist', LENGTH('$v') + 2)`
+    --let $olist = $ops,
+    while ($olist != '')
+    {
+      --let $op = `SELECT SUBSTRING_INDEX('$olist', ',', 1)`
+      --let $olist = `SELECT SUBSTRING('$olist', LENGTH('$op') + 2)`
+      --let $wr = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM w WHERE $col $op $v`
+      --let $ir = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM i WHERE $col $op $v`
+      --let $wr2 = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM w WHERE $v $op $col`
+      --let $ir2 = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM i WHERE $v $op $col`
+      inc $checked;
+      if ($wr != $ir)
+      {
+        inc $wrong;
+        --echo MISMATCH: $col $op $v WARP [$wr] InnoDB [$ir]
+      }
+      if ($wr2 != $ir2)
+      {
+        inc $wrong;
+        --echo MISMATCH: $v $op $col WARP [$wr2] InnoDB [$ir2]
+      }
+    }
+    --let $v2list = 0,5,10,20,-5.25,9.5,100,1e1
+    --let $v2list = $v2list,
+    while ($v2list != '')
+    {
+      --let $v2 = `SELECT SUBSTRING_INDEX('$v2list', ',', 1)`
+      --let $v2list = `SELECT SUBSTRING('$v2list', LENGTH('$v2') + 2)`
+      --let $wr = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM w WHERE $col BETWEEN $v AND $v2`
+      --let $ir = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM i WHERE $col BETWEEN $v AND $v2`
+      --let $wn = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM w WHERE $col NOT BETWEEN $v AND $v2`
+      --let $in = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM i WHERE $col NOT BETWEEN $v AND $v2`
+      inc $checked;
+      if ($wr != $ir)
+      {
+        inc $wrong;
+        --echo MISMATCH: $col BETWEEN $v AND $v2 WARP [$wr] InnoDB [$ir]
+      }
+      if ($wn != $in)
+      {
+        inc $wrong;
+        --echo MISMATCH: $col NOT BETWEEN $v AND $v2 WARP [$wn] InnoDB [$in]
+      }
+    }
+    --let $wr = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM w WHERE $col IN (5, $v, 10.5)`
+    --let $ir = `SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), '-') FROM i WHERE $col IN (5, $v, 10.5)`
+    inc $checked;
+    if ($wr != $ir)
+    {
+      inc $wrong;
+      --echo MISMATCH: $col IN (5, $v, 10.5) WARP [$wr] InnoDB [$ir]
+    }
+  }
+}
+--echo comparisons checked: $checked, mismatches: $wrong
+
+--echo # combined with other conditions, NULL tests and OR
+SELECT id FROM w WHERE b > 5 AND a < 100 AND d <> 10 ORDER BY id;
+SELECT id FROM i WHERE b > 5 AND a < 100 AND d <> 10 ORDER BY id;
+SELECT id FROM w WHERE b IS NULL OR c BETWEEN -6 AND 6 ORDER BY id;
+SELECT id FROM i WHERE b IS NULL OR c BETWEEN -6 AND 6 ORDER BY id;
+SELECT id FROM w WHERE b IS NOT NULL AND b >= 9 ORDER BY id;
+SELECT id FROM i WHERE b IS NOT NULL AND b >= 9 ORDER BY id;
+
+--echo # after an update
+UPDATE w SET a = 7.77, c = 7.7 WHERE id IN (2, 4);
+UPDATE i SET a = 7.77, c = 7.7 WHERE id IN (2, 4);
+DELETE FROM w WHERE id = 11;
+DELETE FROM i WHERE id = 11;
+SELECT id FROM w WHERE a BETWEEN 5 AND 9 ORDER BY id;
+SELECT id FROM i WHERE a BETWEEN 5 AND 9 ORDER BY id;
+SELECT id FROM w WHERE c > 7.7 ORDER BY id;
+SELECT id FROM i WHERE c > 7.7 ORDER BY id;
+
+DROP TABLE w, i;
