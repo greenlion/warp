@@ -1,0 +1,104 @@
+#
+# Rows that are written in small batches go to a small partition (the
+# tail of the table), so that the indexes of the large partitions are not
+# made again after every write.  The tail partitions are merged by the
+# purge (OPTIMIZE TABLE and the background thread).  The content of the
+# table is compared with an InnoDB table all the time.
+#
+# Regression test: every write made the index of the partition that it
+# was written to out of date, the next query made it again, and for a
+# table of a million rows that took a second (sysbench oltp_write_only
+# ran at 1 transaction per second).
+#
+SET GLOBAL warp_purge_interval = 0;
+SET GLOBAL warp_tail_partition_rows = 1000;
+SET GLOBAL warp_partition_max_rows = 64000;
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE t1 (id INT, v VARCHAR(20), n INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i1 LIKE t1;
+ALTER TABLE i1 ENGINE=InnoDB;
+# 12 batches of 500 rows, with a query after each: partitions of 1000 rows
+# (a table that is not queried between the writes is written to the first partition with room)
+p0 1000
+p1 1000
+p2 1000
+p3 1000
+p4 1000
+p5 1000
+# a batch of 3000 rows is written to the first partition with room, as before
+INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT 10001 UNION ALL SELECT x + 1 FROM seq WHERE x < 13000) SELECT x, CONCAT('bulk ', x), x % 100 FROM seq;
+INSERT INTO i1 WITH RECURSIVE seq(x) AS (SELECT 10001 UNION ALL SELECT x + 1 FROM seq WHERE x < 13000) SELECT x, CONCAT('bulk ', x), x % 100 FROM seq;
+p0 4000
+p1 1000
+p2 1000
+p3 1000
+p4 1000
+p5 1000
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+# OPTIMIZE merges the tail partitions, but not the last one
+OPTIMIZE TABLE t1;
+Table	Op	Msg_type	Msg_text
+test.t1	optimize	status	OK
+p0 4000
+p1 4000
+p5 1000
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+9000
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+# nothing is left of the merged partitions
+0 directories of a purge are left
+# small batches still go to a new tail partition, rows can be changed
+INSERT INTO t1 VALUES (20001, 'tail', 1), (20002, 'tail', 2);
+INSERT INTO i1 VALUES (20001, 'tail', 1), (20002, 'tail', 2);
+UPDATE t1 SET n = n + 100 WHERE id IN (1, 20001, 12999);
+UPDATE i1 SET n = n + 100 WHERE id IN (1, 20001, 12999);
+DELETE FROM t1 WHERE id IN (2, 20002);
+DELETE FROM i1 WHERE id IN (2, 20002);
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+# the background purge merges the partitions too
+# a scan that is running while the partitions are merged is not affected
+SELECT COUNT(*) FROM t1 WHERE SLEEP(0.0004) = 0;
+SET GLOBAL warp_purge_threshold = 100;
+SET GLOBAL warp_purge_interval = 1;
+COUNT(*)
+13000
+SET GLOBAL warp_purge_interval = 0;
+p0 4000
+p1 4002
+p5 1000
+p6 803
+p7 3200
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+rows_that_differ
+0
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+rows_that_differ
+0
+# a table that is loaded in small batches and not queried meanwhile stays in one partition
+CREATE TABLE t2 (id INT, v VARCHAR(20), n INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+p0 6000
+SELECT COUNT(*) FROM t2;
+COUNT(*)
+6000
+DROP TABLE t2;
+SET GLOBAL warp_purge_threshold = 10;
+SET GLOBAL warp_purge_interval = 60;
+SET GLOBAL warp_tail_partition_rows = 16384;
+SET GLOBAL warp_partition_max_rows = 1000000;
+DROP TABLE t1, i1;

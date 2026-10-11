@@ -41,6 +41,8 @@
 
 #include <sys/stat.h>
 #include <condition_variable>
+#include <fstream>
+#include <set>
 #include <filesystem>
 #include <thread>
 
@@ -123,53 +125,53 @@ static void warp_forget_partitions_of_dir(const std::string &data_dir) {
 
 /* the rows of the column that are in keep are written to the writer */
 static bool warp_copy_column(const ibis::column *col, const ibis::bitvector &keep,
-                             uint32_t kept, ibis::tablex *writer) {
+                             uint32_t offset, uint32_t kept, ibis::tablex *writer) {
   const char *name = col->name();
   switch(col->type()) {
     case ibis::BYTE: {
       std::unique_ptr<ibis::array_t<signed char>> v(col->selectBytes(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v->begin()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v->begin()) == 0;
     }
     case ibis::UBYTE: {
       std::unique_ptr<ibis::array_t<unsigned char>> v(col->selectUBytes(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v->begin()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v->begin()) == 0;
     }
     case ibis::SHORT: {
       std::unique_ptr<ibis::array_t<int16_t>> v(col->selectShorts(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v->begin()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v->begin()) == 0;
     }
     case ibis::USHORT: {
       std::unique_ptr<ibis::array_t<uint16_t>> v(col->selectUShorts(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v->begin()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v->begin()) == 0;
     }
     case ibis::INT: {
       std::unique_ptr<ibis::array_t<int32_t>> v(col->selectInts(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v->begin()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v->begin()) == 0;
     }
     case ibis::UINT: {
       std::unique_ptr<ibis::array_t<uint32_t>> v(col->selectUInts(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v->begin()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v->begin()) == 0;
     }
     case ibis::LONG: {
       std::unique_ptr<ibis::array_t<int64_t>> v(col->selectLongs(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v->begin()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v->begin()) == 0;
     }
     case ibis::ULONG: {
       std::unique_ptr<ibis::array_t<uint64_t>> v(col->selectULongs(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v->begin()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v->begin()) == 0;
     }
     case ibis::FLOAT: {
       std::unique_ptr<ibis::array_t<float>> v(col->selectFloats(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v->begin()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v->begin()) == 0;
     }
     case ibis::DOUBLE: {
       std::unique_ptr<ibis::array_t<double>> v(col->selectDoubles(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v->begin()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v->begin()) == 0;
     }
     case ibis::TEXT:
     case ibis::CATEGORY: {
       std::unique_ptr<std::vector<std::string>> v(col->selectStrings(keep));
-      return v && v->size() == kept && writer->append(name, 0, kept, v.get()) == 0;
+      return v && v->size() == kept && writer->append(name, offset, offset + kept, v.get()) == 0;
     }
     default:
       return false;
@@ -185,7 +187,23 @@ static void warp_remove_dir(const std::string &dir) {
   }
 }
 
-/* Repairs what a server that stopped while a partition was purged left. */
+/* One purge or merge of a table at a time: the directories that they make
+   and replace are found by the repair of an interrupted one. */
+static std::mutex warp_rewrite_mtx;
+
+/* The file in a merged partition that names the partitions that were merged
+   into it.  It is there from the moment the partition is in place until the
+   partitions that were merged are removed, see warp_purge_recover. */
+static const char *warp_merged_marker = "-merged.txt";
+
+/* Repairs what a server that stopped while partitions were rewritten left:
+
+     <table>.data.purge-p3          a new directory, not in place
+     <table>.data.purge-p3.old      the partition that was replaced
+
+   A partition that was moved away is the partition again, unless the
+   partition that took its rows is in place.  That one has a file that names
+   the partitions that were merged into it.  Called with warp_rewrite_mtx. */
 static void warp_purge_recover(const std::string &data_dir) {
   const std::string prefix = data_dir + ".purge-";
   const size_t slash = prefix.rfind('/');
@@ -197,152 +215,305 @@ static void warp_purge_recover(const std::string &data_dir) {
     const std::string name = entry.path().filename().string();
     if(name.compare(0, base.size(), base) == 0) names.push_back(name);
   }
+  if(names.empty()) return;
+
+  /* the partitions that were merged into another one that is in place */
+  std::set<uint64_t> merged;
+  std::vector<std::string> markers;
+  for(const auto &entry : std::filesystem::directory_iterator(data_dir, ec)) {
+    uint64_t number;
+    if(!warp_partition_number(entry.path().filename().c_str(), number)) continue;
+    const std::string marker = entry.path().string() + "/" + warp_merged_marker;
+    std::ifstream in(marker);
+    if(!in) continue;
+    markers.push_back(marker);
+    uint64_t from;
+    while(in >> from) merged.insert(from);
+  }
+
   for(const auto &name : names) {
     const std::string dir = parent + "/" + name;
     const bool is_old = name.size() > 4 && name.compare(name.size() - 4, 4, ".old") == 0;
     const std::string part_name = is_old ? name.substr(base.size(), name.size() - base.size() - 4)
                                          : name.substr(base.size());
     const std::string part_dir = data_dir + "/" + part_name;
+    uint64_t number = 0;
+    warp_partition_number(part_name.c_str(), number);
+    struct stat st;
     if(is_old) {
-      struct stat st;
-      if(stat(part_dir.c_str(), &st) != 0) {
-        /* the partition was moved away and the new one was not put in place:
-           the old one is the partition */
-        if(rename(dir.c_str(), part_dir.c_str()) == 0) {
-          sql_print_warning("WARP purge: restored the partition %s", part_dir.c_str());
-          ibis::fileManager::instance().flushDir(part_dir.c_str());
-          warp_forget_partitions_of_dir(data_dir);
-        }
-      } else {
+      if(stat(part_dir.c_str(), &st) == 0 || merged.count(number) != 0) {
+        /* the new partition is in place */
         warp_remove_dir(dir);
+      } else if(rename(dir.c_str(), part_dir.c_str()) == 0) {
+        /* the partition was moved away and the new one was not put in place */
+        sql_print_warning("WARP purge: restored the partition %s", part_dir.c_str());
+        ibis::fileManager::instance().flushDir(part_dir.c_str());
+        warp_forget_partitions_of_dir(data_dir);
       }
-    } else {
-      /* a new directory that was not put in place, or the one of a purge that
-         is running now */
-      struct stat st;
-      if(stat((dir + ".old").c_str(), &st) != 0) warp_remove_dir(dir);
+    } else if(stat((dir + ".old").c_str(), &st) != 0) {
+      /* a new directory that was not put in place */
+      warp_remove_dir(dir);
     }
   }
+  /* the partitions that were merged are removed or put back now */
+  for(const auto &marker : markers) {
+    std::error_code ec2;
+    std::filesystem::remove(marker, ec2);
+  }
+  warp_forget_partitions_of_dir(data_dir);
 }
 
-/* Purges one partition.  threshold is the percent of the rows of the
-   partition that must be removable.  Returns the number of rows removed. */
-static uint64_t warp_purge_partition(const std::string &data_dir, uint64_t number,
-                                     unsigned threshold) {
-  const std::string name = "p" + std::to_string(number);
-  const std::string part_dir = data_dir + "/" + name;
-  const std::string stage_dir = data_dir + ".purge-" + name;
-  const std::string old_dir = stage_dir + ".old";
-  struct stat st;
-  if(stat((part_dir + "/-part.txt").c_str(), &st) != 0) return 0;
-
-  warp_part_signature signature;
-  uint32_t kept = 0;
-  uint32_t rows = 0;
-  {
-    /* the partition is read, the writers wait for the lock */
-    warp_partition_read_lock read_lock(part_dir);
-    signature = warp_partition_signature(part_dir);
-    if(!signature.valid) return 0;
-
-    ibis::partList parts;
-    ibis::util::gatherParts(parts, part_dir.c_str(), true);
-    std::unique_ptr<ibis::part> part;
-    for(auto p : parts) {
-      if(!part && p->currentDataDir() != nullptr && part_dir == p->currentDataDir()) {
-        part.reset(p);
-      } else {
-        delete p;
+/* Reserves partitions of a table for a merge: none of them can be chosen by a
+   writer from now on, and it fails if a writer has chosen one already.  The
+   reservation is given up when the object goes away. */
+class warp_reservation {
+ public:
+  warp_reservation(const std::string &data_dir, const std::vector<uint64_t> &numbers)
+      : data_dir_(data_dir), numbers_(numbers) {
+    mysql_mutex_lock(&warp_mutex);
+    std::vector<WARP_SHARE *> shares;
+    for(const auto &entry : *warp_open_tables) {
+      if(data_dir_ == entry.second->data_dir_name) shares.push_back(entry.second);
+    }
+    for(auto share : shares) mysql_mutex_lock(&share->mutex);
+    bool free = true;
+    for(auto share : shares) {
+      for(uint64_t n : numbers_) {
+        if(share->partitions_writing.count(n) != 0) free = false;
       }
     }
-    if(!part || part->nRows() == 0) return 0;
-    rows = part->nRows();
-    const ibis::column *rcol = part->getColumn("r");
-    const ibis::column *tcol = part->getColumn("t");
-    if(rcol == nullptr || tcol == nullptr) return 0;
+    if(free) {
+      std::lock_guard<std::mutex> guard(warp_reserved_mtx);
+      for(uint64_t n : numbers_) warp_reserved_partitions.insert(std::make_pair(data_dir_, n));
+      held_ = true;
+    }
+    for(auto it = shares.rbegin(); it != shares.rend(); ++it) mysql_mutex_unlock(&(*it)->mutex);
+    mysql_mutex_unlock(&warp_mutex);
+  }
+  ~warp_reservation() {
+    if(!held_) return;
+    std::lock_guard<std::mutex> guard(warp_reserved_mtx);
+    for(uint64_t n : numbers_) warp_reserved_partitions.erase(std::make_pair(data_dir_, n));
+  }
+  bool held() const { return held_; }
+  warp_reservation(const warp_reservation &) = delete;
+  warp_reservation &operator=(const warp_reservation &) = delete;
 
-    ibis::bitvector keep;
-    keep.set(1, rows);
-    uint64_t removable = 0;
-    {
-      std::unique_ptr<ibis::array_t<uint64_t>> rowids(rcol->selectULongs(keep));
-      std::unique_ptr<ibis::array_t<uint64_t>> trxs(tcol->selectULongs(keep));
-      if(!rowids || !trxs || rowids->size() != rows || trxs->size() != rows) return 0;
-      /* the history locks of the transactions that are gone do not hold
-         rows any more */
-      warp_state->cleanup_history_locks();
-      for(uint32_t i = 0; i < rows; ++i) {
-        if(warp_state->is_row_purgeable((*rowids)[i], (*trxs)[i])) {
-          keep.setBit(i, 0);
-          ++removable;
+ private:
+  std::string data_dir_;
+  std::vector<uint64_t> numbers_;
+  bool held_ = false;
+};
+
+/* The partitions of a table that are read and rewritten as one */
+struct warp_rewrite_source {
+  uint64_t number = 0;
+  std::string dir;
+  warp_part_signature signature;
+  std::unique_ptr<ibis::part> part;
+  ibis::bitvector keep;
+  uint32_t rows = 0;
+  uint32_t kept = 0;
+};
+
+/* Rewrites the partitions in numbers (ascending) into one partition, the
+   first of them: the rows that nobody can see are not written, and the rows
+   of the others follow those of the first one.  A single partition is
+   purged: it is only rewritten if at least threshold percent of its rows can
+   be removed.  Several are merged, whatever there is to remove.  Returns the
+   number of rows that were not written.  Called with warp_rewrite_mtx. */
+static uint64_t warp_rewrite_partitions(const std::string &data_dir,
+                                        const std::vector<uint64_t> &numbers,
+                                        unsigned threshold) {
+  if(numbers.empty()) return 0;
+  const bool merge = numbers.size() > 1;
+  /* a merge replaces partitions that writers may choose */
+  std::unique_ptr<warp_reservation> reservation;
+  if(merge) {
+    reservation.reset(new warp_reservation(data_dir, numbers));
+    if(!reservation->held()) return 0;
+  }
+  const std::string first_name = "p" + std::to_string(numbers[0]);
+  const std::string first_dir = data_dir + "/" + first_name;
+  const std::string stage_dir = data_dir + ".purge-" + first_name;
+  std::vector<warp_rewrite_source> sources(numbers.size());
+  uint64_t removable = 0;
+  uint64_t total_rows = 0;
+  uint32_t kept_rows = 0;
+  {
+    /* the partitions are read, the writers wait for the locks, in order */
+    std::vector<std::unique_ptr<warp_partition_read_lock>> read_locks;
+    for(size_t n = 0; n < numbers.size(); ++n) {
+      auto &src = sources[n];
+      src.number = numbers[n];
+      src.dir = data_dir + "/p" + std::to_string(numbers[n]);
+      read_locks.emplace_back(new warp_partition_read_lock(src.dir));
+      src.signature = warp_partition_signature(src.dir);
+      if(!src.signature.valid) return 0;
+      ibis::partList parts;
+      ibis::util::gatherParts(parts, src.dir.c_str(), true);
+      for(auto p : parts) {
+        if(!src.part && p->currentDataDir() != nullptr && src.dir == p->currentDataDir()) {
+          src.part.reset(p);
+        } else {
+          delete p;
         }
       }
+      if(!src.part || src.part->nRows() == 0) return 0;
+      src.rows = src.part->nRows();
+      total_rows += src.rows;
     }
-    keep.adjustSize(0, rows);
-    if(removable == 0 || removable * 100 < (uint64_t)rows * threshold) {
-      ibis::fileManager::instance().flushDir(part_dir.c_str());
+    /* the history locks of the transactions that are gone do not hold rows
+       any more */
+    warp_state->cleanup_history_locks();
+    for(auto &src : sources) {
+      const ibis::column *rcol = src.part->getColumn("r");
+      const ibis::column *tcol = src.part->getColumn("t");
+      if(rcol == nullptr || tcol == nullptr) return 0;
+      src.keep.set(1, src.rows);
+      std::unique_ptr<ibis::array_t<uint64_t>> rowids(rcol->selectULongs(src.keep));
+      std::unique_ptr<ibis::array_t<uint64_t>> trxs(tcol->selectULongs(src.keep));
+      if(!rowids || !trxs || rowids->size() != src.rows || trxs->size() != src.rows) return 0;
+      uint32_t gone = 0;
+      for(uint32_t i = 0; i < src.rows; ++i) {
+        if(warp_state->is_row_purgeable((*rowids)[i], (*trxs)[i])) {
+          src.keep.setBit(i, 0);
+          ++gone;
+        }
+      }
+      src.keep.adjustSize(0, src.rows);
+      src.kept = src.rows - gone;
+      kept_rows += src.kept;
+      removable += gone;
+    }
+    if(!merge && (removable == 0 || removable * 100 < total_rows * threshold)) {
+      ibis::fileManager::instance().flushDir(first_dir.c_str());
       return 0;
     }
-    kept = rows - (uint32_t)removable;
 
     warp_remove_dir(stage_dir);
-    if(kept > 0) {
+    if(kept_rows > 0) {
       std::unique_ptr<ibis::tablex> writer(ibis::tablex::create());
-      for(uint32_t c = 0; c < part->nColumns(); ++c) {
-        const ibis::column *col = part->getColumn(c);
+      const ibis::part &model = *sources[0].part;
+      for(uint32_t c = 0; c < model.nColumns(); ++c) {
+        const ibis::column *col = model.getColumn(c);
         if(writer->addColumn(col->name(), col->type(), col->description(),
                              col->indexSpec()) != 0) {
           return 0;
         }
       }
-      for(uint32_t c = 0; c < part->nColumns(); ++c) {
-        if(!warp_copy_column(part->getColumn(c), keep, kept, writer.get())) {
-          sql_print_warning("WARP purge: could not copy the column %s of %s",
-                            part->getColumn(c)->name(), part_dir.c_str());
-          warp_purge_failures_total++;
-          return 0;
+      uint32_t offset = 0;
+      for(auto &src : sources) {
+        if(src.kept > 0) {
+          for(uint32_t c = 0; c < src.part->nColumns(); ++c) {
+            const ibis::column *col = src.part->getColumn(c);
+            if(!warp_copy_column(col, src.keep, offset, src.kept, writer.get())) {
+              sql_print_warning("WARP purge: could not copy the column %s of %s",
+                                col->name(), src.dir.c_str());
+              warp_purge_failures_total++;
+              return 0;
+            }
+          }
         }
+        offset += src.kept;
       }
-      if(writer->write(stage_dir.c_str(), name.c_str()) != (int)kept) {
+      if(writer->write(stage_dir.c_str(), first_name.c_str()) != (int)kept_rows) {
         sql_print_warning("WARP purge: could not write %s", stage_dir.c_str());
         warp_remove_dir(stage_dir);
         warp_purge_failures_total++;
         return 0;
       }
-    }
-    ibis::fileManager::instance().flushDir(part_dir.c_str());
-  }
-
-  /* put the new directory in place */
-  bool swapped = false;
-  {
-    warp_partition_write_lock write_lock(part_dir);
-    if(warp_partition_signature(part_dir) == signature) {
-      if(rename(part_dir.c_str(), old_dir.c_str()) == 0) {
-        if(kept == 0 || rename(stage_dir.c_str(), part_dir.c_str()) == 0) {
-          swapped = true;
-        } else {
-          rename(old_dir.c_str(), part_dir.c_str());
-        }
+      if(merge) {
+        std::ofstream marker(stage_dir + "/" + warp_merged_marker);
+        for(size_t n = 1; n < numbers.size(); ++n) marker << numbers[n] << "\n";
       }
     }
-    ibis::fileManager::instance().flushDir(part_dir.c_str());
+    for(auto &src : sources) ibis::fileManager::instance().flushDir(src.dir.c_str());
   }
-  if(!swapped) {
-    /* rows were written to the partition, or it is gone */
+
+  /* Put the new directory in place, with the partitions locked in order.
+     A merge waits for the scans that listed the partitions to end. */
+  bool swapped = false;
+  std::vector<std::string> old_dirs(sources.size());
+  auto table_locks = warp_table_locks(data_dir);
+  const bool gate = merge && table_locks->scans.enter_exclusive(std::chrono::seconds(5));
+  if(merge && !gate) {
     warp_remove_dir(stage_dir);
     return 0;
   }
-  warp_remove_dir(old_dir);
+  {
+    std::vector<std::unique_ptr<warp_partition_write_lock>> write_locks;
+    for(auto &src : sources) write_locks.emplace_back(new warp_partition_write_lock(src.dir));
+    bool unchanged = true;
+    for(auto &src : sources) {
+      if(!(warp_partition_signature(src.dir) == src.signature)) unchanged = false;
+    }
+    if(unchanged) {
+      size_t moved = 0;
+      bool ok = true;
+      /* the others first, the first one last: if the server stops before
+         the new partition is in place all of them are put back */
+      for(size_t n = sources.size(); n-- > 0 && ok;) {
+        old_dirs[n] = data_dir + ".purge-p" + std::to_string(sources[n].number) + ".old";
+        if(rename(sources[n].dir.c_str(), old_dirs[n].c_str()) == 0) {
+          ++moved;
+        } else {
+          ok = false;
+        }
+      }
+      if(ok && kept_rows > 0 && rename(stage_dir.c_str(), first_dir.c_str()) != 0) {
+        ok = false;
+      }
+      if(ok) {
+        swapped = true;
+      } else {
+        for(size_t n = sources.size(); n-- > sources.size() - moved;) {
+          rename(old_dirs[n].c_str(), sources[n].dir.c_str());
+        }
+      }
+    }
+    for(auto &src : sources) ibis::fileManager::instance().flushDir(src.dir.c_str());
+  }
+  if(gate) table_locks->scans.leave_exclusive();
+  if(!swapped) {
+    /* rows were written to a partition, or it is gone */
+    warp_remove_dir(stage_dir);
+    return 0;
+  }
+  for(size_t n = 0; n < sources.size(); ++n) warp_remove_dir(old_dirs[n]);
+  if(merge) {
+    std::error_code ec;
+    std::filesystem::remove(first_dir + "/" + warp_merged_marker, ec);
+  }
   warp_forget_partitions_of_dir(data_dir);
-  warp_purged_rows_total += rows - kept;
-  warp_purged_partitions_total++;
-  return rows - kept;
+  warp_purged_rows_total += removable;
+  warp_purged_partitions_total += sources.size();
+  return removable;
+}
+
+/* the numbers of the partitions of a table with their rows */
+static std::map<uint64_t, uint64_t> warp_partition_row_counts(const std::string &data_dir) {
+  std::map<uint64_t, uint64_t> rows;
+  std::error_code ec;
+  for(const auto &entry : std::filesystem::directory_iterator(data_dir, ec)) {
+    uint64_t number;
+    if(!warp_partition_number(entry.path().filename().c_str(), number)) continue;
+    ibis::partList parts;
+    ibis::util::gatherParts(parts, entry.path().c_str(), true);
+    for(auto p : parts) {
+      if(p->currentDataDir() != nullptr && entry.path() == p->currentDataDir()) {
+        rows[number] = p->nRows();
+      }
+      delete p;
+    }
+  }
+  return rows;
 }
 
 /* Purges the partitions of a table.  Returns the number of rows removed. */
 static uint64_t warp_purge_table(const std::string &data_dir, unsigned threshold) {
   if(warp_state == NULL) return 0;
+  std::lock_guard<std::mutex> guard(warp_rewrite_mtx);
   uint64_t removed = 0;
   try {
     warp_purge_recover(data_dir);
@@ -356,7 +527,7 @@ static uint64_t warp_purge_table(const std::string &data_dir, unsigned threshold
     }
     std::sort(numbers.begin(), numbers.end());
     for(uint64_t number : numbers) {
-      removed += warp_purge_partition(data_dir, number, threshold);
+      removed += warp_rewrite_partitions(data_dir, {number}, threshold);
     }
   } catch(const std::exception &e) {
     sql_print_warning("WARP purge of %s failed: %s", data_dir.c_str(), e.what());
@@ -366,6 +537,60 @@ static uint64_t warp_purge_table(const std::string &data_dir, unsigned threshold
     warp_purge_failures_total++;
   }
   return removed;
+}
+
+/* The partitions that rows were written to in small batches (see
+   ha_warp::claim_writer_partition) are merged: runs of the partitions that
+   have the rows of a tail partition or less are written as one partition, as
+   long as the rows fit in a partition.  The tail partition that rows are
+   written to now, the last one, is left alone.  Returns the number of
+   partitions that were merged away. */
+static uint64_t warp_merge_tail_partitions(const std::string &data_dir) {
+  if(warp_state == NULL || my_tail_partition_rows == 0) return 0;
+  std::lock_guard<std::mutex> guard(warp_rewrite_mtx);
+  const uint64_t tail_rows = std::min<uint64_t>(my_tail_partition_rows, my_partition_max_rows);
+  uint64_t merged_away = 0;
+  try {
+    warp_purge_recover(data_dir);
+    const auto rows = warp_partition_row_counts(data_dir);
+    /* the partitions with at most the rows of a tail partition, without the
+       last partition of the table */
+    std::vector<uint64_t> small;
+    for(const auto &partition : rows) {
+      if(partition.second > 0 && partition.second <= tail_rows &&
+         partition.first != rows.rbegin()->first) {
+        small.push_back(partition.first);
+      }
+    }
+    /* runs of the partitions that fit in one */
+    size_t i = 0;
+    while(i < small.size()) {
+      std::vector<uint64_t> group;
+      uint64_t total = 0;
+      while(i < small.size() && total + rows.at(small[i]) <= my_partition_max_rows) {
+        total += rows.at(small[i]);
+        group.push_back(small[i]);
+        ++i;
+      }
+      if(group.empty()) {
+        ++i;
+        continue;
+      }
+      /* a few partitions are not worth the writing */
+      if(group.size() >= 4) {
+        const uint64_t before = warp_purged_partitions_total.load();
+        warp_rewrite_partitions(data_dir, group, 0);
+        if(warp_purged_partitions_total.load() > before) merged_away += group.size() - 1;
+      }
+    }
+  } catch(const std::exception &e) {
+    sql_print_warning("WARP merge of %s failed: %s", data_dir.c_str(), e.what());
+    warp_purge_failures_total++;
+  } catch(...) {
+    sql_print_warning("WARP merge of %s failed", data_dir.c_str());
+    warp_purge_failures_total++;
+  }
+  return merged_away;
 }
 
 /* the data directories of all the WARP tables, like ./test/t1.data */
@@ -416,6 +641,7 @@ static void warp_purge_thread_main() {
     for(const auto &table : warp_list_tables()) {
       if(warp_purge_stopping) break;
       warp_purge_table(table, my_purge_threshold);
+      warp_merge_tail_partitions(table);
     }
     lock.lock();
     last_run = std::chrono::steady_clock::now();

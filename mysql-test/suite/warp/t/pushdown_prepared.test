@@ -1,0 +1,118 @@
+--echo #
+--echo # Conditions with the parameters of prepared statements (WHERE id = ?)
+--echo # are pushed down with the values of the execution, like the constants of
+--echo # the other statements.  Every statement is executed with several
+--echo # values and compared with an InnoDB table; the condition belongs to the
+--echo # statement, so a value of an execution must not stay in the next one.
+--echo #
+--echo # Regression test: the parameters were not pushed down, every prepared
+--echo # statement scanned the whole table in MySQL (sysbench oltp_point_select
+--echo # ran at 14 instead of 2000 queries per second).
+--echo #
+
+CREATE TABLE w (
+  id INT, ub BIGINT UNSIGNED, dc DECIMAL(12,3), d DOUBLE, vc VARCHAR(20),
+  dt DATE, ts TIMESTAMP NULL, e ENUM('x', 'y', 'z')
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w VALUES
+  (1, 0, -5.5, -1.5, '', '1999-12-31', '1999-12-31 10:00:00', 'x'),
+  (2, 18446744073709551615, 5.5, 2.5, 'a', '2000-01-01', '2000-01-01 00:00:00', 'y'),
+  (3, 9007199254740993, 10.5, 1e100, 'a ', '2000-01-02', '2000-01-02 00:00:00', 'z'),
+  (4, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+  (5, 5, 0, 0, 'B', '2001-06-30', '2001-06-30 12:00:00', 'x'),
+  (6, 6, 9.999, 9.9, 'abc', '1000-01-01', '1970-01-02 00:00:00', 'y'),
+  (7, 5, 100, 100, 'é', '9999-12-31', '2038-01-19 03:14:07', 'z');
+INSERT INTO i SELECT * FROM w;
+
+--let $checked = 0
+--let $wrong = 0
+--let $cols = id|ub|dc|d|vc|dt|ts|e
+--let $clist = $cols|
+while ($clist != '')
+{
+  --let $col = `SELECT SUBSTRING_INDEX('$clist', '|', 1)`
+  --let $clist = `SELECT SUBSTRING('$clist', LENGTH('$col') + 2)`
+  let $v1 = 5;
+  let $v2 = 100;
+  if ($col == ub) { let $v1 = 18446744073709551615; let $v2 = 9007199254740993; }
+  if ($col == dc) { let $v1 = 5.5; let $v2 = -5.5; }
+  if ($col == d) { let $v1 = 2.5; let $v2 = 1e100; }
+  if ($col == vc) { let $v1 = 'a'; let $v2 = 'B'; }
+  if ($col == dt) { let $v1 = '2000-01-01'; let $v2 = '9999-12-31'; }
+  if ($col == ts) { let $v1 = '2000-01-01 00:00:00'; let $v2 = '2038-01-19 03:14:07'; }
+  if ($col == e) { let $v1 = 'x'; let $v2 = 'z'; }
+
+  let $k = 0;
+  while ($k < 9)
+  {
+    inc $k;
+    let $where = 1;
+    let $using = @a;
+    if ($k == 1) { let $where = $col = ?; }
+    if ($k == 2) { let $where = $col <> ?; }
+    if ($k == 3) { let $where = $col < ?; }
+    if ($k == 4) { let $where = $col >= ?; }
+    if ($k == 5) { let $where = ? > $col; }
+    if ($k == 6) { let $where = $col BETWEEN ? AND ?; let $using = @a, @b; }
+    if ($k == 7) { let $where = $col IN (?, ?); let $using = @a, @b; }
+    if ($k == 8) { let $where = $col <=> ?; }
+    if ($k == 9) { let $where = $col > ? OR $col IS NULL; }
+    --disable_query_log
+    eval PREPARE sw FROM 'SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), "-") INTO @rw FROM w WHERE $where';
+    eval PREPARE si FROM 'SELECT IFNULL(GROUP_CONCAT(id ORDER BY id), "-") INTO @ri FROM i WHERE $where';
+    let $round = 0;
+    while ($round < 4)
+    {
+      inc $round;
+      if ($round == 1) { let $a = $v1; let $b = $v2; }
+      if ($round == 2) { let $a = $v2; let $b = $v1; }
+      if ($round == 3) { let $a = $v1; let $b = $v1; }
+      if ($round == 4) { let $a = NULL; let $b = $v2; }
+      eval SET @a = $a, @b = $b;
+      eval EXECUTE sw USING $using;
+      eval EXECUTE si USING $using;
+      let $rw = `SELECT @rw`;
+      let $ri = `SELECT @ri`;
+      inc $checked;
+      if ($rw != $ri)
+      {
+        inc $wrong;
+        --echo MISMATCH WHERE $where with @a = $a, @b = $b: WARP [$rw] InnoDB [$ri]
+      }
+    }
+    DEALLOCATE PREPARE sw;
+    DEALLOCATE PREPARE si;
+    --enable_query_log
+  }
+}
+--echo $checked executions checked, $wrong mismatches
+
+--echo # The conditions that FastBit evaluates have no Filter in the plan
+SET @a = 5, @b = 100;
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE id = ?';
+--replace_regex /\(cost=[^)]*\)//
+EXECUTE s USING @a;
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE id BETWEEN ? AND ?';
+--replace_regex /\(cost=[^)]*\)//
+EXECUTE s USING @a, @b;
+SET @s = 'a';
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc = ?';
+--replace_regex /\(cost=[^)]*\)//
+EXECUTE s USING @s;
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc IN (?, ?)';
+--replace_regex /\(cost=[^)]*\)//
+EXECUTE s USING @s, @s;
+SET @dc = 5.5;
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dc > ?';
+--replace_regex /\(cost=[^)]*\)//
+EXECUTE s USING @dc;
+SET @n = NULL;
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE id = ?';
+--echo # a NULL parameter is left to MySQL
+--replace_regex /\(cost=[^)]*\)//
+EXECUTE s USING @n;
+DEALLOCATE PREPARE s;
+
+DROP TABLE w, i;

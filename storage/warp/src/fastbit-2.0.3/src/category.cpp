@@ -17,6 +17,7 @@
 #include <algorithm>    // std::copy
 #include <memory>       // std::unique_ptr
 #include <functional>   // std::function
+#include <mutex>
 #include <string_view>
 #include <unordered_set>
 
@@ -1575,6 +1576,12 @@ void ibis::text::startPositions(const char *dir, char *buf,
     std::string spfile = dfile;
     spfile += ".sp";
     mutexLock lock(this, "text::startPositions");
+    // Every query has column objects of its own, and the queries that run at
+    // the same time bring the same .sp file up to date: they would unpack,
+    // change and pack it again together.  One at a time, the later ones find
+    // the file complete.
+    static std::mutex startPositionsMutex;
+    std::lock_guard<std::mutex> startPositionsGuard(startPositionsMutex);
     // The .sp file is updated in place with raw writes below.  If it is
     // compressed (or new while compression is enabled) work on a plain
     // copy and compress it again when done.

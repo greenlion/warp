@@ -1,0 +1,72 @@
+#
+# Conditions with the parameters of prepared statements (WHERE id = ?)
+# are pushed down with the values of the execution, like the constants of
+# the other statements.  Every statement is executed with several
+# values and compared with an InnoDB table; the condition belongs to the
+# statement, so a value of an execution must not stay in the next one.
+#
+# Regression test: the parameters were not pushed down, every prepared
+# statement scanned the whole table in MySQL (sysbench oltp_point_select
+# ran at 14 instead of 2000 queries per second).
+#
+CREATE TABLE w (
+id INT, ub BIGINT UNSIGNED, dc DECIMAL(12,3), d DOUBLE, vc VARCHAR(20),
+dt DATE, ts TIMESTAMP NULL, e ENUM('x', 'y', 'z')
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w VALUES
+(1, 0, -5.5, -1.5, '', '1999-12-31', '1999-12-31 10:00:00', 'x'),
+(2, 18446744073709551615, 5.5, 2.5, 'a', '2000-01-01', '2000-01-01 00:00:00', 'y'),
+(3, 9007199254740993, 10.5, 1e100, 'a ', '2000-01-02', '2000-01-02 00:00:00', 'z'),
+(4, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+(5, 5, 0, 0, 'B', '2001-06-30', '2001-06-30 12:00:00', 'x'),
+(6, 6, 9.999, 9.9, 'abc', '1000-01-01', '1970-01-02 00:00:00', 'y'),
+(7, 5, 100, 100, 'é', '9999-12-31', '2038-01-19 03:14:07', 'z');
+INSERT INTO i SELECT * FROM w;
+288 executions checked, 0 mismatches
+# The conditions that FastBit evaluates have no Filter in the plan
+SET @a = 5, @b = 100;
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE id = ?';
+EXECUTE s USING @a;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE id BETWEEN ? AND ?';
+EXECUTE s USING @a, @b;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+SET @s = 'a';
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc = ?';
+EXECUTE s USING @s;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc IN (?, ?)';
+EXECUTE s USING @s, @s;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+SET @dc = 5.5;
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dc > ?';
+EXECUTE s USING @dc;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+SET @n = NULL;
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE id = ?';
+# a NULL parameter is left to MySQL
+EXECUTE s USING @n;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.id = NULL)  
+        -> Table scan on w  
+
+DEALLOCATE PREPARE s;
+DROP TABLE w, i;

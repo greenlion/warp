@@ -270,6 +270,28 @@ static MYSQL_SYSVAR_UINT(
   0
 );
 
+/* Rows that are written in small batches go to a partition of at most this
+   many rows (a tail partition), so that the index of a partition that was
+   loaded in bulk is not made again for every row that is written (see
+   ha_warp::claim_writer_partition).  The purge merges the tail partitions. */
+static unsigned long long my_tail_partition_rows = 16384;
+
+static MYSQL_SYSVAR_ULONGLONG(
+  tail_partition_rows,
+  my_tail_partition_rows,
+  PLUGIN_VAR_RQCMDARG,
+  "Rows that are written in batches smaller than this are written to a partition "
+  "of at most this many rows, which the background purge merges later.  The "
+  "indexes of the large partitions are then not made again after every write.  "
+  "0 writes to the first partition with room.",
+  NULL,
+  NULL,
+  16384,
+  0,
+  1ULL<<40,
+  0
+);
+
 static MYSQL_THDVAR_ULONG(lock_wait_timeout, PLUGIN_VAR_RQCMDARG,
                           "Timeout in seconds a WARP transaction may wait "
                           "for a lock before being rolled back.",
@@ -334,6 +356,7 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(lock_wait_timeout),
   MYSQL_SYSVAR(purge_interval),
   MYSQL_SYSVAR(purge_threshold),
+  MYSQL_SYSVAR(tail_partition_rows),
   MYSQL_SYSVAR(partition_filter),
   MYSQL_SYSVAR(adjust_table_stats_for_joins),
   MYSQL_SYSVAR(star_aggregation),
@@ -794,6 +817,8 @@ warp_trx* warp_get_trx(handlerton* hton, THD* thd);
 //scanning tables, inserts, updates, deletes, engine condition pushdown
 struct warp_star_agg;  /* warp_star_agg.h */
 
+struct warp_table_lock_set;
+
 class ha_warp : public handler {
   /* MySQL lock - Fastbit has its own internal mutex implementation.  This is used to protect the share.*/
   THR_LOCK_DATA lock; 
@@ -866,6 +891,11 @@ class ha_warp : public handler {
                        ibis::table** filtered);
   void discard_prefetched();
   void release_scanned_table();
+  /* The scan of the table is registered while it runs, so that partitions
+     are not merged under it (see warp_scan_gate) */
+  std::shared_ptr<warp_table_lock_set> scan_lease;
+  void acquire_scan_lease();
+  void release_scan_lease();
   void open_deleted_bitmap(int lock_mode = LOCK_SH);
   void close_deleted_bitmap();
   bool is_deleted(uint64_t rowid);

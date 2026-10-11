@@ -1,0 +1,136 @@
+--echo #
+--echo # Rows that are written in small batches go to a small partition (the
+--echo # tail of the table), so that the indexes of the large partitions are not
+--echo # made again after every write.  The tail partitions are merged by the
+--echo # purge (OPTIMIZE TABLE and the background thread).  The content of the
+--echo # table is compared with an InnoDB table all the time.
+--echo #
+--echo # Regression test: every write made the index of the partition that it
+--echo # was written to out of date, the next query made it again, and for a
+--echo # table of a million rows that took a second (sysbench oltp_write_only
+--echo # ran at 1 transaction per second).
+--echo #
+
+SET GLOBAL warp_purge_interval = 0;
+SET GLOBAL warp_tail_partition_rows = 1000;
+SET GLOBAL warp_partition_max_rows = 64000;
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE t1 (id INT, v VARCHAR(20), n INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE i1 LIKE t1;
+ALTER TABLE i1 ENGINE=InnoDB;
+
+--let $datadir = $MYSQLTEST_VARDIR/mysqld.1/data/test
+
+--echo # 12 batches of 500 rows, with a query after each: partitions of 1000 rows
+--echo # (a table that is not queried between the writes is written to the first partition with room)
+--disable_query_log
+--let $batch = 0
+while ($batch < 12)
+{
+  --let $from = `SELECT $batch * 500 + 1`
+  --let $to = `SELECT ($batch + 1) * 500`
+  eval INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT $from UNION ALL SELECT x + 1 FROM seq WHERE x < $to) SELECT x, CONCAT('row ', x), x % 100 FROM seq;
+  eval INSERT INTO i1 WITH RECURSIVE seq(x) AS (SELECT $from UNION ALL SELECT x + 1 FROM seq WHERE x < $to) SELECT x, CONCAT('row ', x), x % 100 FROM seq;
+  # a query between the writes, it makes the indexes of the partitions
+  SELECT COUNT(*) INTO @n FROM t1 WHERE id = 7 OR n = 5;
+  --inc $batch
+}
+--enable_query_log
+--source suite/warp/include/list_partitions_t1.inc
+
+--echo # a batch of 3000 rows is written to the first partition with room, as before
+INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT 10001 UNION ALL SELECT x + 1 FROM seq WHERE x < 13000) SELECT x, CONCAT('bulk ', x), x % 100 FROM seq;
+INSERT INTO i1 WITH RECURSIVE seq(x) AS (SELECT 10001 UNION ALL SELECT x + 1 FROM seq WHERE x < 13000) SELECT x, CONCAT('bulk ', x), x % 100 FROM seq;
+--source suite/warp/include/list_partitions_t1.inc
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+
+--echo # OPTIMIZE merges the tail partitions, but not the last one
+OPTIMIZE TABLE t1;
+--source suite/warp/include/list_partitions_t1.inc
+SELECT COUNT(*) FROM t1;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+--echo # nothing is left of the merged partitions
+--perl
+  opendir(my $dh, "$ENV{MYSQLTEST_VARDIR}/mysqld.1/data/test") or die;
+  my @left = grep { /purge/ } readdir($dh);
+  print scalar(@left), " directories of a purge are left\n";
+EOF
+
+--echo # small batches still go to a new tail partition, rows can be changed
+INSERT INTO t1 VALUES (20001, 'tail', 1), (20002, 'tail', 2);
+INSERT INTO i1 VALUES (20001, 'tail', 1), (20002, 'tail', 2);
+UPDATE t1 SET n = n + 100 WHERE id IN (1, 20001, 12999);
+UPDATE i1 SET n = n + 100 WHERE id IN (1, 20001, 12999);
+DELETE FROM t1 WHERE id IN (2, 20002);
+DELETE FROM i1 WHERE id IN (2, 20002);
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+
+--echo # the background purge merges the partitions too
+--disable_query_log
+--let $batch = 0
+while ($batch < 10)
+{
+  --let $from = `SELECT 30000 + $batch * 400 + 1`
+  --let $to = `SELECT 30000 + ($batch + 1) * 400`
+  eval INSERT INTO t1 WITH RECURSIVE seq(x) AS (SELECT $from UNION ALL SELECT x + 1 FROM seq WHERE x < $to) SELECT x, CONCAT('more ', x), x % 100 FROM seq;
+  eval INSERT INTO i1 WITH RECURSIVE seq(x) AS (SELECT $from UNION ALL SELECT x + 1 FROM seq WHERE x < $to) SELECT x, CONCAT('more ', x), x % 100 FROM seq;
+  --inc $batch
+}
+--enable_query_log
+--let $before = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_purged_partitions'`
+--let $expected = `SELECT COUNT(*) FROM i1`
+--echo # a scan that is running while the partitions are merged is not affected
+connect (con1,localhost,root,,test);
+connection con1;
+--send SELECT COUNT(*) FROM t1 WHERE SLEEP(0.0004) = 0
+connection default;
+SET GLOBAL warp_purge_threshold = 100;
+SET GLOBAL warp_purge_interval = 1;
+connection con1;
+--reap
+connection default;
+disconnect con1;
+--let $tries = 60
+while ($tries)
+{
+  --let $merged = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_purged_partitions'`
+  if ($merged > $before)
+  {
+    --let $tries = 1
+  }
+  --dec $tries
+  if ($tries)
+  {
+    --sleep 0.5
+  }
+}
+SET GLOBAL warp_purge_interval = 0;
+--source suite/warp/include/list_partitions_t1.inc
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
+SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM i1 EXCEPT ALL SELECT * FROM t1) a;
+
+--echo # a table that is loaded in small batches and not queried meanwhile stays in one partition
+CREATE TABLE t2 (id INT, v VARCHAR(20), n INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+--disable_query_log
+--let $batch = 0
+while ($batch < 12)
+{
+  --let $from = `SELECT $batch * 500 + 1`
+  --let $to = `SELECT ($batch + 1) * 500`
+  eval INSERT INTO t2 WITH RECURSIVE seq(x) AS (SELECT $from UNION ALL SELECT x + 1 FROM seq WHERE x < $to) SELECT x, CONCAT('row ', x), x % 100 FROM seq;
+  --inc $batch
+}
+--enable_query_log
+--source suite/warp/include/list_partitions_t2.inc
+SELECT COUNT(*) FROM t2;
+DROP TABLE t2;
+
+SET GLOBAL warp_purge_threshold = 10;
+SET GLOBAL warp_purge_interval = 60;
+SET GLOBAL warp_tail_partition_rows = 16384;
+SET GLOBAL warp_partition_max_rows = 1000000;
+DROP TABLE t1, i1;
