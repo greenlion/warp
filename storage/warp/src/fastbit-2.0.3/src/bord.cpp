@@ -1571,8 +1571,8 @@ int64_t ibis::bord::getColumnAsStrings(const char *cn,
                 oss << (*arr)[i];
                 vals.push_back(oss.str());
             }
-            else if (col->getDictionary()->size() >= (*arr)[i]) {
-                vals[i] = col->getDictionary()->operator[]((*arr)[i]);
+            else if (col->getDictionary()->operator[]((*arr)[i]) != 0) {
+                vals.push_back(col->getDictionary()->operator[]((*arr)[i]));
             }
             else {
                 std::ostringstream oss;
@@ -5573,7 +5573,7 @@ ibis::bord::column::column(ibis::TYPE_T t, const char *nm, void *st,
 /// Copy constructor.  Performs a shallow copy of the storage buffer.
 ibis::bord::column::column(const ibis::bord::column &c)
     : ibis::column(c), buffer(0), xreader(c.xreader), xmeta(c.xmeta),
-      dic(c.dic), shape(c.shape) {
+      dic(c.dic), dicOwner(c.dicOwner), shape(c.shape) {
     if (c.idx != 0) // to deal with the index only columns
         idx = c.idx->dup();
 
@@ -7810,6 +7810,7 @@ ibis::bord::column::selectUInts(const ibis::bitvector& mask) const {
             ibis::dictionary *dic = new ibis::dictionary();
             for (size_t j = 0; j < nprop; ++ j)
                 dic->insert((*prop)[j].c_str());
+            const_cast<ibis::bord::column*>(this)->dicOwner.reset(dic);
             const_cast<ibis::bord::column*>(this)->dic = dic;
         }
 
@@ -12804,10 +12805,8 @@ int ibis::bord::cursor::getColumnAsString(uint32_t j, std::string& val) const {
             oss << arr[curRow];
             val = oss.str();
         }
-        else if (buffer[j].dic->size() >= arr[curRow]) {
-            val = buffer[j].dic->operator[]
-                ((* static_cast<const array_t<uint32_t>*>
-                  (buffer[j].cval))[curRow]);
+        else if (buffer[j].dic->operator[](arr[curRow]) != 0) {
+            val = buffer[j].dic->operator[](arr[curRow]);
         }
         else {
             oss << arr[curRow];
@@ -12941,7 +12940,7 @@ int ibis::bord::cursor::getColumnAsOpaque(uint32_t j, ibis::opaque& val) const {
             if (buffer[j].dic == 0) {
                 val.copy((const char*)(arr.begin()+curRow), sizeof(int32_t));
             }
-            else if (buffer[j].dic->size() >= arr[curRow]) {
+            else if (buffer[j].dic->operator[](arr[curRow]) != 0) {
                 const char* str = buffer[j].dic->operator[](arr[curRow]);
                 val.copy(str, std::strlen(str));
             }

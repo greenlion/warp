@@ -403,6 +403,10 @@ ibis::direkte* ibis::category::fillIndex(const char *dir) const {
             ints.read(intfile.c_str());
         if (ints.size() == 0 ||
             (iscurrent && ints.size() < thePart->nRows())) {
+            // the strings are read from the beginning of the data file,
+            // the codes of an earlier version of the .int file (from before
+            // rows were appended) would be in front of them
+            ints.clear();
             int fraw = ibis::zfile::openRead(raw.c_str());
             if (fraw < 0) {
                 LOGGER(ibis::gVerbose > 1)
@@ -488,6 +492,8 @@ ibis::direkte* ibis::category::fillIndex(const char *dir) const {
                     "dictionary entries, continue with the existing order";
             }
             ints.write(intfile.c_str());
+            // a copy of the old file may be in the file cache
+            ibis::fileManager::instance().flushFile(intfile.c_str());
         }
         if (rlc != 0) {
             (void) rlc->append(ints);
@@ -499,6 +505,13 @@ ibis::direkte* ibis::category::fillIndex(const char *dir) const {
 
     if (rlc) {
         rlc->write(dir);
+        {
+            std::string idxfile = (dir ? dir : thePart->currentDataDir());
+            idxfile += FASTBIT_DIRSEP;
+            idxfile += m_name;
+            idxfile += ".idx";
+            ibis::fileManager::instance().flushFile(idxfile.c_str());
+        }
         if (dir == thePart->currentDataDir() ||
             (thePart->currentDataDir() !=0 &&
              std::strcmp(dir, thePart->currentDataDir()) == 0)) {

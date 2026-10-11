@@ -4632,6 +4632,23 @@ int ha_warp::append_column_filter(const Item *cond,
       return 0;
     }
 
+    /* An ENUM column is stored as a dictionary coded string.  MySQL compares
+       it with a number by the position of the value in the list, so only
+       the equality with a string, which warp_string_eq_pushable checks,
+       is evaluated by FastBit. */
+    if(!is_is_null && !is_isnot_null) {
+      for (uint i = 0; i < tmp->arg_count; ++i) {
+        if(arg[i]->type() == Item::Type::FIELD_ITEM &&
+           down_cast<Item_field *>(arg[i])->field->real_type() ==
+               MYSQL_TYPE_ENUM &&
+           !(is_eq && tmp->arg_count == 2 &&
+             (arg[0]->type() == Item::Type::STRING_ITEM ||
+              arg[1]->type() == Item::Type::STRING_ITEM))) {
+          return 0;
+        }
+      }
+    }
+
     /* A DECIMAL column is stored as text: FastBit compares it by value with
        decimal_cmp.  The other comparisons of a DECIMAL column are left to
        MySQL */
