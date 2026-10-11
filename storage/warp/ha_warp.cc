@@ -4671,6 +4671,47 @@ int ha_warp::append_column_filter(const Item *cond,
       return 0;
     }
 
+    /* FastBit evaluates the conditions on the columns of the types that it
+       stores as numbers, as dates or as strings of the same order as MySQL's.
+       The other types are stored as text of some other kind (BIT, SET, JSON,
+       the bytes of a TEXT or BLOB) or are not supported (GEOMETRY): MySQL
+       compares them, only IS NULL and IS NOT NULL (not for GEOMETRY) are
+       left to the null markers. */
+    for (uint i = 0; i < tmp->arg_count; ++i) {
+      if(arg[i]->type() != Item::Type::FIELD_ITEM) continue;
+      const enum_field_types frt =
+          down_cast<Item_field *>(arg[i])->field->real_type();
+      if(frt == MYSQL_TYPE_GEOMETRY) return 0;
+      if(is_is_null || is_isnot_null) continue;
+      switch(frt) {
+        case MYSQL_TYPE_TINY:
+        case MYSQL_TYPE_SHORT:
+        case MYSQL_TYPE_INT24:
+        case MYSQL_TYPE_LONG:
+        case MYSQL_TYPE_LONGLONG:
+        case MYSQL_TYPE_FLOAT:
+        case MYSQL_TYPE_DOUBLE:
+        case MYSQL_TYPE_DECIMAL:
+        case MYSQL_TYPE_NEWDECIMAL:
+        case MYSQL_TYPE_YEAR:
+        case MYSQL_TYPE_DATE:
+        case MYSQL_TYPE_NEWDATE:
+        case MYSQL_TYPE_TIME:
+        case MYSQL_TYPE_TIME2:
+        case MYSQL_TYPE_DATETIME:
+        case MYSQL_TYPE_DATETIME2:
+        case MYSQL_TYPE_TIMESTAMP:
+        case MYSQL_TYPE_TIMESTAMP2:
+        case MYSQL_TYPE_VARCHAR:
+        case MYSQL_TYPE_VAR_STRING:
+        case MYSQL_TYPE_STRING:
+        case MYSQL_TYPE_ENUM:
+          break;
+        default:
+          return 0;
+      }
+    }
+
     /* An ENUM column is stored as a dictionary coded string.  MySQL compares
        it with a number by the position of the value in the list, so only
        the equality with a string, which warp_string_eq_pushable checks,
@@ -4895,12 +4936,11 @@ int ha_warp::append_column_filter(const Item *cond,
       }
 
       if((*arg)->type() == Item::Type::NULL_ITEM) {
-        /* x <=> NULL is true for the rows where x is NULL */
-        if(tmp->functype() == Item_func::Functype::EQUAL_FUNC) {
-          return 0;
-        }
-        build_where_clause += " NULL ";
-        continue;
+        /* A comparison with NULL, also NULL in an IN list or as a bound of
+           BETWEEN, is not true for any row, and x <=> NULL is true for the
+           rows where x is NULL: MySQL evaluates them.  FastBit would compare
+           with the value that is stored for the NULL rows. */
+        return 0;
       }
 
       // can't push down decimal comparisons as they are stored
