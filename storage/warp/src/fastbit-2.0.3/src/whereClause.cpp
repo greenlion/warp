@@ -367,7 +367,8 @@ int ibis::whereClause::verifyExpr(ibis::qExpr *&xp0, const ibis::part& part0,
         if (col != 0 && str->isRange()) {
             // <, <=, >, >= and BETWEEN compare strings only, there is no
             // meaningful conversion to a number
-            if (col->type() != ibis::TEXT && col->type() != ibis::CATEGORY) {
+            if ((col->type() != ibis::TEXT && col->type() != ibis::CATEGORY) ||
+                (str->isDecimal() && col->type() != ibis::TEXT)) {
                 ++ ierr;
                 LOGGER(ibis::gVerbose > 2)
                     << "Warning -- whereClause::verifyExpr -- column "

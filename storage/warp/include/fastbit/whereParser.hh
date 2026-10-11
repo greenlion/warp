@@ -264,34 +264,35 @@ namespace ibis {
     XOROP = 269,                   // "xor"
     BETWEENOP = 270,               // "between"
     CONTAINSOP = 271,              // "contains"
-    EXISTSOP = 272,                // "exists"
-    INOP = 273,                    // "in"
-    LIKEOP = 274,                  // "like"
-    FROM_UNIXTIME_GMT = 275,       // "FROM_UNIXTIME_GMT"
-    FROM_UNIXTIME_LOCAL = 276,     // "FROM_UNIXTIME_LOCAL"
-    TO_UNIXTIME_GMT = 277,         // "TO_UNIXTIME_GMT"
-    TO_UNIXTIME_LOCAL = 278,       // "TO_UNIXTIME_LOCAL"
-    ISO_TO_UNIXTIME_GMT = 279,     // "ISO_TO_UNIXTIME_GMT"
-    ISO_TO_UNIXTIME_LOCAL = 280,   // "ISO_TO_UNIXTIME_LOCAL"
-    ANYOP = 281,                   // "any"
-    BITOROP = 282,                 // "|"
-    BITANDOP = 283,                // "&"
-    ADDOP = 284,                   // "+"
-    MINUSOP = 285,                 // "-"
-    MULTOP = 286,                  // "*"
-    DIVOP = 287,                   // "/"
-    REMOP = 288,                   // "%"
-    EXPOP = 289,                   // "**"
-    INT64 = 290,                   // "integer value"
-    UINT64 = 291,                  // "unsigned integer value"
-    NUMBER = 292,                  // "floating-point number"
-    INTSEQ = 293,                  // "signed integer sequence"
-    UINTSEQ = 294,                 // "unsigned integer sequence"
-    NOUNSTR = 295,                 // "name string"
-    NUMSEQ = 296,                  // "number sequence"
-    STRSEQ = 297,                  // "string sequence"
-    STRLIT = 298,                  // "string literal"
-    CONSTAINSOP = 299              // CONSTAINSOP
+    DECIMALOP = 272,               // "decimal_cmp"
+    EXISTSOP = 273,                // "exists"
+    INOP = 274,                    // "in"
+    LIKEOP = 275,                  // "like"
+    FROM_UNIXTIME_GMT = 276,       // "FROM_UNIXTIME_GMT"
+    FROM_UNIXTIME_LOCAL = 277,     // "FROM_UNIXTIME_LOCAL"
+    TO_UNIXTIME_GMT = 278,         // "TO_UNIXTIME_GMT"
+    TO_UNIXTIME_LOCAL = 279,       // "TO_UNIXTIME_LOCAL"
+    ISO_TO_UNIXTIME_GMT = 280,     // "ISO_TO_UNIXTIME_GMT"
+    ISO_TO_UNIXTIME_LOCAL = 281,   // "ISO_TO_UNIXTIME_LOCAL"
+    ANYOP = 282,                   // "any"
+    BITOROP = 283,                 // "|"
+    BITANDOP = 284,                // "&"
+    ADDOP = 285,                   // "+"
+    MINUSOP = 286,                 // "-"
+    MULTOP = 287,                  // "*"
+    DIVOP = 288,                   // "/"
+    REMOP = 289,                   // "%"
+    EXPOP = 290,                   // "**"
+    INT64 = 291,                   // "integer value"
+    UINT64 = 292,                  // "unsigned integer value"
+    NUMBER = 293,                  // "floating-point number"
+    INTSEQ = 294,                  // "signed integer sequence"
+    UINTSEQ = 295,                 // "unsigned integer sequence"
+    NOUNSTR = 296,                 // "name string"
+    NUMSEQ = 297,                  // "number sequence"
+    STRSEQ = 298,                  // "string sequence"
+    STRLIT = 299,                  // "string literal"
+    CONSTAINSOP = 300              // CONSTAINSOP
       };
       /// Backward compatibility alias (Bison 3.6).
       typedef token_kind_type yytokentype;
@@ -308,7 +309,7 @@ namespace ibis {
     {
       enum symbol_kind_type
       {
-        YYNTOKENS = 49, ///< Number of tokens.
+        YYNTOKENS = 50, ///< Number of tokens.
         S_YYEMPTY = -2,
         S_YYEOF = 0,                             // "end of input"
         S_YYerror = 1,                           // error
@@ -327,45 +328,46 @@ namespace ibis {
         S_XOROP = 14,                            // "xor"
         S_BETWEENOP = 15,                        // "between"
         S_CONTAINSOP = 16,                       // "contains"
-        S_EXISTSOP = 17,                         // "exists"
-        S_INOP = 18,                             // "in"
-        S_LIKEOP = 19,                           // "like"
-        S_FROM_UNIXTIME_GMT = 20,                // "FROM_UNIXTIME_GMT"
-        S_FROM_UNIXTIME_LOCAL = 21,              // "FROM_UNIXTIME_LOCAL"
-        S_TO_UNIXTIME_GMT = 22,                  // "TO_UNIXTIME_GMT"
-        S_TO_UNIXTIME_LOCAL = 23,                // "TO_UNIXTIME_LOCAL"
-        S_ISO_TO_UNIXTIME_GMT = 24,              // "ISO_TO_UNIXTIME_GMT"
-        S_ISO_TO_UNIXTIME_LOCAL = 25,            // "ISO_TO_UNIXTIME_LOCAL"
-        S_ANYOP = 26,                            // "any"
-        S_BITOROP = 27,                          // "|"
-        S_BITANDOP = 28,                         // "&"
-        S_ADDOP = 29,                            // "+"
-        S_MINUSOP = 30,                          // "-"
-        S_MULTOP = 31,                           // "*"
-        S_DIVOP = 32,                            // "/"
-        S_REMOP = 33,                            // "%"
-        S_EXPOP = 34,                            // "**"
-        S_INT64 = 35,                            // "integer value"
-        S_UINT64 = 36,                           // "unsigned integer value"
-        S_NUMBER = 37,                           // "floating-point number"
-        S_INTSEQ = 38,                           // "signed integer sequence"
-        S_UINTSEQ = 39,                          // "unsigned integer sequence"
-        S_NOUNSTR = 40,                          // "name string"
-        S_NUMSEQ = 41,                           // "number sequence"
-        S_STRSEQ = 42,                           // "string sequence"
-        S_STRLIT = 43,                           // "string literal"
-        S_CONSTAINSOP = 44,                      // CONSTAINSOP
-        S_45_ = 45,                              // '('
-        S_46_ = 46,                              // ')'
-        S_47_ = 47,                              // ','
-        S_48_ = 48,                              // ';'
-        S_YYACCEPT = 49,                         // $accept
-        S_qexpr = 50,                            // qexpr
-        S_simpleRange = 51,                      // simpleRange
-        S_compRange2 = 52,                       // compRange2
-        S_compRange3 = 53,                       // compRange3
-        S_mathExpr = 54,                         // mathExpr
-        S_START = 55                             // START
+        S_DECIMALOP = 17,                        // "decimal_cmp"
+        S_EXISTSOP = 18,                         // "exists"
+        S_INOP = 19,                             // "in"
+        S_LIKEOP = 20,                           // "like"
+        S_FROM_UNIXTIME_GMT = 21,                // "FROM_UNIXTIME_GMT"
+        S_FROM_UNIXTIME_LOCAL = 22,              // "FROM_UNIXTIME_LOCAL"
+        S_TO_UNIXTIME_GMT = 23,                  // "TO_UNIXTIME_GMT"
+        S_TO_UNIXTIME_LOCAL = 24,                // "TO_UNIXTIME_LOCAL"
+        S_ISO_TO_UNIXTIME_GMT = 25,              // "ISO_TO_UNIXTIME_GMT"
+        S_ISO_TO_UNIXTIME_LOCAL = 26,            // "ISO_TO_UNIXTIME_LOCAL"
+        S_ANYOP = 27,                            // "any"
+        S_BITOROP = 28,                          // "|"
+        S_BITANDOP = 29,                         // "&"
+        S_ADDOP = 30,                            // "+"
+        S_MINUSOP = 31,                          // "-"
+        S_MULTOP = 32,                           // "*"
+        S_DIVOP = 33,                            // "/"
+        S_REMOP = 34,                            // "%"
+        S_EXPOP = 35,                            // "**"
+        S_INT64 = 36,                            // "integer value"
+        S_UINT64 = 37,                           // "unsigned integer value"
+        S_NUMBER = 38,                           // "floating-point number"
+        S_INTSEQ = 39,                           // "signed integer sequence"
+        S_UINTSEQ = 40,                          // "unsigned integer sequence"
+        S_NOUNSTR = 41,                          // "name string"
+        S_NUMSEQ = 42,                           // "number sequence"
+        S_STRSEQ = 43,                           // "string sequence"
+        S_STRLIT = 44,                           // "string literal"
+        S_CONSTAINSOP = 45,                      // CONSTAINSOP
+        S_46_ = 46,                              // '('
+        S_47_ = 47,                              // ')'
+        S_48_ = 48,                              // ','
+        S_49_ = 49,                              // ';'
+        S_YYACCEPT = 50,                         // $accept
+        S_qexpr = 51,                            // qexpr
+        S_simpleRange = 52,                      // simpleRange
+        S_compRange2 = 53,                       // compRange2
+        S_compRange3 = 54,                       // compRange3
+        S_mathExpr = 55,                         // mathExpr
+        S_START = 56                             // START
       };
     };
 
@@ -622,7 +624,7 @@ namespace ibis {
     // YYDEFACT[STATE-NUM] -- Default reduction number in state STATE-NUM.
     // Performed when YYTABLE does not specify something else to do.  Zero
     // means the default is an error.
-    static const signed char yydefact_[];
+    static const unsigned char yydefact_[];
 
     // YYPGOTO[NTERM-NUM].
     static const signed char yypgoto_[];
@@ -877,9 +879,9 @@ namespace ibis {
     /// Constants.
     enum
     {
-      yylast_ = 577,     ///< Last index in yytable_.
+      yylast_ = 554,     ///< Last index in yytable_.
       yynnts_ = 7,  ///< Number of nonterminal symbols.
-      yyfinal_ = 79 ///< Termination state number.
+      yyfinal_ = 81 ///< Termination state number.
     };
 
 
@@ -891,7 +893,7 @@ namespace ibis {
 
 #line 25 "whereParser.yy"
 } // ibis
-#line 895 "whereParser.hh"
+#line 897 "whereParser.hh"
 
 
 

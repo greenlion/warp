@@ -589,12 +589,15 @@ public:
     enum COMPARE {STR_EQ=0, STR_LT, STR_LE, STR_GT, STR_GE, STR_BETWEEN};
 
     // construct the qString from two strings
-    qString() : qExpr(STRING), lstr(0), rstr(0), ustr(0), cmp_(STR_EQ) {};
+    qString() : qExpr(STRING), lstr(0), rstr(0), ustr(0), cmp_(STR_EQ),
+                dec_(false) {};
     qString(const char* ls, const char* rs);
-    /// Column ls compared with the string rs, "ls op rs".
-    qString(const char* ls, COMPARE op, const char* rs);
+    /// Column ls compared with the string rs, "ls op rs".  If dec is true
+    /// the strings are decimal numbers that are compared by value (see
+    /// ibis::util::decimalCompare), also for STR_EQ.
+    qString(const char* ls, COMPARE op, const char* rs, bool dec=false);
     /// Column ls between the strings lo and hi, both inclusive.
-    qString(const char* ls, const char* lo, const char* hi);
+    qString(const char* ls, const char* lo, const char* hi, bool dec=false);
     virtual ~qString() {delete [] ustr; delete [] rstr; delete [] lstr;}
 
     const char* leftString() const {return lstr;}
@@ -602,7 +605,11 @@ public:
     /// The upper bound of a BETWEEN comparison, NULL for the others.
     const char* upperString() const {return ustr;}
     COMPARE comparison() const {return cmp_;}
-    bool isRange() const {return cmp_ != STR_EQ;}
+    /// Are the strings decimal numbers compared by value?
+    bool isDecimal() const {return dec_;}
+    /// Is it a comparison other than the equality of strings?  The
+    /// equality of decimal numbers is one, because "1.0" equals "1.00".
+    bool isRange() const {return cmp_ != STR_EQ || dec_;}
     /// The two sides are exchanged.  The comparison is mirrored so that
     /// the expression keeps its meaning.
     void swapLeftRight() {
@@ -623,13 +630,14 @@ private:
     char* rstr;
     char* ustr; ///< Upper bound of BETWEEN.
     COMPARE cmp_;
+    bool dec_; ///< The strings are decimal numbers.
 
     /// Copy Constructor.  Deep copy.
     qString(const qString& rhs) : qExpr(STRING),
 	lstr(ibis::util::strnewdup(rhs.lstr)),
 	rstr(ibis::util::strnewdup(rhs.rstr)),
 	ustr(rhs.ustr ? ibis::util::strnewdup(rhs.ustr) : 0),
-	cmp_(rhs.cmp_) {}
+	cmp_(rhs.cmp_), dec_(rhs.dec_) {}
     qString& operator=(const qString&);
     static char* unescape(const char* str);
 }; // ibis::qString

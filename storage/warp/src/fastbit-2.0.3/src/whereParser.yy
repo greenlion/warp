@@ -57,6 +57,7 @@
 %token <integerVal> XOROP	"xor"
 %token <integerVal> BETWEENOP	"between"
 %token <integerVal> CONTAINSOP	"contains"
+%token <integerVal> DECIMALOP	"decimal_cmp"
 %token <integerVal> EXISTSOP	"exists"
 %token <integerVal> INOP	"in"
 %token <integerVal> LIKEOP	"like"
@@ -114,7 +115,8 @@
    name of a column.  It and the strings are deleted. */
 static ibis::qExpr* stringCompare(ibis::qExpr *left,
                                   ibis::qString::COMPARE op,
-                                  std::string *lo, std::string *hi) {
+                                  std::string *lo, std::string *hi,
+                                  bool dec=false) {
     ibis::math::variable *var = dynamic_cast<ibis::math::variable*>(left);
     if (var == 0) {
         LOGGER(ibis::gVerbose >= 0)
@@ -125,9 +127,20 @@ static ibis::qExpr* stringCompare(ibis::qExpr *left,
         delete left;
         throw "A string can only be compared with a column name";
     }
+    if (dec && (! ibis::util::isDecimalString(lo->c_str()) ||
+                (hi != 0 && ! ibis::util::isDecimalString(hi->c_str())))) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "whereParser.yy: decimal_cmp expects decimal numbers in "
+            "quotes, not " << *lo << (hi != 0 ? " and " : "")
+            << (hi != 0 ? *hi : std::string());
+        delete hi;
+        delete lo;
+        delete var;
+        throw "decimal_cmp expects decimal numbers";
+    }
     ibis::qExpr *ret = (hi != 0 ?
-        new ibis::qString(var->variableName(), lo->c_str(), hi->c_str()) :
-        new ibis::qString(var->variableName(), op, lo->c_str()));
+        new ibis::qString(var->variableName(), lo->c_str(), hi->c_str(), dec) :
+        new ibis::qString(var->variableName(), op, lo->c_str(), dec));
     delete hi;
     delete lo;
     delete var;
@@ -1003,6 +1016,24 @@ mathExpr LTOP INT64 {
 }
 | mathExpr BETWEENOP STRLIT ANDOP STRLIT {
     $$ = stringCompare($1, ibis::qString::STR_BETWEEN, $3, $5);
+}
+| DECIMALOP mathExpr EQOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_EQ, $4, 0, true);
+}
+| DECIMALOP mathExpr LTOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_LT, $4, 0, true);
+}
+| DECIMALOP mathExpr LEOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_LE, $4, 0, true);
+}
+| DECIMALOP mathExpr GTOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_GT, $4, 0, true);
+}
+| DECIMALOP mathExpr GEOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_GE, $4, 0, true);
+}
+| DECIMALOP mathExpr BETWEENOP STRLIT ANDOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_BETWEEN, $4, $6, true);
 }
 ;
 

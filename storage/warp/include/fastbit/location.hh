@@ -1,4 +1,4 @@
-// A Bison parser, made by GNU Bison 3.7.6.
+// A Bison parser, made by GNU Bison 3.8.2.
 
 // Locations for Bison parsers in C++
 
@@ -53,7 +53,7 @@
 #  endif
 # endif
 
-#line 26 "whereParser.yy"
+#line 25 "whereParser.yy"
 namespace ibis {
 #line 59 "location.hh"
 
@@ -299,7 +299,7 @@ namespace ibis {
     return ostr;
   }
 
-#line 26 "whereParser.yy"
+#line 25 "whereParser.yy"
 } // ibis
 #line 305 "location.hh"
 

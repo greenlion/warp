@@ -4196,6 +4196,113 @@ static bool warp_push_string_range(Item_func *func, bool is_between,
   return true;
 }
 
+/* Pushes a comparison of a DECIMAL column with constants (=, <>, <, <=, >,
+   >=, <=> and BETWEEN) down to FastBit.  WARP stores a DECIMAL as text,
+   which FastBit compares by value with decimal_cmp.  MySQL compares a
+   DECIMAL with an integer or a DECIMAL exactly, so only those constants are
+   pushed: a constant that is a double (or a string) makes MySQL compare
+   doubles.  Returns true and appends the FastBit condition to out if the
+   condition was pushed. */
+static bool warp_push_decimal(Item_func *func, bool is_between,
+                              const std::string &op, std::string &out) {
+  Item **args = func->arguments();
+  const uint nargs = func->arg_count;
+  const Item_field *col_item = NULL;
+  std::string fb_op = op;
+  const Item *consts[2] = {NULL, NULL};
+  uint nconsts = 0;
+
+  if(is_between) {
+    if(nargs != 3 || args[0]->type() != Item::Type::FIELD_ITEM) {
+      return false;
+    }
+    col_item = down_cast<Item_field *>(args[0]);
+    consts[0] = args[1];
+    consts[1] = args[2];
+    nconsts = 2;
+  } else {
+    if(nargs != 2) {
+      return false;
+    }
+    if(args[0]->type() == Item::Type::FIELD_ITEM) {
+      col_item = down_cast<Item_field *>(args[0]);
+      consts[0] = args[1];
+    } else if(args[1]->type() == Item::Type::FIELD_ITEM) {
+      /* constant OP column: the column goes first, so mirror the operator */
+      col_item = down_cast<Item_field *>(args[1]);
+      consts[0] = args[0];
+      if(op == " < ") fb_op = " > ";
+      else if(op == " <= ") fb_op = " >= ";
+      else if(op == " > ") fb_op = " < ";
+      else if(op == " >= ") fb_op = " <= ";
+    } else {
+      return false;
+    }
+    nconsts = 1;
+  }
+
+  if(!is_between && fb_op != " = " && fb_op != " != " && fb_op != " < " &&
+     fb_op != " <= " && fb_op != " > " && fb_op != " >= ") {
+    return false; /* IN lists, for example */
+  }
+
+  std::string values[2];
+  for(uint i = 0; i < nconsts; ++i) {
+    Item *citem = const_cast<Item *>(consts[i]);
+    if(citem->type() == Item::Type::INT_ITEM) {
+      if(!warp_format_int(citem, false, false, values[i])) {
+        return false;
+      }
+    } else if(citem->type() == Item::Type::DECIMAL_ITEM) {
+      String s;
+      String *val = citem->val_str(&s);
+      if(val == NULL) {
+        return false;
+      }
+      values[i].assign(val->ptr(), val->length());
+    } else {
+      return false;
+    }
+    /* only the plain notation: sign, digits and a decimal point */
+    const std::string &v = values[i];
+    size_t digits = 0;
+    for(size_t j = 0; j < v.length(); ++j) {
+      const char c = v[j];
+      if(c >= '0' && c <= '9') {
+        ++digits;
+      } else if(!((c == '-' && j == 0) || c == '.')) {
+        return false;
+      }
+    }
+    if(digits == 0) {
+      return false;
+    }
+  }
+
+  const std::string field_index = std::to_string(col_item->field->field_index());
+  const bool nullable = col_item->field->is_nullable();
+  const std::string col = "c" + field_index;
+  std::string cond;
+  if(nullable) {
+    cond = "(n" + field_index + " = 0 AND ";
+  }
+  if(is_between) {
+    cond += "decimal_cmp " + col + " BETWEEN '" + values[0] + "' AND '" +
+            values[1] + "'";
+  } else if(fb_op == " = ") {
+    cond += "decimal_cmp " + col + " == '" + values[0] + "'";
+  } else if(fb_op == " != ") {
+    cond += "NOT (decimal_cmp " + col + " == '" + values[0] + "')";
+  } else {
+    cond += "decimal_cmp " + col + fb_op + "'" + values[0] + "'";
+  }
+  if(nullable) {
+    cond += ")";
+  }
+  out += cond;
+  return true;
+}
+
 int ha_warp::append_column_filter(const Item *cond,
                                    std::string &where_clause) {
   bool field_may_be_null = false;
@@ -4426,17 +4533,27 @@ int ha_warp::append_column_filter(const Item *cond,
       return 0;
     }
 
-    /* A DECIMAL column is stored as text, so FastBit can not compare it with
-       a number: leave these comparisons to MySQL */
+    /* A DECIMAL column is stored as text: FastBit compares it by value with
+       decimal_cmp.  The other comparisons of a DECIMAL column are left to
+       MySQL */
     if(!is_is_null && !is_isnot_null && op != " LIKE ") {
+      bool decimal_col = false;
       for (uint i = 0; i < tmp->arg_count; ++i) {
         if(arg[i]->type() == Item::Type::FIELD_ITEM) {
           const enum_field_types rt =
               down_cast<Item_field *>(arg[i])->field->real_type();
           if(rt == MYSQL_TYPE_DECIMAL || rt == MYSQL_TYPE_NEWDECIMAL) {
-            return 0;
+            decimal_col = true;
           }
         }
+      }
+      if(decimal_col) {
+        std::string decimal_condition;
+        if(warp_push_decimal(tmp, is_between, op, decimal_condition)) {
+          where_clause += decimal_condition;
+          return 1;
+        }
+        return 0;
       }
     }
 

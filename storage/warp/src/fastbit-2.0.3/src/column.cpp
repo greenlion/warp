@@ -7149,6 +7149,15 @@ long ibis::column::stringRangeSearch(const char*, bool, const char*, bool,
     return -1;
 }
 
+long ibis::column::decimalRangeSearch(const char*, bool, const char*, bool,
+                                      ibis::bitvector&) const {
+    LOGGER(ibis::gVerbose > 0)
+        << "Warning -- column[" << (thePart ? thePart->name() : "") << '.'
+        << m_name << "]::decimalRangeSearch is not supported on column type "
+        << ibis::TYPESTRING[(int)m_type];
+    return -1;
+}
+
 long ibis::column::stringSearch(const char*) const {
     return (thePart ? (long)thePart->nRows() : INT_MAX);
 }

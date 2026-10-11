@@ -704,6 +704,18 @@ namespace ibis {
         FASTBIT_CXX_DLLSPEC int padSpaceCompare(const char* a, size_t alen,
                                                 const char* b, size_t blen);
 
+        /// Compare two decimal numbers written as text, such as "-5.25",
+        /// "10.50" or "9": an optional sign, digits, and optionally a
+        /// decimal point followed by digits.  The numbers are compared by
+        /// value, so 10.5 > 9.00, -5 < 1 and 1.0 == 1.00.  A string that is
+        /// empty or has no digits is zero.  Returns a negative, zero or
+        /// positive value if a is less than, equal to or greater than b.
+        FASTBIT_CXX_DLLSPEC int decimalCompare(const char* a, size_t alen,
+                                               const char* b, size_t blen);
+
+        /// Is the string a decimal number, as decimalCompare expects it?
+        FASTBIT_CXX_DLLSPEC bool isDecimalString(const char* s);
+
         /// The number of threads (the calling thread included) that the
         /// statement of the calling thread may use for building the
         /// missing indexes of a query.  1 means one after another.
