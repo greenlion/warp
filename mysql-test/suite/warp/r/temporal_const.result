@@ -1,0 +1,77 @@
+#
+# Constant temporal expressions compared with DATE, DATETIME, TIMESTAMP
+# and TIME columns: DATE_SUB('1997-01-01', INTERVAL 30 DAY),
+# '1997-01-01' - INTERVAL 30 DAY, STR_TO_DATE(...), MAKEDATE(...), ...
+# are evaluated once and pushed down as the stored value.  Every
+# condition is also run against an InnoDB table and the results must
+# match, in several time zones.
+#
+# Regression test: only some of these were pushed down (the others were
+# evaluated by MySQL for every row), a constant on the left of a
+# comparison was pushed down with the operands in the wrong order, and
+# a comparison with a NULL date compared with the date 0.
+#
+CREATE TABLE w (id INT, d DATE, dt DATETIME(3), ts TIMESTAMP NULL, tm TIME) ENGINE=WARP;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO w VALUES (1,'1996-12-01','1996-12-01 10:00:00.5','1996-12-01 10:00:00','10:00:00'),(2,'1997-01-01','1997-01-01 00:00:00','1997-01-01 00:00:00','-01:00:00'),(3,'1997-01-31','1997-01-31 23:59:59.999','1997-01-31 23:59:59','100:00:00'),(4,'1997-02-01','1997-02-01 12:00:00','1997-02-01 12:00:00',NULL);
+INSERT INTO i SELECT * FROM w;
+120 conditions checked, 0 mismatches
+# The conditions that FastBit evaluates have no Filter in the plan, the others do
+SET time_zone = '+03:00';
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= DATE_SUB('1997-01-01', INTERVAL 30 DAY);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= '1997-01-01' - INTERVAL 30 DAY;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d BETWEEN DATE_SUB('1997-01-01', INTERVAL 30 DAY) AND DATE_ADD('1997-01-01', INTERVAL 30 DAY);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d IN (DATE_ADD('1997-01-01', INTERVAL 30 DAY), '1997-02-01');
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE DATE_SUB('1997-01-01', INTERVAL 30 DAY) <= d;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= STR_TO_DATE('01/02/1997','%d/%m/%Y');
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ts >= DATE_SUB('1997-01-31 12:00:00', INTERVAL 1 DAY);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE tm >= SEC_TO_TIME(3600);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d > DATE_SUB(NULL, INTERVAL 1 DAY);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.d > <cache>((NULL - interval 1 day)))  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= (SELECT MAX(d) FROM i);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.d >= (select #2))  
+        -> Table scan on w  
+        -> Select #2 (subquery in condition; run only once)
+            -> Aggregate: max(i.d)  
+                -> Table scan on i  
+
+DROP TABLE w, i;
