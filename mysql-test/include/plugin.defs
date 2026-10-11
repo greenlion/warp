@@ -45,6 +45,7 @@ ha_blackhole                            plugin_output_directory  no BLACKHOLE_PL
 ha_federated                            plugin_output_directory  no FEDERATED_PLUGIN
 ha_partition                            plugin_output_directory  no PARTITION_PLUGIN  partition
 ha_mock                                 plugin_output_directory  no MOCK_PLUGIN
+ha_warp                                 plugin_output_directory  no WARP_PLUGIN WARP
 mypluglib                               plugin_output_directory  no SIMPLE_PARSER
 libpluginmecab                          plugin_output_directory  no MECAB
 adt_null                                plugin_output_directory  no AUDIT_NULL
