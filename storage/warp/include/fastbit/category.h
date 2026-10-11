@@ -13,6 +13,7 @@
 /// named STAR.
 ///
 #include "column.h"	// ibis::column
+#include <functional>
 #include "dictionary.h" // ibis::dictionary
 #include "idirekte.h"	// ibis::direkte
 
@@ -106,6 +107,9 @@ protected:
     /// decimal numbers.
     long scanRange(const char* lo, bool loIncl, const char* hi, bool hiIncl,
                    bool decimal, ibis::bitvector& hits) const;
+    /// Mark the rows of the strings that the function accepts.
+    long scanStrings(const std::function<bool(const char*, size_t)>& match,
+                     const char* what, ibis::bitvector& hits) const;
     void startPositions(const char *dir, char *buf, uint32_t nbuf) const;
     int  readString(uint32_t i, std::string &val) const;
     int  readString(std::string&, int, long, long, char*, uint32_t,

@@ -3983,45 +3983,26 @@ ibis::qAnyString::qAnyString(const char *col, const char *sval)
         std::string tmp;
         tmp.erase();
         while (*sval && isspace(*sval)) ++ sval; // skip leading space
-        if (*sval == '\'') { // single quoted string
+        if (*sval == '\'' || *sval == '"') { // quoted string
+            // a back slash takes the next character as it is, and the
+            // empty string is a value
+            const char quote = *sval;
             ++ sval;
-            while (*sval) {
-                if (*sval != '\'')
-                    tmp += *sval;
-                else if (tmp.size() > 0 && tmp[tmp.size()-1] == '\\')
-                    // escaped quote
-                    tmp[tmp.size()-1] = '\'';
-                else {// found the end quote
-                    ++ sval; // skip the closing quote
-                    break;
-                }
+            while (*sval != 0 && *sval != quote) {
+                if (*sval == '\\' && sval[1] != 0)
+                    ++ sval;
+                tmp += *sval;
                 ++ sval;
             }
-            if (! tmp.empty())
-                sset.insert(tmp);
-        }
-        else if (*sval == '"') { // double quoted string
-            ++ sval;
-            while (*sval) {
-                if (*sval != '"')
-                    tmp += *sval;
-                else if (tmp.size() > 0 && tmp[tmp.size()-1] == '\\')
-                    // escaped quote
-                    tmp[tmp.size()-1] = '"';
-                else {
-                    ++ sval; // skip the closing quote
-                    break;
-                }
-                ++ sval;
-            }
-            if (! tmp.empty())
-                sset.insert(tmp);
+            if (*sval == quote)
+                ++ sval; // skip the closing quote
+            sset.insert(tmp);
         }
         else { // space and comma delimited string
             while (*sval) {
                 if (*sval != ',' && ! isspace(*sval))
                     tmp += *sval;
-                else if (tmp[tmp.size()-1] == '\\')
+                else if (! tmp.empty() && tmp[tmp.size()-1] == '\\')
                     tmp[tmp.size()-1] = *sval;
                 else
                     break;
@@ -4059,9 +4040,19 @@ ibis::qExpr* ibis::qAnyString::convert() const {
     if (name.empty()) return 0;
     if (values.empty()) return 0;
 
-    ibis::qExpr *ret = new ibis::qString(name.c_str(), values[0].c_str());
+    // the qString constructor removes the back slashes that escape
+    // characters, but the values are as they are
+    std::vector<std::string> esc(values.size());
+    for (uint32_t i = 0; i < values.size(); ++ i) {
+        for (std::string::const_iterator c = values[i].begin();
+             c != values[i].end(); ++ c) {
+            if (*c == '\\') esc[i] += '\\';
+            esc[i] += *c;
+        }
+    }
+    ibis::qExpr *ret = new ibis::qString(name.c_str(), esc[0].c_str());
     for (uint32_t i = 1; i < values.size(); ++ i) {
-        ibis::qExpr *rhs = new ibis::qString(name.c_str(), values[i].c_str());
+        ibis::qExpr *rhs = new ibis::qString(name.c_str(), esc[i].c_str());
         ibis::qExpr *op = new ibis::qExpr(ibis::qExpr::LOGICAL_OR);
         op->setRight(rhs);
         op->setLeft(ret);

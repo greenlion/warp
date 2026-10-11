@@ -110,6 +110,22 @@
 #undef yylex
 #define yylex driver.lexer->lex
 
+/* Quotes a value of an IN list for ibis::qAnyString, which takes a back
+   slash to escape the next character.  The value is as it was written in
+   the quotes of the literal. */
+static std::string listValue(const std::string &lit) {
+    std::string res = "'";
+    for (size_t i = 0; i < lit.size(); ++ i) {
+        if (lit[i] == '\\' && i + 1 < lit.size())
+            ++ i;
+        if (lit[i] == '\'' || lit[i] == '\\')
+            res += '\\';
+        res += lit[i];
+    }
+    res += '\'';
+    return res;
+}
+
 /* Builds the comparison of a column with string literals, "name op 'lo'" or
    "name between 'lo' and 'hi'".  The expression on the left has to be the
    name of a column.  It and the strings are deleted. */
@@ -328,11 +344,7 @@ EXISTSOP NOUNSTR {
 	<< *$4 << ", " << *$6 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$4;
-    val += "\", \"";
-    val += *$6;
-    val += '"';
+    val = listValue(*$4) + ", " + listValue(*$6);
     $$ = new ibis::qAnyString($1->c_str(), val.c_str());
     delete $6;
     delete $4;
@@ -345,11 +357,7 @@ EXISTSOP NOUNSTR {
 	<< *$4 << ", " << *$6 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$4;
-    val += "\", \"";
-    val += *$6;
-    val += '"';
+    val = listValue(*$4) + ", " + listValue(*$6);
     $$ = new ibis::qAnyString($1->c_str(), val.c_str());
     delete $6;
     delete $4;
@@ -362,11 +370,7 @@ EXISTSOP NOUNSTR {
 	<< *$4 << ", " << *$6 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$4;
-    val += "\", \"";
-    val += *$6;
-    val += '"';
+    val = listValue(*$4) + ", " + listValue(*$6);
     $$ = new ibis::qAnyString($1->c_str(), val.c_str());
     delete $6;
     delete $4;
@@ -379,11 +383,7 @@ EXISTSOP NOUNSTR {
 	<< *$4 << ", " << *$6 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$4;
-    val += "\", \"";
-    val += *$6;
-    val += '"';
+    val = listValue(*$4) + ", " + listValue(*$6);
     $$ = new ibis::qAnyString($1->c_str(), val.c_str());
     delete $6;
     delete $4;
@@ -396,9 +396,7 @@ EXISTSOP NOUNSTR {
 	<< *$4 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$4;
-    val += '"';
+    val = listValue(*$4);
     $$ = new ibis::qAnyString($1->c_str(), val.c_str());
     delete $4;
     delete $1;
@@ -410,9 +408,7 @@ EXISTSOP NOUNSTR {
 	<< *$4 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$4;
-    val += '"';
+    val = listValue(*$4);
     $$ = new ibis::qAnyString($1->c_str(), val.c_str());
     delete $4;
     delete $1;
@@ -455,11 +451,7 @@ EXISTSOP NOUNSTR {
 	<< *$5 << ", " << *$7 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$5;
-    val += "\", \"";
-    val += *$7;
-    val += '"';
+    val = listValue(*$5) + ", " + listValue(*$7);
     $$ = new ibis::qExpr(ibis::qExpr::LOGICAL_NOT);
     $$->setLeft(new ibis::qAnyString($1->c_str(), val.c_str()));
     delete $7;
@@ -473,11 +465,7 @@ EXISTSOP NOUNSTR {
 	<< *$5 << ", " << *$7 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$5;
-    val += "\", \"";
-    val += *$7;
-    val += '"';
+    val = listValue(*$5) + ", " + listValue(*$7);
     $$ = new ibis::qExpr(ibis::qExpr::LOGICAL_NOT);
     $$->setLeft(new ibis::qAnyString($1->c_str(), val.c_str()));
     delete $7;
@@ -491,11 +479,7 @@ EXISTSOP NOUNSTR {
 	<< *$5 << ", " << *$7 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$5;
-    val += "\", \"";
-    val += *$7;
-    val += '"';
+    val = listValue(*$5) + ", " + listValue(*$7);
     $$ = new ibis::qExpr(ibis::qExpr::LOGICAL_NOT);
     $$->setLeft(new ibis::qAnyString($1->c_str(), val.c_str()));
     delete $7;
@@ -509,11 +493,7 @@ EXISTSOP NOUNSTR {
 	<< *$5 << ", " << *$7 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$5;
-    val += "\", \"";
-    val += *$7;
-    val += '"';
+    val = listValue(*$5) + ", " + listValue(*$7);
     $$ = new ibis::qExpr(ibis::qExpr::LOGICAL_NOT);
     $$->setLeft(new ibis::qAnyString($1->c_str(), val.c_str()));
     delete $7;
@@ -527,9 +507,7 @@ EXISTSOP NOUNSTR {
 	<< *$5 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$5;
-    val += '"';
+    val = listValue(*$5);
     $$ = new ibis::qExpr(ibis::qExpr::LOGICAL_NOT);
     $$->setLeft(new ibis::qAnyString($1->c_str(), val.c_str()));
     delete $5;
@@ -542,9 +520,7 @@ EXISTSOP NOUNSTR {
 	<< *$5 << ")";
 #endif
     std::string val;
-    val = '"'; /* add quote to keep strings intact */
-    val += *$5;
-    val += '"';
+    val = listValue(*$5);
     $$ = new ibis::qExpr(ibis::qExpr::LOGICAL_NOT);
     $$->setLeft(new ibis::qAnyString($1->c_str(), val.c_str()));
     delete $5;

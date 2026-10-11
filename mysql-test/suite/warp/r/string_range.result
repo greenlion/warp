@@ -118,4 +118,48 @@ EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+#
+# IN lists of strings are evaluated by FastBit in one pass.  Lists of
+# 1 to 6 values of the pool (quotes, back slashes, spaces, the empty
+# string, tabs and multi-byte characters included) on every column.
+#
+465 IN conditions checked, 0 mismatches
+# A long list, and values with a quote, a back slash and a space
+SELECT COUNT(*) > 0 AS quote_and_backslash FROM w WHERE v IN ('a\'', 'a\\');
+quote_and_backslash
+1
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE v IN ('a\'', 'a\\')) AS same_as_innodb FROM w WHERE v IN ('a\'', 'a\\');
+same_as_innodb
+1
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE v IN ('', 'b')) AS empty_string FROM w WHERE v IN ('', 'b');
+empty_string
+1
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v IN ('a', 'b ', 'c');
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE n IN ('a', 'b') AND p < 10;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v NOT IN ('a', 'b');
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.v not in ('a','b'))  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v IN ('a', NULL);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.v in ('a',NULL))  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v IN ('a', c);
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.v in ('a',w.c))  
+        -> Table scan on w  
+
 DROP TABLE w, i, pool;
