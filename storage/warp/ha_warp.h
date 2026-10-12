@@ -40,6 +40,7 @@
 #include <iostream>  
 #include <string> 
 #include <thread>
+#include <condition_variable>
 #include <future>
 #include <map>
 #include <forward_list>
@@ -186,6 +187,47 @@ static void warp_update_compression_level(THD *, SYS_VAR *, void *var_ptr,
   *static_cast<uint *>(var_ptr) = *static_cast<const uint *>(save);
   warp_apply_compression();
 }
+
+/* Durability of commits.  With warp_sync_commit = ON (the default) a commit
+   returns when its rows are on disk.  With OFF the rows of a transaction
+   that only inserts are written without waiting for the disk, the
+   transaction is committed at once, and every warp_sync_interval
+   milliseconds the rows and then the commits are made durable: a crash of
+   the system loses the transactions of the last interval, whole, and the
+   tables stay consistent (see warp_sync_round and repair_tables). */
+static bool my_sync_commit = true;
+static uint my_sync_interval = 1000;
+static void warp_update_sync_commit(THD *, SYS_VAR *, void *var_ptr,
+                                    const void *save);
+static void warp_update_sync_interval(THD *, SYS_VAR *, void *var_ptr,
+                                      const void *save);
+
+static MYSQL_SYSVAR_BOOL(
+  sync_commit,
+  my_sync_commit,
+  PLUGIN_VAR_OPCMDARG,
+  "Wait for the rows of a transaction to be on disk when it commits.  When "
+  "OFF, the transactions that only insert are made durable every "
+  "warp_sync_interval milliseconds: a crash of the system may lose the "
+  "transactions of the last interval",
+  NULL,
+  warp_update_sync_commit,
+  true
+);
+
+static MYSQL_SYSVAR_UINT(
+  sync_interval,
+  my_sync_interval,
+  PLUGIN_VAR_RQCMDARG,
+  "Milliseconds between the times the rows and the commits of "
+  "warp_sync_commit = OFF are made durable",
+  NULL,
+  warp_update_sync_interval,
+  1000,
+  1,
+  60000,
+  0
+);
 
 static MYSQL_SYSVAR_BOOL(
   compression,
@@ -396,6 +438,8 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(cache_size),
   MYSQL_SYSVAR(write_cache_size),
   MYSQL_SYSVAR(compression),
+  MYSQL_SYSVAR(sync_commit),
+  MYSQL_SYSVAR(sync_interval),
   MYSQL_SYSVAR(compression_level),
   MYSQL_SYSVAR(lock_wait_timeout),
   MYSQL_SYSVAR(purge_interval),
@@ -677,6 +721,12 @@ class warp_trx {
   //is called
   bool autocommit = false;
 
+  /* rows of the transaction were written without waiting for the disk
+     (warp_sync_commit = OFF), and the transaction deleted rows: a
+     transaction that deletes commits durably, see warp_trx::commit */
+  bool wrote_relaxed = false;
+  bool has_deletes = false;
+
   //selected transaction isolation level.  Only SERIALIZABLE,
   //REPEATABLE-READ and READ-COMMITTED are actually supported
   enum enum_tx_isolation isolation_level;
@@ -730,6 +780,15 @@ class warp_global_data {
   std::string commit_filename     = "commits.warp";
   /* the bitmap of the committed transactions */
   std::string commit_bitmap_file  = "commit_bitmap.warp";
+  /* the commits that are pending (see sync_round), written without a sync
+     after the boot id of the system: after a crash of the server alone they
+     are complete (the system has the writes), after a crash of the system
+     they are not used */
+  std::string pending_commit_file = "pending_commits.warp";
+  int pending_log_fd = -1;
+  std::string boot_id;
+  void open_pending_log();
+  void rewrite_pending_log();
   std::string delete_bitmap_file  = "deletes.warp";
 
   uint64_t rowid_batch_size = 10000;
@@ -825,8 +884,35 @@ class warp_global_data {
 
   /* true if the transaction committed */
   bool is_trx_committed(uint64_t trx_id) {
-    return commit_bitmap != NULL && commit_bitmap->is_set(trx_id);
+    if(commit_bitmap != NULL && commit_bitmap->is_set(trx_id)) {
+      return true;
+    }
+    return pending_commit_count.load(std::memory_order_acquire) != 0 &&
+           is_pending_commit(trx_id);
   }
+
+  /* The commits of warp_sync_commit = OFF: the transaction is committed
+     (visible) at once, its bit in the commit bitmap is written when its rows
+     are durable (sync_round).  pending_partitions are the partitions that
+     were written without waiting for the disk. */
+  std::mutex durable_mtx;
+  std::set<std::string> pending_partitions;
+  std::vector<uint64_t> pending_commit_order;
+  std::unordered_set<uint64_t> pending_commits;
+  std::atomic<uint64_t> pending_commit_count{0};
+  std::mutex round_mtx;
+  std::condition_variable syncer_cv;
+  bool syncer_stopping = false;
+  bool syncer_interval_changed = false;
+  std::thread syncer;
+  bool is_pending_commit(uint64_t trx_id);
+  void add_pending_partition(const std::string &part_dir);
+  void add_pending_commit(uint64_t trx_id);
+  bool has_pending();
+  /* makes the pending partitions, then the pending commits, durable */
+  void sync_round();
+  void start_syncer();
+  void stop_syncer();
   /* the transaction ended (commit or rollback) and is not open any more */
   void unregister_open_trx(uint64_t trx_id);
   /* converts the list of the committed transactions of older versions

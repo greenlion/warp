@@ -531,8 +531,39 @@ namespace ibis {
             uint64_t comp_size; ///< bytes of valid zstd frames after header
             uint32_t nframes;   ///< number of zstd frames
             uint32_t elem_size; ///< element size, informational only
-            char     pad[24];
+            /// The frames that are known to be on disk (synced), see
+            /// makeDurable: the frames after them may be lost by a crash
+            /// of the system.  Only valid when durable_magic is
+            /// DURABLE_MAGIC; in the files written before, which were
+            /// synced before their header was written, every frame is.
+            uint64_t durable_comp;
+            uint64_t durable_raw;
+            uint32_t durable_frames;
+            uint32_t durable_magic;
         };
+        static const uint32_t DURABLE_MAGIC = 0x42525544; // "DURB"
+
+        /// Are the appends of the calling thread synced before the header
+        /// refers to them (the default)?  When they are not, the frames of an append are
+        /// written and the header is updated at once; makeDurable makes
+        /// them durable later, and recover finds the frames that are valid
+        /// after a crash of the system.
+        FASTBIT_CXX_DLLSPEC void setSyncAppends(bool sync);
+        FASTBIT_CXX_DLLSPEC bool syncAppends();
+        /// Makes the content of a file durable: syncs it and records in the
+        /// header of a compressed file that all its frames are on disk.
+        /// Returns 0 or < 0 on error.
+        FASTBIT_CXX_DLLSPEC int makeDurable(const char* fname);
+        /// After a crash: the frames of a compressed file that are valid
+        /// (the durable ones and the ones after them that decompress and
+        /// have a valid checksum), up to the first that is not; the header
+        /// and the size of the file are corrected.  Returns the logical
+        /// size of the content, the size of a plain file, or < 0.
+        FASTBIT_CXX_DLLSPEC int64_t recover(const char* fname);
+        /// Cuts the content of a file to its first size logical bytes (the
+        /// file is written again).  Returns 0 or < 0 on error.
+        FASTBIT_CXX_DLLSPEC int truncateLogical(const char* fname,
+                                                uint64_t size);
 
         /// Compression level for newly created files, 0 = do not compress.
         FASTBIT_CXX_DLLSPEC int level();

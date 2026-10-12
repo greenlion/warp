@@ -458,6 +458,7 @@ static int warp_init_func(void *p) {
   warp_state = new warp_global_data();
   
   assert(warp_state != NULL);
+  warp_state->start_syncer();
   warp_purge_start();
   sql_print_information("WARP storage engine initialization completed");
   DBUG_RETURN(0);
@@ -466,6 +467,8 @@ static int warp_init_func(void *p) {
 static int warp_done_func(void *) {
   sql_print_information("WARP storage engine shutdown started");
   warp_purge_stop();
+  /* the commits of warp_sync_commit = OFF are made durable */
+  warp_state->stop_syncer();
   warp_open_tables.reset();
 
   // destroying warp_state writes the state to disk
@@ -1366,6 +1369,23 @@ uint64_t ha_warp::table_row_count() {
    reach the server.  share->mutex is only held while a partition is chosen,
    so the other connections that write to the table keep buffering rows
    while the columns are written. */
+/* The statements whose rows may be written without waiting for the disk
+   (see warp_sync_commit) */
+static bool warp_relaxed_statement(THD *thd) {
+  switch(thd_sql_command(thd)) {
+    case SQLCOM_INSERT:
+    case SQLCOM_INSERT_SELECT:
+    case SQLCOM_REPLACE:
+    case SQLCOM_REPLACE_SELECT:
+    case SQLCOM_LOAD:
+    case SQLCOM_UPDATE:
+    case SQLCOM_UPDATE_MULTI:
+      return true;
+    default:
+      return false;
+  }
+}
+
 int ha_warp::write_buffered_rows_to_disk() {
   int rc = 0;
   bool claimed = false;
@@ -1387,7 +1407,21 @@ int ha_warp::write_buffered_rows_to_disk() {
     const std::string part_dir = std::string(share->data_dir_name) + "/" + part_name;
     /* no scan reads the partition while it is written */
     warp_partition_write_lock data_lock(part_dir, !file_exists(part_dir.c_str()));
+    /* The rows of a statement that changes data are not synced with
+       warp_sync_commit = OFF: the syncer makes them durable before the
+       commit of the transaction (warp_global_data::sync_round).  The other
+       writes (ALTER TABLE, CREATE TABLE ... SELECT) are synced. */
+    const bool relaxed = !my_sync_commit && warp_relaxed_statement(table->in_use);
+    ibis::zfile::setSyncAppends(!relaxed);
     int written = writer->write(part_dir.c_str(), part_name.c_str());
+    ibis::zfile::setSyncAppends(true);
+    if(relaxed) {
+      warp_state->add_pending_partition(part_dir);
+      auto current_trx = warp_get_trx(warp_hton, table->in_use);
+      if(current_trx != NULL) {
+        current_trx->wrote_relaxed = true;
+      }
+    }
     if(written < 0) {
       sql_print_error("WARP: could not write the buffered rows to %s (error %d)",
                       part_dir.c_str(), written);
@@ -6337,12 +6371,19 @@ warp_trx* ha_warp::create_trx(THD* thd) {
   trx->begin();
   warp_state->register_active_trx(trx->trx_id);
   trx->active_registered = true;
-  trx->open_log();
+  /* the log is opened by the first change of the transaction (see
+     open_log), a transaction that only reads has none */
   trx->autocommit = !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_TABLE_LOCK);
   trx_mutex.unlock();
   return trx;
 }
 
+/* The log of the transaction: its inserts, its deletes and the savepoints
+   of its statements.  It is read only by the transaction itself, when a
+   statement is rolled back and when the deletes are applied at commit; the
+   logs are removed when the server starts (remove_stale_trx_logs), they are
+   never read after a crash.  So the log is not synced: what makes a commit
+   durable are the delete bitmap and the commit bitmap. */
 void warp_trx::open_log() {
   if(log == NULL) {
     log_filename = std::to_string(trx_id) + std::string(".txlog");
@@ -6387,6 +6428,7 @@ void warp_trx::close_log() {
 }
 
 void warp_trx::write_insert_log_rowid(uint64_t rowid) {
+  open_log();
   int sz = 0;
   sz = fwrite(&insert_marker, sizeof(insert_marker), 1, log);
   if(sz == 0 || ferror(log) != 0) {
@@ -6401,9 +6443,7 @@ void warp_trx::write_insert_log_rowid(uint64_t rowid) {
 }
 
 void warp_trx::write_savepoint(uint64_t query_id) {
-  if(log == NULL) {
-    return;
-  }
+  open_log();
   if(fwrite(&savepoint_marker, sizeof(savepoint_marker), 1, log) != 1 ||
      ferror(log) != 0) {
     sql_print_error("failed to write a savepoint into transaction log: %s",
@@ -6414,6 +6454,8 @@ void warp_trx::write_savepoint(uint64_t query_id) {
 }
 
 void warp_trx::write_delete_log_rowid(uint64_t rowid) {
+  open_log();
+  has_deletes = true;
   int sz = 0;
   //sql_print_warning("Writing delete rowid %d", rowid);
   sz = fwrite(&delete_marker, sizeof(delete_marker), 1, log);
@@ -6487,6 +6529,9 @@ void warp_global_data::cleanup_history_locks() {
 /* Applies the deletes in the log of the transaction to the delete bitmap.
    The caller holds commit_mtx. */
 void warp_trx::apply_log_deletes() {
+  if(log == NULL) {
+    return;
+  }
   int sz = 0;
   uint64_t rowid = 0;
   char marker;
@@ -6582,15 +6627,36 @@ void warp_trx::commit() {
     return;
   }
 
-  // the commit marker of the transaction log is on disk before the
-  // transaction can be committed.  The log belongs to the transaction, so
-  // the transactions that commit together sync their logs together too.
+  /* warp_sync_commit = OFF: a transaction that only inserted rows is
+     committed at once, its bit is written to the commit bitmap when its rows
+     are durable (warp_global_data::sync_round).  A crash of the system loses
+     it whole: its rows are not committed. */
+  if(wrote_relaxed && !has_deletes) {
+    commit_mtx.lock();
+    warp_state->add_pending_commit(trx_id);
+    warp_state->open_trx.erase(trx_id);
+    open_registered = false;
+    close_log();
+    commit_mtx.unlock();
+    return;
+  }
+
+  /* The other commits are durable when they return.  The commits before
+     them, and the rows of this transaction that were not synced, are made
+     durable first: the transactions are durable in the order of their
+     commits.  A transaction that deletes rows commits this way, the delete
+     bitmap does not know the transactions of its bits. */
+  if(warp_state->has_pending()) {
+    warp_state->sync_round();
+  }
+
+  /* the deletes are read from the log by the commit (apply_log_deletes) */
+  open_log();
   int sz = fwrite(&commit_marker, sizeof(commit_marker), 1, log);
   if(sz != 1) {
     sql_print_error("failed to write commit marker into transaction log");
   }
   fflush(log);
-  fsync(fileno(log));
 
   std::unique_lock<std::mutex> lock(warp_group_mtx);
   commit_done = false;
@@ -6622,7 +6688,8 @@ void warp_trx::commit() {
 // used when a transaction or statement rolls back
 void warp_trx::rollback(bool all) {
   commit_mtx.lock();
-  if(dirty) {
+  /* a transaction without a log has changed nothing yet */
+  if(dirty && log != NULL) {
     if(warp_state->open_trx.find(trx_id) == warp_state->open_trx.end()) {
       sql_print_error("Open transaction is not registered as open");
       assert(false);
@@ -6634,7 +6701,6 @@ void warp_trx::rollback(bool all) {
       }
     }
     fflush(log);
-    fsync(fileno(log));
     if(all == ROLLBACK_STATEMENT) {
       /* The statement is what the log has after the last savepoint (a
          statement of a transaction that is not autocommit writes one before
@@ -6688,7 +6754,6 @@ void warp_trx::rollback(bool all) {
           sql_print_error("could not truncate transaction log %s",
                           log_filename.c_str());
         }
-        fsync(fileno(log));
         savepoint_query_id = 0;
       }
       fseek(log, 0, SEEK_END);
@@ -6707,6 +6772,248 @@ void warp_trx::rollback(bool all) {
   commit_mtx.unlock();
 }
 
+
+/* ---------------------------------------------------------------------
+   warp_sync_commit = OFF
+
+   The rows of the statements that change data are written to the column
+   files without waiting for the disk (ibis::zfile::setSyncAppends): their
+   frames are written and the headers of the files refer to them at once, a
+   header also says which frames are durable.  A transaction that only
+   inserted is committed at once, in memory (pending_commits, which
+   is_trx_committed looks at).  Every warp_sync_interval milliseconds, and
+   before a commit that is durable, sync_round makes the written partitions
+   durable, then writes the bits of the pending commits to the commit bitmap
+   and syncs it.  After a crash of the system the partitions are cut back to
+   the rows that are on disk in every column (repair_tables): the rows of a
+   transaction whose bit is not in the bitmap may be lost, the others are
+   there.
+   --------------------------------------------------------------------- */
+
+bool warp_global_data::is_pending_commit(uint64_t trx_id) {
+  std::lock_guard<std::mutex> guard(durable_mtx);
+  return pending_commits.count(trx_id) != 0;
+}
+
+void warp_global_data::add_pending_partition(const std::string &part_dir) {
+  std::lock_guard<std::mutex> guard(durable_mtx);
+  pending_partitions.insert(part_dir);
+}
+
+void warp_global_data::add_pending_commit(uint64_t trx_id) {
+  std::lock_guard<std::mutex> guard(durable_mtx);
+  pending_commits.insert(trx_id);
+  pending_commit_order.push_back(trx_id);
+  pending_commit_count.store(pending_commits.size(), std::memory_order_release);
+  /* the commit survives a crash of the server, see open_pending_log */
+  if(pending_log_fd >= 0 &&
+     ::write(pending_log_fd, &trx_id, sizeof(trx_id)) != (ssize_t)sizeof(trx_id)) {
+    sql_print_error("WARP: could not write to %s", pending_commit_file.c_str());
+  }
+}
+
+/* The log of the pending commits starts with the boot id of the system.
+   When the server starts and the log is of the same boot, only the server
+   crashed: the system has every write of the server, the rows of the
+   pending commits are complete, so they are committed.  After a crash of
+   the system the log is not used, the rows that were not durable are cut
+   (repair_tables) and the pending commits are lost.  Called when the server
+   starts, after the commit bitmap is opened. */
+void warp_global_data::open_pending_log() {
+  char id[64] = {0};
+  FILE *f = fopen("/proc/sys/kernel/random/boot_id", "r");
+  if(f != NULL) {
+    if(fgets(id, sizeof(id), f) == NULL) id[0] = 0;
+    fclose(f);
+  }
+  boot_id = std::string(id);
+  while(!boot_id.empty() && (boot_id.back() == '\n' || boot_id.back() == ' ')) {
+    boot_id.pop_back();
+  }
+  boot_id.resize(36, ' ');
+  FILE *old = fopen(pending_commit_file.c_str(), "rb");
+  if(old != NULL) {
+    char old_id[36];
+    uint64_t committed = 0;
+    if(fread(old_id, sizeof(old_id), 1, old) == 1 && !boot_id.empty() &&
+       boot_id.compare(0, 36, old_id, 36) == 0) {
+      uint64_t trx_id = 0;
+      while(fread(&trx_id, sizeof(trx_id), 1, old) == 1) {
+        if(trx_id != 0 && commit_bitmap->set_bit_direct(trx_id, false) == 0) {
+          ++committed;
+        }
+      }
+      if(committed > 0 && commit_bitmap->sync_direct() != 0) {
+        sql_print_error("Failed to sync the commit bitmap");
+        assert(false);
+      }
+    }
+    fclose(old);
+    if(committed > 0) {
+      sql_print_information("WARP: %llu commits of warp_sync_commit = OFF were "
+                            "made durable after a crash of the server",
+                            (unsigned long long)committed);
+    }
+  }
+  pending_log_fd = ::open(pending_commit_file.c_str(),
+                          O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0660);
+  if(pending_log_fd < 0 ||
+     ::write(pending_log_fd, boot_id.data(), 36) != 36) {
+    sql_print_error("WARP: could not write %s", pending_commit_file.c_str());
+  }
+  if(pending_log_fd >= 0) {
+    (void) fdatasync(pending_log_fd);
+  }
+}
+
+/* the log has the commits that are still pending.  Called with durable_mtx
+   held. */
+void warp_global_data::rewrite_pending_log() {
+  if(pending_log_fd < 0) return;
+  if(ftruncate(pending_log_fd, 36) != 0 ||
+     lseek(pending_log_fd, 36, SEEK_SET) != 36) {
+    sql_print_error("WARP: could not write %s", pending_commit_file.c_str());
+    return;
+  }
+  for(uint64_t trx_id : pending_commit_order) {
+    if(::write(pending_log_fd, &trx_id, sizeof(trx_id)) != (ssize_t)sizeof(trx_id)) {
+      sql_print_error("WARP: could not write %s", pending_commit_file.c_str());
+      return;
+    }
+  }
+}
+
+bool warp_global_data::has_pending() {
+  std::lock_guard<std::mutex> guard(durable_mtx);
+  return !pending_commits.empty() || !pending_partitions.empty();
+}
+
+/* syncs a file or a directory */
+static void warp_sync_path(const std::string &path, bool directory) {
+  const int fd = open(path.c_str(), (directory ? O_RDONLY | O_DIRECTORY : O_RDONLY) | O_CLOEXEC);
+  if(fd >= 0) {
+    if(directory ? fsync(fd) != 0 : fdatasync(fd) != 0) {
+      sql_print_error("WARP: could not sync %s: %s", path.c_str(), strerror(errno));
+    }
+    close(fd);
+  }
+}
+
+void warp_global_data::sync_round() {
+  std::lock_guard<std::mutex> round_guard(round_mtx);
+  /* The commits are taken before the partitions: the rows of a transaction
+     are written, and its partition is pending, before it commits. */
+  std::vector<uint64_t> commits;
+  std::set<std::string> partitions;
+  {
+    std::lock_guard<std::mutex> guard(durable_mtx);
+    commits = pending_commit_order;
+    partitions.swap(pending_partitions);
+  }
+  if(commits.empty() && partitions.empty()) {
+    return;
+  }
+  /* the rows: every file of the partitions, the partitions and their
+     tables (new files and the -part.txt that took the place of the old) */
+  std::set<std::string> tables;
+  for(const std::string &part_dir : partitions) {
+    warp_partition_write_lock data_lock(part_dir, false);
+    std::error_code ec;
+    for(const auto &entry : std::filesystem::directory_iterator(part_dir, ec)) {
+      std::error_code ec2;
+      if(!entry.is_regular_file(ec2)) continue;
+      const std::string file = entry.path().string();
+      if(file.size() > 4 && file.compare(file.size() - 4, 4, ".tmp") == 0) continue;
+      if(ibis::zfile::makeDurable(file.c_str()) < 0) {
+        sql_print_error("WARP: could not make %s durable", file.c_str());
+      }
+    }
+    warp_sync_path(part_dir, true);
+    const size_t slash = part_dir.rfind('/');
+    if(slash != std::string::npos) {
+      tables.insert(part_dir.substr(0, slash));
+    }
+  }
+  for(const std::string &table_dir : tables) {
+    warp_sync_path(table_dir, true);
+  }
+  /* then the commits */
+  if(!commits.empty()) {
+    for(uint64_t trx_id : commits) {
+      if(commit_bitmap->set_bit_direct(trx_id, false) != 0) {
+        sql_print_error("Failed to write to the commit bitmap");
+        assert(false);
+      }
+    }
+    if(commit_bitmap->sync_direct() != 0) {
+      sql_print_error("Failed to sync the commit bitmap");
+      assert(false);
+    }
+    std::lock_guard<std::mutex> guard(durable_mtx);
+    for(uint64_t trx_id : commits) {
+      pending_commits.erase(trx_id);
+    }
+    pending_commit_order.erase(pending_commit_order.begin(),
+                               pending_commit_order.begin() + commits.size());
+    pending_commit_count.store(pending_commits.size(), std::memory_order_release);
+    rewrite_pending_log();
+  }
+}
+
+void warp_global_data::start_syncer() {
+  syncer_stopping = false;
+  syncer = std::thread([this]() {
+    my_thread_init();
+    std::unique_lock<std::mutex> lock(durable_mtx);
+    while(!syncer_stopping) {
+      syncer_cv.wait_for(lock, std::chrono::milliseconds(my_sync_interval));
+      if(syncer_stopping) break;
+      /* the interval was changed: the wait starts again with it */
+      if(syncer_interval_changed) {
+        syncer_interval_changed = false;
+        continue;
+      }
+      if(pending_commits.empty() && pending_partitions.empty()) continue;
+      lock.unlock();
+      sync_round();
+      lock.lock();
+    }
+    lock.unlock();
+    my_thread_end();
+  });
+}
+
+void warp_global_data::stop_syncer() {
+  {
+    std::lock_guard<std::mutex> guard(durable_mtx);
+    syncer_stopping = true;
+    syncer_cv.notify_all();
+  }
+  if(syncer.joinable()) {
+    syncer.join();
+  }
+  /* what is pending is made durable before the shutdown */
+  sync_round();
+}
+
+static void warp_update_sync_interval(THD *, SYS_VAR *, void *var_ptr,
+                                      const void *save) {
+  *static_cast<uint *>(var_ptr) = *static_cast<const uint *>(save);
+  if(warp_state != NULL) {
+    std::lock_guard<std::mutex> guard(warp_state->durable_mtx);
+    warp_state->syncer_interval_changed = true;
+    warp_state->syncer_cv.notify_all();
+  }
+}
+
+static void warp_update_sync_commit(THD *, SYS_VAR *, void *var_ptr,
+                                    const void *save) {
+  *static_cast<bool *>(var_ptr) = *static_cast<const bool *>(save);
+  /* the commits that are pending are durable when the setting is ON */
+  if(*static_cast<const bool *>(save) && warp_state != NULL) {
+    warp_state->sync_round();
+  }
+}
 
 warp_trx* warp_get_trx(handlerton* hton, THD* thd) {
   return (warp_trx*)thd->get_ha_data(hton->slot)->ha_ptr;
@@ -7021,6 +7328,9 @@ warp_global_data::warp_global_data() {
     sql_print_error("Could not open commit bitmap: %s", commit_bitmap_file.c_str());
     assert(false);
   }
+
+  /* the commits of warp_sync_commit = OFF after a crash of the server */
+  open_pending_log();
 
   /* older versions kept a list of the committed transaction ids */
   if(!migrate_commit_list()) {
@@ -7399,7 +7709,237 @@ uint64_t warp_global_data::get_state_and_return_version() {
   return state_record->version;
 }
 
+/* ---------------------------------------------------------------------
+   Recovery after a crash of the system
+
+   The rows of warp_sync_commit = OFF that were not synced may be lost, in
+   some columns and not in others, and the -part.txt of a partition may say
+   more rows than the columns have.  Every column file keeps the frames that
+   are durable and the valid ones after them (ibis::zfile::recover); a
+   partition is then cut back to the number of rows that all its columns
+   have.  The rows that are cut were written by transactions whose commit is
+   not in the commit bitmap: they were never durable.
+   --------------------------------------------------------------------- */
+
+namespace {
+struct warp_part_column {
+  std::string name;
+  std::string type;
+};
+struct warp_part_meta {
+  bool valid = false;
+  uint64_t rows = 0;
+  std::vector<warp_part_column> columns;
+  std::vector<std::string> lines;
+};
+}
+
+/* reads a -part.txt: its lines, the number of rows and the columns */
+static warp_part_meta warp_read_part_meta(const std::string &file) {
+  warp_part_meta meta;
+  std::ifstream in(file);
+  if(!in) return meta;
+  std::string line;
+  bool in_header = false, header_seen = false, in_column = false;
+  warp_part_column column;
+  auto value_of = [](const std::string &l) {
+    const size_t eq = l.find('=');
+    std::string v = eq == std::string::npos ? "" : l.substr(eq + 1);
+    v.erase(0, v.find_first_not_of(" \t\"'"));
+    while(!v.empty() && (v.back() == ' ' || v.back() == '"' || v.back() == '\'' ||
+                         v.back() == '\r')) v.pop_back();
+    return v;
+  };
+  while(std::getline(in, line)) {
+    meta.lines.push_back(line);
+    if(line.compare(0, 12, "BEGIN HEADER") == 0) { in_header = true; continue; }
+    if(line.compare(0, 10, "END HEADER") == 0) { in_header = false; header_seen = true; continue; }
+    if(in_header && line.compare(0, 14, "Number_of_rows") == 0) {
+      meta.rows = strtoull(value_of(line).c_str(), NULL, 10);
+    }
+    if(line.compare(0, 12, "Begin Column") == 0) { in_column = true; column = warp_part_column(); continue; }
+    if(line.compare(0, 10, "End Column") == 0) {
+      if(in_column && !column.name.empty()) meta.columns.push_back(column);
+      in_column = false;
+      continue;
+    }
+    if(in_column && line.compare(0, 4, "name") == 0) column.name = value_of(line);
+    if(in_column && line.compare(0, 9, "data_type") == 0) column.type = value_of(line);
+  }
+  meta.valid = header_seen && !meta.columns.empty();
+  return meta;
+}
+
+/* bytes of a value of a fixed size type, 0 for the strings */
+static uint64_t warp_type_size(const std::string &type) {
+  if(type == "BYTE" || type == "UBYTE") return 1;
+  if(type == "SHORT" || type == "USHORT") return 2;
+  if(type == "INT" || type == "UINT" || type == "FLOAT") return 4;
+  if(type == "LONG" || type == "ULONG" || type == "DOUBLE" || type == "OID") return 8;
+  return 0;
+}
+
+/* the logical content of a column file */
+static bool warp_read_column(const std::string &file, uint64_t size,
+                             std::vector<char> &content) {
+  content.resize(size);
+  return size == 0 ||
+         ibis::zfile::readRange(file.c_str(), 0, size, content.data()) == (int64_t)size;
+}
+
+/* Repairs a partition after a crash, see above.  table_meta is the
+   -part.txt of the table, which has the same columns. */
+static void warp_repair_partition(const std::string &part_dir,
+                                  const warp_part_meta &table_meta) {
+  const std::string meta_file = part_dir + "/-part.txt";
+  (void) unlink((meta_file + ".tmp").c_str());
+  warp_part_meta meta = warp_read_part_meta(meta_file);
+  const bool meta_found = meta.valid;
+  if(!meta_found) {
+    meta = table_meta;
+    meta.rows = UINT64_MAX;
+  }
+  if(!meta.valid) return;
+  /* the rows of every column, a file that recover changed (or a plain file)
+     makes the partition suspect: then the strings are counted too */
+  struct column_state {
+    std::string file;
+    uint64_t fixed = 0;
+    uint64_t size = 0;
+    uint64_t rows = 0;
+  };
+  std::vector<column_state> columns;
+  bool suspect = !meta_found;
+  bool any_file = false;
+  for(const auto &column : meta.columns) {
+    column_state state;
+    state.file = part_dir + "/" + column.name;
+    state.fixed = warp_type_size(column.type);
+    const int64_t before = ibis::zfile::logicalSize(state.file.c_str());
+    const int64_t after = before < 0 ? -1 : ibis::zfile::recover(state.file.c_str());
+    if(before >= 0) any_file = true;
+    if(after < 0) {
+      /* no file, or one that can not be read: no row of it is there */
+      state.size = 0;
+      suspect = true;
+    } else {
+      state.size = (uint64_t)after;
+      if(after != before || !ibis::zfile::isCompressed(state.file.c_str())) suspect = true;
+    }
+    if(state.fixed > 0) {
+      state.rows = state.size / state.fixed;
+      if(state.rows != meta.rows) suspect = true;
+    }
+    columns.push_back(state);
+  }
+  if(!any_file) {
+    /* a partition that was created and has no data: nothing to keep */
+    std::error_code ec;
+    std::filesystem::remove_all(part_dir, ec);
+    sql_print_information("WARP: recovery removed the empty partition %s", part_dir.c_str());
+    return;
+  }
+  if(!suspect) return;
+  std::vector<char> content;
+  uint64_t rows = UINT64_MAX;
+  for(auto &state : columns) {
+    if(state.fixed == 0) {
+      /* the strings end with a NUL */
+      if(!warp_read_column(state.file, state.size, content)) {
+        state.rows = 0;
+      } else {
+        state.rows = std::count(content.begin(), content.end(), '\0');
+      }
+    }
+    rows = std::min(rows, state.rows);
+  }
+  if(rows == meta.rows) {
+    bool same = true;
+    for(const auto &state : columns) {
+      if(state.rows != rows) same = false;
+    }
+    if(same) return;
+  }
+  sql_print_warning("WARP: recovery cuts the partition %s back to %llu rows "
+                    "(its metadata had %llu)", part_dir.c_str(),
+                    (unsigned long long)rows,
+                    (unsigned long long)(meta.rows == UINT64_MAX ? 0 : meta.rows));
+  if(rows == 0) {
+    std::error_code ec;
+    std::filesystem::remove_all(part_dir, ec);
+    return;
+  }
+  /* the columns are cut to the rows */
+  for(auto &state : columns) {
+    if(state.rows == rows) continue;
+    uint64_t bytes = rows * state.fixed;
+    if(state.fixed == 0) {
+      if(!warp_read_column(state.file, state.size, content)) continue;
+      uint64_t seen = 0;
+      bytes = 0;
+      for(size_t i = 0; i < content.size(); ++i) {
+        if(content[i] == 0 && ++seen == rows) {
+          bytes = i + 1;
+          break;
+        }
+      }
+    }
+    if(ibis::zfile::truncateLogical(state.file.c_str(), bytes) != 0) {
+      sql_print_error("WARP: recovery could not cut %s to %llu bytes",
+                      state.file.c_str(), (unsigned long long)bytes);
+    }
+  }
+  /* the files made from the columns (positions of strings, indexes) are
+     made again when they are needed */
+  std::set<std::string> keep;
+  for(const auto &state : columns) keep.insert(state.file);
+  keep.insert(meta_file);
+  std::error_code ec;
+  for(const auto &entry : std::filesystem::directory_iterator(part_dir, ec)) {
+    const std::string file = entry.path().string();
+    if(keep.count(file) == 0) {
+      std::error_code ec2;
+      std::filesystem::remove(entry.path(), ec2);
+    }
+  }
+  /* the metadata says the number of rows */
+  const std::string tmp = meta_file + ".tmp";
+  {
+    std::ofstream out(tmp);
+    const std::string name = part_dir.substr(part_dir.rfind('/') + 1);
+    for(const std::string &line : meta.lines) {
+      if(line.compare(0, 14, "Number_of_rows") == 0) {
+        out << "Number_of_rows = " << rows << "\n";
+      } else if(!meta_found && line.compare(0, 4, "Name") == 0) {
+        out << "Name = " << name << "\n";
+      } else {
+        out << line << "\n";
+      }
+    }
+  }
+  warp_sync_path(tmp, false);
+  if(rename(tmp.c_str(), meta_file.c_str()) != 0) {
+    sql_print_error("WARP: recovery could not write %s", meta_file.c_str());
+  }
+  warp_sync_path(part_dir, true);
+}
+
 bool warp_global_data::repair_tables() {
+  sql_print_information("WARP: the server did not shut down cleanly, checking the partitions");
+  for(const std::string &table_dir : warp_list_tables()) {
+    const warp_part_meta table_meta = warp_read_part_meta(table_dir + "/-part.txt");
+    std::error_code ec;
+    for(const auto &entry : std::filesystem::directory_iterator(table_dir, ec)) {
+      std::error_code ec2;
+      if(!entry.is_directory(ec2)) continue;
+      const std::string name = entry.path().filename().string();
+      if(name.size() < 2 || name[0] != 'p' ||
+         name.find_first_not_of("0123456789", 1) != std::string::npos) {
+        continue;
+      }
+      warp_repair_partition(entry.path().string(), table_meta);
+    }
+  }
   return true;
 }
 
