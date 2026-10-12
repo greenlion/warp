@@ -67,7 +67,7 @@ ENDIF()
 #)
 #ADD_SUBDIRECTORY(lemire_sorted_simd)
 
-SET(WARP_SOURCES ha_warp.cc ha_warp.h)
+SET(WARP_SOURCES ha_warp.cc ha_warp.h ha_warp_part.h)
 
 # WARP is built as a loadable plugin, ha_warp.so, which contains FastBit, so
 # that it can be distributed apart from the server

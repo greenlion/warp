@@ -1,0 +1,248 @@
+--echo #
+--echo # Partitioned WARP tables (PARTITION BY ...).  Every partition, and every
+--echo # subpartition, is stored like a WARP table in its own data directory
+--echo # (<table>#p#<partition>.data, <table>#p#<partition>#sp#<sub>.data).
+--echo # DROP PARTITION removes the directories of the partition, ADD PARTITION
+--echo # (RANGE, LIST) creates empty ones and TRUNCATE PARTITION empties them,
+--echo # without reading the other partitions.  The other changes of the
+--echo # partitioning copy the table.  The results are compared with identical
+--echo # InnoDB tables.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+let $MYSQLD_DATADIR= `SELECT @@datadir`;
+
+CREATE TABLE src (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2))
+  ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO src WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 3000)
+  SELECT x, DATE_ADD('2019-01-01', INTERVAL x DAY), x % 37, CONCAT(CHAR(97 + x % 5), x % 11),
+         x / 7 FROM seq;
+
+let $crc = SELECT CONCAT(COUNT(*), ':', IFNULL(BIT_XOR(CRC32(CONCAT_WS('|', id, d, k, s, v))), 0)) FROM;
+
+--echo #
+--echo # Every kind of partitioning: the rows go to their partitions, and every
+--echo # condition gives the rows that InnoDB gives
+--echo #
+let $t = 0;
+while ($t < 10)
+{
+  inc $t;
+  if ($t == 1) { let $part = PARTITION BY RANGE (YEAR(d)) (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021), PARTITION p2021 VALUES LESS THAN (2022), PARTITION pmax VALUES LESS THAN MAXVALUE); }
+  if ($t == 2) { let $part = PARTITION BY RANGE COLUMNS (d, k) (PARTITION a VALUES LESS THAN ('2020-01-01', 10), PARTITION b VALUES LESS THAN ('2021-06-01', 0), PARTITION c VALUES LESS THAN (MAXVALUE, MAXVALUE)); }
+  if ($t == 3) { let $part = PARTITION BY LIST (k % 4) (PARTITION l0 VALUES IN (0), PARTITION l1 VALUES IN (1, 2), PARTITION l3 VALUES IN (3)); }
+  if ($t == 4) { let $part = PARTITION BY LIST COLUMNS (s) (PARTITION la VALUES IN ('a0','a1','a2','a3','a4','a5','a6','a7','a8','a9','a10'), PARTITION lb VALUES IN ('b0','b1','b2','b3','b4','b5','b6','b7','b8','b9','b10'), PARTITION lrest VALUES IN ('c0','c1','c2','c3','c4','c5','c6','c7','c8','c9','c10','d0','d1','d2','d3','d4','d5','d6','d7','d8','d9','d10','e0','e1','e2','e3','e4','e5','e6','e7','e8','e9','e10')); }
+  if ($t == 5) { let $part = PARTITION BY HASH (k) PARTITIONS 5; }
+  if ($t == 6) { let $part = PARTITION BY LINEAR HASH (id) PARTITIONS 6; }
+  if ($t == 7) { let $part = PARTITION BY KEY (s) PARTITIONS 4; }
+  if ($t == 8) { let $part = PARTITION BY KEY (d, k) PARTITIONS 3; }
+  if ($t == 9) { let $part = PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (k) SUBPARTITIONS 3 (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021), PARTITION pmax VALUES LESS THAN MAXVALUE); }
+  if ($t == 10) { let $part = PARTITION BY LIST (k % 3) SUBPARTITION BY KEY (id) (PARTITION l0 VALUES IN (0) (SUBPARTITION s0a, SUBPARTITION s0b), PARTITION l1 VALUES IN (1) (SUBPARTITION s1a, SUBPARTITION s1b), PARTITION l2 VALUES IN (2) (SUBPARTITION s2a, SUBPARTITION s2b)); }
+  eval CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+    ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin $part;
+  eval CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+    ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin $part;
+  INSERT INTO w SELECT * FROM src;
+  INSERT INTO i SELECT * FROM src;
+  let $wc = `$crc w`;
+  let $ic = `$crc i`;
+  if ($wc != $ic)
+  {
+    --echo MISMATCH of the rows for $part: WARP $wc, InnoDB $ic
+  }
+  --echo # $part
+  SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+    WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+  --echo # the rows of every partition are the ones InnoDB puts there
+  let $p = `SELECT COUNT(*) FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w'`;
+  let $n = 0;
+  while ($n < $p)
+  {
+    let $pname = `SELECT IFNULL(SUBPARTITION_NAME, PARTITION_NAME) FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION LIMIT $n, 1`;
+    inc $n;
+    let $wc = `$crc w PARTITION ($pname)`;
+    let $ic = `$crc i PARTITION ($pname)`;
+    if ($wc != $ic)
+    {
+      --echo MISMATCH of partition $pname: WARP $wc, InnoDB $ic
+    }
+  }
+  let $checked = 0;
+  let $wrong = 0;
+  let $k = 0;
+  while ($k < 14)
+  {
+    inc $k;
+    if ($k == 1) { let $q = WHERE d < '2020-03-01'; }
+    if ($k == 2) { let $q = WHERE d BETWEEN '2020-06-01' AND '2021-02-01' AND k > 5; }
+    if ($k == 3) { let $q = WHERE k = 7; }
+    if ($k == 4) { let $q = WHERE k IN (1, 2, 30) OR s = 'a3'; }
+    if ($k == 5) { let $q = WHERE s IN ('a1', 'b2', 'e10'); }
+    if ($k == 6) { let $q = WHERE v > 300 AND YEAR(d) = 2021; }
+    if ($k == 7) { let $q = WHERE id = 1234; }
+    if ($k == 8) { let $q = FORCE INDEX (k) WHERE k = 11; }
+    if ($k == 9) { let $q = FORCE INDEX (d) WHERE d BETWEEN '2020-01-01' AND '2020-01-31'; }
+    if ($k == 10) { let $q = FORCE INDEX (k) WHERE k BETWEEN 3 AND 5 AND d > '2021-01-01'; }
+    if ($k == 11) { let $q = WHERE id % 13 = 0; }
+    if ($k == 12) { let $q = WHERE d IS NULL; }
+    if ($k == 13) { let $q = WHERE k = 7 AND s LIKE 'c%'; }
+    if ($k == 14) { let $q = WHERE id > 2990; }
+    let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w $q`;
+    let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i $q`;
+    inc $checked;
+    if ($w != $i)
+    {
+      inc $wrong;
+      --echo MISMATCH for $q: WARP $w, InnoDB $i
+    }
+  }
+  --echo $checked conditions checked, $wrong mismatches
+  --echo # a join, and updates that move rows to other partitions
+  let $wj = `SELECT CONCAT(COUNT(*), ':', SUM(a.id + b.id)) FROM w a JOIN src b ON a.k = b.k AND a.id < 300 AND b.id < 50`;
+  let $ij = `SELECT CONCAT(COUNT(*), ':', SUM(a.id + b.id)) FROM i a JOIN src b ON a.k = b.k AND a.id < 300 AND b.id < 50`;
+  if ($wj != $ij)
+  {
+    --echo MISMATCH of the join: WARP $wj, InnoDB $ij
+  }
+  UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+  UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+  DELETE FROM w WHERE id % 10 = 3;
+  DELETE FROM i WHERE id % 10 = 3;
+  let $wc = `$crc w`;
+  let $ic = `$crc i`;
+  if ($wc != $ic)
+  {
+    --echo MISMATCH after the updates: WARP $wc, InnoDB $ic
+  }
+  let $n = 0;
+  while ($n < $p)
+  {
+    let $pname = `SELECT IFNULL(SUBPARTITION_NAME, PARTITION_NAME) FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION LIMIT $n, 1`;
+    inc $n;
+    let $wc = `$crc w PARTITION ($pname)`;
+    let $ic = `$crc i PARTITION ($pname)`;
+    if ($wc != $ic)
+    {
+      --echo MISMATCH of partition $pname after the updates: WARP $wc, InnoDB $ic
+    }
+  }
+  DROP TABLE w, i;
+}
+
+--echo #
+--echo # The partitions that the conditions do not need are not read
+--echo #
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+  PARTITION BY RANGE (YEAR(d)) (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021),
+                                PARTITION p2021 VALUES LESS THAN (2022), PARTITION pmax VALUES LESS THAN MAXVALUE);
+INSERT INTO w SELECT * FROM src;
+EXPLAIN SELECT COUNT(*) FROM w WHERE d >= '2020-03-01' AND d < '2020-09-01';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= '2020-03-01' AND d < '2020-09-01' AND k = 3;
+SELECT COUNT(*) FROM w WHERE d >= '2020-03-01' AND d < '2020-09-01' AND k = 3;
+SELECT COUNT(*) FROM w PARTITION (p2019, pmax);
+DELETE FROM w PARTITION (pmax) WHERE k < 10;
+UPDATE w PARTITION (p2019) SET s = 'x' WHERE k = 1;
+SELECT COUNT(*), SUM(s = 'x') FROM w;
+
+--echo #
+--echo # DROP PARTITION removes the data directory of the partition, ADD
+--echo # PARTITION creates an empty one, TRUNCATE PARTITION empties one
+--echo #
+--echo # the data directories of w
+--exec ls $MYSQLD_DATADIR/test | grep '^w#' | sort
+ALTER TABLE w DROP PARTITION p2019;
+--exec ls $MYSQLD_DATADIR/test | grep '^w#' | sort
+SELECT COUNT(*), MIN(d) FROM w;
+ALTER TABLE w ALGORITHM=INPLACE, DROP PARTITION p2020, pmax;
+--exec ls $MYSQLD_DATADIR/test | grep '^w#' | sort
+SELECT COUNT(*), MIN(d), MAX(d) FROM w;
+--error ER_NO_PARTITION_FOR_GIVEN_VALUE
+INSERT INTO w VALUES (1, '2025-01-01', 1, 'a', 1);
+ALTER TABLE w ADD PARTITION (PARTITION p2022 VALUES LESS THAN (2023), PARTITION p2025 VALUES LESS THAN (2026));
+--exec ls $MYSQLD_DATADIR/test | grep '^w#' | sort
+INSERT INTO w VALUES (1, '2025-01-01', 1, 'a', 1), (2, '2022-02-02', 2, 'b', 2);
+SELECT * FROM w PARTITION (p2022, p2025) ORDER BY id;
+ALTER TABLE w TRUNCATE PARTITION p2021;
+SELECT COUNT(*) FROM w;
+SELECT PARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION;
+INSERT INTO w VALUES (3, '2021-03-03', 3, 'c', 3);
+SELECT * FROM w ORDER BY id;
+
+--echo # Subpartitions: DROP PARTITION removes all of them, TRUNCATE empties one
+CREATE TABLE ws (id INT, d DATE, k INT) ENGINE=WARP
+  PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (k) SUBPARTITIONS 2
+  (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021), PARTITION p2029 VALUES LESS THAN (2030));
+INSERT INTO ws SELECT id, d, k FROM src;
+--exec ls $MYSQLD_DATADIR/test | grep '^ws#' | sort
+ALTER TABLE ws DROP PARTITION p2020;
+--exec ls $MYSQLD_DATADIR/test | grep '^ws#' | sort
+ALTER TABLE ws TRUNCATE PARTITION p2019sp0;
+SELECT COUNT(*) = (SELECT COUNT(*) FROM src WHERE YEAR(d) < 2020 AND k % 2 = 1) + (SELECT COUNT(*) FROM src WHERE YEAR(d) >= 2021)
+  AS rows_left FROM ws;
+ALTER TABLE ws ADD PARTITION (PARTITION p2030 VALUES LESS THAN (2031));
+--exec ls $MYSQLD_DATADIR/test | grep '^ws#' | sort
+INSERT INTO ws VALUES (1, '2030-06-06', 5);
+SELECT * FROM ws PARTITION (p2030);
+--error ER_SAME_NAME_PARTITION
+ALTER TABLE ws ADD PARTITION (PARTITION p2019 VALUES LESS THAN (2032));
+
+--echo # A transaction that is rolled back leaves no rows in the partitions
+BEGIN;
+INSERT INTO w VALUES (10, '2022-05-05', 1, 'z', 1), (11, '2025-05-05', 1, 'z', 1);
+DELETE FROM w WHERE id = 3;
+ROLLBACK;
+SELECT * FROM w ORDER BY id;
+
+--echo #
+--echo # The other changes of the partitioning copy the table
+--echo #
+CREATE TABLE wh (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY HASH (id) PARTITIONS 4;
+INSERT INTO wh SELECT * FROM src;
+let $before = `$crc wh`;
+ALTER TABLE wh ADD PARTITION PARTITIONS 2;
+ALTER TABLE wh COALESCE PARTITION 3;
+--exec ls $MYSQLD_DATADIR/test | grep '^wh#' | sort
+ALTER TABLE wh REORGANIZE PARTITION;
+ALTER TABLE wh PARTITION BY RANGE (k) (PARTITION a VALUES LESS THAN (10), PARTITION b VALUES LESS THAN MAXVALUE);
+ALTER TABLE wh REORGANIZE PARTITION b INTO (PARTITION b1 VALUES LESS THAN (20), PARTITION b2 VALUES LESS THAN MAXVALUE);
+--exec ls $MYSQLD_DATADIR/test | grep '^wh#' | sort
+let $after = `$crc wh`;
+let $same = `SELECT '$before' = '$after'`;
+--echo same rows after the changes: $same
+SELECT COUNT(*) FROM wh PARTITION (b1);
+ALTER TABLE wh REMOVE PARTITIONING;
+--exec ls $MYSQLD_DATADIR/test | grep '^wh' | grep -v '\.sdi$' | sort
+let $after = `$crc wh`;
+let $same = `SELECT '$before' = '$after'`;
+--echo same rows without partitioning: $same
+ALTER TABLE wh PARTITION BY KEY (s) PARTITIONS 2;
+--exec ls $MYSQLD_DATADIR/test | grep '^wh' | grep -v '\.sdi$' | sort
+let $after = `$crc wh`;
+let $same = `SELECT '$before' = '$after'`;
+--echo same rows partitioned again: $same
+--echo # EXCHANGE PARTITION is not supported
+CREATE TABLE wx (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+--error ER_PARTITION_MGMT_ON_NONPARTITIONED
+ALTER TABLE w EXCHANGE PARTITION p2025 WITH TABLE wx;
+DROP TABLE wx;
+
+--echo #
+--echo # RENAME TABLE moves the directories of the partitions, DROP TABLE removes
+--echo # them, and the rows survive a restart
+--echo #
+RENAME TABLE wh TO wh2;
+--exec ls $MYSQLD_DATADIR/test | grep '^wh' | grep -v '\.sdi$' | sort
+SELECT COUNT(*) FROM wh2;
+--source include/restart_mysqld.inc
+let $after = `$crc wh2`;
+let $same = `SELECT '$before' = '$after'`;
+--echo same rows after the restart: $same
+SELECT * FROM w ORDER BY id;
+SELECT COUNT(*) FROM ws;
+DROP TABLE w, ws, wh2, src;
+--exec ls $MYSQLD_DATADIR/test | grep '#' | grep -v '\.sdi$' | sort

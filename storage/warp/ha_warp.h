@@ -876,6 +876,13 @@ struct warp_star_agg;  /* warp_star_agg.h */
 
 struct warp_table_lock_set;
 
+/* The flags of the WARP tables, partitioned (ha_warp_part) or not */
+static inline handler::Table_flags warp_table_flags() {
+  return (HA_BINLOG_ROW_CAPABLE | HA_NO_AUTO_INCREMENT | HA_CAN_REPAIR |
+          HA_NULL_IN_KEY | HA_GENERATED_COLUMNS |
+          HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN);
+}
+
 class ha_warp : public handler {
   /* MySQL lock - Fastbit has its own internal mutex implementation.  This is used to protect the share.*/
   THR_LOCK_DATA lock; 
@@ -1073,6 +1080,18 @@ class ha_warp : public handler {
   bool has_deleted_rows = false;
   
  public:
+  /* A partition of a partitioned table (see ha_warp_part).  It is not a
+     table of its own for the join pushdown and the statistics of joins:
+     its pushdown information is kept under its own name (pd_alias, the
+     alias of the table followed by pd_alias_suffix), which the conditions
+     on the table (they name its alias) never find. */
+  bool is_partition_child = false;
+  std::string pd_alias_suffix;
+  std::string pd_alias() const {
+    return std::string(table->alias) + pd_alias_suffix;
+  }
+  friend class ha_warp_part;
+
   ha_warp(handlerton *hton, TABLE_SHARE *table_arg);
   handlerton* warp_hton;
   ~ha_warp() {
@@ -1091,9 +1110,7 @@ class ha_warp : public handler {
        column, such as the hidden column of a functional index, is evaluated
        on the stored values.  The server computes the virtual columns again
        after a row is read (WARP has no index-only reads). */
-    return (HA_BINLOG_ROW_CAPABLE | HA_NO_AUTO_INCREMENT | HA_CAN_REPAIR |
-            HA_NULL_IN_KEY | HA_GENERATED_COLUMNS |
-            HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN);
+    return warp_table_flags();
   }
  
   uint max_record_length() const { return 0; }
