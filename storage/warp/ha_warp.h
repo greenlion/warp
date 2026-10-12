@@ -292,6 +292,25 @@ static MYSQL_SYSVAR_ULONGLONG(
   0
 );
 
+/* A partition is read ahead by a thread of its own only if it has this many
+   rows or more: making and joining a thread (and unmapping its stack on every
+   core) costs more than reading a small partition. */
+static unsigned long long my_prefetch_min_rows = 100000;
+
+static MYSQL_SYSVAR_ULONGLONG(
+  prefetch_min_rows,
+  my_prefetch_min_rows,
+  PLUGIN_VAR_RQCMDARG,
+  "Smallest number of rows of a partition that is read ahead by a thread of its own "
+  "while the rows of the partition before it are returned.",
+  NULL,
+  NULL,
+  100000,
+  0,
+  1ULL<<40,
+  0
+);
+
 static MYSQL_THDVAR_ULONG(lock_wait_timeout, PLUGIN_VAR_RQCMDARG,
                           "Timeout in seconds a WARP transaction may wait "
                           "for a lock before being rolled back.",
@@ -357,6 +376,7 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(purge_interval),
   MYSQL_SYSVAR(purge_threshold),
   MYSQL_SYSVAR(tail_partition_rows),
+  MYSQL_SYSVAR(prefetch_min_rows),
   MYSQL_SYSVAR(partition_filter),
   MYSQL_SYSVAR(adjust_table_stats_for_joins),
   MYSQL_SYSVAR(star_aggregation),
@@ -655,6 +675,10 @@ class warp_global_data {
   // transaction is committed, this idenifier is written into the
   // commit bitmap.
   ulonglong next_trx_id = 1;
+  /* The highest transaction id that is covered by the state file.  Ids are
+     reserved in batches so that a transaction does not wait for two fsyncs.
+     After a crash the ids up to this value may be skipped. */
+  ulonglong trx_id_reserved = 0;
 
   // Each time a write into a table starts, WARP hands out 
   // a set of 10000 rowid values, and this counter is 
@@ -838,6 +862,10 @@ class ha_warp : public handler {
   // to limit the partition scanned by a query
   std::string partition_filter_alias;
   std::string partition_filter_partition_name;
+  /* the files of every partition as they were when the scan listed the
+     partitions: a partition that is still the same is not read again */
+  std::unordered_map<std::string, std::string> scan_part_sigs;
+  ibis::part *scan_liga_part = nullptr;
 
   ibis::partList* partitions = NULL;
   ibis::partList::iterator part_it;

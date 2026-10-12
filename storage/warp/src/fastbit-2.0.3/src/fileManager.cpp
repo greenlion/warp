@@ -16,6 +16,7 @@
 #pragma warning(disable:4786)   // some identifier longer than 256 characters
 #endif
 #include "fileManager.h"
+#include <thread>
 #include "resource.h"
 #include "array_t.h"
 
@@ -3592,10 +3593,81 @@ int ibis::zfile::append(const char* fname, const void* buf, size_t n,
     return append(fdes, buf, n, elem);
 }
 
+namespace {
+    // an append whose frames are written and whose header is not
+    struct DeferredAppend {
+        int fd;                    // a copy of the descriptor, owned here
+        ibis::zfile::header hdr;   // the header to write when the frames are on disk
+        dev_t dev;
+        ino_t ino;
+    };
+    struct DeferState {
+        int depth = 0;
+        std::vector<DeferredAppend> pending;
+    };
+    thread_local DeferState gDefer;
+}
+
+ibis::zfile::deferSync::deferSync() {
+    ++ gDefer.depth;
+}
+
+ibis::zfile::deferSync::~deferSync() {
+    if (-- gDefer.depth == 0)
+        (void) ibis::zfile::commitDeferred();
+}
+
+int ibis::zfile::commitDeferred() {
+    std::vector<DeferredAppend> pending;
+    pending.swap(gDefer.pending);
+    if (pending.empty()) return 0;
+    std::vector<int> failed(pending.size(), 0);
+    if (pending.size() == 1) {
+        failed[0] = (fdatasync(pending[0].fd) != 0);
+    }
+    else { // the disk works on all of them together
+        std::vector<std::thread> workers;
+        for (size_t i = 1; i < pending.size(); ++ i) {
+            workers.emplace_back([&pending, &failed, i]() {
+                failed[i] = (fdatasync(pending[i].fd) != 0);
+            });
+        }
+        failed[0] = (fdatasync(pending[0].fd) != 0);
+        for (auto &w : workers) w.join();
+    }
+    int nfail = 0;
+    for (size_t i = 0; i < pending.size(); ++ i) {
+        // the header refers to frames that are on disk now
+        if (failed[i] == 0 &&
+            fbzPwrite(pending[i].fd, &(pending[i].hdr), sizeof(pending[i].hdr), 0)
+            == (int64_t)sizeof(pending[i].hdr)) {
+            // done
+        }
+        else {
+            ++ nfail;
+            LOGGER(ibis::gVerbose >= 0)
+                << "Warning -- zfile::commitDeferred failed to make an "
+                "appended file durable";
+        }
+        UnixClose(pending[i].fd);
+    }
+    return nfail;
+}
+
 int ibis::zfile::append(int fdes, const void* buf, size_t n, uint32_t elem) {
     ibis::zfile::header hdr;
     Stat_T st;
     if (fstat(fdes, &st) != 0) return -3;
+    // The header of a file that has an append waiting is not up to date:
+    // the append is completed first.
+    if (gDefer.depth > 0) {
+        for (const auto &d : gDefer.pending) {
+            if (d.dev == st.st_dev && d.ino == st.st_ino) {
+                (void) commitDeferred();
+                break;
+            }
+        }
+    }
     if (st.st_size == 0) {
         fbzInitHeader(hdr, elem);
     }
@@ -3620,6 +3692,23 @@ int ibis::zfile::append(int fdes, const void* buf, size_t n, uint32_t elem) {
         return -6;
     if ((uint64_t)st.st_size > pos + comp.size()) {
         if (ftruncate(fdes, pos + comp.size()) != 0) return -7;
+    }
+    if (gDefer.depth > 0 && !comp.empty()) {
+        // the frames are synced with the ones of the other files, the header
+        // is written then
+        const int copy = dup(fdes);
+        if (copy >= 0) {
+            hdr.raw_size += n;
+            hdr.comp_size += comp.size();
+            hdr.nframes += nf;
+            DeferredAppend d;
+            d.fd = copy;
+            d.hdr = hdr;
+            d.dev = st.st_dev;
+            d.ino = st.st_ino;
+            gDefer.pending.push_back(d);
+            return 0;
+        }
     }
     // make sure the frames are on disk before the header refers to them
     if (!comp.empty() && fdatasync(fdes) != 0) return -8;

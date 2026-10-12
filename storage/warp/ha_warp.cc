@@ -917,6 +917,116 @@ int ha_warp::reset_table() {
   DBUG_RETURN(0);
 }
 
+/* Opening the table (reading the metadata of every partition) to count its
+   rows or to estimate a condition costs more than the point query that
+   asks for the estimate.  The answer only changes when a partition changes,
+   and a partition that changed has another signature (writers rewrite
+   -part.txt last).  The signature of a table is the one of its partitions. */
+struct warp_table_estimates {
+  std::string signature;
+  uint64_t rows = 0;
+  std::map<std::string, uint64_t> maxima;
+};
+
+static std::string warp_table_signature(const std::string &datadir) {
+  std::string out;
+  DIR *dirp = opendir(datadir.c_str());
+  if(dirp == nullptr) return out;
+  std::vector<std::string> names;
+  struct dirent *ent;
+  while((ent = readdir(dirp)) != nullptr) {
+    if(ent->d_name[0] == '.' || ent->d_type == DT_REG) continue;
+    names.push_back(ent->d_name);
+  }
+  closedir(dirp);
+  std::sort(names.begin(), names.end());
+  for(const auto &name : names) {
+    const warp_part_signature sig = warp_partition_signature(datadir + "/" + name);
+    if(!sig.valid) return std::string();
+    char buf[160];
+    snprintf(buf, sizeof(buf), "%s:%lu:%ld:%ld.%09ld:%ld:%ld;", name.c_str(),
+             (unsigned long)sig.dir_inode, (long)sig.meta_size,
+             (long)sig.meta_mtime.tv_sec, (long)sig.meta_mtime.tv_nsec,
+             (long)sig.r_size, (long)sig.t_size);
+    out += buf;
+  }
+  return out;
+}
+
+/* the rows of the table, and the upper estimate of a condition if where is
+   not empty; the caller holds the table lock */
+static uint64_t warp_table_estimate(const std::string &datadir,
+                                    const std::string &where) {
+  static std::mutex registry_mtx;
+  static std::unordered_map<std::string, warp_table_estimates> registry;
+  const std::string signature = warp_table_signature(datadir);
+  /* The estimate of "col = constant" is the one of any other constant: the
+     optimizer needs the order of magnitude, and finding it out opens every
+     partition of the table.  The other conditions are estimated for the
+     constants that they have. */
+  std::string shape = where;
+  bool equality = !where.empty();
+  {
+    int comparisons = 0;
+    std::string out;
+    for(size_t i = 0; i < where.size() && equality; ++i) {
+      const char ch = where[i];
+      if(ch == '=') ++comparisons;
+      if(ch == '<' || ch == '>' || ch == '!' || ch == '\'' || ch == '"' ||
+         ch == ',' || ch == '.' || ch == '&' ||
+         ch == '|' || ch == '+' || ch == '*' || ch == '/' || ch == '%') {
+        equality = false;
+      } else if(isdigit((unsigned char)ch) && (i == 0 || !isalnum((unsigned char)where[i - 1]))) {
+        while(i + 1 < where.size() && isdigit((unsigned char)where[i + 1])) ++i;
+        out += '?';
+      } else if(ch == '-' && i + 1 < where.size() && isdigit((unsigned char)where[i + 1])) {
+        // the sign belongs to the constant
+      } else {
+        out += ch;
+      }
+    }
+    if(equality && comparisons == 1 && where.find(" or ") == std::string::npos &&
+       where.find(" and ") == std::string::npos &&
+       where.find("OR") == std::string::npos && where.find("AND") == std::string::npos) {
+      shape = "=:" + out;
+    } else {
+      equality = false;
+    }
+  }
+  const std::string &key = equality ? shape : where;
+  if(!signature.empty()) {
+    std::lock_guard<std::mutex> guard(registry_mtx);
+    auto it = registry.find(datadir);
+    if(it != registry.end() && it->second.signature == signature) {
+      if(where.empty()) return it->second.rows;
+      auto est = it->second.maxima.find(key);
+      if(est != it->second.maxima.end()) return est->second;
+    }
+  }
+  std::unique_ptr<ibis::mensa> table(new ibis::mensa(datadir.c_str()));
+  const uint64_t rows = table->nRows();
+  uint64_t result = rows;
+  if(!where.empty()) {
+    uint64_t min = 0, max = 0;
+    table->estimate(where.c_str(), min, max);
+    result = max;
+  }
+  if(!signature.empty() && warp_table_signature(datadir) == signature) {
+    std::lock_guard<std::mutex> guard(registry_mtx);
+    auto &entry = registry[datadir];
+    if(entry.signature != signature) {
+      entry.signature = signature;
+      entry.maxima.clear();
+    }
+    entry.rows = rows;
+    if(!where.empty()) {
+      if(entry.maxima.size() >= 256) entry.maxima.clear();
+      entry.maxima[key] = result;
+    }
+  }
+  return result;
+}
+
 void ha_warp::update_row_count() {
   DBUG_ENTER("ha_warp::row_count");
   /* The table is only opened to count the rows.  It must not be kept: it
@@ -925,8 +1035,7 @@ void ha_warp::update_row_count() {
      append to can not be removed from the cache (they are "in use") and the
      scans that follow read the old copy with the new number of rows. */
   warp_table_read_lock data_lock(share->data_dir_name);
-  std::unique_ptr<ibis::mensa> counted(new ibis::mensa(share->data_dir_name));
-  stats.records = counted->nRows();
+  stats.records = warp_table_estimate(share->data_dir_name, "");
   DBUG_VOID_RETURN;
 }
 
@@ -1516,12 +1625,38 @@ static void warp_release_partition(const char *partition_dir) {
 
 /* Brings the indexes of the columns of a partition up to date.  The
    function does not use the handler, so look ahead threads can run it. */
+/* What is known about the indexes of a partition: they were made up to date
+   when the files of the partition were as signature says.  Looking at every
+   index of the partition for every query is much more work than the query
+   itself for a table that is read and written all the time. */
+struct warp_index_state {
+  std::mutex mtx;
+  warp_part_signature verified;
+};
+
+static std::shared_ptr<warp_index_state> warp_index_state_of(const std::string &datadir) {
+  static std::mutex registry_mtx;
+  static std::unordered_map<std::string, std::shared_ptr<warp_index_state>> registry;
+  std::lock_guard<std::mutex> guard(registry_mtx);
+  auto &state = registry[datadir];
+  if(!state) state = std::make_shared<warp_index_state>();
+  return state;
+}
+
 static void warp_maintain_partition_indexes(const char *datadir,
                                             const std::vector<uint> &field_indexes) {
-  /* the scans that run at the same time would load, rebuild and unload the
-     same index files */
-  static std::mutex maintain_mtx;
-  std::lock_guard<std::mutex> maintain_guard(maintain_mtx);
+  /* The files of the partition are what they were when its indexes were
+     looked at last: nothing to do (rows written to the partition or a
+     partition that took its place change the signature) */
+  const warp_part_signature before = warp_partition_signature(datadir);
+  auto state = warp_index_state_of(datadir);
+  /* the scans of the same partition that run at the same time would load,
+     rebuild and unload the same index files, the others do not wait for
+     them */
+  std::lock_guard<std::mutex> maintain_guard(state->mtx);
+  if(before.valid && state->verified == before) {
+    return;
+  }
   std::unique_ptr<ibis::part> tbl(new ibis::part(datadir));
   for (uint field_index : field_indexes) {
     std::string columnIndexFilename = std::string(datadir) + "/c" + std::to_string(field_index) + ".idx";
@@ -1545,6 +1680,10 @@ static void warp_maintain_partition_indexes(const char *datadir,
         col->unloadIndex();
       }
     }
+  }
+  /* remembered if the partition did not change meanwhile */
+  if(before.valid && warp_partition_signature(datadir) == before) {
+    state->verified = before;
   }
 }
 
@@ -1625,6 +1764,9 @@ void ha_warp::prefetch_following_partitions() {
     if(dir == std::string(share->data_dir_name)) {
       continue; // the top level directory has no rows
     }
+    if((*it)->nRows() < my_prefetch_min_rows) {
+      continue; // a thread costs more than reading it here
+    }
     if(matching_ridset.size() > 0) {
       auto find_it = matching_ridset.find(dir);
       if(find_it == matching_ridset.end() || find_it->second == NULL) {
@@ -1678,6 +1820,12 @@ void ha_warp::release_scanned_table() {
   if(filtered_table != NULL) {
     delete base_table;
     base_table = NULL;
+    if(scan_liga_part != nullptr) {
+      /* the partition object outlives the table; the indexes that the
+         select loaded must not stay in memory until the scan ends */
+      scan_liga_part->unloadIndexes();
+      scan_liga_part = nullptr;
+    }
   }
 }
 
@@ -2207,6 +2355,34 @@ enum_alter_inplace_result ha_warp::check_if_supported_inplace_alter(
    for each evaluated expression.  Fastbit will automatically
    construct indexes for these evaluations when appropriate.
 */
+/* The files of a partition as one string, empty if they can not be looked at */
+static std::string warp_partition_signature_string(const std::string &dir) {
+  const warp_part_signature sig = warp_partition_signature(dir);
+  if(!sig.valid) return std::string();
+  char buf[160];
+  snprintf(buf, sizeof(buf), "%lu:%ld:%ld.%09ld:%ld:%ld",
+           (unsigned long)sig.dir_inode, (long)sig.meta_size,
+           (long)sig.meta_mtime.tv_sec, (long)sig.meta_mtime.tv_nsec,
+           (long)sig.r_size, (long)sig.t_size);
+  return buf;
+}
+
+static std::unordered_map<std::string, std::string>
+warp_partition_signature_strings(const std::string &datadir) {
+  std::unordered_map<std::string, std::string> out;
+  DIR *dirp = opendir(datadir.c_str());
+  if(dirp == nullptr) return out;
+  struct dirent *ent;
+  while((ent = readdir(dirp)) != nullptr) {
+    if(ent->d_name[0] == '.' || ent->d_type == DT_REG) continue;
+    const std::string dir = datadir + "/" + ent->d_name;
+    const std::string sig = warp_partition_signature_string(dir);
+    if(!sig.empty()) out[dir] = sig;
+  }
+  closedir(dirp);
+  return out;
+}
+
 int ha_warp::rnd_init(bool) {
   DBUG_ENTER("ha_warp::rnd_init");
   if(star_agg) {
@@ -2334,6 +2510,9 @@ int ha_warp::rnd_init(bool) {
     } else {
       partitions = new ibis::partList;
       full_partition_scan = true;
+      /* taken before the partitions are read: a partition that still has
+         this signature when it is scanned has not changed since */
+      scan_part_sigs = warp_partition_signature_strings(share->data_dir_name);
       ibis::util::gatherParts(*partitions, share->data_dir_name, true);
       part_it = partitions->begin();
     }
@@ -2968,7 +3147,16 @@ fetch_again:
           filtered_table == NULL ) {
         warp_partition_read_lock data_lock((*part_it)->currentDataDir());
         delete base_table;
-        base_table = ibis::table::create((*part_it)->currentDataDir());
+        const std::string part_dir((*part_it)->currentDataDir());
+        auto known = scan_part_sigs.find(part_dir);
+        if(known != scan_part_sigs.end() &&
+           known->second == warp_partition_signature_string(part_dir)) {
+          /* the partition is as it was when the scan read its metadata */
+          base_table = new ibis::liga(**part_it);
+          scan_liga_part = *part_it;
+        } else {
+          base_table = ibis::table::create(part_dir.c_str());
+        }
         assert(base_table != NULL);
       
         maintain_indexes((*part_it)->currentDataDir());
@@ -3280,6 +3468,7 @@ int ha_warp::end_scan(bool finish) {
   }
   scan_uses_pushdown_tables = false;
 
+  scan_liga_part = nullptr;
   if(partitions) {
     /* The partitions the scan went through were released one by one as it
        left them.  Releasing them all here would empty the cache whenever it
@@ -3808,14 +3997,7 @@ ha_rows ha_warp::records_in_range(uint idxno, key_range *min_key,
   }
   try {
     warp_table_read_lock data_lock(share->data_dir_name);
-    std::unique_ptr<ibis::mensa> estimator(
-        new ibis::mensa(share->data_dir_name));
-    uint64_t rows = estimator->nRows();
-    if(where != "") {
-      uint64_t min = 0, max = 0;
-      estimator->estimate(where.c_str(), min, max);
-      rows = max;
-    }
+    const uint64_t rows = warp_table_estimate(share->data_dir_name, where);
     return rows > 0 ? rows : 1;
   } catch(...) {
     return HA_POS_ERROR;
@@ -6101,9 +6283,13 @@ bool warp_global_data::check_state() {
 uint64_t warp_global_data::get_next_trx_id() {
   mtx.lock();
   ++next_trx_id;
-  write();
+  if(next_trx_id > trx_id_reserved) {
+    trx_id_reserved = next_trx_id + 1023;
+    write();
+  }
+  const uint64_t id = next_trx_id;
   mtx.unlock();
-  return next_trx_id;
+  return id;
 }
 
 uint64_t warp_global_data::get_next_rowid_batch(uint64_t count) {
@@ -6353,6 +6539,7 @@ uint64_t warp_global_data::get_state_and_return_version() {
   }
 
   next_trx_id = state_record->next_trx_id;
+  trx_id_reserved = next_trx_id;
   next_rowid = state_record->next_rowid;
   state_counter = state_record->state_counter;
 
@@ -6404,7 +6591,7 @@ void warp_global_data::write() {
     assert(false);
   }
   record.next_rowid  = next_rowid;
-  record.next_trx_id = next_trx_id;
+  record.next_trx_id = trx_id_reserved > next_trx_id ? trx_id_reserved : next_trx_id;
   record.version     = WARP_VERSION;
   record.state_counter = ++state_counter;
   fwrite(&record, sizeof(struct on_disk_state), 1, fp);
@@ -6428,7 +6615,7 @@ void warp_global_data::write() {
   }  
   fflush(fp);
   record.next_rowid  = next_rowid;
-  record.next_trx_id = next_trx_id;
+  record.next_trx_id = trx_id_reserved > next_trx_id ? trx_id_reserved : next_trx_id;
   record.version     = WARP_VERSION;
   record.state_counter = ++state_counter;
   fwrite(&record, sizeof(struct on_disk_state), 1, fp);

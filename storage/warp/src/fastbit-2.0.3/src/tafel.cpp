@@ -2101,6 +2101,8 @@ int ibis::tafel::writeData(const char* dir, const char* tname,
         << (cols.size()>1?"s":"") << " to " << mydir << " as data partition "
         << tname;
 
+    // the files of the columns are synced together, not one after another
+    ibis::zfile::deferSync defer_sync;
     std::string mdfile = mydir;
     mdfile += FASTBIT_DIRSEP;
     mdfile += "-part.txt";
@@ -2437,6 +2439,8 @@ int ibis::tafel::writeData(const char* dir, const char* tname,
                 << "\" in the binary format to \"" << dictname << '"';
         }
     }
+    // the data of the columns is on disk before the metadata file says so
+    (void) ibis::zfile::commitDeferred();
     md.close(); // close the metadata file
     ibis::fileManager::instance().flushDir(mydir);
     if (ibis::gVerbose > 0) {

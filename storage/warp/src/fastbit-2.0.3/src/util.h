@@ -596,6 +596,26 @@ namespace ibis {
         /// are converted.  Returns 0 on success, 1 if nothing was done.
         FASTBIT_CXX_DLLSPEC int compact(const char* fname);
 
+        /// Make the data that zfile::append writes durable all at once.
+        /// While an object of this class exists in a thread, the appends of
+        /// the thread write their frames but do not wait for the disk: the
+        /// frames of all the files are synced together (in parallel) when
+        /// commitDeferred is called or the last object of the thread goes
+        /// away, and only then are the headers that refer to them written.
+        /// A file is never changed to refer to data that is not on disk.
+        class FASTBIT_CXX_DLLSPEC deferSync {
+        public:
+            deferSync();
+            ~deferSync();
+        private:
+            deferSync(const deferSync&);
+            deferSync& operator=(const deferSync&);
+        };
+        /// Sync the frames that were appended while a deferSync object
+        /// exists, then write the headers.  Returns the number of files
+        /// that could not be made durable.
+        FASTBIT_CXX_DLLSPEC int commitDeferred();
+
         /// Temporarily turn a data file into a plain file so that legacy
         /// code that seeks and writes raw bytes can modify it.  The file is
         /// compressed again when the object goes out of scope if it was

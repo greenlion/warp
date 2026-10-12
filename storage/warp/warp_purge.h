@@ -432,12 +432,16 @@ static uint64_t warp_rewrite_partitions(const std::string &data_dir,
   }
 
   /* Put the new directory in place, with the partitions locked in order.
-     A merge waits for the scans that listed the partitions to end. */
+     The scans that listed the partitions are waited for. */
   bool swapped = false;
   std::vector<std::string> old_dirs(sources.size());
   auto table_locks = warp_table_locks(data_dir);
-  const bool gate = merge && table_locks->scans.enter_exclusive(std::chrono::seconds(5));
-  if(merge && !gate) {
+  /* The files of a partition that a scan still uses can not be taken out of
+     the FastBit cache, which is kept by file name: after the swap a query
+     would read the old files with the rows of the new ones.  So the scans
+     that run must be gone, for a purge of one partition too. */
+  const bool gate = table_locks->scans.enter_exclusive(std::chrono::seconds(5));
+  if(!gate) {
     warp_remove_dir(stage_dir);
     return 0;
   }
