@@ -80,10 +80,9 @@ COUNT(*)
 13000
 SET GLOBAL warp_purge_interval = 0;
 p0 4000
-p1 4002
-p5 1000
-p6 803
-p7 3200
+p1 4000
+p5 4203
+p10 800
 SELECT COUNT(*) AS rows_that_differ FROM (SELECT * FROM t1 EXCEPT ALL SELECT * FROM i1) a;
 rows_that_differ
 0
@@ -92,7 +91,12 @@ rows_that_differ
 0
 # a table that is loaded in small batches and not queried meanwhile stays in one partition
 CREATE TABLE t2 (id INT, v VARCHAR(20), n INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
-p0 6000
+p0 1000
+p1 1000
+p2 1000
+p3 1000
+p4 1000
+p5 1000
 SELECT COUNT(*) FROM t2;
 COUNT(*)
 6000

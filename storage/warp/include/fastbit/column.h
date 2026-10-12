@@ -137,6 +137,11 @@ public:
     /// column.
     const char* resolveIndexSpec(const char* iopt=0) const;
     /// Is the index specification one that turns indexing off?
+    /// Data partitions with fewer rows than this get no index: a scan of
+    /// a small partition costs less than building (and rebuilding, when
+    /// rows are appended) and reading an index.  Zero indexes everything.
+    static void setMinIndexRows(uint64_t n);
+    static uint64_t minIndexRows();
     static bool isNoIndexSpec(const char* spec);
     /// Rough estimate of the memory needed to build the index with the
     /// given specification, in bytes.

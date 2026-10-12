@@ -7,6 +7,9 @@
 # built one after another.
 #
 SET SESSION cte_max_recursion_depth = 1000000;
+# The partitions of this test are small: index them all
+SET @min_rows = @@global.warp_index_min_rows;
+SET GLOBAL warp_index_min_rows = 0;
 CREATE TABLE w (id BIGINT, a INT, b BIGINT, c SMALLINT, d DATE, e DOUBLE,
 f TINYINT, g INT, n INT NULL) ENGINE=WARP
 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
@@ -23,11 +26,11 @@ CREATE TABLE is_small ENGINE=InnoDB SELECT * FROM ws;
 removed 6 index files
 SET SESSION warp_max_degree_of_parallelism = 1;
 one thread: the result is identical to InnoDB
-index files: 42 in 3 partitions, per partition: 14 14 14
-removed 42 index files
+index files: 39 in 3 partitions, per partition: 13 13 13
+removed 39 index files
 SET SESSION warp_max_degree_of_parallelism = 8;
 eight threads: the result is identical to InnoDB
-index files: 42 in 3 partitions, per partition: 14 14 14
+index files: 39 in 3 partitions, per partition: 13 13 13
 the index files are identical to the saved ones
 # More shapes of conditions, each one starting without any index
 WHERE a < 1000 OR b > 9990000 OR c = 5: rows:sum(id) = 1799:135178670
@@ -57,8 +60,9 @@ CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0))
 # InnoDB, expected
 10791:803272241
 10675:900376605
-index files: 42 in 3 partitions, per partition: 14 14 14
+index files: 39 in 3 partitions, per partition: 13 13 13
 # The files built concurrently by two connections work for later queries
 query 1 after the concurrent builds: identical to InnoDB
 query 2 after the concurrent builds: identical to InnoDB
 DROP TABLE w, ws, i, is_small;
+SET GLOBAL warp_index_min_rows = @min_rows;

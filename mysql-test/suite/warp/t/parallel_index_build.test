@@ -8,6 +8,9 @@
 --echo #
 
 SET SESSION cte_max_recursion_depth = 1000000;
+--echo # The partitions of this test are small: index them all
+SET @min_rows = @@global.warp_index_min_rows;
+SET GLOBAL warp_index_min_rows = 0;
 
 CREATE TABLE w (id BIGINT, a INT, b BIGINT, c SMALLINT, d DATE, e DOUBLE,
                 f TINYINT, g INT, n INT NULL) ENGINE=WARP
@@ -191,3 +194,4 @@ if ($actual == $expected2)
 --remove_file $MYSQL_TMP_DIR/idx_tool.pl
 --remove_file $MYSQL_TMP_DIR/idx_serial.txt
 DROP TABLE w, ws, i, is_small;
+SET GLOBAL warp_index_min_rows = @min_rows;

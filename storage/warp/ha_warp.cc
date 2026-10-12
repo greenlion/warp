@@ -231,6 +231,7 @@ static int warp_done_func(void *p);
 static void warp_purge_start();
 static void warp_purge_stop();
 
+#include <condition_variable>
 #include "warp_locks.h"
 
 /* Status variables: Warp_history_locks is the number of history locks that
@@ -300,6 +301,7 @@ static int warp_init_func(void *p) {
   ibis::init(NULL, "/tmp/fastbit.log");
   ibis::util::setVerboseLevel(0);
   warp_apply_compression();
+  ibis::column::setMinIndexRows(my_index_min_rows);
 #ifdef HAVE_PSI_INTERFACE
   init_warp_psi_keys();
 #endif
@@ -1156,10 +1158,9 @@ uint64_t ha_warp::claim_writer_partition() {
   /* Writing rows to a partition makes its indexes out of date, they are made
      again by the next query, and for a large partition that takes long (a
      second for a million rows).  A small batch of rows therefore goes to a
-     partition that is small itself, the tail of the table, unless the
-     partition that has room has no indexes: a table that is loaded in small
-     batches and not queried meanwhile is written to the first partition with
-     room, as a large batch is. */
+     partition that is small itself, the tail of the table.  The partitions
+     of the tail have no indexes (see warp_index_min_rows), the rows that
+     they collect are merged into larger partitions later. */
   const bool small_batch = my_tail_partition_rows > 0 && rows < my_tail_partition_rows;
   const uint64_t tail_rows = std::min<uint64_t>(my_tail_partition_rows, my_partition_max_rows);
   for(const auto &partition : share->partition_rows) {
@@ -1168,9 +1169,7 @@ uint64_t ha_warp::claim_writer_partition() {
        warp_partition_reserved(share->data_dir_name, partition.first)) {
       continue;
     }
-    if(small_batch && partition.second + rows > tail_rows &&
-       warp_partition_has_indexes(std::string(share->data_dir_name) + "/p" +
-                                  std::to_string(partition.first))) {
+    if(small_batch && partition.second + rows > tail_rows) {
       continue;
     }
     share->partitions_writing.insert(partition.first);
@@ -1658,6 +1657,22 @@ static void warp_maintain_partition_indexes(const char *datadir,
     return;
   }
   std::unique_ptr<ibis::part> tbl(new ibis::part(datadir));
+  if(tbl->nRows() < my_index_min_rows) {
+    /* the partition is scanned: its old index files are of no use and would
+       have to be made again after every write to the partition */
+    for (uint field_index : field_indexes) {
+      std::string columnIndexFilename = std::string(datadir) + "/c" + std::to_string(field_index) + ".idx";
+      if(file_exists(columnIndexFilename)) {
+        auto col = tbl->getColumn(field_index);
+        if(col != NULL) col->purgeIndexFile();
+        ibis::fileManager::instance().flushFile(columnIndexFilename.c_str());
+      }
+    }
+    if(before.valid && warp_partition_signature(datadir) == before) {
+      state->verified = before;
+    }
+    return;
+  }
   for (uint field_index : field_indexes) {
     std::string columnIndexFilename = std::string(datadir) + "/c" + std::to_string(field_index) + ".idx";
     if(file_exists(columnIndexFilename)) {
@@ -3694,16 +3709,17 @@ static bool warp_decode_key_part(TABLE *table, const KEY_PART_INFO *kp,
       if(f->val_time(&t)) {
         ok = false;
       } else {
-        v.text = std::to_string(warp_encode_time(t));
+        v.text = std::to_string(warp_encode_time(t)) + "U";
       }
     } else if(warp_is_timestamp_type(f->real_type())) {
-      v.text = std::to_string(warp_timestamp_field_value(f));
+      v.text = std::to_string(warp_timestamp_field_value(f)) + "U";
     } else {
       Datetime_val dt;
       if(f->val_datetime(&dt, TIME_DATETIME_ONLY)) {
         ok = false;
       } else {
-        v.text = std::to_string(TIME_to_longlong_datetime_packed(dt));
+        /* about 2^60: a double can not hold it exactly */
+        v.text = std::to_string(TIME_to_longlong_datetime_packed(dt)) + "U";
       }
     }
   } else {
@@ -5158,7 +5174,11 @@ int ha_warp::append_column_filter(const Item *cond,
         }
         /* a comparison with NULL is never true, MySQL evaluates it */
         if((*arg)->null_value) return 0;
+        /* the packed DATETIME values are about 2^60, more than a double
+           holds: an exact 64-bit unsigned constant, or the comparison finds
+           nothing when a column is scanned instead of looked up in an index */
         build_where_clause += std::to_string(t);
+        if(t > (1ULL << 53)) build_where_clause += "U";
         continue;
       }
 
@@ -5686,78 +5706,138 @@ void warp_global_data::cleanup_history_locks() {
 
 // used when a transaction commits
 // not called when statements commit
-void warp_trx::commit() {
-  commit_mtx.lock();
+/* Applies the deletes in the log of the transaction to the delete bitmap.
+   The caller holds commit_mtx. */
+void warp_trx::apply_log_deletes() {
   int sz = 0;
   uint64_t rowid = 0;
   char marker;
-  
-  if(dirty) {
-  
-    if(warp_state->open_trx.find(trx_id) == warp_state->open_trx.end()) {
+  fseek(log, 0, SEEK_SET);
+  while( (sz = fread(&marker, sizeof(marker), 1, log) == 1) ) {
+    switch(marker) {
+      case savepoint_marker:
+        continue;
+        break;
+
+      case commit_marker:
+        continue;
+        break;
+
+      case insert_marker:
+        // insertions are already written to disk
+        fseek(log, sizeof(uint64_t), SEEK_CUR);
+        break;
+
+      case delete_marker:
+        fread(&rowid, sizeof(uint64_t), 1, log);
+        if(sz != 1) {
+          sql_print_error("transaction log read failed");
+          assert(false);
+        }
+
+        warp_state->delete_bitmap->set_bit(rowid);
+        continue;
+        break;
+
+      default:
+        sql_print_error("transaction log read failed");
+        assert(false);
+        break;
+    }
+  }
+}
+
+/* The transactions that commit at the same time share the syncs of the delete
+   bitmap and of the commit bitmap.  The first one that finds no commit in
+   progress (the leader) commits all the transactions that are waiting, the
+   others sleep until the leader has made their commit durable.  A transaction
+   that arrives while a group is committing is in the next group. */
+static std::mutex warp_group_mtx;
+static std::condition_variable warp_group_cv;
+static std::vector<warp_trx *> warp_group_queue;
+static bool warp_group_leader_active = false;
+
+static void warp_commit_group(const std::vector<warp_trx *> &group) {
+  commit_mtx.lock();
+  for(warp_trx *trx : group) {
+    if(warp_state->open_trx.find(trx->trx_id) == warp_state->open_trx.end()) {
       sql_print_error("Open transaction is not registered as open");
       assert(false);
     }
+    trx->apply_log_deletes();
+  }
 
-    sz = fwrite(&commit_marker, sizeof(commit_marker), 1, log);
-    if(sz != 1) {
-      sql_print_error("failed to write commit marker into transaction log");
-    }
-    fflush(log);
-    fsync(fileno(log));
-    fseek(log, 0, SEEK_SET);
-    while( (sz = fread(&marker, sizeof(marker), 1, log) == 1) ) {
-      switch(marker) {
-        case savepoint_marker:
-          continue;
-          break;
+  // commit the deletes of all the transactions, one sync for the group
+  if(warp_state->delete_bitmap->commit() != 0) {
+    sql_print_error("Failed to commit delete bitmap %s", warp_state->delete_bitmap->get_fname().c_str());
+    assert(false);
+  }
 
-         case commit_marker:
-          continue;
-          break;
-      
-        case insert_marker:
-          // insertions are already written to disk
-          fseek(log, sizeof(uint64_t), SEEK_CUR);
-          break;
-
-        case delete_marker:
-          fread(&rowid, sizeof(uint64_t), 1, log);
-          if(sz != 1) {
-            sql_print_error("transaction log read failed");
-            assert(false);
-          }
-          
-          warp_state->delete_bitmap->set_bit(rowid);
-          continue;
-          break;
-
-        default:
-          sql_print_error("transaction log read failed");
-          assert(false);
-          break;
-      }
-    } 
-
-    // commit the deletes
-    if(warp_state->delete_bitmap->commit() != 0) {
-      sql_print_error("Failed to commit delete bitmap %s", warp_state->delete_bitmap->get_fname().c_str());
-      assert(false);
-    }
-    
-    // mark the transaction committed: set its bit in the commit bitmap and
-    // make sure it is on disk
-    if(warp_state->commit_bitmap->set_bit_direct(trx_id) != 0) {
+  // mark the transactions committed: set their bits in the commit bitmap and
+  // make sure they are on disk
+  for(warp_trx *trx : group) {
+    if(warp_state->commit_bitmap->set_bit_direct(trx->trx_id, false) != 0) {
       sql_print_error("Failed to write to the commit bitmap");
       assert(false);
     }
-
-    // the transaction is not open any more
-    warp_state->open_trx.erase(trx_id);
-    open_registered = false;
   }
+  if(warp_state->commit_bitmap->sync_direct() != 0) {
+    sql_print_error("Failed to sync the commit bitmap");
+    assert(false);
+  }
+
+  // the transactions are not open any more
+  for(warp_trx *trx : group) {
+    warp_state->open_trx.erase(trx->trx_id);
+    trx->open_registered = false;
+  }
+  commit_mtx.unlock();
+}
+
+// used when a transaction commits
+// not called when statements commit
+void warp_trx::commit() {
+  if(!dirty) {
+    commit_mtx.lock();
+    close_log();
+    commit_mtx.unlock();
+    return;
+  }
+
+  // the commit marker of the transaction log is on disk before the
+  // transaction can be committed.  The log belongs to the transaction, so
+  // the transactions that commit together sync their logs together too.
+  int sz = fwrite(&commit_marker, sizeof(commit_marker), 1, log);
+  if(sz != 1) {
+    sql_print_error("failed to write commit marker into transaction log");
+  }
+  fflush(log);
+  fsync(fileno(log));
+
+  std::unique_lock<std::mutex> lock(warp_group_mtx);
+  commit_done = false;
+  warp_group_queue.push_back(this);
+  while(!commit_done) {
+    if(!warp_group_leader_active) {
+      warp_group_leader_active = true;
+      std::vector<warp_trx *> group;
+      group.swap(warp_group_queue);
+      lock.unlock();
+      warp_commit_group(group);
+      lock.lock();
+      for(warp_trx *trx : group) {
+        trx->commit_done = true;
+      }
+      warp_group_leader_active = false;
+      warp_group_cv.notify_all();
+    } else {
+      warp_group_cv.wait(lock);
+    }
+  }
+  lock.unlock();
+
+  commit_mtx.lock();
   close_log();
-  
   commit_mtx.unlock();
 }
 
