@@ -100,11 +100,11 @@ id
 ROLLBACK;
 SELECT id FROM w FORCE INDEX (a_idx) WHERE a = 99;
 id
+# UNIQUE and PRIMARY KEY are checked when rows are written (see unique_keys)
+CREATE TABLE u1 (a INT, UNIQUE KEY (a)) ENGINE=WARP;
+CREATE TABLE u2 (a INT, PRIMARY KEY (a)) ENGINE=WARP;
+DROP TABLE u1, u2;
 # indexes that WARP can not use
-CREATE TABLE bad1 (a INT, UNIQUE KEY (a)) ENGINE=WARP;
-ERROR HY000: Table storage engine 'WARP' does not support the create option 'UNIQUE or PRIMARY KEY'
-CREATE TABLE bad2 (a INT, PRIMARY KEY (a)) ENGINE=WARP;
-ERROR HY000: Table storage engine 'WARP' does not support the create option 'UNIQUE or PRIMARY KEY'
 CREATE TABLE bad3 (a DOUBLE, KEY (a)) ENGINE=WARP;
 ERROR 42000: The used storage engine can't index column 'a'
 CREATE TABLE bad4 (a VARCHAR(20), KEY (a(5))) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

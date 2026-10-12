@@ -83,9 +83,11 @@ ALTER TABLE t1 ADD KEY kp (s(3)), ALGORITHM=INSTANT;
 ERROR 0A000: ALGORITHM=INSTANT is not supported for this operation. Try ALGORITHM=COPY/INPLACE.
 ALTER TABLE t1 ADD KEY k_new (id), DROP COLUMN s, ALGORITHM=INSTANT;
 ERROR 0A000: ALGORITHM=INSTANT is not supported for this operation. Try ALGORITHM=COPY/INPLACE.
-# and the table copy reports the same errors as before
+# a UNIQUE KEY is added by copying the table, which checks the rows,
+# and dropped instantly
 ALTER TABLE t1 ADD UNIQUE KEY u (id);
-ERROR HY000: Table storage engine 'WARP' does not support the create option 'UNIQUE or PRIMARY KEY'
+ALTER TABLE t1 DROP KEY u, ALGORITHM=INSTANT;
+# and the table copy reports the same errors as before
 ALTER TABLE t1 ADD KEY kp (s(3));
 ERROR 42000: The used storage engine can't index column 's'
 ALTER TABLE t1 ADD COLUMN extra INT;
