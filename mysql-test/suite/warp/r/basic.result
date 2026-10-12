@@ -8,7 +8,7 @@ WARP	YES	YES
 # String columns must use a case sensitive or binary collation
 CREATE TABLE t_bad (c VARCHAR(10)) ENGINE=WARP
 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-ERROR HY000: Table storage engine for 'Unsupported character set or collation for column (only case sensitive and binary collations of character sets without NUL bytes are supported): c' doesn't have this option
+ERROR HY000: Table storage engine for 'Unsupported character set or collation for column (only binary strings and case sensitive and binary collations of character sets without NUL bytes are supported): c' doesn't have this option
 CREATE TABLE t1 (
 id INT NOT NULL,
 name VARCHAR(20),

@@ -1,0 +1,253 @@
+--echo #
+--echo # Binary strings (BINARY, VARBINARY and BLOB) are stored like VARCHAR.
+--echo # Their bytes may be anything, NUL included, so WARP writes them encoded
+--echo # (0x00 as 0x01 0x01, 0x01 as 0x01 0x02) and decodes them when they are
+--echo # read.  The encoding keeps the order and the equality of the strings, so
+--echo # the comparisons of BINARY and VARBINARY columns with constants are
+--echo # pushed down and compared in the binary collation (byte by byte, the
+--echo # spaces at the end count).  Every value and every condition is checked
+--echo # against an identical InnoDB table.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE pool (k INT, s VARBINARY(20)) ENGINE=InnoDB;
+INSERT INTO pool VALUES
+  (1, x''),
+  (2, x'00'),
+  (3, x'0000'),
+  (4, x'01'),
+  (5, x'0100'),
+  (6, x'0001'),
+  (7, x'0101'),
+  (8, x'02'),
+  (9, x'0102'),
+  (10, x'010101'),
+  (11, x'20'),
+  (12, x'61'),
+  (13, x'6120'),
+  (14, x'6100'),
+  (15, x'610001'),
+  (16, x'41'),
+  (17, x'62'),
+  (18, x'616263'),
+  (19, x'61626300'),
+  (20, x'7f'),
+  (21, x'80'),
+  (22, x'ff'),
+  (23, x'ffff'),
+  (24, x'ff00'),
+  (25, x'c3a9'),
+  (26, x'0a0d09'),
+  (27, x'22'),
+  (28, x'2c'),
+  (29, x'27'),
+  (30, x'5c'),
+  (31, x'00ff01fe02');
+
+CREATE TABLE w (
+  id INT,
+  vb VARBINARY(20),
+  b BINARY(6),
+  vbn VARBINARY(20) NULL,
+  bl BLOB,
+  p INT
+) ENGINE=WARP;
+INSERT INTO w WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 3000)
+  SELECT x, pool.s, LEFT(pool.s, 6), IF(x % 5 = 0, NULL, pool.s),
+         REPEAT(pool.s, 1 + x % 3), x % 100
+  FROM seq JOIN pool ON pool.k = 1 + (x * 7) % 31;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO i SELECT * FROM w;
+
+--echo # The values are read back as they were written
+SELECT COUNT(*), COUNT(vbn), COUNT(DISTINCT vb), COUNT(DISTINCT b), SUM(LENGTH(bl)) FROM w;
+SELECT (SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, HEX(vb), HEX(b), IFNULL(HEX(vbn), 'N'), HEX(bl), p))) FROM w) =
+       (SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, HEX(vb), HEX(b), IFNULL(HEX(vbn), 'N'), HEX(bl), p))) FROM i)
+  AS same_values;
+SELECT HEX(vb), LENGTH(vb), HEX(b), LENGTH(b) FROM w WHERE id < 40 GROUP BY vb, b ORDER BY vb, b;
+
+--echo #
+--echo # Every column compared with every string of the pool
+--echo #
+let $checked = 0;
+let $wrong = 0;
+let $c = 0;
+while ($c < 3)
+{
+  inc $c;
+  if ($c == 1) { let $col = vb; }
+  if ($c == 2) { let $col = b; }
+  if ($c == 3) { let $col = vbn; }
+  let $v = 0;
+  while ($v < 31)
+  {
+    inc $v;
+    let $lit = `SELECT CONCAT('x''', HEX(s), '''') FROM pool WHERE k = $v`;
+    let $o = 0;
+    while ($o < 8)
+    {
+      inc $o;
+      if ($o == 1) { let $cond = $col = $lit; }
+      if ($o == 2) { let $cond = $col < $lit; }
+      if ($o == 3) { let $cond = $col <= $lit; }
+      if ($o == 4) { let $cond = $col > $lit; }
+      if ($o == 5) { let $cond = $col >= $lit; }
+      if ($o == 6) { let $cond = $lit < $col; }
+      if ($o == 7) { let $cond = $col <=> $lit; }
+      if ($o == 8) { let $cond = $col <> $lit; }
+      let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $cond`;
+      let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $cond`;
+      inc $checked;
+      if ($w != $i)
+      {
+        inc $wrong;
+        --echo MISMATCH for WHERE $cond: WARP $w, InnoDB $i
+      }
+    }
+  }
+}
+--echo $checked comparisons checked, $wrong mismatches
+
+--echo #
+--echo # BETWEEN and IN lists of 1 to 5 strings
+--echo #
+let $checked = 0;
+let $wrong = 0;
+let $c = 0;
+while ($c < 3)
+{
+  inc $c;
+  if ($c == 1) { let $col = vb; }
+  if ($c == 2) { let $col = b; }
+  if ($c == 3) { let $col = vbn; }
+  let $a = 0;
+  while ($a < 31)
+  {
+    inc $a;
+    let $b = `SELECT 1 + ($a * 5) % 31`;
+    let $d = `SELECT 1 + ($a * 11) % 31`;
+    let $e = `SELECT 1 + ($a * 17) % 31`;
+    let $f = `SELECT 1 + ($a * 23) % 31`;
+    let $la = `SELECT CONCAT('x''', HEX(s), '''') FROM pool WHERE k = $a`;
+    let $lb = `SELECT CONCAT('x''', HEX(s), '''') FROM pool WHERE k = $b`;
+    let $k = 0;
+    while ($k < 7)
+    {
+      inc $k;
+      if ($k == 1) { let $cond = $col BETWEEN $la AND $lb; }
+      if ($k == 2) { let $cond = $col BETWEEN $lb AND $la; }
+      if ($k == 3) { let $cond = `SELECT CONCAT('$col IN (', GROUP_CONCAT(CONCAT('x''', HEX(s), '''') ORDER BY k), ')') FROM pool WHERE k IN ($a)`; }
+      if ($k == 4) { let $cond = `SELECT CONCAT('$col IN (', GROUP_CONCAT(CONCAT('x''', HEX(s), '''') ORDER BY k), ')') FROM pool WHERE k IN ($a, $b)`; }
+      if ($k == 5) { let $cond = `SELECT CONCAT('$col IN (', GROUP_CONCAT(CONCAT('x''', HEX(s), '''') ORDER BY k), ')') FROM pool WHERE k IN ($a, $b, $d, $e, $f)`; }
+      if ($k == 6) { let $cond = $col >= $la AND $col < $lb AND p < 50; }
+      if ($k == 7) { let $cond = $col = $la OR $col = $lb OR p = 7; }
+      let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $cond`;
+      let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $cond`;
+      inc $checked;
+      if ($w != $i)
+      {
+        inc $wrong;
+        --echo MISMATCH for WHERE $cond: WARP $w, InnoDB $i
+      }
+    }
+  }
+}
+--echo $checked conditions checked, $wrong mismatches
+
+--echo # String constants, and the spaces and NULs at the end count
+let $checked = 0;
+let $wrong = 0;
+let $k = 0;
+while ($k < 14)
+{
+  inc $k;
+  if ($k == 1) { let $cond = vb = 'a'; }
+  if ($k == 2) { let $cond = vb = 'a '; }
+  if ($k == 3) { let $cond = vb < 'abc'; }
+  if ($k == 4) { let $cond = vb BETWEEN 'a' AND 'b'; }
+  if ($k == 5) { let $cond = vb IN ('a', 'abc', 'é'); }
+  if ($k == 6) { let $cond = b = 'a'; }
+  if ($k == 7) { let $cond = b = x'610000000000'; }
+  if ($k == 8) { let $cond = b = 'abc\0\0\0'; }
+  if ($k == 9) { let $cond = vb = 'A'; }
+  if ($k == 10) { let $cond = vb = _utf8mb4 'é'; }
+  if ($k == 11) { let $cond = vb LIKE 'a%'; }
+  if ($k == 12) { let $cond = bl = x'6161'; }
+  if ($k == 13) { let $cond = bl > x'61'; }
+  if ($k == 14) { let $cond = vb = b; }
+  let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $cond`;
+  let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $cond`;
+  inc $checked;
+  if ($w != $i)
+  {
+    inc $wrong;
+    --echo MISMATCH for WHERE $cond: WARP $w, InnoDB $i
+  }
+}
+--echo $checked conditions checked, $wrong mismatches
+
+--echo # The conditions that FastBit evaluates have no Filter in the plan, the others do
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vb = x'0001';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vbn BETWEEN x'00' AND 'a';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b IN (x'00', x'01', 'a');
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE bl = x'6161';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vb LIKE 'a%';
+
+--echo #
+--echo # Indexes on binary strings
+--echo #
+CREATE TABLE wk (id INT, vb VARBINARY(20), b BINARY(6) NULL, KEY (vb), KEY (b, id)) ENGINE=WARP;
+INSERT INTO wk SELECT id, vb, IF(id % 7 = 0, NULL, b) FROM w;
+CREATE TABLE ik LIKE wk;
+ALTER TABLE ik ENGINE=InnoDB;
+INSERT INTO ik SELECT * FROM wk;
+let $checked = 0;
+let $wrong = 0;
+let $v = 0;
+while ($v < 31)
+{
+  inc $v;
+  let $lit = `SELECT CONCAT('x''', HEX(s), '''') FROM pool WHERE k = $v`;
+  let $lit2 = `SELECT CONCAT('x''', HEX(s), '''') FROM pool WHERE k = 1 + ($v * 5) % 31`;
+  let $k = 0;
+  while ($k < 5)
+  {
+    inc $k;
+    if ($k == 1) { let $ix = vb; let $cond = vb = $lit; }
+    if ($k == 2) { let $ix = vb; let $cond = vb > $lit; }
+    if ($k == 3) { let $ix = vb; let $cond = vb BETWEEN $lit AND $lit2; }
+    if ($k == 4) { let $ix = b; let $cond = b = $lit AND id > 100; }
+    if ($k == 5) { let $ix = b; let $cond = b <= $lit; }
+    let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM wk FORCE INDEX ($ix) WHERE $cond`;
+    let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM ik FORCE INDEX ($ix) WHERE $cond`;
+    inc $checked;
+    if ($w != $i)
+    {
+      inc $wrong;
+      --echo MISMATCH for FORCE INDEX ($ix) WHERE $cond: WARP $w, InnoDB $i
+    }
+  }
+}
+--echo $checked index reads checked, $wrong mismatches
+--echo # A join that looks up the rows of wk by the value of another table
+SELECT COUNT(*) = (SELECT COUNT(*) FROM pool JOIN ik ON ik.vb = pool.s)
+  AS join_matches FROM pool JOIN wk FORCE INDEX (vb) ON wk.vb = pool.s;
+
+--echo # UPDATE and DELETE by binary values
+UPDATE w SET vb = x'000102' WHERE vb = x'00';
+UPDATE i SET vb = x'000102' WHERE vb = x'00';
+DELETE FROM w WHERE b = x'010000000000';
+DELETE FROM i WHERE b = x'010000000000';
+SELECT (SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, HEX(vb), HEX(b), IFNULL(HEX(vbn), 'N'), HEX(bl), p))) FROM w) =
+       (SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, HEX(vb), HEX(b), IFNULL(HEX(vbn), 'N'), HEX(bl), p))) FROM i)
+  AS same_values;
+SELECT COUNT(*) FROM w WHERE vb = x'000102';
+
+DROP TABLE w, i, wk, ik, pool;

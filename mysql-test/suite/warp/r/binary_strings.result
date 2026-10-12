@@ -1,0 +1,167 @@
+#
+# Binary strings (BINARY, VARBINARY and BLOB) are stored like VARCHAR.
+# Their bytes may be anything, NUL included, so WARP writes them encoded
+# (0x00 as 0x01 0x01, 0x01 as 0x01 0x02) and decodes them when they are
+# read.  The encoding keeps the order and the equality of the strings, so
+# the comparisons of BINARY and VARBINARY columns with constants are
+# pushed down and compared in the binary collation (byte by byte, the
+# spaces at the end count).  Every value and every condition is checked
+# against an identical InnoDB table.
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE pool (k INT, s VARBINARY(20)) ENGINE=InnoDB;
+INSERT INTO pool VALUES
+(1, x''),
+(2, x'00'),
+(3, x'0000'),
+(4, x'01'),
+(5, x'0100'),
+(6, x'0001'),
+(7, x'0101'),
+(8, x'02'),
+(9, x'0102'),
+(10, x'010101'),
+(11, x'20'),
+(12, x'61'),
+(13, x'6120'),
+(14, x'6100'),
+(15, x'610001'),
+(16, x'41'),
+(17, x'62'),
+(18, x'616263'),
+(19, x'61626300'),
+(20, x'7f'),
+(21, x'80'),
+(22, x'ff'),
+(23, x'ffff'),
+(24, x'ff00'),
+(25, x'c3a9'),
+(26, x'0a0d09'),
+(27, x'22'),
+(28, x'2c'),
+(29, x'27'),
+(30, x'5c'),
+(31, x'00ff01fe02');
+CREATE TABLE w (
+id INT,
+vb VARBINARY(20),
+b BINARY(6),
+vbn VARBINARY(20) NULL,
+bl BLOB,
+p INT
+) ENGINE=WARP;
+INSERT INTO w WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 3000)
+SELECT x, pool.s, LEFT(pool.s, 6), IF(x % 5 = 0, NULL, pool.s),
+REPEAT(pool.s, 1 + x % 3), x % 100
+FROM seq JOIN pool ON pool.k = 1 + (x * 7) % 31;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO i SELECT * FROM w;
+# The values are read back as they were written
+SELECT COUNT(*), COUNT(vbn), COUNT(DISTINCT vb), COUNT(DISTINCT b), SUM(LENGTH(bl)) FROM w;
+COUNT(*)	COUNT(vbn)	COUNT(DISTINCT vb)	COUNT(DISTINCT b)	SUM(LENGTH(bl))
+3000	2400	31	25	10654
+SELECT (SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, HEX(vb), HEX(b), IFNULL(HEX(vbn), 'N'), HEX(bl), p))) FROM w) =
+(SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, HEX(vb), HEX(b), IFNULL(HEX(vbn), 'N'), HEX(bl), p))) FROM i)
+AS same_values;
+same_values
+1
+SELECT HEX(vb), LENGTH(vb), HEX(b), LENGTH(b) FROM w WHERE id < 40 GROUP BY vb, b ORDER BY vb, b;
+HEX(vb)	LENGTH(vb)	HEX(b)	LENGTH(b)
+	0	000000000000	6
+00	1	000000000000	6
+0000	2	000000000000	6
+0001	2	000100000000	6
+00FF01FE02	5	00FF01FE0200	6
+01	1	010000000000	6
+0100	2	010000000000	6
+0101	2	010100000000	6
+010101	3	010101000000	6
+0102	2	010200000000	6
+02	1	020000000000	6
+0A0D09	3	0A0D09000000	6
+20	1	200000000000	6
+22	1	220000000000	6
+27	1	270000000000	6
+2C	1	2C0000000000	6
+41	1	410000000000	6
+5C	1	5C0000000000	6
+61	1	610000000000	6
+6100	2	610000000000	6
+610001	3	610001000000	6
+6120	2	612000000000	6
+616263	3	616263000000	6
+61626300	4	616263000000	6
+62	1	620000000000	6
+7F	1	7F0000000000	6
+80	1	800000000000	6
+C3A9	2	C3A900000000	6
+FF	1	FF0000000000	6
+FF00	2	FF0000000000	6
+FFFF	2	FFFF00000000	6
+#
+# Every column compared with every string of the pool
+#
+744 comparisons checked, 0 mismatches
+#
+# BETWEEN and IN lists of 1 to 5 strings
+#
+651 conditions checked, 0 mismatches
+# String constants, and the spaces and NULs at the end count
+14 conditions checked, 0 mismatches
+# The conditions that FastBit evaluates have no Filter in the plan, the others do
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vb = x'0001';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vbn BETWEEN x'00' AND 'a';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b IN (x'00', x'01', 'a');
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE bl = x'6161';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.bl = 0x6161)  
+        -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vb LIKE 'a%';
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Filter: (w.vb like 'a%')  
+        -> Table scan on w  
+
+#
+# Indexes on binary strings
+#
+CREATE TABLE wk (id INT, vb VARBINARY(20), b BINARY(6) NULL, KEY (vb), KEY (b, id)) ENGINE=WARP;
+INSERT INTO wk SELECT id, vb, IF(id % 7 = 0, NULL, b) FROM w;
+CREATE TABLE ik LIKE wk;
+ALTER TABLE ik ENGINE=InnoDB;
+INSERT INTO ik SELECT * FROM wk;
+155 index reads checked, 0 mismatches
+# A join that looks up the rows of wk by the value of another table
+SELECT COUNT(*) = (SELECT COUNT(*) FROM pool JOIN ik ON ik.vb = pool.s)
+AS join_matches FROM pool JOIN wk FORCE INDEX (vb) ON wk.vb = pool.s;
+join_matches
+1
+# UPDATE and DELETE by binary values
+UPDATE w SET vb = x'000102' WHERE vb = x'00';
+UPDATE i SET vb = x'000102' WHERE vb = x'00';
+DELETE FROM w WHERE b = x'010000000000';
+DELETE FROM i WHERE b = x'010000000000';
+SELECT (SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, HEX(vb), HEX(b), IFNULL(HEX(vbn), 'N'), HEX(bl), p))) FROM w) =
+(SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, HEX(vb), HEX(b), IFNULL(HEX(vbn), 'N'), HEX(bl), p))) FROM i)
+AS same_values;
+same_values
+1
+SELECT COUNT(*) FROM w WHERE vb = x'000102';
+COUNT(*)
+97
+DROP TABLE w, i, wk, ik, pool;
