@@ -19594,11 +19594,60 @@ int ibis::part::writeStrings(const char *fnm,
         }
         if (nnew0 < nnew)
             buf.append(nnew - nnew0, '\0');
+        // The starting positions (.sp) are brought up to date here, the
+        // writer knows where the strings are.  Otherwise the next query
+        // that reads the strings unpacks the whole data file to find them
+        // and rewrites the .sp file.
+        const std::string spname = std::string(fnm) + ".sp";
+        const int64_t oldbytes = std::max<int64_t>(ibis::zfile::logicalSize(fnm), 0);
+        bool spappend = false;
+        {
+            const int64_t splen = ibis::zfile::logicalSize(spname.c_str());
+            if (splen < 0 || splen == 0) {
+                spappend = (nold == 0 && oldbytes == 0);
+            }
+            else if (splen == (int64_t)(nold + 1) * (int64_t)sizeof(int64_t)) {
+                int64_t last = -1;
+                spappend = (ibis::zfile::readRange
+                            (spname.c_str(), splen - sizeof(int64_t), splen,
+                             &last) == (int64_t)sizeof(int64_t) &&
+                            last == oldbytes);
+            }
+        }
         if (ibis::zfile::append(fnm, buf.data(), buf.size()) < 0) {
             LOGGER(ibis::gVerbose > 0)
                 << "Warning -- " << evt << " failed to append to the "
                 "compressed data file";
             return -4;
+        }
+        if (spappend) {
+            std::vector<int64_t> pos;
+            pos.reserve(nnew + 1);
+            int64_t at = oldbytes;
+            if (nold == 0 && oldbytes == 0) pos.push_back(0);
+            uint32_t k = 0;
+            for (uint32_t j = voffset; j < jend; ++ j, ++ k) {
+                at += vals[j].size() + 1;
+                pos.push_back(at);
+            }
+            for (; k < nnew; ++ k) {
+                ++ at;
+                pos.push_back(at);
+            }
+            const bool plainsp = (ibis::util::getFileSize(spname.c_str()) > 0 &&
+                                  ! ibis::zfile::isCompressed(spname.c_str()));
+            if (plainsp) {
+                FILE *fsp = fopen(spname.c_str(), "ab");
+                if (fsp != 0) {
+                    (void) fwrite(pos.data(), sizeof(int64_t), pos.size(), fsp);
+                    fclose(fsp);
+                }
+            }
+            else {
+                (void) ibis::zfile::append(spname.c_str(), pos.data(),
+                                           pos.size() * sizeof(int64_t),
+                                           sizeof(int64_t));
+            }
         }
         totmask.adjustSize(nold, nold);
         totmask += newmask;

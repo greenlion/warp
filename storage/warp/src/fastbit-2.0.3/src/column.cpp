@@ -6,7 +6,8 @@
 //
 #include "resource.h"   // ibis::resource, ibis::gParameters()
 #include "category.h"   // ibis::text, ibis::category
-#include "column.h"     // ibis::column
+#include "column.h"
+#include <atomic>     // ibis::column
 #include "part.h"       // ibis::part
 #include "iroster.h"    // ibis::roster
 #include "irelic.h"     // ibis::relic
@@ -5781,6 +5782,12 @@ void ibis::column::loadIndexNoPoison() const throw () {
     }
 }
 
+namespace {
+std::atomic<uint64_t> gMinIndexRows(0);
+}
+void ibis::column::setMinIndexRows(uint64_t n) {gMinIndexRows.store(n);}
+uint64_t ibis::column::minIndexRows() {return gMinIndexRows.load();}
+
 /// Is the index specification one that turns indexing off?  An index is
 /// not used if the specification starts with "noindex", "null" or "none".
 bool ibis::column::isNoIndexSpec(const char* spec) {
@@ -5869,6 +5876,8 @@ void ibis::column::loadIndexInternal(const char* iopt, int ropt,
                                      bool poison) const throw () {
     if ((idx != 0 && !idx->empty()) || (thePart != 0 && thePart->nRows() == 0))
         return;
+    if (thePart != 0 && thePart->nRows() < gMinIndexRows.load())
+        return; // too small to be worth an index
     iopt = resolveIndexSpec(iopt);
     // no index is to be used if the index specification start
     // with "noindex", "null" or "none".

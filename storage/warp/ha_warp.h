@@ -311,6 +311,31 @@ static MYSQL_SYSVAR_ULONGLONG(
   0
 );
 
+/* A scan of a small partition costs less than an index that is made again
+   after every write to the partition. */
+static unsigned long long my_index_min_rows = 65536;
+
+static void warp_update_index_min_rows(THD *, SYS_VAR *, void *var_ptr,
+                                       const void *save) {
+  *static_cast<unsigned long long *>(var_ptr) = *static_cast<const unsigned long long *>(save);
+  ibis::column::setMinIndexRows(my_index_min_rows);
+}
+
+static MYSQL_SYSVAR_ULONGLONG(
+  index_min_rows,
+  my_index_min_rows,
+  PLUGIN_VAR_RQCMDARG,
+  "Partitions with fewer rows than this get no indexes (they are scanned).  "
+  "Indexes of the partitions that the writes append to are not made again "
+  "after every write.  0 indexes every partition.",
+  NULL,
+  warp_update_index_min_rows,
+  65536,
+  0,
+  1ULL<<40,
+  0
+);
+
 static MYSQL_THDVAR_ULONG(lock_wait_timeout, PLUGIN_VAR_RQCMDARG,
                           "Timeout in seconds a WARP transaction may wait "
                           "for a lock before being rolled back.",
@@ -377,6 +402,7 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(purge_threshold),
   MYSQL_SYSVAR(tail_partition_rows),
   MYSQL_SYSVAR(prefetch_min_rows),
+  MYSQL_SYSVAR(index_min_rows),
   MYSQL_SYSVAR(partition_filter),
   MYSQL_SYSVAR(adjust_table_stats_for_joins),
   MYSQL_SYSVAR(star_aggregation),
@@ -610,6 +636,13 @@ class warp_trx {
   //modified rows in the database, so it must be writen into
   //the commit bitmap when it commmits
   bool dirty = false;
+
+  //set by the leader of a group commit when the commit of the
+  //transaction is durable, protected by the mutex of the group
+  bool commit_done = false;
+
+  //applies the deletes of the transaction log to the delete bitmap
+  void apply_log_deletes();
 
   //autocommit statements commit each time the commit function
   //is called
