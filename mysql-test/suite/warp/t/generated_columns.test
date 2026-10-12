@@ -1,0 +1,167 @@
+--echo #
+--echo # Generated columns (stored and virtual) and functional indexes.  WARP
+--echo # stores the generated columns like the other columns; the server
+--echo # computes them for an insert, and for an update the ones that change.
+--echo # The conditions on generated columns are pushed down, and the indexes
+--echo # on them (the hidden column of a functional index included) are
+--echo # evaluated on the stored values.  Every result is compared with an
+--echo # identical InnoDB table.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE w (
+  id INT NOT NULL,
+  a INT,
+  s VARCHAR(20),
+  p INT,
+  g INT AS (a * 2) STORED,
+  v INT AS (a + p) VIRTUAL,
+  vs VARCHAR(30) AS (CONCAT(s, '-', a)) VIRTUAL,
+  vn INT AS (IF(a % 3 = 0, NULL, a)) VIRTUAL,
+  gd DATE AS (DATE_ADD('2020-01-01', INTERVAL a DAY)) STORED,
+  KEY (v),
+  KEY (vs),
+  KEY f1 ((a * 3)),
+  KEY f2 ((LEFT(s, 2)), p),
+  KEY f3 ((p - a))
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+SHOW CREATE TABLE w;
+INSERT INTO w (id, a, s, p) WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 3000)
+  SELECT x, x % 97, CONCAT(CHAR(97 + x % 26), CHAR(65 + x % 7), x % 13), x % 50 FROM seq;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO i (id, a, s, p) SELECT id, a, s, p FROM w;
+
+let $check_all = SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, a, s, p, g, v, vs, IFNULL(vn, 'N'), gd))) FROM;
+let $same = `SELECT ($check_all w) = ($check_all i)`;
+--echo same rows: $same
+SELECT * FROM w ORDER BY id LIMIT 5;
+
+--echo # Conditions on generated columns, and lookups through their indexes
+let $checked = 0;
+let $wrong = 0;
+let $k = 0;
+while ($k < 24)
+{
+  inc $k;
+  if ($k == 1) { let $q = WHERE g = 40; }
+  if ($k == 2) { let $q = WHERE g BETWEEN 10 AND 30; }
+  if ($k == 3) { let $q = WHERE v = 60; }
+  if ($k == 4) { let $q = WHERE v > 100 AND p < 10; }
+  if ($k == 5) { let $q = WHERE vs = 'bB3-27'; }
+  if ($k == 6) { let $q = WHERE vs < 'c'; }
+  if ($k == 7) { let $q = WHERE vn IS NULL; }
+  if ($k == 8) { let $q = WHERE vn IN (1, 2, 4, 5); }
+  if ($k == 9) { let $q = WHERE gd = '2020-02-01'; }
+  if ($k == 10) { let $q = WHERE gd > '2020-03-01'; }
+  if ($k == 11) { let $q = FORCE INDEX (v) WHERE v = 60; }
+  if ($k == 12) { let $q = FORCE INDEX (v) WHERE v BETWEEN 50 AND 60; }
+  if ($k == 13) { let $q = FORCE INDEX (vs) WHERE vs = 'bB3-27'; }
+  if ($k == 14) { let $q = FORCE INDEX (vs) WHERE vs >= 'z'; }
+  if ($k == 15) { let $q = FORCE INDEX (f1) WHERE a * 3 = 30; }
+  if ($k == 16) { let $q = FORCE INDEX (f1) WHERE a * 3 BETWEEN 30 AND 60; }
+  if ($k == 17) { let $q = FORCE INDEX (f2) WHERE LEFT(s, 2) = 'bB'; }
+  if ($k == 18) { let $q = FORCE INDEX (f2) WHERE LEFT(s, 2) = 'bB' AND p = 1; }
+  if ($k == 19) { let $q = FORCE INDEX (f3) WHERE p - a = 0; }
+  if ($k == 20) { let $q = FORCE INDEX (f3) WHERE p - a < -40; }
+  if ($k == 21) { let $q = WHERE a * 3 = 30; }
+  if ($k == 22) { let $q = WHERE LEFT(s, 2) IN ('aA', 'bB'); }
+  if ($k == 23) { let $q = WHERE g = v; }
+  if ($k == 24) { let $q = WHERE vs LIKE 'a%'; }
+  let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0), ':', IFNULL(SUM(v), 0)) FROM w $q`;
+  let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0), ':', IFNULL(SUM(v), 0)) FROM i $q`;
+  inc $checked;
+  if ($w != $i)
+  {
+    inc $wrong;
+    --echo MISMATCH for $q: WARP $w, InnoDB $i
+  }
+}
+--echo $checked conditions checked, $wrong mismatches
+
+--echo # A condition on the expression of a functional index is evaluated by
+--echo # FastBit on its hidden column (no Filter in the plan)
+--replace_regex /\(cost=[^)]*\)// /rows=[0-9]+/rows=N/
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE a * 3 = 30;
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w IGNORE INDEX (f1) WHERE g = 40 AND v > 10;
+
+--echo #
+--echo # Updates: of a base column (the generated columns change), and of a
+--echo # column that no generated column depends on (the stored values of the
+--echo # generated columns must stay right)
+--echo #
+UPDATE w SET a = a + 1 WHERE id % 10 = 0;
+UPDATE i SET a = a + 1 WHERE id % 10 = 0;
+UPDATE w SET id = id + 10000 WHERE id % 7 = 0;
+UPDATE i SET id = id + 10000 WHERE id % 7 = 0;
+UPDATE w SET p = p + 3 WHERE id % 11 = 0;
+UPDATE i SET p = p + 3 WHERE id % 11 = 0;
+UPDATE w SET s = UPPER(s) WHERE id % 13 = 0;
+UPDATE i SET s = UPPER(s) WHERE id % 13 = 0;
+DELETE FROM w WHERE id % 17 = 0;
+DELETE FROM i WHERE id % 17 = 0;
+let $same = `SELECT ($check_all w) = ($check_all i)`;
+--echo same rows: $same
+let $checked = 0;
+let $wrong = 0;
+let $k = 0;
+while ($k < 8)
+{
+  inc $k;
+  if ($k == 1) { let $q = WHERE v = 60; }
+  if ($k == 2) { let $q = FORCE INDEX (v) WHERE v BETWEEN 50 AND 60; }
+  if ($k == 3) { let $q = FORCE INDEX (vs) WHERE vs < 'c'; }
+  if ($k == 4) { let $q = FORCE INDEX (f1) WHERE a * 3 = 33; }
+  if ($k == 5) { let $q = FORCE INDEX (f2) WHERE LEFT(s, 2) = 'BB'; }
+  if ($k == 6) { let $q = FORCE INDEX (f3) WHERE p - a = 3; }
+  if ($k == 7) { let $q = WHERE vn IS NULL AND g > 100; }
+  if ($k == 8) { let $q = WHERE id > 10000 AND v < 30; }
+  let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0), ':', IFNULL(SUM(v), 0)) FROM w $q`;
+  let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0), ':', IFNULL(SUM(v), 0)) FROM i $q`;
+  inc $checked;
+  if ($w != $i)
+  {
+    inc $wrong;
+    --echo MISMATCH after the updates for $q: WARP $w, InnoDB $i
+  }
+}
+--echo $checked conditions checked, $wrong mismatches
+
+--echo #
+--echo # ALTER TABLE: a new virtual column and an index on it, a new functional
+--echo # index, and an index on an existing virtual column added in place
+--echo #
+ALTER TABLE w ADD COLUMN v2 INT AS (a * p) VIRTUAL;
+ALTER TABLE i ADD COLUMN v2 INT AS (a * p) VIRTUAL;
+ALTER TABLE w ADD INDEX f4 ((a + 1000));
+ALTER TABLE i ADD INDEX f4 ((a + 1000));
+ALTER TABLE w ADD INDEX (v2), ALGORITHM=INPLACE;
+ALTER TABLE i ADD INDEX (v2);
+ALTER TABLE w DROP INDEX f3;
+ALTER TABLE i DROP INDEX f3;
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i FORCE INDEX (v2) WHERE v2 BETWEEN 100 AND 200)
+  AS v2_index FROM w FORCE INDEX (v2) WHERE v2 BETWEEN 100 AND 200;
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE a + 1000 = 1050)
+  AS f4_index FROM w FORCE INDEX (f4) WHERE a + 1000 = 1050;
+
+--echo # The values survive a restart
+--source include/restart_mysqld.inc
+let $check_all = SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, a, s, p, g, v, vs, IFNULL(vn, 'N'), gd, v2))) FROM;
+let $same = `SELECT ($check_all w) = ($check_all i)`;
+--echo same rows: $same
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE a * 3 = 30) AS f1_index
+  FROM w FORCE INDEX (f1) WHERE a * 3 = 30;
+
+--echo #
+--echo # The generated columns follow the rules of the other columns: a string
+--echo # in a case insensitive collation is refused, and so is a multi-valued
+--echo # index
+--echo #
+--error ER_ILLEGAL_HA
+CREATE TABLE bad (s VARCHAR(10), v VARCHAR(10) AS (LOWER(s)) COLLATE utf8mb4_0900_ai_ci) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+--error ER_CHECK_NOT_IMPLEMENTED
+CREATE TABLE bad (j JSON, KEY ((CAST(j->'$.a' AS UNSIGNED ARRAY)))) ENGINE=WARP;
+
+DROP TABLE w, i;

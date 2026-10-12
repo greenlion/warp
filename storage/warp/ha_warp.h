@@ -1084,8 +1084,16 @@ class ha_warp : public handler {
  
   ulonglong table_flags() const {
     // return (HA_NO_TRANSACTIONS | HA_NO_AUTO_INCREMENT | HA_BINLOG_ROW_CAPABLE | HA_CAN_REPAIR);
+    /* Generated columns, stored and virtual, are stored like the other
+       columns: the server computes all of them for an insert, and for an
+       update the ones that change (and the indexed virtual ones), the others
+       are read back with the row.  A condition or an index on a virtual
+       column, such as the hidden column of a functional index, is evaluated
+       on the stored values.  The server computes the virtual columns again
+       after a row is read (WARP has no index-only reads). */
     return (HA_BINLOG_ROW_CAPABLE | HA_NO_AUTO_INCREMENT | HA_CAN_REPAIR |
-            HA_NULL_IN_KEY);
+            HA_NULL_IN_KEY | HA_GENERATED_COLUMNS |
+            HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN);
   }
  
   uint max_record_length() const { return 0; }
