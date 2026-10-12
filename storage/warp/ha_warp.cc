@@ -93,10 +93,9 @@ static std::unique_ptr<collation_unordered_multimap<std::string, WARP_SHARE *>>
 static handler *warp_create_handler(handlerton *hton, TABLE_SHARE *table,
                                     bool partitioned, MEM_ROOT *mem_root);
 
-static handler *warp_create_handler(handlerton *hton, TABLE_SHARE *table, bool,
-                                    MEM_ROOT *mem_root) {
-  return new (mem_root) ha_warp(hton, table);
-}
+/* WARP takes no table locks, has no unique keys and no foreign keys: there
+   is nothing to say about partitioning */
+static uint warp_partition_flags() { return 0; }
 
 /* TIME values are stored as signed microseconds biased by WARP_TIME_BIAS so
    that they fit in an unsigned Fastbit column and still sort correctly.
@@ -445,7 +444,8 @@ static int warp_init_func(void *p) {
   warp_hton->state = SHOW_OPTION_YES;
   warp_hton->db_type = DB_TYPE_UNKNOWN;
   warp_hton->create = warp_create_handler;
-  warp_hton->flags = (HTON_CAN_RECREATE | HTON_NO_PARTITION);
+  warp_hton->flags = HTON_CAN_RECREATE;
+  warp_hton->partition_flags = warp_partition_flags;
   warp_hton->file_extensions = ha_warp_exts;
   warp_hton->rm_tmp_tables = default_rm_tmp_tables;
   warp_hton->commit = warp_commit;
@@ -1646,7 +1646,8 @@ int ha_warp::info(uint) {
   // if this is the fact table set the records to the smallest possible value,
   // the number of rows of the smallest table of the statement plus 2
   // (otherwise const evaluation will be used)
-  if(is_fact_table && THDVAR(table->in_use, adjust_table_stats_for_joins)) {
+  if(is_fact_table && !is_partition_child &&
+     THDVAR(table->in_use, adjust_table_stats_for_joins)) {
     stats.records = least_row_count+2;
   }
 
@@ -1715,12 +1716,13 @@ int ha_warp::info(uint) {
      ::engine_push so this ensures the table information for hybrid join is
      available when we get there
   */
-  warp_pushdown_information* pushdown_info = get_or_create_pushdown_info(table->in_use, table->alias, share->data_dir_name);
+  warp_pushdown_information* pushdown_info = get_or_create_pushdown_info(table->in_use, pd_alias().c_str(), share->data_dir_name);
   pushdown_info->fields = table->s->field;
   set_column_set();
 
   pushdown_info->column_set = column_set;
-  pushdown_info->is_fact_table = is_fact_table;
+  /* a partition is not a table of the joins (see is_partition_child) */
+  pushdown_info->is_fact_table = is_fact_table && !is_partition_child;
 
   DBUG_RETURN(0);
 }
@@ -2023,14 +2025,14 @@ void ha_warp::cleanup_pushdown_info() {
   }
   index_base_where = "";
   // free up memory used for pushdown filters
-  auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
+  auto pushdown_info = get_pushdown_info(table->in_use, pd_alias().c_str());
   
   pushdown_mtx.lock();
   auto it = pd_info.find(table->in_use);
   if(it != pd_info.end()) {
   
     // remove the pushdown info for this table
-    auto it2 = it->second->find(table->alias);
+    auto it2 = it->second->find(pd_alias().c_str());
     if(it2 != it->second->end()) {
       it->second->erase(it2);
     }
@@ -2548,11 +2550,11 @@ int ha_warp::rnd_init(bool) {
   }
   discard_prefetched();
   fetch_count = 0;
-  auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
+  auto pushdown_info = get_pushdown_info(table->in_use, pd_alias().c_str());
   if(pushdown_info == NULL) {
     /* ::info creates the pushdown information while a statement is
        optimized.  A replica applying row events looks up rows without it. */
-    pushdown_info = get_or_create_pushdown_info(table->in_use, table->alias, share->data_dir_name);
+    pushdown_info = get_or_create_pushdown_info(table->in_use, pd_alias().c_str(), share->data_dir_name);
     pushdown_info->fields = table->s->field;
   }
   char* partition_filter = THDVAR(table->in_use, partition_filter);
@@ -2646,7 +2648,8 @@ int ha_warp::rnd_init(bool) {
        appends to a partition rewrites.  A partition whose metadata is read
        at that moment is not found, the scan then returns no rows at all. */
     warp_table_read_lock partitions_lock(share->data_dir_name);
-    if( (get_pushdown_info_count(current_thd) > 1 && pushdown_info->is_fact_table) || partition_filter_partition_name != "" ) {
+    if( (!is_partition_child && get_pushdown_info_count(current_thd) > 1 &&
+         pushdown_info->is_fact_table) || partition_filter_partition_name != "" ) {
       partitions = new ibis::partList;
     
       // read all partitions unless a filter is set
@@ -3494,7 +3497,7 @@ bool ha_warp::count_visible_rows(ha_rows *num_rows) {
   if(push_where_clause != "" && push_where_clause != "1=1") {
     return false;
   }
-  auto pushdown_info = get_pushdown_info(table->in_use, table->alias);
+  auto pushdown_info = get_pushdown_info(table->in_use, pd_alias().c_str());
   if(pushdown_info != NULL &&
      (pushdown_info->base_table != NULL || !pushdown_info->join_info.empty())) {
     return false;
@@ -4191,10 +4194,30 @@ ha_rows ha_warp::records_in_range(uint idxno, key_range *min_key,
  * Whatever part of the FILTER condition can not be evaluated by WARP is left
  * in the FILTER.  If everything was pushed the FILTER is eliminated.
  */
+#include "ha_warp_part.h"
+
+/* a partitioned table is a WARP table for each partition, see ha_warp_part */
+static handler *warp_create_handler(handlerton *hton, TABLE_SHARE *table,
+                                    bool partitioned, MEM_ROOT *mem_root) {
+  if (partitioned) {
+    ha_warp_part *file = new (mem_root) ha_warp_part(hton, table);
+    if (file != nullptr && file->init_partitioning(mem_root)) {
+      ::destroy_at(file);
+      return nullptr;
+    }
+    return file;
+  }
+  return new (mem_root) ha_warp(hton, table);
+}
+
 static void warp_push_table_conditions(THD *thd, TABLE *table,
                                        AccessPath *filter, const JOIN *join) {
   // we can't do pushdown to non-WARP tables.
-  ha_warp *const ha = dynamic_cast<ha_warp *>(table->file);
+  ha_warp *ha = dynamic_cast<ha_warp *>(table->file);
+  /* A partitioned table: the condition is made by its first partition (the
+     partitions have the same columns) and given to all of them */
+  ha_warp_part *const part_ha = dynamic_cast<ha_warp_part *>(table->file);
+  if (ha == nullptr && part_ha != nullptr) ha = part_ha->condition_handler();
   if (ha == nullptr) return;
 
   /* The handler is reused by later statements.  A condition pushed down for
@@ -4202,13 +4225,14 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
      must not be applied to a statement that has no condition. */
   ha->push_where_clause = "";
   ha->star_agg.reset();
+  if (part_ha != nullptr) part_ha->set_pushed_condition("");
 
   const Item *cond = (filter != nullptr) ? filter->filter().condition : nullptr;
   if (cond == nullptr && join->where_cond == nullptr) return;
 
   auto share = ha->get_warp_share();
   auto pushdown_info =
-      get_or_create_pushdown_info(thd, table->alias, share->data_dir_name);
+      get_or_create_pushdown_info(thd, ha->pd_alias().c_str(), share->data_dir_name);
   assert(pushdown_info != nullptr);
 
   ha->push_where_clause = "";
@@ -4227,6 +4251,7 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
   }
   ha->push_where_clause += save_where;
   pushdown_info->filter = ha->push_where_clause;
+  if (part_ha != nullptr) part_ha->set_pushed_condition(ha->push_where_clause);
 
   if (filter == nullptr) return;
 
@@ -4267,7 +4292,8 @@ static bool warp_path_reads_warp_table(AccessPath *path, const JOIN *join) {
                   [&found](AccessPath *subpath, const JOIN *) {
                     TABLE *table = GetBasicTable(subpath);
                     if (table != nullptr &&
-                        dynamic_cast<ha_warp *>(table->file) != nullptr) {
+                        (dynamic_cast<ha_warp *>(table->file) != nullptr ||
+                         dynamic_cast<ha_warp_part *>(table->file) != nullptr)) {
                       found = true;
                     }
                     return found;
@@ -5416,7 +5442,7 @@ int ha_warp::bitmap_merge_join() {
     return 0;
   }
   bitmap_merge_join_executed = true;
-  auto fact_pushdown_info=get_pushdown_info(table->in_use, table->alias);
+  auto fact_pushdown_info=get_pushdown_info(table->in_use, pd_alias().c_str());
   
   if(fact_pushdown_info == NULL) {
     return 0;
@@ -7095,3 +7121,7 @@ warp_pushdown_information* get_or_create_pushdown_info(THD* thd, const char* ali
   
   return pushdown_info;
 }
+
+/* ha_warp.h defines the state of the engine, the partitioned tables are in
+   this translation unit too */
+#include "ha_warp_part.cc"

@@ -1,0 +1,1447 @@
+#
+# Partitioned WARP tables (PARTITION BY ...).  Every partition, and every
+# subpartition, is stored like a WARP table in its own data directory
+# (<table>#p#<partition>.data, <table>#p#<partition>#sp#<sub>.data).
+# DROP PARTITION removes the directories of the partition, ADD PARTITION
+# (RANGE, LIST) creates empty ones and TRUNCATE PARTITION empties them,
+# without reading the other partitions.  The other changes of the
+# partitioning copy the table.  The results are compared with identical
+# InnoDB tables.
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE src (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO src WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 3000)
+SELECT x, DATE_ADD('2019-01-01', INTERVAL x DAY), x % 37, CONCAT(CHAR(97 + x % 5), x % 11),
+x / 7 FROM seq;
+Warnings:
+Note	1265	Data truncated for column 'v' at row 1
+Note	1265	Data truncated for column 'v' at row 2
+Note	1265	Data truncated for column 'v' at row 3
+Note	1265	Data truncated for column 'v' at row 4
+Note	1265	Data truncated for column 'v' at row 5
+Note	1265	Data truncated for column 'v' at row 6
+Note	1265	Data truncated for column 'v' at row 8
+Note	1265	Data truncated for column 'v' at row 9
+Note	1265	Data truncated for column 'v' at row 10
+Note	1265	Data truncated for column 'v' at row 11
+Note	1265	Data truncated for column 'v' at row 12
+Note	1265	Data truncated for column 'v' at row 13
+Note	1265	Data truncated for column 'v' at row 15
+Note	1265	Data truncated for column 'v' at row 16
+Note	1265	Data truncated for column 'v' at row 17
+Note	1265	Data truncated for column 'v' at row 18
+Note	1265	Data truncated for column 'v' at row 19
+Note	1265	Data truncated for column 'v' at row 20
+Note	1265	Data truncated for column 'v' at row 22
+Note	1265	Data truncated for column 'v' at row 23
+Note	1265	Data truncated for column 'v' at row 24
+Note	1265	Data truncated for column 'v' at row 25
+Note	1265	Data truncated for column 'v' at row 26
+Note	1265	Data truncated for column 'v' at row 27
+Note	1265	Data truncated for column 'v' at row 29
+Note	1265	Data truncated for column 'v' at row 30
+Note	1265	Data truncated for column 'v' at row 31
+Note	1265	Data truncated for column 'v' at row 32
+Note	1265	Data truncated for column 'v' at row 33
+Note	1265	Data truncated for column 'v' at row 34
+Note	1265	Data truncated for column 'v' at row 36
+Note	1265	Data truncated for column 'v' at row 37
+Note	1265	Data truncated for column 'v' at row 38
+Note	1265	Data truncated for column 'v' at row 39
+Note	1265	Data truncated for column 'v' at row 40
+Note	1265	Data truncated for column 'v' at row 41
+Note	1265	Data truncated for column 'v' at row 43
+Note	1265	Data truncated for column 'v' at row 44
+Note	1265	Data truncated for column 'v' at row 45
+Note	1265	Data truncated for column 'v' at row 46
+Note	1265	Data truncated for column 'v' at row 47
+Note	1265	Data truncated for column 'v' at row 48
+Note	1265	Data truncated for column 'v' at row 50
+Note	1265	Data truncated for column 'v' at row 51
+Note	1265	Data truncated for column 'v' at row 52
+Note	1265	Data truncated for column 'v' at row 53
+Note	1265	Data truncated for column 'v' at row 54
+Note	1265	Data truncated for column 'v' at row 55
+Note	1265	Data truncated for column 'v' at row 57
+Note	1265	Data truncated for column 'v' at row 58
+Note	1265	Data truncated for column 'v' at row 59
+Note	1265	Data truncated for column 'v' at row 60
+Note	1265	Data truncated for column 'v' at row 61
+Note	1265	Data truncated for column 'v' at row 62
+Note	1265	Data truncated for column 'v' at row 64
+Note	1265	Data truncated for column 'v' at row 65
+Note	1265	Data truncated for column 'v' at row 66
+Note	1265	Data truncated for column 'v' at row 67
+Note	1265	Data truncated for column 'v' at row 68
+Note	1265	Data truncated for column 'v' at row 69
+Note	1265	Data truncated for column 'v' at row 71
+Note	1265	Data truncated for column 'v' at row 72
+Note	1265	Data truncated for column 'v' at row 73
+Note	1265	Data truncated for column 'v' at row 74
+Note	1265	Data truncated for column 'v' at row 75
+Note	1265	Data truncated for column 'v' at row 76
+Note	1265	Data truncated for column 'v' at row 78
+Note	1265	Data truncated for column 'v' at row 79
+Note	1265	Data truncated for column 'v' at row 80
+Note	1265	Data truncated for column 'v' at row 81
+Note	1265	Data truncated for column 'v' at row 82
+Note	1265	Data truncated for column 'v' at row 83
+Note	1265	Data truncated for column 'v' at row 85
+Note	1265	Data truncated for column 'v' at row 86
+Note	1265	Data truncated for column 'v' at row 87
+Note	1265	Data truncated for column 'v' at row 88
+Note	1265	Data truncated for column 'v' at row 89
+Note	1265	Data truncated for column 'v' at row 90
+Note	1265	Data truncated for column 'v' at row 92
+Note	1265	Data truncated for column 'v' at row 93
+Note	1265	Data truncated for column 'v' at row 94
+Note	1265	Data truncated for column 'v' at row 95
+Note	1265	Data truncated for column 'v' at row 96
+Note	1265	Data truncated for column 'v' at row 97
+Note	1265	Data truncated for column 'v' at row 99
+Note	1265	Data truncated for column 'v' at row 100
+Note	1265	Data truncated for column 'v' at row 101
+Note	1265	Data truncated for column 'v' at row 102
+Note	1265	Data truncated for column 'v' at row 103
+Note	1265	Data truncated for column 'v' at row 104
+Note	1265	Data truncated for column 'v' at row 106
+Note	1265	Data truncated for column 'v' at row 107
+Note	1265	Data truncated for column 'v' at row 108
+Note	1265	Data truncated for column 'v' at row 109
+Note	1265	Data truncated for column 'v' at row 110
+Note	1265	Data truncated for column 'v' at row 111
+Note	1265	Data truncated for column 'v' at row 113
+Note	1265	Data truncated for column 'v' at row 114
+Note	1265	Data truncated for column 'v' at row 115
+Note	1265	Data truncated for column 'v' at row 116
+Note	1265	Data truncated for column 'v' at row 117
+Note	1265	Data truncated for column 'v' at row 118
+Note	1265	Data truncated for column 'v' at row 120
+Note	1265	Data truncated for column 'v' at row 121
+Note	1265	Data truncated for column 'v' at row 122
+Note	1265	Data truncated for column 'v' at row 123
+Note	1265	Data truncated for column 'v' at row 124
+Note	1265	Data truncated for column 'v' at row 125
+Note	1265	Data truncated for column 'v' at row 127
+Note	1265	Data truncated for column 'v' at row 128
+Note	1265	Data truncated for column 'v' at row 129
+Note	1265	Data truncated for column 'v' at row 130
+Note	1265	Data truncated for column 'v' at row 131
+Note	1265	Data truncated for column 'v' at row 132
+Note	1265	Data truncated for column 'v' at row 134
+Note	1265	Data truncated for column 'v' at row 135
+Note	1265	Data truncated for column 'v' at row 136
+Note	1265	Data truncated for column 'v' at row 137
+Note	1265	Data truncated for column 'v' at row 138
+Note	1265	Data truncated for column 'v' at row 139
+Note	1265	Data truncated for column 'v' at row 141
+Note	1265	Data truncated for column 'v' at row 142
+Note	1265	Data truncated for column 'v' at row 143
+Note	1265	Data truncated for column 'v' at row 144
+Note	1265	Data truncated for column 'v' at row 145
+Note	1265	Data truncated for column 'v' at row 146
+Note	1265	Data truncated for column 'v' at row 148
+Note	1265	Data truncated for column 'v' at row 149
+Note	1265	Data truncated for column 'v' at row 150
+Note	1265	Data truncated for column 'v' at row 151
+Note	1265	Data truncated for column 'v' at row 152
+Note	1265	Data truncated for column 'v' at row 153
+Note	1265	Data truncated for column 'v' at row 155
+Note	1265	Data truncated for column 'v' at row 156
+Note	1265	Data truncated for column 'v' at row 157
+Note	1265	Data truncated for column 'v' at row 158
+Note	1265	Data truncated for column 'v' at row 159
+Note	1265	Data truncated for column 'v' at row 160
+Note	1265	Data truncated for column 'v' at row 162
+Note	1265	Data truncated for column 'v' at row 163
+Note	1265	Data truncated for column 'v' at row 164
+Note	1265	Data truncated for column 'v' at row 165
+Note	1265	Data truncated for column 'v' at row 166
+Note	1265	Data truncated for column 'v' at row 167
+Note	1265	Data truncated for column 'v' at row 169
+Note	1265	Data truncated for column 'v' at row 170
+Note	1265	Data truncated for column 'v' at row 171
+Note	1265	Data truncated for column 'v' at row 172
+Note	1265	Data truncated for column 'v' at row 173
+Note	1265	Data truncated for column 'v' at row 174
+Note	1265	Data truncated for column 'v' at row 176
+Note	1265	Data truncated for column 'v' at row 177
+Note	1265	Data truncated for column 'v' at row 178
+Note	1265	Data truncated for column 'v' at row 179
+Note	1265	Data truncated for column 'v' at row 180
+Note	1265	Data truncated for column 'v' at row 181
+Note	1265	Data truncated for column 'v' at row 183
+Note	1265	Data truncated for column 'v' at row 184
+Note	1265	Data truncated for column 'v' at row 185
+Note	1265	Data truncated for column 'v' at row 186
+Note	1265	Data truncated for column 'v' at row 187
+Note	1265	Data truncated for column 'v' at row 188
+Note	1265	Data truncated for column 'v' at row 190
+Note	1265	Data truncated for column 'v' at row 191
+Note	1265	Data truncated for column 'v' at row 192
+Note	1265	Data truncated for column 'v' at row 193
+Note	1265	Data truncated for column 'v' at row 194
+Note	1265	Data truncated for column 'v' at row 195
+Note	1265	Data truncated for column 'v' at row 197
+Note	1265	Data truncated for column 'v' at row 198
+Note	1265	Data truncated for column 'v' at row 199
+Note	1265	Data truncated for column 'v' at row 200
+Note	1265	Data truncated for column 'v' at row 201
+Note	1265	Data truncated for column 'v' at row 202
+Note	1265	Data truncated for column 'v' at row 204
+Note	1265	Data truncated for column 'v' at row 205
+Note	1265	Data truncated for column 'v' at row 206
+Note	1265	Data truncated for column 'v' at row 207
+Note	1265	Data truncated for column 'v' at row 208
+Note	1265	Data truncated for column 'v' at row 209
+Note	1265	Data truncated for column 'v' at row 211
+Note	1265	Data truncated for column 'v' at row 212
+Note	1265	Data truncated for column 'v' at row 213
+Note	1265	Data truncated for column 'v' at row 214
+Note	1265	Data truncated for column 'v' at row 215
+Note	1265	Data truncated for column 'v' at row 216
+Note	1265	Data truncated for column 'v' at row 218
+Note	1265	Data truncated for column 'v' at row 219
+Note	1265	Data truncated for column 'v' at row 220
+Note	1265	Data truncated for column 'v' at row 221
+Note	1265	Data truncated for column 'v' at row 222
+Note	1265	Data truncated for column 'v' at row 223
+Note	1265	Data truncated for column 'v' at row 225
+Note	1265	Data truncated for column 'v' at row 226
+Note	1265	Data truncated for column 'v' at row 227
+Note	1265	Data truncated for column 'v' at row 228
+Note	1265	Data truncated for column 'v' at row 229
+Note	1265	Data truncated for column 'v' at row 230
+Note	1265	Data truncated for column 'v' at row 232
+Note	1265	Data truncated for column 'v' at row 233
+Note	1265	Data truncated for column 'v' at row 234
+Note	1265	Data truncated for column 'v' at row 235
+Note	1265	Data truncated for column 'v' at row 236
+Note	1265	Data truncated for column 'v' at row 237
+Note	1265	Data truncated for column 'v' at row 239
+Note	1265	Data truncated for column 'v' at row 240
+Note	1265	Data truncated for column 'v' at row 241
+Note	1265	Data truncated for column 'v' at row 242
+Note	1265	Data truncated for column 'v' at row 243
+Note	1265	Data truncated for column 'v' at row 244
+Note	1265	Data truncated for column 'v' at row 246
+Note	1265	Data truncated for column 'v' at row 247
+Note	1265	Data truncated for column 'v' at row 248
+Note	1265	Data truncated for column 'v' at row 249
+Note	1265	Data truncated for column 'v' at row 250
+Note	1265	Data truncated for column 'v' at row 251
+Note	1265	Data truncated for column 'v' at row 253
+Note	1265	Data truncated for column 'v' at row 254
+Note	1265	Data truncated for column 'v' at row 255
+Note	1265	Data truncated for column 'v' at row 256
+Note	1265	Data truncated for column 'v' at row 257
+Note	1265	Data truncated for column 'v' at row 258
+Note	1265	Data truncated for column 'v' at row 260
+Note	1265	Data truncated for column 'v' at row 261
+Note	1265	Data truncated for column 'v' at row 262
+Note	1265	Data truncated for column 'v' at row 263
+Note	1265	Data truncated for column 'v' at row 264
+Note	1265	Data truncated for column 'v' at row 265
+Note	1265	Data truncated for column 'v' at row 267
+Note	1265	Data truncated for column 'v' at row 268
+Note	1265	Data truncated for column 'v' at row 269
+Note	1265	Data truncated for column 'v' at row 270
+Note	1265	Data truncated for column 'v' at row 271
+Note	1265	Data truncated for column 'v' at row 272
+Note	1265	Data truncated for column 'v' at row 274
+Note	1265	Data truncated for column 'v' at row 275
+Note	1265	Data truncated for column 'v' at row 276
+Note	1265	Data truncated for column 'v' at row 277
+Note	1265	Data truncated for column 'v' at row 278
+Note	1265	Data truncated for column 'v' at row 279
+Note	1265	Data truncated for column 'v' at row 281
+Note	1265	Data truncated for column 'v' at row 282
+Note	1265	Data truncated for column 'v' at row 283
+Note	1265	Data truncated for column 'v' at row 284
+Note	1265	Data truncated for column 'v' at row 285
+Note	1265	Data truncated for column 'v' at row 286
+Note	1265	Data truncated for column 'v' at row 288
+Note	1265	Data truncated for column 'v' at row 289
+Note	1265	Data truncated for column 'v' at row 290
+Note	1265	Data truncated for column 'v' at row 291
+Note	1265	Data truncated for column 'v' at row 292
+Note	1265	Data truncated for column 'v' at row 293
+Note	1265	Data truncated for column 'v' at row 295
+Note	1265	Data truncated for column 'v' at row 296
+Note	1265	Data truncated for column 'v' at row 297
+Note	1265	Data truncated for column 'v' at row 298
+Note	1265	Data truncated for column 'v' at row 299
+Note	1265	Data truncated for column 'v' at row 300
+Note	1265	Data truncated for column 'v' at row 302
+Note	1265	Data truncated for column 'v' at row 303
+Note	1265	Data truncated for column 'v' at row 304
+Note	1265	Data truncated for column 'v' at row 305
+Note	1265	Data truncated for column 'v' at row 306
+Note	1265	Data truncated for column 'v' at row 307
+Note	1265	Data truncated for column 'v' at row 309
+Note	1265	Data truncated for column 'v' at row 310
+Note	1265	Data truncated for column 'v' at row 311
+Note	1265	Data truncated for column 'v' at row 312
+Note	1265	Data truncated for column 'v' at row 313
+Note	1265	Data truncated for column 'v' at row 314
+Note	1265	Data truncated for column 'v' at row 316
+Note	1265	Data truncated for column 'v' at row 317
+Note	1265	Data truncated for column 'v' at row 318
+Note	1265	Data truncated for column 'v' at row 319
+Note	1265	Data truncated for column 'v' at row 320
+Note	1265	Data truncated for column 'v' at row 321
+Note	1265	Data truncated for column 'v' at row 323
+Note	1265	Data truncated for column 'v' at row 324
+Note	1265	Data truncated for column 'v' at row 325
+Note	1265	Data truncated for column 'v' at row 326
+Note	1265	Data truncated for column 'v' at row 327
+Note	1265	Data truncated for column 'v' at row 328
+Note	1265	Data truncated for column 'v' at row 330
+Note	1265	Data truncated for column 'v' at row 331
+Note	1265	Data truncated for column 'v' at row 332
+Note	1265	Data truncated for column 'v' at row 333
+Note	1265	Data truncated for column 'v' at row 334
+Note	1265	Data truncated for column 'v' at row 335
+Note	1265	Data truncated for column 'v' at row 337
+Note	1265	Data truncated for column 'v' at row 338
+Note	1265	Data truncated for column 'v' at row 339
+Note	1265	Data truncated for column 'v' at row 340
+Note	1265	Data truncated for column 'v' at row 341
+Note	1265	Data truncated for column 'v' at row 342
+Note	1265	Data truncated for column 'v' at row 344
+Note	1265	Data truncated for column 'v' at row 345
+Note	1265	Data truncated for column 'v' at row 346
+Note	1265	Data truncated for column 'v' at row 347
+Note	1265	Data truncated for column 'v' at row 348
+Note	1265	Data truncated for column 'v' at row 349
+Note	1265	Data truncated for column 'v' at row 351
+Note	1265	Data truncated for column 'v' at row 352
+Note	1265	Data truncated for column 'v' at row 353
+Note	1265	Data truncated for column 'v' at row 354
+Note	1265	Data truncated for column 'v' at row 355
+Note	1265	Data truncated for column 'v' at row 356
+Note	1265	Data truncated for column 'v' at row 358
+Note	1265	Data truncated for column 'v' at row 359
+Note	1265	Data truncated for column 'v' at row 360
+Note	1265	Data truncated for column 'v' at row 361
+Note	1265	Data truncated for column 'v' at row 362
+Note	1265	Data truncated for column 'v' at row 363
+Note	1265	Data truncated for column 'v' at row 365
+Note	1265	Data truncated for column 'v' at row 366
+Note	1265	Data truncated for column 'v' at row 367
+Note	1265	Data truncated for column 'v' at row 368
+Note	1265	Data truncated for column 'v' at row 369
+Note	1265	Data truncated for column 'v' at row 370
+Note	1265	Data truncated for column 'v' at row 372
+Note	1265	Data truncated for column 'v' at row 373
+Note	1265	Data truncated for column 'v' at row 374
+Note	1265	Data truncated for column 'v' at row 375
+Note	1265	Data truncated for column 'v' at row 376
+Note	1265	Data truncated for column 'v' at row 377
+Note	1265	Data truncated for column 'v' at row 379
+Note	1265	Data truncated for column 'v' at row 380
+Note	1265	Data truncated for column 'v' at row 381
+Note	1265	Data truncated for column 'v' at row 382
+Note	1265	Data truncated for column 'v' at row 383
+Note	1265	Data truncated for column 'v' at row 384
+Note	1265	Data truncated for column 'v' at row 386
+Note	1265	Data truncated for column 'v' at row 387
+Note	1265	Data truncated for column 'v' at row 388
+Note	1265	Data truncated for column 'v' at row 389
+Note	1265	Data truncated for column 'v' at row 390
+Note	1265	Data truncated for column 'v' at row 391
+Note	1265	Data truncated for column 'v' at row 393
+Note	1265	Data truncated for column 'v' at row 394
+Note	1265	Data truncated for column 'v' at row 395
+Note	1265	Data truncated for column 'v' at row 396
+Note	1265	Data truncated for column 'v' at row 397
+Note	1265	Data truncated for column 'v' at row 398
+Note	1265	Data truncated for column 'v' at row 400
+Note	1265	Data truncated for column 'v' at row 401
+Note	1265	Data truncated for column 'v' at row 402
+Note	1265	Data truncated for column 'v' at row 403
+Note	1265	Data truncated for column 'v' at row 404
+Note	1265	Data truncated for column 'v' at row 405
+Note	1265	Data truncated for column 'v' at row 407
+Note	1265	Data truncated for column 'v' at row 408
+Note	1265	Data truncated for column 'v' at row 409
+Note	1265	Data truncated for column 'v' at row 410
+Note	1265	Data truncated for column 'v' at row 411
+Note	1265	Data truncated for column 'v' at row 412
+Note	1265	Data truncated for column 'v' at row 414
+Note	1265	Data truncated for column 'v' at row 415
+Note	1265	Data truncated for column 'v' at row 416
+Note	1265	Data truncated for column 'v' at row 417
+Note	1265	Data truncated for column 'v' at row 418
+Note	1265	Data truncated for column 'v' at row 419
+Note	1265	Data truncated for column 'v' at row 421
+Note	1265	Data truncated for column 'v' at row 422
+Note	1265	Data truncated for column 'v' at row 423
+Note	1265	Data truncated for column 'v' at row 424
+Note	1265	Data truncated for column 'v' at row 425
+Note	1265	Data truncated for column 'v' at row 426
+Note	1265	Data truncated for column 'v' at row 428
+Note	1265	Data truncated for column 'v' at row 429
+Note	1265	Data truncated for column 'v' at row 430
+Note	1265	Data truncated for column 'v' at row 431
+Note	1265	Data truncated for column 'v' at row 432
+Note	1265	Data truncated for column 'v' at row 433
+Note	1265	Data truncated for column 'v' at row 435
+Note	1265	Data truncated for column 'v' at row 436
+Note	1265	Data truncated for column 'v' at row 437
+Note	1265	Data truncated for column 'v' at row 438
+Note	1265	Data truncated for column 'v' at row 439
+Note	1265	Data truncated for column 'v' at row 440
+Note	1265	Data truncated for column 'v' at row 442
+Note	1265	Data truncated for column 'v' at row 443
+Note	1265	Data truncated for column 'v' at row 444
+Note	1265	Data truncated for column 'v' at row 445
+Note	1265	Data truncated for column 'v' at row 446
+Note	1265	Data truncated for column 'v' at row 447
+Note	1265	Data truncated for column 'v' at row 449
+Note	1265	Data truncated for column 'v' at row 450
+Note	1265	Data truncated for column 'v' at row 451
+Note	1265	Data truncated for column 'v' at row 452
+Note	1265	Data truncated for column 'v' at row 453
+Note	1265	Data truncated for column 'v' at row 454
+Note	1265	Data truncated for column 'v' at row 456
+Note	1265	Data truncated for column 'v' at row 457
+Note	1265	Data truncated for column 'v' at row 458
+Note	1265	Data truncated for column 'v' at row 459
+Note	1265	Data truncated for column 'v' at row 460
+Note	1265	Data truncated for column 'v' at row 461
+Note	1265	Data truncated for column 'v' at row 463
+Note	1265	Data truncated for column 'v' at row 464
+Note	1265	Data truncated for column 'v' at row 465
+Note	1265	Data truncated for column 'v' at row 466
+Note	1265	Data truncated for column 'v' at row 467
+Note	1265	Data truncated for column 'v' at row 468
+Note	1265	Data truncated for column 'v' at row 470
+Note	1265	Data truncated for column 'v' at row 471
+Note	1265	Data truncated for column 'v' at row 472
+Note	1265	Data truncated for column 'v' at row 473
+Note	1265	Data truncated for column 'v' at row 474
+Note	1265	Data truncated for column 'v' at row 475
+Note	1265	Data truncated for column 'v' at row 477
+Note	1265	Data truncated for column 'v' at row 478
+Note	1265	Data truncated for column 'v' at row 479
+Note	1265	Data truncated for column 'v' at row 480
+Note	1265	Data truncated for column 'v' at row 481
+Note	1265	Data truncated for column 'v' at row 482
+Note	1265	Data truncated for column 'v' at row 484
+Note	1265	Data truncated for column 'v' at row 485
+Note	1265	Data truncated for column 'v' at row 486
+Note	1265	Data truncated for column 'v' at row 487
+Note	1265	Data truncated for column 'v' at row 488
+Note	1265	Data truncated for column 'v' at row 489
+Note	1265	Data truncated for column 'v' at row 491
+Note	1265	Data truncated for column 'v' at row 492
+Note	1265	Data truncated for column 'v' at row 493
+Note	1265	Data truncated for column 'v' at row 494
+Note	1265	Data truncated for column 'v' at row 495
+Note	1265	Data truncated for column 'v' at row 496
+Note	1265	Data truncated for column 'v' at row 498
+Note	1265	Data truncated for column 'v' at row 499
+Note	1265	Data truncated for column 'v' at row 500
+Note	1265	Data truncated for column 'v' at row 501
+Note	1265	Data truncated for column 'v' at row 502
+Note	1265	Data truncated for column 'v' at row 503
+Note	1265	Data truncated for column 'v' at row 505
+Note	1265	Data truncated for column 'v' at row 506
+Note	1265	Data truncated for column 'v' at row 507
+Note	1265	Data truncated for column 'v' at row 508
+Note	1265	Data truncated for column 'v' at row 509
+Note	1265	Data truncated for column 'v' at row 510
+Note	1265	Data truncated for column 'v' at row 512
+Note	1265	Data truncated for column 'v' at row 513
+Note	1265	Data truncated for column 'v' at row 514
+Note	1265	Data truncated for column 'v' at row 515
+Note	1265	Data truncated for column 'v' at row 516
+Note	1265	Data truncated for column 'v' at row 517
+Note	1265	Data truncated for column 'v' at row 519
+Note	1265	Data truncated for column 'v' at row 520
+Note	1265	Data truncated for column 'v' at row 521
+Note	1265	Data truncated for column 'v' at row 522
+Note	1265	Data truncated for column 'v' at row 523
+Note	1265	Data truncated for column 'v' at row 524
+Note	1265	Data truncated for column 'v' at row 526
+Note	1265	Data truncated for column 'v' at row 527
+Note	1265	Data truncated for column 'v' at row 528
+Note	1265	Data truncated for column 'v' at row 529
+Note	1265	Data truncated for column 'v' at row 530
+Note	1265	Data truncated for column 'v' at row 531
+Note	1265	Data truncated for column 'v' at row 533
+Note	1265	Data truncated for column 'v' at row 534
+Note	1265	Data truncated for column 'v' at row 535
+Note	1265	Data truncated for column 'v' at row 536
+Note	1265	Data truncated for column 'v' at row 537
+Note	1265	Data truncated for column 'v' at row 538
+Note	1265	Data truncated for column 'v' at row 540
+Note	1265	Data truncated for column 'v' at row 541
+Note	1265	Data truncated for column 'v' at row 542
+Note	1265	Data truncated for column 'v' at row 543
+Note	1265	Data truncated for column 'v' at row 544
+Note	1265	Data truncated for column 'v' at row 545
+Note	1265	Data truncated for column 'v' at row 547
+Note	1265	Data truncated for column 'v' at row 548
+Note	1265	Data truncated for column 'v' at row 549
+Note	1265	Data truncated for column 'v' at row 550
+Note	1265	Data truncated for column 'v' at row 551
+Note	1265	Data truncated for column 'v' at row 552
+Note	1265	Data truncated for column 'v' at row 554
+Note	1265	Data truncated for column 'v' at row 555
+Note	1265	Data truncated for column 'v' at row 556
+Note	1265	Data truncated for column 'v' at row 557
+Note	1265	Data truncated for column 'v' at row 558
+Note	1265	Data truncated for column 'v' at row 559
+Note	1265	Data truncated for column 'v' at row 561
+Note	1265	Data truncated for column 'v' at row 562
+Note	1265	Data truncated for column 'v' at row 563
+Note	1265	Data truncated for column 'v' at row 564
+Note	1265	Data truncated for column 'v' at row 565
+Note	1265	Data truncated for column 'v' at row 566
+Note	1265	Data truncated for column 'v' at row 568
+Note	1265	Data truncated for column 'v' at row 569
+Note	1265	Data truncated for column 'v' at row 570
+Note	1265	Data truncated for column 'v' at row 571
+Note	1265	Data truncated for column 'v' at row 572
+Note	1265	Data truncated for column 'v' at row 573
+Note	1265	Data truncated for column 'v' at row 575
+Note	1265	Data truncated for column 'v' at row 576
+Note	1265	Data truncated for column 'v' at row 577
+Note	1265	Data truncated for column 'v' at row 578
+Note	1265	Data truncated for column 'v' at row 579
+Note	1265	Data truncated for column 'v' at row 580
+Note	1265	Data truncated for column 'v' at row 582
+Note	1265	Data truncated for column 'v' at row 583
+Note	1265	Data truncated for column 'v' at row 584
+Note	1265	Data truncated for column 'v' at row 585
+Note	1265	Data truncated for column 'v' at row 586
+Note	1265	Data truncated for column 'v' at row 587
+Note	1265	Data truncated for column 'v' at row 589
+Note	1265	Data truncated for column 'v' at row 590
+Note	1265	Data truncated for column 'v' at row 591
+Note	1265	Data truncated for column 'v' at row 592
+Note	1265	Data truncated for column 'v' at row 593
+Note	1265	Data truncated for column 'v' at row 594
+Note	1265	Data truncated for column 'v' at row 596
+Note	1265	Data truncated for column 'v' at row 597
+Note	1265	Data truncated for column 'v' at row 598
+Note	1265	Data truncated for column 'v' at row 599
+Note	1265	Data truncated for column 'v' at row 600
+Note	1265	Data truncated for column 'v' at row 601
+Note	1265	Data truncated for column 'v' at row 603
+Note	1265	Data truncated for column 'v' at row 604
+Note	1265	Data truncated for column 'v' at row 605
+Note	1265	Data truncated for column 'v' at row 606
+Note	1265	Data truncated for column 'v' at row 607
+Note	1265	Data truncated for column 'v' at row 608
+Note	1265	Data truncated for column 'v' at row 610
+Note	1265	Data truncated for column 'v' at row 611
+Note	1265	Data truncated for column 'v' at row 612
+Note	1265	Data truncated for column 'v' at row 613
+Note	1265	Data truncated for column 'v' at row 614
+Note	1265	Data truncated for column 'v' at row 615
+Note	1265	Data truncated for column 'v' at row 617
+Note	1265	Data truncated for column 'v' at row 618
+Note	1265	Data truncated for column 'v' at row 619
+Note	1265	Data truncated for column 'v' at row 620
+Note	1265	Data truncated for column 'v' at row 621
+Note	1265	Data truncated for column 'v' at row 622
+Note	1265	Data truncated for column 'v' at row 624
+Note	1265	Data truncated for column 'v' at row 625
+Note	1265	Data truncated for column 'v' at row 626
+Note	1265	Data truncated for column 'v' at row 627
+Note	1265	Data truncated for column 'v' at row 628
+Note	1265	Data truncated for column 'v' at row 629
+Note	1265	Data truncated for column 'v' at row 631
+Note	1265	Data truncated for column 'v' at row 632
+Note	1265	Data truncated for column 'v' at row 633
+Note	1265	Data truncated for column 'v' at row 634
+Note	1265	Data truncated for column 'v' at row 635
+Note	1265	Data truncated for column 'v' at row 636
+Note	1265	Data truncated for column 'v' at row 638
+Note	1265	Data truncated for column 'v' at row 639
+Note	1265	Data truncated for column 'v' at row 640
+Note	1265	Data truncated for column 'v' at row 641
+Note	1265	Data truncated for column 'v' at row 642
+Note	1265	Data truncated for column 'v' at row 643
+Note	1265	Data truncated for column 'v' at row 645
+Note	1265	Data truncated for column 'v' at row 646
+Note	1265	Data truncated for column 'v' at row 647
+Note	1265	Data truncated for column 'v' at row 648
+Note	1265	Data truncated for column 'v' at row 649
+Note	1265	Data truncated for column 'v' at row 650
+Note	1265	Data truncated for column 'v' at row 652
+Note	1265	Data truncated for column 'v' at row 653
+Note	1265	Data truncated for column 'v' at row 654
+Note	1265	Data truncated for column 'v' at row 655
+Note	1265	Data truncated for column 'v' at row 656
+Note	1265	Data truncated for column 'v' at row 657
+Note	1265	Data truncated for column 'v' at row 659
+Note	1265	Data truncated for column 'v' at row 660
+Note	1265	Data truncated for column 'v' at row 661
+Note	1265	Data truncated for column 'v' at row 662
+Note	1265	Data truncated for column 'v' at row 663
+Note	1265	Data truncated for column 'v' at row 664
+Note	1265	Data truncated for column 'v' at row 666
+Note	1265	Data truncated for column 'v' at row 667
+Note	1265	Data truncated for column 'v' at row 668
+Note	1265	Data truncated for column 'v' at row 669
+Note	1265	Data truncated for column 'v' at row 670
+Note	1265	Data truncated for column 'v' at row 671
+Note	1265	Data truncated for column 'v' at row 673
+Note	1265	Data truncated for column 'v' at row 674
+Note	1265	Data truncated for column 'v' at row 675
+Note	1265	Data truncated for column 'v' at row 676
+Note	1265	Data truncated for column 'v' at row 677
+Note	1265	Data truncated for column 'v' at row 678
+Note	1265	Data truncated for column 'v' at row 680
+Note	1265	Data truncated for column 'v' at row 681
+Note	1265	Data truncated for column 'v' at row 682
+Note	1265	Data truncated for column 'v' at row 683
+Note	1265	Data truncated for column 'v' at row 684
+Note	1265	Data truncated for column 'v' at row 685
+Note	1265	Data truncated for column 'v' at row 687
+Note	1265	Data truncated for column 'v' at row 688
+Note	1265	Data truncated for column 'v' at row 689
+Note	1265	Data truncated for column 'v' at row 690
+Note	1265	Data truncated for column 'v' at row 691
+Note	1265	Data truncated for column 'v' at row 692
+Note	1265	Data truncated for column 'v' at row 694
+Note	1265	Data truncated for column 'v' at row 695
+Note	1265	Data truncated for column 'v' at row 696
+Note	1265	Data truncated for column 'v' at row 697
+Note	1265	Data truncated for column 'v' at row 698
+Note	1265	Data truncated for column 'v' at row 699
+Note	1265	Data truncated for column 'v' at row 701
+Note	1265	Data truncated for column 'v' at row 702
+Note	1265	Data truncated for column 'v' at row 703
+Note	1265	Data truncated for column 'v' at row 704
+Note	1265	Data truncated for column 'v' at row 705
+Note	1265	Data truncated for column 'v' at row 706
+Note	1265	Data truncated for column 'v' at row 708
+Note	1265	Data truncated for column 'v' at row 709
+Note	1265	Data truncated for column 'v' at row 710
+Note	1265	Data truncated for column 'v' at row 711
+Note	1265	Data truncated for column 'v' at row 712
+Note	1265	Data truncated for column 'v' at row 713
+Note	1265	Data truncated for column 'v' at row 715
+Note	1265	Data truncated for column 'v' at row 716
+Note	1265	Data truncated for column 'v' at row 717
+Note	1265	Data truncated for column 'v' at row 718
+Note	1265	Data truncated for column 'v' at row 719
+Note	1265	Data truncated for column 'v' at row 720
+Note	1265	Data truncated for column 'v' at row 722
+Note	1265	Data truncated for column 'v' at row 723
+Note	1265	Data truncated for column 'v' at row 724
+Note	1265	Data truncated for column 'v' at row 725
+Note	1265	Data truncated for column 'v' at row 726
+Note	1265	Data truncated for column 'v' at row 727
+Note	1265	Data truncated for column 'v' at row 729
+Note	1265	Data truncated for column 'v' at row 730
+Note	1265	Data truncated for column 'v' at row 731
+Note	1265	Data truncated for column 'v' at row 732
+Note	1265	Data truncated for column 'v' at row 733
+Note	1265	Data truncated for column 'v' at row 734
+Note	1265	Data truncated for column 'v' at row 736
+Note	1265	Data truncated for column 'v' at row 737
+Note	1265	Data truncated for column 'v' at row 738
+Note	1265	Data truncated for column 'v' at row 739
+Note	1265	Data truncated for column 'v' at row 740
+Note	1265	Data truncated for column 'v' at row 741
+Note	1265	Data truncated for column 'v' at row 743
+Note	1265	Data truncated for column 'v' at row 744
+Note	1265	Data truncated for column 'v' at row 745
+Note	1265	Data truncated for column 'v' at row 746
+Note	1265	Data truncated for column 'v' at row 747
+Note	1265	Data truncated for column 'v' at row 748
+Note	1265	Data truncated for column 'v' at row 750
+Note	1265	Data truncated for column 'v' at row 751
+Note	1265	Data truncated for column 'v' at row 752
+Note	1265	Data truncated for column 'v' at row 753
+Note	1265	Data truncated for column 'v' at row 754
+Note	1265	Data truncated for column 'v' at row 755
+Note	1265	Data truncated for column 'v' at row 757
+Note	1265	Data truncated for column 'v' at row 758
+Note	1265	Data truncated for column 'v' at row 759
+Note	1265	Data truncated for column 'v' at row 760
+Note	1265	Data truncated for column 'v' at row 761
+Note	1265	Data truncated for column 'v' at row 762
+Note	1265	Data truncated for column 'v' at row 764
+Note	1265	Data truncated for column 'v' at row 765
+Note	1265	Data truncated for column 'v' at row 766
+Note	1265	Data truncated for column 'v' at row 767
+Note	1265	Data truncated for column 'v' at row 768
+Note	1265	Data truncated for column 'v' at row 769
+Note	1265	Data truncated for column 'v' at row 771
+Note	1265	Data truncated for column 'v' at row 772
+Note	1265	Data truncated for column 'v' at row 773
+Note	1265	Data truncated for column 'v' at row 774
+Note	1265	Data truncated for column 'v' at row 775
+Note	1265	Data truncated for column 'v' at row 776
+Note	1265	Data truncated for column 'v' at row 778
+Note	1265	Data truncated for column 'v' at row 779
+Note	1265	Data truncated for column 'v' at row 780
+Note	1265	Data truncated for column 'v' at row 781
+Note	1265	Data truncated for column 'v' at row 782
+Note	1265	Data truncated for column 'v' at row 783
+Note	1265	Data truncated for column 'v' at row 785
+Note	1265	Data truncated for column 'v' at row 786
+Note	1265	Data truncated for column 'v' at row 787
+Note	1265	Data truncated for column 'v' at row 788
+Note	1265	Data truncated for column 'v' at row 789
+Note	1265	Data truncated for column 'v' at row 790
+Note	1265	Data truncated for column 'v' at row 792
+Note	1265	Data truncated for column 'v' at row 793
+Note	1265	Data truncated for column 'v' at row 794
+Note	1265	Data truncated for column 'v' at row 795
+Note	1265	Data truncated for column 'v' at row 796
+Note	1265	Data truncated for column 'v' at row 797
+Note	1265	Data truncated for column 'v' at row 799
+Note	1265	Data truncated for column 'v' at row 800
+Note	1265	Data truncated for column 'v' at row 801
+Note	1265	Data truncated for column 'v' at row 802
+Note	1265	Data truncated for column 'v' at row 803
+Note	1265	Data truncated for column 'v' at row 804
+Note	1265	Data truncated for column 'v' at row 806
+Note	1265	Data truncated for column 'v' at row 807
+Note	1265	Data truncated for column 'v' at row 808
+Note	1265	Data truncated for column 'v' at row 809
+Note	1265	Data truncated for column 'v' at row 810
+Note	1265	Data truncated for column 'v' at row 811
+Note	1265	Data truncated for column 'v' at row 813
+Note	1265	Data truncated for column 'v' at row 814
+Note	1265	Data truncated for column 'v' at row 815
+Note	1265	Data truncated for column 'v' at row 816
+Note	1265	Data truncated for column 'v' at row 817
+Note	1265	Data truncated for column 'v' at row 818
+Note	1265	Data truncated for column 'v' at row 820
+Note	1265	Data truncated for column 'v' at row 821
+Note	1265	Data truncated for column 'v' at row 822
+Note	1265	Data truncated for column 'v' at row 823
+Note	1265	Data truncated for column 'v' at row 824
+Note	1265	Data truncated for column 'v' at row 825
+Note	1265	Data truncated for column 'v' at row 827
+Note	1265	Data truncated for column 'v' at row 828
+Note	1265	Data truncated for column 'v' at row 829
+Note	1265	Data truncated for column 'v' at row 830
+Note	1265	Data truncated for column 'v' at row 831
+Note	1265	Data truncated for column 'v' at row 832
+Note	1265	Data truncated for column 'v' at row 834
+Note	1265	Data truncated for column 'v' at row 835
+Note	1265	Data truncated for column 'v' at row 836
+Note	1265	Data truncated for column 'v' at row 837
+Note	1265	Data truncated for column 'v' at row 838
+Note	1265	Data truncated for column 'v' at row 839
+Note	1265	Data truncated for column 'v' at row 841
+Note	1265	Data truncated for column 'v' at row 842
+Note	1265	Data truncated for column 'v' at row 843
+Note	1265	Data truncated for column 'v' at row 844
+Note	1265	Data truncated for column 'v' at row 845
+Note	1265	Data truncated for column 'v' at row 846
+Note	1265	Data truncated for column 'v' at row 848
+Note	1265	Data truncated for column 'v' at row 849
+Note	1265	Data truncated for column 'v' at row 850
+Note	1265	Data truncated for column 'v' at row 851
+Note	1265	Data truncated for column 'v' at row 852
+Note	1265	Data truncated for column 'v' at row 853
+Note	1265	Data truncated for column 'v' at row 855
+Note	1265	Data truncated for column 'v' at row 856
+Note	1265	Data truncated for column 'v' at row 857
+Note	1265	Data truncated for column 'v' at row 858
+Note	1265	Data truncated for column 'v' at row 859
+Note	1265	Data truncated for column 'v' at row 860
+Note	1265	Data truncated for column 'v' at row 862
+Note	1265	Data truncated for column 'v' at row 863
+Note	1265	Data truncated for column 'v' at row 864
+Note	1265	Data truncated for column 'v' at row 865
+Note	1265	Data truncated for column 'v' at row 866
+Note	1265	Data truncated for column 'v' at row 867
+Note	1265	Data truncated for column 'v' at row 869
+Note	1265	Data truncated for column 'v' at row 870
+Note	1265	Data truncated for column 'v' at row 871
+Note	1265	Data truncated for column 'v' at row 872
+Note	1265	Data truncated for column 'v' at row 873
+Note	1265	Data truncated for column 'v' at row 874
+Note	1265	Data truncated for column 'v' at row 876
+Note	1265	Data truncated for column 'v' at row 877
+Note	1265	Data truncated for column 'v' at row 878
+Note	1265	Data truncated for column 'v' at row 879
+Note	1265	Data truncated for column 'v' at row 880
+Note	1265	Data truncated for column 'v' at row 881
+Note	1265	Data truncated for column 'v' at row 883
+Note	1265	Data truncated for column 'v' at row 884
+Note	1265	Data truncated for column 'v' at row 885
+Note	1265	Data truncated for column 'v' at row 886
+Note	1265	Data truncated for column 'v' at row 887
+Note	1265	Data truncated for column 'v' at row 888
+Note	1265	Data truncated for column 'v' at row 890
+Note	1265	Data truncated for column 'v' at row 891
+Note	1265	Data truncated for column 'v' at row 892
+Note	1265	Data truncated for column 'v' at row 893
+Note	1265	Data truncated for column 'v' at row 894
+Note	1265	Data truncated for column 'v' at row 895
+Note	1265	Data truncated for column 'v' at row 897
+Note	1265	Data truncated for column 'v' at row 898
+Note	1265	Data truncated for column 'v' at row 899
+Note	1265	Data truncated for column 'v' at row 900
+Note	1265	Data truncated for column 'v' at row 901
+Note	1265	Data truncated for column 'v' at row 902
+Note	1265	Data truncated for column 'v' at row 904
+Note	1265	Data truncated for column 'v' at row 905
+Note	1265	Data truncated for column 'v' at row 906
+Note	1265	Data truncated for column 'v' at row 907
+Note	1265	Data truncated for column 'v' at row 908
+Note	1265	Data truncated for column 'v' at row 909
+Note	1265	Data truncated for column 'v' at row 911
+Note	1265	Data truncated for column 'v' at row 912
+Note	1265	Data truncated for column 'v' at row 913
+Note	1265	Data truncated for column 'v' at row 914
+Note	1265	Data truncated for column 'v' at row 915
+Note	1265	Data truncated for column 'v' at row 916
+Note	1265	Data truncated for column 'v' at row 918
+Note	1265	Data truncated for column 'v' at row 919
+Note	1265	Data truncated for column 'v' at row 920
+Note	1265	Data truncated for column 'v' at row 921
+Note	1265	Data truncated for column 'v' at row 922
+Note	1265	Data truncated for column 'v' at row 923
+Note	1265	Data truncated for column 'v' at row 925
+Note	1265	Data truncated for column 'v' at row 926
+Note	1265	Data truncated for column 'v' at row 927
+Note	1265	Data truncated for column 'v' at row 928
+Note	1265	Data truncated for column 'v' at row 929
+Note	1265	Data truncated for column 'v' at row 930
+Note	1265	Data truncated for column 'v' at row 932
+Note	1265	Data truncated for column 'v' at row 933
+Note	1265	Data truncated for column 'v' at row 934
+Note	1265	Data truncated for column 'v' at row 935
+Note	1265	Data truncated for column 'v' at row 936
+Note	1265	Data truncated for column 'v' at row 937
+Note	1265	Data truncated for column 'v' at row 939
+Note	1265	Data truncated for column 'v' at row 940
+Note	1265	Data truncated for column 'v' at row 941
+Note	1265	Data truncated for column 'v' at row 942
+Note	1265	Data truncated for column 'v' at row 943
+Note	1265	Data truncated for column 'v' at row 944
+Note	1265	Data truncated for column 'v' at row 946
+Note	1265	Data truncated for column 'v' at row 947
+Note	1265	Data truncated for column 'v' at row 948
+Note	1265	Data truncated for column 'v' at row 949
+Note	1265	Data truncated for column 'v' at row 950
+Note	1265	Data truncated for column 'v' at row 951
+Note	1265	Data truncated for column 'v' at row 953
+Note	1265	Data truncated for column 'v' at row 954
+Note	1265	Data truncated for column 'v' at row 955
+Note	1265	Data truncated for column 'v' at row 956
+Note	1265	Data truncated for column 'v' at row 957
+Note	1265	Data truncated for column 'v' at row 958
+Note	1265	Data truncated for column 'v' at row 960
+Note	1265	Data truncated for column 'v' at row 961
+Note	1265	Data truncated for column 'v' at row 962
+Note	1265	Data truncated for column 'v' at row 963
+Note	1265	Data truncated for column 'v' at row 964
+Note	1265	Data truncated for column 'v' at row 965
+Note	1265	Data truncated for column 'v' at row 967
+Note	1265	Data truncated for column 'v' at row 968
+Note	1265	Data truncated for column 'v' at row 969
+Note	1265	Data truncated for column 'v' at row 970
+Note	1265	Data truncated for column 'v' at row 971
+Note	1265	Data truncated for column 'v' at row 972
+Note	1265	Data truncated for column 'v' at row 974
+Note	1265	Data truncated for column 'v' at row 975
+Note	1265	Data truncated for column 'v' at row 976
+Note	1265	Data truncated for column 'v' at row 977
+Note	1265	Data truncated for column 'v' at row 978
+Note	1265	Data truncated for column 'v' at row 979
+Note	1265	Data truncated for column 'v' at row 981
+Note	1265	Data truncated for column 'v' at row 982
+Note	1265	Data truncated for column 'v' at row 983
+Note	1265	Data truncated for column 'v' at row 984
+Note	1265	Data truncated for column 'v' at row 985
+Note	1265	Data truncated for column 'v' at row 986
+Note	1265	Data truncated for column 'v' at row 988
+Note	1265	Data truncated for column 'v' at row 989
+Note	1265	Data truncated for column 'v' at row 990
+Note	1265	Data truncated for column 'v' at row 991
+Note	1265	Data truncated for column 'v' at row 992
+Note	1265	Data truncated for column 'v' at row 993
+Note	1265	Data truncated for column 'v' at row 995
+Note	1265	Data truncated for column 'v' at row 996
+Note	1265	Data truncated for column 'v' at row 997
+Note	1265	Data truncated for column 'v' at row 998
+Note	1265	Data truncated for column 'v' at row 999
+Note	1265	Data truncated for column 'v' at row 1000
+Note	1265	Data truncated for column 'v' at row 1002
+Note	1265	Data truncated for column 'v' at row 1003
+Note	1265	Data truncated for column 'v' at row 1004
+Note	1265	Data truncated for column 'v' at row 1005
+Note	1265	Data truncated for column 'v' at row 1006
+Note	1265	Data truncated for column 'v' at row 1007
+Note	1265	Data truncated for column 'v' at row 1009
+Note	1265	Data truncated for column 'v' at row 1010
+Note	1265	Data truncated for column 'v' at row 1011
+Note	1265	Data truncated for column 'v' at row 1012
+Note	1265	Data truncated for column 'v' at row 1013
+Note	1265	Data truncated for column 'v' at row 1014
+Note	1265	Data truncated for column 'v' at row 1016
+Note	1265	Data truncated for column 'v' at row 1017
+Note	1265	Data truncated for column 'v' at row 1018
+Note	1265	Data truncated for column 'v' at row 1019
+Note	1265	Data truncated for column 'v' at row 1020
+Note	1265	Data truncated for column 'v' at row 1021
+Note	1265	Data truncated for column 'v' at row 1023
+Note	1265	Data truncated for column 'v' at row 1024
+Note	1265	Data truncated for column 'v' at row 1025
+Note	1265	Data truncated for column 'v' at row 1026
+Note	1265	Data truncated for column 'v' at row 1027
+Note	1265	Data truncated for column 'v' at row 1028
+Note	1265	Data truncated for column 'v' at row 1030
+Note	1265	Data truncated for column 'v' at row 1031
+Note	1265	Data truncated for column 'v' at row 1032
+Note	1265	Data truncated for column 'v' at row 1033
+Note	1265	Data truncated for column 'v' at row 1034
+Note	1265	Data truncated for column 'v' at row 1035
+Note	1265	Data truncated for column 'v' at row 1037
+Note	1265	Data truncated for column 'v' at row 1038
+Note	1265	Data truncated for column 'v' at row 1039
+Note	1265	Data truncated for column 'v' at row 1040
+Note	1265	Data truncated for column 'v' at row 1041
+Note	1265	Data truncated for column 'v' at row 1042
+Note	1265	Data truncated for column 'v' at row 1044
+Note	1265	Data truncated for column 'v' at row 1045
+Note	1265	Data truncated for column 'v' at row 1046
+Note	1265	Data truncated for column 'v' at row 1047
+Note	1265	Data truncated for column 'v' at row 1048
+Note	1265	Data truncated for column 'v' at row 1049
+Note	1265	Data truncated for column 'v' at row 1051
+Note	1265	Data truncated for column 'v' at row 1052
+Note	1265	Data truncated for column 'v' at row 1053
+Note	1265	Data truncated for column 'v' at row 1054
+Note	1265	Data truncated for column 'v' at row 1055
+Note	1265	Data truncated for column 'v' at row 1056
+Note	1265	Data truncated for column 'v' at row 1058
+Note	1265	Data truncated for column 'v' at row 1059
+Note	1265	Data truncated for column 'v' at row 1060
+Note	1265	Data truncated for column 'v' at row 1061
+Note	1265	Data truncated for column 'v' at row 1062
+Note	1265	Data truncated for column 'v' at row 1063
+Note	1265	Data truncated for column 'v' at row 1065
+Note	1265	Data truncated for column 'v' at row 1066
+Note	1265	Data truncated for column 'v' at row 1067
+Note	1265	Data truncated for column 'v' at row 1068
+Note	1265	Data truncated for column 'v' at row 1069
+Note	1265	Data truncated for column 'v' at row 1070
+Note	1265	Data truncated for column 'v' at row 1072
+Note	1265	Data truncated for column 'v' at row 1073
+Note	1265	Data truncated for column 'v' at row 1074
+Note	1265	Data truncated for column 'v' at row 1075
+Note	1265	Data truncated for column 'v' at row 1076
+Note	1265	Data truncated for column 'v' at row 1077
+Note	1265	Data truncated for column 'v' at row 1079
+Note	1265	Data truncated for column 'v' at row 1080
+Note	1265	Data truncated for column 'v' at row 1081
+Note	1265	Data truncated for column 'v' at row 1082
+Note	1265	Data truncated for column 'v' at row 1083
+Note	1265	Data truncated for column 'v' at row 1084
+Note	1265	Data truncated for column 'v' at row 1086
+Note	1265	Data truncated for column 'v' at row 1087
+Note	1265	Data truncated for column 'v' at row 1088
+Note	1265	Data truncated for column 'v' at row 1089
+Note	1265	Data truncated for column 'v' at row 1090
+Note	1265	Data truncated for column 'v' at row 1091
+Note	1265	Data truncated for column 'v' at row 1093
+Note	1265	Data truncated for column 'v' at row 1094
+Note	1265	Data truncated for column 'v' at row 1095
+Note	1265	Data truncated for column 'v' at row 1096
+Note	1265	Data truncated for column 'v' at row 1097
+Note	1265	Data truncated for column 'v' at row 1098
+Note	1265	Data truncated for column 'v' at row 1100
+Note	1265	Data truncated for column 'v' at row 1101
+Note	1265	Data truncated for column 'v' at row 1102
+Note	1265	Data truncated for column 'v' at row 1103
+Note	1265	Data truncated for column 'v' at row 1104
+Note	1265	Data truncated for column 'v' at row 1105
+Note	1265	Data truncated for column 'v' at row 1107
+Note	1265	Data truncated for column 'v' at row 1108
+Note	1265	Data truncated for column 'v' at row 1109
+Note	1265	Data truncated for column 'v' at row 1110
+Note	1265	Data truncated for column 'v' at row 1111
+Note	1265	Data truncated for column 'v' at row 1112
+Note	1265	Data truncated for column 'v' at row 1114
+Note	1265	Data truncated for column 'v' at row 1115
+Note	1265	Data truncated for column 'v' at row 1116
+Note	1265	Data truncated for column 'v' at row 1117
+Note	1265	Data truncated for column 'v' at row 1118
+Note	1265	Data truncated for column 'v' at row 1119
+Note	1265	Data truncated for column 'v' at row 1121
+Note	1265	Data truncated for column 'v' at row 1122
+Note	1265	Data truncated for column 'v' at row 1123
+Note	1265	Data truncated for column 'v' at row 1124
+Note	1265	Data truncated for column 'v' at row 1125
+Note	1265	Data truncated for column 'v' at row 1126
+Note	1265	Data truncated for column 'v' at row 1128
+Note	1265	Data truncated for column 'v' at row 1129
+Note	1265	Data truncated for column 'v' at row 1130
+Note	1265	Data truncated for column 'v' at row 1131
+Note	1265	Data truncated for column 'v' at row 1132
+Note	1265	Data truncated for column 'v' at row 1133
+Note	1265	Data truncated for column 'v' at row 1135
+Note	1265	Data truncated for column 'v' at row 1136
+Note	1265	Data truncated for column 'v' at row 1137
+Note	1265	Data truncated for column 'v' at row 1138
+Note	1265	Data truncated for column 'v' at row 1139
+Note	1265	Data truncated for column 'v' at row 1140
+Note	1265	Data truncated for column 'v' at row 1142
+Note	1265	Data truncated for column 'v' at row 1143
+Note	1265	Data truncated for column 'v' at row 1144
+Note	1265	Data truncated for column 'v' at row 1145
+Note	1265	Data truncated for column 'v' at row 1146
+Note	1265	Data truncated for column 'v' at row 1147
+Note	1265	Data truncated for column 'v' at row 1149
+Note	1265	Data truncated for column 'v' at row 1150
+Note	1265	Data truncated for column 'v' at row 1151
+Note	1265	Data truncated for column 'v' at row 1152
+Note	1265	Data truncated for column 'v' at row 1153
+Note	1265	Data truncated for column 'v' at row 1154
+Note	1265	Data truncated for column 'v' at row 1156
+Note	1265	Data truncated for column 'v' at row 1157
+Note	1265	Data truncated for column 'v' at row 1158
+Note	1265	Data truncated for column 'v' at row 1159
+Note	1265	Data truncated for column 'v' at row 1160
+Note	1265	Data truncated for column 'v' at row 1161
+Note	1265	Data truncated for column 'v' at row 1163
+Note	1265	Data truncated for column 'v' at row 1164
+Note	1265	Data truncated for column 'v' at row 1165
+Note	1265	Data truncated for column 'v' at row 1166
+Note	1265	Data truncated for column 'v' at row 1167
+Note	1265	Data truncated for column 'v' at row 1168
+Note	1265	Data truncated for column 'v' at row 1170
+Note	1265	Data truncated for column 'v' at row 1171
+Note	1265	Data truncated for column 'v' at row 1172
+Note	1265	Data truncated for column 'v' at row 1173
+Note	1265	Data truncated for column 'v' at row 1174
+Note	1265	Data truncated for column 'v' at row 1175
+Note	1265	Data truncated for column 'v' at row 1177
+Note	1265	Data truncated for column 'v' at row 1178
+Note	1265	Data truncated for column 'v' at row 1179
+Note	1265	Data truncated for column 'v' at row 1180
+Note	1265	Data truncated for column 'v' at row 1181
+Note	1265	Data truncated for column 'v' at row 1182
+Note	1265	Data truncated for column 'v' at row 1184
+Note	1265	Data truncated for column 'v' at row 1185
+Note	1265	Data truncated for column 'v' at row 1186
+Note	1265	Data truncated for column 'v' at row 1187
+Note	1265	Data truncated for column 'v' at row 1188
+Note	1265	Data truncated for column 'v' at row 1189
+Note	1265	Data truncated for column 'v' at row 1191
+Note	1265	Data truncated for column 'v' at row 1192
+Note	1265	Data truncated for column 'v' at row 1193
+Note	1265	Data truncated for column 'v' at row 1194
+#
+# Every kind of partitioning: the rows go to their partitions, and every
+# condition gives the rows that InnoDB gives
+#
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY RANGE (YEAR(d)) (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021), PARTITION p2021 VALUES LESS THAN (2022), PARTITION pmax VALUES LESS THAN MAXVALUE);
+CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY RANGE (YEAR(d)) (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021), PARTITION p2021 VALUES LESS THAN (2022), PARTITION pmax VALUES LESS THAN MAXVALUE);
+INSERT INTO w SELECT * FROM src;
+INSERT INTO i SELECT * FROM src;
+# PARTITION BY RANGE (YEAR(d)) (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021), PARTITION p2021 VALUES LESS THAN (2022), PARTITION pmax VALUES LESS THAN MAXVALUE)
+SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+PARTITION_NAME	SUBPARTITION_NAME	TABLE_ROWS
+p2019	NULL	364
+p2020	NULL	366
+p2021	NULL	365
+pmax	NULL	1905
+# the rows of every partition are the ones InnoDB puts there
+14 conditions checked, 0 mismatches
+# a join, and updates that move rows to other partitions
+UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+DELETE FROM w WHERE id % 10 = 3;
+DELETE FROM i WHERE id % 10 = 3;
+DROP TABLE w, i;
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY RANGE COLUMNS (d, k) (PARTITION a VALUES LESS THAN ('2020-01-01', 10), PARTITION b VALUES LESS THAN ('2021-06-01', 0), PARTITION c VALUES LESS THAN (MAXVALUE, MAXVALUE));
+CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY RANGE COLUMNS (d, k) (PARTITION a VALUES LESS THAN ('2020-01-01', 10), PARTITION b VALUES LESS THAN ('2021-06-01', 0), PARTITION c VALUES LESS THAN (MAXVALUE, MAXVALUE));
+INSERT INTO w SELECT * FROM src;
+INSERT INTO i SELECT * FROM src;
+# PARTITION BY RANGE COLUMNS (d, k) (PARTITION a VALUES LESS THAN ('2020-01-01', 10), PARTITION b VALUES LESS THAN ('2021-06-01', 0), PARTITION c VALUES LESS THAN (MAXVALUE, MAXVALUE))
+SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+PARTITION_NAME	SUBPARTITION_NAME	TABLE_ROWS
+a	NULL	364
+b	NULL	517
+c	NULL	2119
+# the rows of every partition are the ones InnoDB puts there
+14 conditions checked, 0 mismatches
+# a join, and updates that move rows to other partitions
+UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+DELETE FROM w WHERE id % 10 = 3;
+DELETE FROM i WHERE id % 10 = 3;
+DROP TABLE w, i;
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY LIST (k % 4) (PARTITION l0 VALUES IN (0), PARTITION l1 VALUES IN (1, 2), PARTITION l3 VALUES IN (3));
+CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY LIST (k % 4) (PARTITION l0 VALUES IN (0), PARTITION l1 VALUES IN (1, 2), PARTITION l3 VALUES IN (3));
+INSERT INTO w SELECT * FROM src;
+INSERT INTO i SELECT * FROM src;
+# PARTITION BY LIST (k % 4) (PARTITION l0 VALUES IN (0), PARTITION l1 VALUES IN (1, 2), PARTITION l3 VALUES IN (3))
+SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+PARTITION_NAME	SUBPARTITION_NAME	TABLE_ROWS
+l0	NULL	810
+l1	NULL	1460
+l3	NULL	730
+# the rows of every partition are the ones InnoDB puts there
+14 conditions checked, 0 mismatches
+# a join, and updates that move rows to other partitions
+UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+DELETE FROM w WHERE id % 10 = 3;
+DELETE FROM i WHERE id % 10 = 3;
+DROP TABLE w, i;
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY LIST COLUMNS (s) (PARTITION la VALUES IN ('a0','a1','a2','a3','a4','a5','a6','a7','a8','a9','a10'), PARTITION lb VALUES IN ('b0','b1','b2','b3','b4','b5','b6','b7','b8','b9','b10'), PARTITION lrest VALUES IN ('c0','c1','c2','c3','c4','c5','c6','c7','c8','c9','c10','d0','d1','d2','d3','d4','d5','d6','d7','d8','d9','d10','e0','e1','e2','e3','e4','e5','e6','e7','e8','e9','e10'));
+CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY LIST COLUMNS (s) (PARTITION la VALUES IN ('a0','a1','a2','a3','a4','a5','a6','a7','a8','a9','a10'), PARTITION lb VALUES IN ('b0','b1','b2','b3','b4','b5','b6','b7','b8','b9','b10'), PARTITION lrest VALUES IN ('c0','c1','c2','c3','c4','c5','c6','c7','c8','c9','c10','d0','d1','d2','d3','d4','d5','d6','d7','d8','d9','d10','e0','e1','e2','e3','e4','e5','e6','e7','e8','e9','e10'));
+INSERT INTO w SELECT * FROM src;
+INSERT INTO i SELECT * FROM src;
+# PARTITION BY LIST COLUMNS (s) (PARTITION la VALUES IN ('a0','a1','a2','a3','a4','a5','a6','a7','a8','a9','a10'), PARTITION lb VALUES IN ('b0','b1','b2','b3','b4','b5','b6','b7','b8','b9','b10'), PARTITION lrest VALUES IN ('c0','c1','c2','c3','c4','c5','c6','c7','c8','c9','c10','d0','d1','d2','d3','d4','d5','d6','d7','d8','d9','d10','e0','e1','e2','e3','e4','e5','e6','e7','e8','e9','e10'))
+SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+PARTITION_NAME	SUBPARTITION_NAME	TABLE_ROWS
+la	NULL	600
+lb	NULL	600
+lrest	NULL	1800
+# the rows of every partition are the ones InnoDB puts there
+14 conditions checked, 0 mismatches
+# a join, and updates that move rows to other partitions
+UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+DELETE FROM w WHERE id % 10 = 3;
+DELETE FROM i WHERE id % 10 = 3;
+DROP TABLE w, i;
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY HASH (k) PARTITIONS 5;
+CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY HASH (k) PARTITIONS 5;
+INSERT INTO w SELECT * FROM src;
+INSERT INTO i SELECT * FROM src;
+# PARTITION BY HASH (k) PARTITIONS 5
+SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+PARTITION_NAME	SUBPARTITION_NAME	TABLE_ROWS
+p0	NULL	648
+p1	NULL	649
+p2	NULL	568
+p3	NULL	568
+p4	NULL	567
+# the rows of every partition are the ones InnoDB puts there
+14 conditions checked, 0 mismatches
+# a join, and updates that move rows to other partitions
+UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+DELETE FROM w WHERE id % 10 = 3;
+DELETE FROM i WHERE id % 10 = 3;
+DROP TABLE w, i;
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY LINEAR HASH (id) PARTITIONS 6;
+CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY LINEAR HASH (id) PARTITIONS 6;
+INSERT INTO w SELECT * FROM src;
+INSERT INTO i SELECT * FROM src;
+# PARTITION BY LINEAR HASH (id) PARTITIONS 6
+SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+PARTITION_NAME	SUBPARTITION_NAME	TABLE_ROWS
+p0	NULL	375
+p1	NULL	375
+p2	NULL	750
+p3	NULL	750
+p4	NULL	375
+p5	NULL	375
+# the rows of every partition are the ones InnoDB puts there
+14 conditions checked, 0 mismatches
+# a join, and updates that move rows to other partitions
+UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+DELETE FROM w WHERE id % 10 = 3;
+DELETE FROM i WHERE id % 10 = 3;
+DROP TABLE w, i;
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY KEY (s) PARTITIONS 4;
+CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY KEY (s) PARTITIONS 4;
+INSERT INTO w SELECT * FROM src;
+INSERT INTO i SELECT * FROM src;
+# PARTITION BY KEY (s) PARTITIONS 4
+SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+PARTITION_NAME	SUBPARTITION_NAME	TABLE_ROWS
+p0	NULL	438
+p1	NULL	1255
+p2	NULL	380
+p3	NULL	927
+# the rows of every partition are the ones InnoDB puts there
+14 conditions checked, 0 mismatches
+# a join, and updates that move rows to other partitions
+UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+DELETE FROM w WHERE id % 10 = 3;
+DELETE FROM i WHERE id % 10 = 3;
+DROP TABLE w, i;
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY KEY (d, k) PARTITIONS 3;
+CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY KEY (d, k) PARTITIONS 3;
+INSERT INTO w SELECT * FROM src;
+INSERT INTO i SELECT * FROM src;
+# PARTITION BY KEY (d, k) PARTITIONS 3
+SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+PARTITION_NAME	SUBPARTITION_NAME	TABLE_ROWS
+p0	NULL	980
+p1	NULL	1018
+p2	NULL	1002
+# the rows of every partition are the ones InnoDB puts there
+14 conditions checked, 0 mismatches
+# a join, and updates that move rows to other partitions
+UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+DELETE FROM w WHERE id % 10 = 3;
+DELETE FROM i WHERE id % 10 = 3;
+DROP TABLE w, i;
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (k) SUBPARTITIONS 3 (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021), PARTITION pmax VALUES LESS THAN MAXVALUE);
+CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (k) SUBPARTITIONS 3 (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021), PARTITION pmax VALUES LESS THAN MAXVALUE);
+INSERT INTO w SELECT * FROM src;
+INSERT INTO i SELECT * FROM src;
+# PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (k) SUBPARTITIONS 3 (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021), PARTITION pmax VALUES LESS THAN MAXVALUE)
+SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+PARTITION_NAME	SUBPARTITION_NAME	TABLE_ROWS
+p2019	p2019sp0	127
+p2019	p2019sp1	119
+p2019	p2019sp2	118
+p2020	p2020sp0	129
+p2020	p2020sp1	118
+p2020	p2020sp2	119
+pmax	pmaxsp0	798
+pmax	pmaxsp1	736
+pmax	pmaxsp2	736
+# the rows of every partition are the ones InnoDB puts there
+14 conditions checked, 0 mismatches
+# a join, and updates that move rows to other partitions
+UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+DELETE FROM w WHERE id % 10 = 3;
+DELETE FROM i WHERE id % 10 = 3;
+DROP TABLE w, i;
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY LIST (k % 3) SUBPARTITION BY KEY (id) (PARTITION l0 VALUES IN (0) (SUBPARTITION s0a, SUBPARTITION s0b), PARTITION l1 VALUES IN (1) (SUBPARTITION s1a, SUBPARTITION s1b), PARTITION l2 VALUES IN (2) (SUBPARTITION s2a, SUBPARTITION s2b));
+CREATE TABLE i (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2), KEY (k), KEY (d))
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY LIST (k % 3) SUBPARTITION BY KEY (id) (PARTITION l0 VALUES IN (0) (SUBPARTITION s0a, SUBPARTITION s0b), PARTITION l1 VALUES IN (1) (SUBPARTITION s1a, SUBPARTITION s1b), PARTITION l2 VALUES IN (2) (SUBPARTITION s2a, SUBPARTITION s2b));
+INSERT INTO w SELECT * FROM src;
+INSERT INTO i SELECT * FROM src;
+# PARTITION BY LIST (k % 3) SUBPARTITION BY KEY (id) (PARTITION l0 VALUES IN (0) (SUBPARTITION s0a, SUBPARTITION s0b), PARTITION l1 VALUES IN (1) (SUBPARTITION s1a, SUBPARTITION s1b), PARTITION l2 VALUES IN (2) (SUBPARTITION s2a, SUBPARTITION s2b))
+SELECT PARTITION_NAME, SUBPARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION;
+PARTITION_NAME	SUBPARTITION_NAME	TABLE_ROWS
+l0	s0a	313
+l0	s0b	741
+l1	s1a	287
+l1	s1b	686
+l2	s2a	288
+l2	s2b	685
+# the rows of every partition are the ones InnoDB puts there
+14 conditions checked, 0 mismatches
+# a join, and updates that move rows to other partitions
+UPDATE w SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+UPDATE i SET d = DATE_ADD(d, INTERVAL 400 DAY), k = k + 1, s = CONCAT('b', id % 11) WHERE id % 9 = 0;
+DELETE FROM w WHERE id % 10 = 3;
+DELETE FROM i WHERE id % 10 = 3;
+DROP TABLE w, i;
+#
+# The partitions that the conditions do not need are not read
+#
+CREATE TABLE w (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+PARTITION BY RANGE (YEAR(d)) (PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021),
+PARTITION p2021 VALUES LESS THAN (2022), PARTITION pmax VALUES LESS THAN MAXVALUE);
+INSERT INTO w SELECT * FROM src;
+EXPLAIN SELECT COUNT(*) FROM w WHERE d >= '2020-03-01' AND d < '2020-09-01';
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	w	p2020	ALL	NULL	NULL	NULL	NULL	366	11.11	NULL
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`test`.`w`.`d` >= DATE'2020-03-01') and (`test`.`w`.`d` < DATE'2020-09-01'))
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= '2020-03-01' AND d < '2020-09-01' AND k = 3;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+SELECT COUNT(*) FROM w WHERE d >= '2020-03-01' AND d < '2020-09-01' AND k = 3;
+COUNT(*)
+5
+SELECT COUNT(*) FROM w PARTITION (p2019, pmax);
+COUNT(*)
+2269
+DELETE FROM w PARTITION (pmax) WHERE k < 10;
+UPDATE w PARTITION (p2019) SET s = 'x' WHERE k = 1;
+SELECT COUNT(*), SUM(s = 'x') FROM w;
+COUNT(*)	SUM(s = 'x')
+2486	10
+#
+# DROP PARTITION removes the data directory of the partition, ADD
+# PARTITION creates an empty one, TRUNCATE PARTITION empties one
+#
+# the data directories of w
+w#p#p2019.data
+w#p#p2020.data
+w#p#p2021.data
+w#p#pmax.data
+ALTER TABLE w DROP PARTITION p2019;
+w#p#p2020.data
+w#p#p2021.data
+w#p#pmax.data
+SELECT COUNT(*), MIN(d) FROM w;
+COUNT(*)	MIN(d)
+2122	2020-01-01
+ALTER TABLE w ALGORITHM=INPLACE, DROP PARTITION p2020, pmax;
+w#p#p2021.data
+SELECT COUNT(*), MIN(d), MAX(d) FROM w;
+COUNT(*)	MIN(d)	MAX(d)
+365	2021-01-01	2021-12-31
+INSERT INTO w VALUES (1, '2025-01-01', 1, 'a', 1);
+ERROR HY000: Table has no partition for value 2025
+ALTER TABLE w ADD PARTITION (PARTITION p2022 VALUES LESS THAN (2023), PARTITION p2025 VALUES LESS THAN (2026));
+w#p#p2021.data
+w#p#p2022.data
+w#p#p2025.data
+INSERT INTO w VALUES (1, '2025-01-01', 1, 'a', 1), (2, '2022-02-02', 2, 'b', 2);
+SELECT * FROM w PARTITION (p2022, p2025) ORDER BY id;
+id	d	k	s	v
+1	2025-01-01	1	a	1.00
+2	2022-02-02	2	b	2.00
+ALTER TABLE w TRUNCATE PARTITION p2021;
+SELECT COUNT(*) FROM w;
+COUNT(*)
+2
+SELECT PARTITION_NAME, TABLE_ROWS FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'w' ORDER BY PARTITION_ORDINAL_POSITION;
+PARTITION_NAME	TABLE_ROWS
+p2021	0
+p2022	1
+p2025	1
+INSERT INTO w VALUES (3, '2021-03-03', 3, 'c', 3);
+SELECT * FROM w ORDER BY id;
+id	d	k	s	v
+1	2025-01-01	1	a	1.00
+2	2022-02-02	2	b	2.00
+3	2021-03-03	3	c	3.00
+# Subpartitions: DROP PARTITION removes all of them, TRUNCATE empties one
+CREATE TABLE ws (id INT, d DATE, k INT) ENGINE=WARP
+PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (k) SUBPARTITIONS 2
+(PARTITION p2019 VALUES LESS THAN (2020), PARTITION p2020 VALUES LESS THAN (2021), PARTITION p2029 VALUES LESS THAN (2030));
+INSERT INTO ws SELECT id, d, k FROM src;
+ws#p#p2019#sp#p2019sp0.data
+ws#p#p2019#sp#p2019sp1.data
+ws#p#p2020#sp#p2020sp0.data
+ws#p#p2020#sp#p2020sp1.data
+ws#p#p2029#sp#p2029sp0.data
+ws#p#p2029#sp#p2029sp1.data
+ALTER TABLE ws DROP PARTITION p2020;
+ws#p#p2019#sp#p2019sp0.data
+ws#p#p2019#sp#p2019sp1.data
+ws#p#p2029#sp#p2029sp0.data
+ws#p#p2029#sp#p2029sp1.data
+ALTER TABLE ws TRUNCATE PARTITION p2019sp0;
+SELECT COUNT(*) = (SELECT COUNT(*) FROM src WHERE YEAR(d) < 2020 AND k % 2 = 1) + (SELECT COUNT(*) FROM src WHERE YEAR(d) >= 2021)
+AS rows_left FROM ws;
+rows_left
+1
+ALTER TABLE ws ADD PARTITION (PARTITION p2030 VALUES LESS THAN (2031));
+ws#p#p2019#sp#p2019sp0.data
+ws#p#p2019#sp#p2019sp1.data
+ws#p#p2029#sp#p2029sp0.data
+ws#p#p2029#sp#p2029sp1.data
+ws#p#p2030#sp#p2030sp0.data
+ws#p#p2030#sp#p2030sp1.data
+INSERT INTO ws VALUES (1, '2030-06-06', 5);
+SELECT * FROM ws PARTITION (p2030);
+id	d	k
+1	2030-06-06	5
+ALTER TABLE ws ADD PARTITION (PARTITION p2019 VALUES LESS THAN (2032));
+ERROR HY000: Duplicate partition name p2019
+# A transaction that is rolled back leaves no rows in the partitions
+BEGIN;
+INSERT INTO w VALUES (10, '2022-05-05', 1, 'z', 1), (11, '2025-05-05', 1, 'z', 1);
+DELETE FROM w WHERE id = 3;
+ROLLBACK;
+SELECT * FROM w ORDER BY id;
+id	d	k	s	v
+1	2025-01-01	1	a	1.00
+2	2022-02-02	2	b	2.00
+3	2021-03-03	3	c	3.00
+#
+# The other changes of the partitioning copy the table
+#
+CREATE TABLE wh (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin PARTITION BY HASH (id) PARTITIONS 4;
+INSERT INTO wh SELECT * FROM src;
+ALTER TABLE wh ADD PARTITION PARTITIONS 2;
+ALTER TABLE wh COALESCE PARTITION 3;
+wh#p#p0.data
+wh#p#p1.data
+wh#p#p2.data
+ALTER TABLE wh REORGANIZE PARTITION;
+ALTER TABLE wh PARTITION BY RANGE (k) (PARTITION a VALUES LESS THAN (10), PARTITION b VALUES LESS THAN MAXVALUE);
+ALTER TABLE wh REORGANIZE PARTITION b INTO (PARTITION b1 VALUES LESS THAN (20), PARTITION b2 VALUES LESS THAN MAXVALUE);
+wh#p#a.data
+wh#p#b1.data
+wh#p#b2.data
+same rows after the changes: 1
+SELECT COUNT(*) FROM wh PARTITION (b1);
+COUNT(*)
+810
+ALTER TABLE wh REMOVE PARTITIONING;
+wh.data
+same rows without partitioning: 1
+ALTER TABLE wh PARTITION BY KEY (s) PARTITIONS 2;
+wh#p#p0.data
+wh#p#p1.data
+same rows partitioned again: 1
+# EXCHANGE PARTITION is not supported
+CREATE TABLE wx (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+ALTER TABLE w EXCHANGE PARTITION p2025 WITH TABLE wx;
+ERROR HY000: Partition management on a not partitioned table is not possible
+DROP TABLE wx;
+#
+# RENAME TABLE moves the directories of the partitions, DROP TABLE removes
+# them, and the rows survive a restart
+#
+RENAME TABLE wh TO wh2;
+wh2#p#p0.data
+wh2#p#p1.data
+SELECT COUNT(*) FROM wh2;
+COUNT(*)
+3000
+# restart
+same rows after the restart: 1
+SELECT * FROM w ORDER BY id;
+id	d	k	s	v
+1	2025-01-01	1	a	1.00
+2	2022-02-02	2	b	2.00
+3	2021-03-03	3	c	3.00
+SELECT COUNT(*) FROM ws;
+COUNT(*)
+2449
+DROP TABLE w, ws, wh2, src;
