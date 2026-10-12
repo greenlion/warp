@@ -85,6 +85,7 @@ using namespace SIMDCompressionLib;
 
 int warp_push_to_engine(THD *, AccessPath *, JOIN *);
 static void forget_partitions(const char *table_name);
+static std::string warp_autoinc_file(const char *data_dir);
 // Stuff for shares */
 mysql_mutex_t warp_mutex;
 static std::unique_ptr<collation_unordered_multimap<std::string, WARP_SHARE *>>
@@ -518,15 +519,6 @@ bool ha_warp::is_deleted(uint64_t rownum) {
   return warp_state->delete_bitmap->is_set(rownum);
 }
 
-/*
-void ha_warp::get_auto_increment(ulonglong, ulonglong, ulonglong,
-                                 ulonglong *first_value,
-                                 ulonglong *nb_reserved_values) {
-  *first_value = stats.auto_increment_value ? stats.auto_increment_value : 1;
-  *nb_reserved_values = ULLONG_MAX;
-}
-*/
-
 int ha_warp::encode_quote(uchar *) {
   char attribute_buffer[1024];
   String attribute(attribute_buffer, sizeof(attribute_buffer), &my_charset_bin);
@@ -762,6 +754,9 @@ static void forget_partitions(const char *table_name) {
   for(auto it = range.first; it != range.second; ++it) {
     mysql_mutex_lock(&it->second->mutex);
     it->second->partitions_loaded = false;
+    /* the next AUTO_INCREMENT value is read again too */
+    it->second->autoinc_loaded = false;
+    it->second->autoinc_dirty = false;
     mysql_mutex_unlock(&it->second->mutex);
     /* the values of the UNIQUE indexes are read from disk again */
     std::lock_guard<std::mutex> unique_guard(it->second->unique_mtx);
@@ -1428,6 +1423,7 @@ int ha_warp::write_buffered_rows_to_disk() {
   } catch(...) {
   }
   buffered_rowids.clear();
+  save_autoinc();
   return rc;
 }
 
@@ -1487,7 +1483,8 @@ int ha_warp::write_row_impl(uchar *buf) {
     restarts at the moment.  AUTO_INCREMENT should definitely be
     considered and ALPHA level feature.
   */
-  if(table->next_number_field && buf == table->record[0]) {
+  /* the value of a partition is made by the partitioned table */
+  if(table->next_number_field && buf == table->record[0] && !is_partition_child) {
     int error;
     if((error = update_auto_increment())) DBUG_RETURN(error);
   }
@@ -1515,6 +1512,7 @@ int ha_warp::write_row_impl(uchar *buf) {
     remember_unique_keys(buf);
     buffered_rowids.insert(current_rowid);
   }
+  autoinc_value_written(buf);
   /* the inserts of a statement that is rolled back alone are deleted, see
      warp_trx::rollback */
   {
@@ -1770,8 +1768,12 @@ int ha_warp::info(uint flag) {
         stats.mean_rec_length += 8;
         break;
     }
+  }
 
-    stats.auto_increment_value = stats.records;
+  /* SHOW TABLE STATUS, SHOW CREATE TABLE, and the value that ALTER TABLE
+     gives the copy of the table */
+  if(table->found_next_number_field != nullptr) {
+    stats.auto_increment_value = autoinc_next_value();
   }
 
   /* estimate the data size from the record count and average record size */
@@ -2390,8 +2392,8 @@ int ha_warp::create_writer(TABLE *table_arg) {
 // int ha_warp::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *info,
 static bool warp_key_part_supported(const KEY_PART_INFO *kp);
 
-int ha_warp::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
-                    dd::Table *) {
+int ha_warp::create(const char *name, TABLE *table_arg,
+                    HA_CREATE_INFO *create_info, dd::Table *) {
   DBUG_ENTER("ha_warp::create");
   int rc = 0;
   /* the indexes are declarations, see ha_warp::make_key_condition */
@@ -2441,6 +2443,16 @@ int ha_warp::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
       rmdir(share->data_dir_name);
     }
     rc = -1;
+  }
+  /* CREATE TABLE ... AUTO_INCREMENT = n, and the next value of a table that
+     ALTER TABLE copies */
+  if(rc == 0 && create_info != NULL && create_info->auto_increment_value > 1) {
+    FILE *f = fopen(warp_autoinc_file(share->data_dir_name).c_str(), "w");
+    if(f != NULL) {
+      const uint64_t next = create_info->auto_increment_value;
+      fwrite(&next, sizeof(next), 1, f);
+      fclose(f);
+    }
   }
   forget_partitions(name);
 
@@ -4401,6 +4413,186 @@ int ha_warp::check_unique_keys(uchar *record) {
     }
   }
   return 0;
+}
+
+/* ---------------------------------------------------------------------
+   AUTO_INCREMENT
+
+   The next value of the table is in the share.  It is read when it is
+   first needed: the value of the auto_increment file in the data directory
+   (written by CREATE TABLE ... AUTO_INCREMENT = n and whenever values are
+   given out), or the largest value of the column on disk plus one if that
+   is larger.  A statement is given the values it asks for, the ones it did
+   not use are given back when it ends if no other statement took values
+   since.  A value that is written (given in the statement, or by an update)
+   and is not smaller than the next one moves the next one after it.
+   --------------------------------------------------------------------- */
+
+static std::string warp_autoinc_file(const char *data_dir) {
+  return std::string(data_dir) + "/auto_increment";
+}
+
+void ha_warp::load_autoinc() {
+  mysql_mutex_lock(&share->mutex);
+  const bool loaded = share->autoinc_loaded;
+  mysql_mutex_unlock(&share->mutex);
+  if(loaded) {
+    return;
+  }
+  /* the column is read without share->mutex, which the purge takes while it
+     holds the lock of the table */
+  uint64_t next = 1;
+  FILE *f = fopen(warp_autoinc_file(share->data_dir_name).c_str(), "r");
+  if(f != NULL) {
+    uint64_t value = 0;
+    if(fread(&value, sizeof(value), 1, f) == 1 && value > next) {
+      next = value;
+    }
+    fclose(f);
+  }
+  Field *field = table->found_next_number_field;
+  if(field != nullptr) {
+    try {
+      warp_table_read_lock data_lock(share->data_dir_name);
+      ibis::table *base = ibis::mensa::create(share->data_dir_name);
+      if(base != NULL && base->nRows() > 0) {
+        const std::string column = "c" + std::to_string(field->field_index());
+        ibis::table *rows = base->select(column.c_str(), "1=1");
+        ibis::table::cursor *cursor = rows != NULL ? rows->createCursor() : NULL;
+        while(cursor != NULL && cursor->fetch() == 0) {
+          uint64_t value = 0;
+          if(field->is_unsigned()) {
+            cursor->getColumnAsULong(column.c_str(), value);
+          } else {
+            int64_t signed_value = 0;
+            cursor->getColumnAsLong(column.c_str(), signed_value);
+            value = signed_value > 0 ? static_cast<uint64_t>(signed_value) : 0;
+          }
+          if(value != UINT64_MAX && value + 1 > next) {
+            next = value + 1;
+          }
+        }
+        delete cursor;
+        delete rows;
+      }
+      delete base;
+    } catch(...) {
+    }
+  }
+  mysql_mutex_lock(&share->mutex);
+  if(!share->autoinc_loaded) {
+    share->autoinc_next = next;
+    share->autoinc_loaded = true;
+  }
+  mysql_mutex_unlock(&share->mutex);
+}
+
+/* Writes the next value to the auto_increment file if it changed */
+void ha_warp::save_autoinc() {
+  mysql_mutex_lock(&share->mutex);
+  if(share->autoinc_dirty) {
+    FILE *f = fopen(warp_autoinc_file(share->data_dir_name).c_str(), "w");
+    if(f != NULL) {
+      fwrite(&share->autoinc_next, sizeof(share->autoinc_next), 1, f);
+      fclose(f);
+      share->autoinc_dirty = false;
+    }
+  }
+  mysql_mutex_unlock(&share->mutex);
+}
+
+uint64_t ha_warp::autoinc_next_value() {
+  load_autoinc();
+  mysql_mutex_lock(&share->mutex);
+  const uint64_t next = share->autoinc_next;
+  mysql_mutex_unlock(&share->mutex);
+  return next;
+}
+
+/* A row was written: its value of the column moves the next value */
+void ha_warp::autoinc_value_written(const uchar *record) {
+  Field *field = table->found_next_number_field;
+  if(field == nullptr) {
+    return;
+  }
+  const ptrdiff_t diff = record - table->record[0];
+  if(field->is_null(diff)) {
+    return;
+  }
+  field->move_field_offset(diff);
+  const longlong value = field->val_int();
+  field->move_field_offset(-diff);
+  if(!field->is_unsigned() && value <= 0) {
+    return;
+  }
+  const uint64_t u = static_cast<uint64_t>(value);
+  load_autoinc();
+  mysql_mutex_lock(&share->mutex);
+  if(u != UINT64_MAX && u + 1 > share->autoinc_next) {
+    share->autoinc_next = u + 1;
+    share->autoinc_dirty = true;
+  }
+  mysql_mutex_unlock(&share->mutex);
+}
+
+void ha_warp::get_auto_increment(ulonglong offset, ulonglong increment,
+                                 ulonglong nb_desired_values,
+                                 ulonglong *first_value,
+                                 ulonglong *nb_reserved_values) {
+  load_autoinc();
+  const uint64_t step = increment > 0 ? increment : 1;
+  const uint64_t count = nb_desired_values > 0 ? nb_desired_values : 1;
+  mysql_mutex_lock(&share->mutex);
+  /* the first value of the series of auto_increment_offset and
+     auto_increment_increment from the next value on (the offset is not used
+     when it is larger than the increment) */
+  uint64_t first = share->autoinc_next;
+  if(step > 1) {
+    const uint64_t start = (offset > 0 && offset <= step) ? offset : 1;
+    if(first <= start) {
+      first = start;
+    } else if(first - start > UINT64_MAX - step) {
+      first = UINT64_MAX;
+    } else {
+      first = start + ((first - start + step - 1) / step) * step;
+    }
+  }
+  uint64_t end = UINT64_MAX;
+  if(first != UINT64_MAX && count <= (UINT64_MAX - first) / step) {
+    end = first + count * step;
+  }
+  share->autoinc_next = end;
+  share->autoinc_dirty = true;
+  mysql_mutex_unlock(&share->mutex);
+  autoinc_reserved_end = end;
+  save_autoinc();
+  *first_value = first;
+  *nb_reserved_values = count;
+}
+
+/* SHOW CREATE TABLE, and ALTER TABLE, which gives the copy of the table the
+   next value */
+void ha_warp::update_create_info(HA_CREATE_INFO *create_info) {
+  if(!(create_info->used_fields & HA_CREATE_USED_AUTO) &&
+     table->found_next_number_field != nullptr) {
+    create_info->auto_increment_value = autoinc_next_value();
+  }
+}
+
+/* The values that the statement did not use are given back, if no other
+   statement has taken values since */
+void ha_warp::release_auto_increment() {
+  if(autoinc_reserved_end != 0 && next_insert_id > 0) {
+    mysql_mutex_lock(&share->mutex);
+    if(share->autoinc_next == autoinc_reserved_end &&
+       next_insert_id < autoinc_reserved_end) {
+      share->autoinc_next = next_insert_id;
+      share->autoinc_dirty = true;
+    }
+    mysql_mutex_unlock(&share->mutex);
+    save_autoinc();
+  }
+  autoinc_reserved_end = 0;
 }
 
 /* Starts the scan for a lookup.  The scan of an earlier lookup is ended

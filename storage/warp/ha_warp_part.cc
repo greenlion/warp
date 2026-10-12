@@ -160,6 +160,12 @@ int ha_warp_part::open(const char *name, int mode, uint test_if_locked,
     unlock_shared_ha_data();
     return HA_ERR_INTERNAL_ERROR;
   }
+  if (m_part_share->auto_inc_mutex == nullptr &&
+      table->found_next_number_field != nullptr &&
+      m_part_share->init_auto_inc_mutex(table_share)) {
+    unlock_shared_ha_data();
+    return HA_ERR_INTERNAL_ERROR;
+  }
   unlock_shared_ha_data();
 
   m_part_paths = partition_paths(name, m_part_info);
@@ -541,9 +547,42 @@ int ha_warp_part::info(uint flag) {
   }
   stats.records = records;
   stats.deleted = deleted;
+  if ((flag & HA_STATUS_AUTO) && table->found_next_number_field != nullptr &&
+      m_part_share->auto_inc_mutex != nullptr) {
+    m_part_share->lock_auto_inc();
+    if (!m_part_share->auto_inc_initialized) {
+      initialize_auto_increment(false);
+    }
+    stats.auto_increment_value = m_part_share->next_auto_inc_val;
+    m_part_share->unlock_auto_inc();
+  }
   stats.data_file_length = data_file_length;
   stats.mean_rec_length = mean_rec_length;
   return 0;
+}
+
+/* The next value is the largest next value of the partitions: every
+   partition keeps the next value after the rows written to it (see
+   ha_warp::autoinc_value_written) */
+int ha_warp_part::initialize_auto_increment(bool) {
+  uint64_t next = 1;
+  if (!m_parts_closed) {
+    for (auto &part : m_parts) {
+      next = std::max(next, part->autoinc_next_value());
+    }
+  }
+  m_part_share->next_auto_inc_val = next;
+  m_part_share->auto_inc_initialized = true;
+  stats.auto_increment_value = next;
+  return 0;
+}
+
+void ha_warp_part::get_auto_increment(ulonglong, ulonglong increment,
+                                      ulonglong nb_desired_values,
+                                      ulonglong *first_value,
+                                      ulonglong *nb_reserved_values) {
+  get_auto_increment_first_field(increment, nb_desired_values, first_value,
+                                 nb_reserved_values);
 }
 
 int ha_warp_part::records(ha_rows *num_rows) {

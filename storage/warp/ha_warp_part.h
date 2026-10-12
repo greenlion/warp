@@ -154,6 +154,20 @@ class ha_warp_part : public handler,
                                   const dd::Table *old_table_def,
                                   dd::Table *new_table_def) override;
 
+  /* AUTO_INCREMENT: the next value of the table is the largest next value
+     of the partitions, Partition_helper gives the values out */
+  void get_auto_increment(ulonglong offset, ulonglong increment,
+                          ulonglong nb_desired_values, ulonglong *first_value,
+                          ulonglong *nb_reserved_values) override;
+  void release_auto_increment() override { ph_release_auto_increment(); }
+  void update_create_info(HA_CREATE_INFO *create_info) override {
+    if (!(create_info->used_fields & HA_CREATE_USED_AUTO) &&
+        table->found_next_number_field != nullptr) {
+      info(HA_STATUS_AUTO);
+      create_info->auto_increment_value = stats.auto_increment_value;
+    }
+  }
+
   uint32_t calculate_key_hash_value(Field **field_array) override {
     return ph_calculate_key_hash_value(field_array);
   }
@@ -189,7 +203,7 @@ class ha_warp_part : public handler,
   int update_row_in_part(uint part_id, const uchar *old_data,
                          uchar *new_data) override;
   int delete_row_in_part(uint part_id, const uchar *buf) override;
-  int initialize_auto_increment(bool) override { return 0; }
+  int initialize_auto_increment(bool no_lock) override;
   int rnd_init_in_part(uint part_id, bool table_scan) override;
   int rnd_next_in_part(uint part_id, uchar *buf) override;
   int rnd_end_in_part(uint part_id, bool scan) override;
