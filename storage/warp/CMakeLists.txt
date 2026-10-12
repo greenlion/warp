@@ -37,7 +37,10 @@ ExternalProject_Add(
   SOURCE_DIR=fastbit-2.0.3
   # FastBit is linked statically into ha_warp.so, so only the (position
   # independent) static library is built
-  CONFIGURE_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/src/fastbit-2.0.3/configure --prefix=${CMAKE_CURRENT_SOURCE_DIR} --with-pic --disable-shared CPPFLAGS=${FASTBIT_ZSTD_CPPFLAGS} LIBS=${FASTBIT_ZSTD_LIBS}
+  # Build with the same compilers as the server (on EL8 that is a
+  # gcc-toolset, not the older system gcc found first in PATH) and C++17,
+  # which configure does not add by itself
+  CONFIGURE_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/src/fastbit-2.0.3/configure --prefix=${CMAKE_CURRENT_SOURCE_DIR} --with-pic --disable-shared CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER} "CXXFLAGS=-g -O2 -std=c++17" CPPFLAGS=${FASTBIT_ZSTD_CPPFLAGS} LIBS=${FASTBIT_ZSTD_LIBS}
   PREFIX ${CMAKE_CURRENT_SOURCE_DIR}/
   BUILD_BYPRODUCTS ${CMAKE_CURRENT_SOURCE_DIR}/lib/libfastbit.a
   #PATCH_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/patch_fastbit.sh ${CMAKE_CURRENT_SOURCE_DIR}
