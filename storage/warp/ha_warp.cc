@@ -340,6 +340,65 @@ static bool warp_collation_supported(const CHARSET_INFO *cs) {
   return (cs->state & (MY_CS_BINSORT | MY_CS_CSSORT)) != 0;
 }
 
+/* Is the column a binary string (BINARY, VARBINARY or BLOB)?  Its value may
+   contain any byte, NUL included, so it is stored encoded, see
+   warp_encode_binary. */
+static bool warp_is_binary_string(const Field *f) {
+  switch(f->real_type()) {
+    case MYSQL_TYPE_VAR_STRING:
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_STRING:
+    case MYSQL_TYPE_TINY_BLOB:
+    case MYSQL_TYPE_MEDIUM_BLOB:
+    case MYSQL_TYPE_LONG_BLOB:
+    case MYSQL_TYPE_BLOB:
+      return f->charset() == &my_charset_bin;
+    default:
+      return false;
+  }
+}
+
+/* Can the strings of the column be stored and compared like MySQL does?
+   The binary strings are stored encoded and compared in the binary
+   collation, the other strings in their collation. */
+static bool warp_string_column_supported(const Field *f) {
+  return warp_is_binary_string(f) || warp_collation_supported(f->charset());
+}
+
+/* FastBit stores a string with a NUL at the end, so the bytes of a binary
+   string are written with 0x01 as an escape: 0x00 as 0x01 0x01, 0x01 as
+   0x01 0x02, the other bytes as they are.  The codes of the bytes are in
+   the order of the bytes and none is the beginning of another, so the
+   encoded strings compare (byte by byte, a shorter string first) and are
+   equal like the strings themselves: the comparisons of the binary
+   collation are evaluated on the encoded strings. */
+static void warp_encode_binary(const char *ptr, size_t len, std::string &out) {
+  out.clear();
+  out.reserve(len);
+  for(size_t i = 0; i < len; ++i) {
+    const unsigned char c = static_cast<unsigned char>(ptr[i]);
+    if(c <= 1) {
+      out += '\x01';
+      out += static_cast<char>(c + 1);
+    } else {
+      out += static_cast<char>(c);
+    }
+  }
+}
+
+static void warp_decode_binary(const std::string &in, std::string &out) {
+  out.clear();
+  out.reserve(in.size());
+  for(size_t i = 0; i < in.size(); ++i) {
+    if(in[i] == '\x01' && i + 1 < in.size()) {
+      ++i;
+      out += static_cast<char>(in[i] - 1);
+    } else {
+      out += in[i];
+    }
+  }
+}
+
 /* What a FastBit condition on a string column is prefixed with, so that
    FastBit compares the strings in the collation of the column: nothing for
    utf8mb4_bin, which FastBit compares itself (byte by byte, PAD SPACE), and
@@ -553,6 +612,14 @@ int ha_warp::encode_quote(uchar *) {
     if((*field)->str_needs_quotes() && !no_quote) {
       ptr = attribute.ptr();
       end_ptr = attribute.length() + ptr;
+
+      /* the bytes of a binary string, NUL included, are written encoded */
+      std::string encoded;
+      if(warp_is_binary_string(*field)) {
+        warp_encode_binary(ptr, attribute.length(), encoded);
+        ptr = encoded.data();
+        end_ptr = ptr + encoded.size();
+      }
 
       buffer.append('"');
 
@@ -858,6 +925,11 @@ int ha_warp::find_current_row(uchar *buf, ibis::table::cursor *cursor) {
         case MYSQL_TYPE_JSON: {
           std::string tmp;
           rc = cursor->getColumnAsString(cname.c_str(), tmp);
+          if(warp_is_binary_string(*field)) {
+            std::string encoded;
+            encoded.swap(tmp);
+            warp_decode_binary(encoded, tmp);
+          }
           if((*field)->store(tmp.c_str(), tmp.length(), (*field)->charset(),
                               CHECK_FIELD_WARN)) {
             rc = HA_ERR_CRASHED_ON_USAGE;
@@ -2107,9 +2179,9 @@ int ha_warp::create_writer(TABLE *table_arg) {
       case MYSQL_TYPE_BLOB:
       case MYSQL_TYPE_JSON:
         /* the strings are compared in the collation of the column, see
-           warp_collation_supported */
-        if(!warp_collation_supported((*field)->charset())) {
-          std::string errmsg = "Unsupported character set or collation for column (only case sensitive and binary collations of character sets without NUL bytes are supported): " +
+           warp_string_column_supported */
+        if(!warp_string_column_supported(*field)) {
+          std::string errmsg = "Unsupported character set or collation for column (only binary strings and case sensitive and binary collations of character sets without NUL bytes are supported): " +
                              std::string((*field)->field_name);
           my_error(1031, MYF(0), errmsg.c_str());
           return 1;
@@ -3703,10 +3775,39 @@ static bool warp_key_part_supported(const KEY_PART_INFO *kp) {
         return false;
       }
       /* FastBit compares the strings in the collation of the column */
-      return warp_collation_supported(f->charset());
+      return warp_string_column_supported(f);
     default:
       return false;
   }
+}
+
+/* Writes the bytes of a string as a quoted FastBit string literal, the
+   bytes of a binary string encoded the way they are stored (see
+   warp_encode_binary).  Returns false for another string that contains a
+   NUL: FastBit strings end at a NUL. */
+static bool warp_quote_string(const char *ptr, size_t len, bool binary,
+                              std::string &quoted) {
+  std::string encoded;
+  if(binary) {
+    warp_encode_binary(ptr, len, encoded);
+    ptr = encoded.data();
+    len = encoded.size();
+  }
+  std::string escaped;
+  for(size_t i = 0; i < len; ++i) {
+    const char c = ptr[i];
+    if(c == 0) {
+      return false;
+    } else if(c == '\'') {
+      escaped += "\\'";
+    } else if(c == '\\') {
+      escaped += "\\\\";
+    } else {
+      escaped += c;
+    }
+  }
+  quoted = "'" + escaped + "'";
+  return true;
 }
 
 /* The value of a key part, as it is written in a FastBit condition */
@@ -3743,20 +3844,8 @@ static bool warp_decode_key_part(TABLE *table, const KEY_PART_INFO *kp,
     if(val == NULL) {
       ok = false;
     } else {
-      std::string escaped;
-      for(size_t i = 0; ok && i < val->length(); ++i) {
-        const char c = val->ptr()[i];
-        if(c == 0) {
-          ok = false; /* FastBit strings end at a NUL */
-        } else if(c == '\'') {
-          escaped += "\\'";
-        } else if(c == '\\') {
-          escaped += "\\\\";
-        } else {
-          escaped += c;
-        }
-      }
-      v.text = "'" + escaped + "'";
+      ok = warp_quote_string(val->ptr(), val->length(),
+                             warp_is_binary_string(f), v.text);
     }
   } else if(f->real_type() == MYSQL_TYPE_YEAR) {
     v.text = std::to_string(f->val_int());
@@ -4422,13 +4511,18 @@ static bool warp_is_temporal_const(Item *item, int kind) {
 /* Writes a string constant as a quoted FastBit string literal in the
    character set cs of the column it is compared with, the way MySQL
    converts the constant to compare it in the collation of the column.
-   Returns false if the constant is not a plain string that FastBit compares
-   like MySQL: a constant that is not a string, a NULL, a string that can not
-   be converted to the character set without a loss and a string with a NUL
-   character (FastBit strings end at a NUL). */
+   The constants compared with a binary string are its bytes, encoded (see
+   warp_quote_string), a hexadecimal string (x'00ff') included.  Returns false
+   if the constant is not a plain string that FastBit compares like MySQL: a
+   constant that is not a string, a NULL, a string that can not be converted
+   to the character set without a loss and a string with a NUL character
+   compared with a string that is not binary (FastBit strings end at a
+   NUL). */
 static bool warp_quote_string_const(const Item *item, const CHARSET_INFO *cs,
                                     std::string &quoted) {
-  if(item->type() != Item::Type::STRING_ITEM) {
+  const bool binary = cs == &my_charset_bin;
+  if(item->type() != Item::Type::STRING_ITEM &&
+     !(binary && item->type() == Item::Type::HEX_BIN_ITEM)) {
     return false;
   }
   Item *citem = const_cast<Item *>(item);
@@ -4438,7 +4532,7 @@ static bool warp_quote_string_const(const Item *item, const CHARSET_INFO *cs,
     return false;
   }
   String converted;
-  if(!my_charset_same(val->charset(), cs)) {
+  if(!binary && !my_charset_same(val->charset(), cs)) {
     uint errors = 0;
     if(converted.copy(val->ptr(), val->length(), val->charset(), cs,
                       &errors) ||
@@ -4447,25 +4541,7 @@ static bool warp_quote_string_const(const Item *item, const CHARSET_INFO *cs,
     }
     val = &converted;
   }
-  const char *ptr = val->ptr();
-  for(size_t j = 0; j < val->length(); ++j) {
-    if(ptr[j] == 0) {
-      return false;
-    }
-  }
-  std::string escaped;
-  for(size_t j = 0; j < val->length(); ++j) {
-    const char c = ptr[j];
-    if(c == '\'') {
-      escaped += "\\'";
-    } else if(c == '\\') {
-      escaped += "\\\\";
-    } else {
-      escaped += c;
-    }
-  }
-  quoted = "'" + escaped + "'";
-  return true;
+  return warp_quote_string(val->ptr(), val->length(), binary, quoted);
 }
 
 /* Is a comparison of the string column fld evaluated by FastBit in the
@@ -4480,7 +4556,7 @@ static bool warp_string_column_pushable(Item_func *func, const Field *fld) {
      rt != MYSQL_TYPE_VAR_STRING) {
     return false;
   }
-  if(!warp_collation_supported(fld->charset())) {
+  if(!warp_string_column_supported(fld)) {
     return false;
   }
   const CHARSET_INFO *cmp_cs = func->compare_collation();

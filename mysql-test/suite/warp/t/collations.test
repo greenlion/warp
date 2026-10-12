@@ -281,8 +281,8 @@ SELECT COUNT(*) = (SELECT COUNT(*) FROM pool JOIN ik ON ik.cs = pool.s COLLATE u
 
 --echo #
 --echo # The collations that WARP can not compare like MySQL are refused:
---echo # case insensitive collations, binary strings and character sets in
---echo # which a character may have a 0 byte
+--echo # case insensitive collations and character sets in which a character
+--echo # may have a 0 byte (binary strings are supported, see binary_strings)
 --echo #
 --error ER_ILLEGAL_HA
 CREATE TABLE bad (v VARCHAR(10) COLLATE utf8mb4_0900_ai_ci) ENGINE=WARP;
@@ -290,8 +290,6 @@ CREATE TABLE bad (v VARCHAR(10) COLLATE utf8mb4_0900_ai_ci) ENGINE=WARP;
 CREATE TABLE bad (v VARCHAR(10) CHARACTER SET latin1 COLLATE latin1_swedish_ci) ENGINE=WARP;
 --error ER_ILLEGAL_HA
 CREATE TABLE bad (v VARCHAR(10) CHARACTER SET utf16 COLLATE utf16_bin) ENGINE=WARP;
---error ER_ILLEGAL_HA
-CREATE TABLE bad (v VARBINARY(10)) ENGINE=WARP;
 CREATE TABLE good (a VARCHAR(10) CHARACTER SET ascii COLLATE ascii_bin,
                    b TEXT COLLATE utf8mb4_0900_as_cs,
                    c CHAR(5) CHARACTER SET latin1 COLLATE latin1_general_cs) ENGINE=WARP;
