@@ -447,6 +447,21 @@ public:
 
 typedef std::unordered_map<warp_filter_info*, std::unordered_map<uint64_t, uint64_t>*> fact_table_filter;
 
+/* The values of a UNIQUE index of a table, see ha_warp::check_unique_keys:
+   the key of every row (as a sort key, which compares like the collations of
+   the columns), its row id and the transaction that inserted it.  The keys
+   are sorted, the ones added since the last merge are in recent. */
+struct warp_unique_entry {
+  std::string key;
+  uint64_t rowid;
+  uint64_t trx_id;
+  bool operator<(const warp_unique_entry &other) const { return key < other.key; }
+};
+struct warp_unique_cache {
+  std::vector<warp_unique_entry> sorted;
+  std::multimap<std::string, std::pair<uint64_t, uint64_t>> recent;
+};
+
 struct WARP_SHARE {
   std::string table_name;
   uint table_name_length, use_count;
@@ -462,6 +477,13 @@ struct WARP_SHARE {
   /* the partitions that rows are being written to right now */
   std::set<uint64_t> partitions_writing;
   uint64_t next_partition = 0;
+  /* The values of the UNIQUE indexes, by the columns of the index (see
+     ha_warp::unique_key_columns).  Read from disk by the first write, then
+     every row that is written is added, the rows that are buffered too.
+     Protected by unique_mtx. */
+  std::mutex unique_mtx;
+  bool unique_cache_built = false;
+  std::map<std::string, warp_unique_cache> unique_caches;
   mysql_mutex_t mutex;
   THR_LOCK lock;
 };
@@ -661,6 +683,13 @@ class warp_trx {
   void rollback(bool all);
   void write_insert_log_rowid(uint64_t rowid);
   void write_delete_log_rowid(uint64_t rowid);
+
+  /* A statement of a transaction that is not autocommit starts with a
+     savepoint in the transaction log: the statement is rolled back by
+     undoing what the log has after it (see rollback).  query_id is the
+     statement that has written the last savepoint. */
+  uint64_t savepoint_query_id = 0;
+  void write_savepoint(uint64_t query_id);
   void open_log();
 
   /* Closes the transaction log and removes its file.  A transaction opens
@@ -816,6 +845,8 @@ class warp_global_data {
     return history_lock_count.load(std::memory_order_acquire) != 0;
   }
   void add_history_lock(uint64_t rowid, uint64_t trx_id);
+  /* removes the history lock of a delete that is rolled back */
+  void remove_history_lock(uint64_t rowid, uint64_t trx_id);
   uint64_t history_lock_total() const {
     return history_lock_count.load(std::memory_order_acquire);
   }
@@ -880,7 +911,7 @@ struct warp_table_lock_set;
 static inline handler::Table_flags warp_table_flags() {
   return (HA_BINLOG_ROW_CAPABLE | HA_NO_AUTO_INCREMENT | HA_CAN_REPAIR |
           HA_NULL_IN_KEY | HA_GENERATED_COLUMNS |
-          HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN);
+          HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN | HA_DUPLICATE_POS);
 }
 
 class ha_warp : public handler {
@@ -919,6 +950,7 @@ class ha_warp : public handler {
   int set_column_set(); 
   //int set_column_set(uint32_t idxno);
   int find_current_row(uchar *buf, ibis::table::cursor* cursor);
+  int find_current_row_impl(uchar *buf, ibis::table::cursor* cursor);
   int create_writer(TABLE *table_arg);
   void load_partition_rows();
   uint64_t claim_writer_partition();
@@ -1092,6 +1124,30 @@ class ha_warp : public handler {
   }
   friend class ha_warp_part;
 
+  /* UNIQUE and PRIMARY KEY, see check_unique_keys */
+  /* the row that an update replaces, it is not a duplicate of the new one */
+  uint64_t unique_exclude_rowid = 0;
+  /* the key of the last duplicate, info(HA_STATUS_ERRKEY) returns it */
+  uint dup_key_nr = (uint)-1;
+  /* REPLACE and INSERT ... ON DUPLICATE KEY UPDATE read the row of a
+     duplicate key (HA_EXTRA_WRITE_CAN_REPLACE, HA_EXTRA_INSERT_WITH_UPDATE) */
+  bool dup_row_is_read = false;
+  /* the rows of this handler that are buffered, not on disk yet */
+  std::unordered_set<uint64_t> buffered_rowids;
+  bool has_unique_keys() const;
+  std::string unique_key_columns(uint key_nr) const;
+  bool unique_key_image(uint key_nr, const uchar *record, std::string *image) const;
+  uint64_t unique_key_lock(uint key_nr, const uchar *record) const;
+  bool unique_key_is_null(uint key_nr, const uchar *record) const;
+  int lock_unique_keys(const uchar *record);
+  int check_unique_keys(uchar *record);
+  void remember_unique_keys(const uchar *record);
+  bool build_unique_cache();
+  bool unique_row_exists(uint64_t rowid, uint64_t trx_id);
+  /* the columns that find_current_row reads instead of the ones of the
+     statement, when it is set */
+  const MY_BITMAP *decode_only = nullptr;
+
   ha_warp(handlerton *hton, TABLE_SHARE *table_arg);
   handlerton* warp_hton;
   ~ha_warp() {
@@ -1177,6 +1233,10 @@ class ha_warp : public handler {
   void position(const uchar *record);
   int info(uint);
   int extra(enum ha_extra_function operation);
+  int reset() override {
+    dup_row_is_read = false;
+    return 0;
+  }
   int delete_all_rows(void);
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
              dd::Table *table_def);

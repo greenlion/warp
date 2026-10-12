@@ -1,0 +1,294 @@
+#
+# UNIQUE and PRIMARY KEY.  A row may not have the key of a row that
+# exists (committed or written by the transaction, and not deleted).
+# The key is locked before it is looked for, so two transactions can
+# not insert it at the same time.  NULL is not equal to NULL.
+#
+CREATE TABLE t (id INT NOT NULL, u VARCHAR(10), v INT, PRIMARY KEY (id), UNIQUE KEY (u))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+SHOW CREATE TABLE t;
+Table	Create Table
+t	CREATE TABLE `t` (
+  `id` int NOT NULL,
+  `u` varchar(10) COLLATE utf8mb4_bin DEFAULT NULL,
+  `v` int DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `u` (`u`)
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20), (3, NULL, 30), (4, NULL, 40);
+INSERT INTO t VALUES (1, 'z', 0);
+ERROR 23000: Duplicate entry '1' for key 't.PRIMARY'
+INSERT INTO t VALUES (9, 'a', 0);
+ERROR 23000: Duplicate entry 'a' for key 't.u'
+# PAD SPACE: 'a ' is 'a' in utf8mb4_bin
+INSERT INTO t VALUES (9, 'a ', 0);
+ERROR 23000: Duplicate entry 'a ' for key 't.u'
+# a duplicate within the statement, nothing of the statement is inserted
+INSERT INTO t VALUES (5, 'e', 50), (6, 'f', 60), (5, 'g', 70);
+ERROR 23000: Duplicate entry '5' for key 't.PRIMARY'
+SELECT * FROM t ORDER BY id;
+id	u	v
+1	a	10
+2	b	20
+3	NULL	30
+4	NULL	40
+INSERT IGNORE INTO t VALUES (1, 'x', 0), (5, 'e', 50), (6, 'b', 60), (7, NULL, 70);
+Warnings:
+Warning	1062	Duplicate entry '1' for key 't.PRIMARY'
+Warning	1062	Duplicate entry 'b' for key 't.u'
+SELECT * FROM t ORDER BY id;
+id	u	v
+1	a	10
+2	b	20
+3	NULL	30
+4	NULL	40
+5	e	50
+7	NULL	70
+REPLACE INTO t VALUES (2, 'bb', 22), (8, 'a', 88);
+SELECT * FROM t ORDER BY id;
+id	u	v
+2	bb	22
+3	NULL	30
+4	NULL	40
+5	e	50
+7	NULL	70
+8	a	88
+INSERT INTO t VALUES (8, 'h', 0) ON DUPLICATE KEY UPDATE v = v + 1, u = 'h';
+INSERT INTO t VALUES (9, 'h', 99) ON DUPLICATE KEY UPDATE v = v + 100;
+INSERT INTO t VALUES (10, 'j', 100) ON DUPLICATE KEY UPDATE v = 0;
+SELECT * FROM t ORDER BY id;
+id	u	v
+2	bb	22
+3	NULL	30
+4	NULL	40
+5	e	50
+7	NULL	70
+8	h	189
+10	j	100
+# updates
+UPDATE t SET id = 2 WHERE id = 5;
+ERROR 23000: Duplicate entry '2' for key 't.PRIMARY'
+UPDATE t SET u = 'bb' WHERE id = 10;
+ERROR 23000: Duplicate entry 'bb' for key 't.u'
+UPDATE t SET v = v + 1 WHERE id = 5;
+UPDATE t SET u = 'a ' WHERE u = 'a';
+UPDATE t SET id = id + 100 WHERE id > 7;
+UPDATE t SET u = NULL WHERE id IN (1, 5);
+SELECT * FROM t ORDER BY id;
+id	u	v
+2	bb	22
+3	NULL	30
+4	NULL	40
+5	NULL	51
+7	NULL	70
+108	h	189
+110	j	100
+# a deleted key can be inserted again
+DELETE FROM t WHERE id = 2;
+INSERT INTO t VALUES (2, 'bb', 2);
+SELECT * FROM t ORDER BY id;
+id	u	v
+2	bb	2
+3	NULL	30
+4	NULL	40
+5	NULL	51
+7	NULL	70
+108	h	189
+110	j	100
+# the lookups through the keys
+SELECT * FROM t WHERE id = 108;
+id	u	v
+108	h	189
+SELECT * FROM t WHERE u = 'h';
+id	u	v
+108	h	189
+SELECT id FROM t FORCE INDEX (PRIMARY) WHERE id BETWEEN 2 AND 7 ORDER BY id;
+id
+2
+3
+4
+5
+7
+#
+# In a transaction: the statement that fails is rolled back, the others
+# stay
+#
+BEGIN;
+INSERT INTO t VALUES (20, 't20', 0);
+INSERT INTO t VALUES (21, 't21', 0), (22, 't22', 0), (20, 'dup', 0);
+ERROR 23000: Duplicate entry '20' for key 't.PRIMARY'
+INSERT INTO t VALUES (21, 't21', 1);
+UPDATE t SET id = 2 WHERE id = 21;
+ERROR 23000: Duplicate entry '2' for key 't.PRIMARY'
+DELETE FROM t WHERE id = 20;
+INSERT INTO t VALUES (20, 't20b', 2);
+REPLACE INTO t VALUES (30, 't30', 0), (31, 't30', 0), (30, 'x', 0), (32, 'bb', 0), (33, 'h', 0), (34, NULL, 0), (35, 'h', 0), (35, 'q', 0), (36, 'h', 0), (35, 'x', 0) ;
+SELECT * FROM t WHERE id >= 20 ORDER BY id;
+id	u	v
+20	t20b	2
+21	t21	1
+31	t30	0
+32	bb	0
+34	NULL	0
+35	x	0
+36	h	0
+110	j	100
+COMMIT;
+SELECT * FROM t WHERE id >= 20 ORDER BY id;
+id	u	v
+20	t20b	2
+21	t21	1
+31	t30	0
+32	bb	0
+34	NULL	0
+35	x	0
+36	h	0
+110	j	100
+BEGIN;
+INSERT INTO t VALUES (40, 't40', 0);
+ROLLBACK;
+INSERT INTO t VALUES (40, 't40', 1);
+SELECT * FROM t WHERE id = 40;
+id	u	v
+40	t40	1
+#
+# Two transactions: the second insert of a key waits for the first one,
+# which committed (duplicate) or rolled back (no duplicate)
+#
+BEGIN;
+INSERT INTO t VALUES (50, 'c50', 0);
+INSERT INTO t VALUES (50, 'c50b', 1);
+COMMIT;
+ERROR 23000: Duplicate entry '50' for key 't.PRIMARY'
+BEGIN;
+INSERT INTO t VALUES (51, 'c51', 0);
+INSERT INTO t VALUES (51, 'c51b', 1);
+ROLLBACK;
+SELECT * FROM t WHERE id IN (50, 51) ORDER BY id;
+id	u	v
+50	c50	0
+51	c51b	1
+# a key that an open transaction deletes is free once it commits
+BEGIN;
+DELETE FROM t WHERE id = 51;
+INSERT INTO t VALUES (51, 'c51c', 2);
+COMMIT;
+SELECT * FROM t WHERE id = 51;
+id	u	v
+51	c51c	2
+# the lock wait times out
+BEGIN;
+INSERT INTO t VALUES (52, 'c52', 0);
+SET SESSION warp_lock_wait_timeout = 1;
+INSERT INTO t VALUES (52, 'c52b', 1);
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+COMMIT;
+# REPEATABLE READ: a key that another transaction committed after the
+# snapshot is a duplicate, though the row is not visible
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT COUNT(*) FROM t;
+COUNT(*)
+16
+INSERT INTO t VALUES (53, 'c53', 0);
+SELECT COUNT(*) FROM t WHERE id = 53;
+COUNT(*)
+0
+INSERT INTO t VALUES (53, 'c53b', 0);
+ERROR 23000: Duplicate entry '53' for key 't.PRIMARY'
+COMMIT;
+#
+# Keys of several columns, of other types, and of other collations
+#
+CREATE TABLE m (a INT, b DATE, c VARCHAR(10) COLLATE utf8mb4_0900_as_cs, d BIGINT,
+UNIQUE KEY ab (a, b), UNIQUE KEY c (c), PRIMARY KEY (d)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO m VALUES (1, '2020-01-01', 'a', 1), (1, '2020-01-02', 'A', 2), (2, '2020-01-01', 'a ', 3), (NULL, '2020-01-01', NULL, 4), (NULL, '2020-01-01', NULL, 5);
+INSERT INTO m VALUES (1, '2020-01-01', 'q', 6);
+ERROR 23000: Duplicate entry '1-2020-01-01' for key 'm.ab'
+INSERT INTO m VALUES (7, '2020-01-01', 'A', 7);
+ERROR 23000: Duplicate entry 'A' for key 'm.c'
+INSERT INTO m VALUES (7, '2020-01-01', 'r', 9223372036854775807), (8, '2020-01-01', 's', 9223372036854775807);
+ERROR 23000: Duplicate entry '9223372036854775807' for key 'm.PRIMARY'
+SELECT * FROM m ORDER BY d;
+a	b	c	d
+1	2020-01-01	a	1
+1	2020-01-02	A	2
+2	2020-01-01	a 	3
+NULL	2020-01-01	NULL	4
+NULL	2020-01-01	NULL	5
+#
+# Many rows: the keys of the rows that are not written yet are checked
+# too, and a long load
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE big (id INT PRIMARY KEY, k INT, UNIQUE KEY (k)) ENGINE=WARP;
+INSERT INTO big WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 5000)
+SELECT x, x * 2 FROM seq;
+INSERT INTO big WITH RECURSIVE seq(x) AS (SELECT 6000 UNION ALL SELECT x + 1 FROM seq WHERE x < 7000)
+SELECT x, IF(x = 6999, 10, x * 2) FROM seq;
+ERROR 23000: Duplicate entry '10' for key 'big.k'
+INSERT INTO big WITH RECURSIVE seq(x) AS (SELECT 6000 UNION ALL SELECT x + 1 FROM seq WHERE x < 7000)
+SELECT IF(x = 6500, 6001, x), x * 2 FROM seq;
+ERROR 23000: Duplicate entry '6001' for key 'big.PRIMARY'
+SELECT COUNT(*), MIN(id), MAX(id) FROM big;
+COUNT(*)	MIN(id)	MAX(id)
+5000	1	5000
+INSERT INTO big WITH RECURSIVE seq(x) AS (SELECT 6000 UNION ALL SELECT x + 1 FROM seq WHERE x < 7000)
+SELECT x, x * 2 FROM seq;
+SELECT COUNT(*), COUNT(DISTINCT id), COUNT(DISTINCT k) FROM big;
+COUNT(*)	COUNT(DISTINCT id)	COUNT(DISTINCT k)
+6001	6001	6001
+#
+# ALTER TABLE: a new UNIQUE or PRIMARY KEY checks the rows, dropping one
+# does not
+#
+CREATE TABLE a (id INT, k INT) ENGINE=WARP;
+INSERT INTO a VALUES (1, 1), (2, 2), (3, 2);
+ALTER TABLE a ADD UNIQUE KEY (k);
+ERROR 23000: Duplicate entry '2' for key 'a.k'
+ALTER TABLE a ADD PRIMARY KEY (id);
+INSERT INTO a VALUES (1, 5);
+ERROR 23000: Duplicate entry '1' for key 'a.PRIMARY'
+ALTER TABLE a DROP PRIMARY KEY, ALGORITHM=INPLACE;
+INSERT INTO a VALUES (1, 5);
+ALTER TABLE a ADD INDEX (k), ALGORITHM=INPLACE;
+SELECT * FROM a ORDER BY id, k;
+id	k
+1	1
+1	5
+2	2
+3	2
+#
+# Partitioned tables: the keys contain the columns of the partitioning
+#
+CREATE TABLE p (id INT, d DATE, s VARCHAR(10), PRIMARY KEY (id, d), UNIQUE KEY (s, d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+PARTITION BY RANGE (YEAR(d)) (PARTITION p2020 VALUES LESS THAN (2021), PARTITION pmax VALUES LESS THAN MAXVALUE);
+INSERT INTO p VALUES (1, '2020-01-01', 'a'), (1, '2021-01-01', 'a'), (2, '2020-05-05', 'b');
+INSERT INTO p VALUES (1, '2021-01-01', 'z');
+ERROR 23000: Duplicate entry '1-2021-01-01' for key 'p.PRIMARY'
+INSERT INTO p VALUES (3, '2020-01-01', 'a');
+ERROR 23000: Duplicate entry 'a-2020-01-01' for key 'p.s'
+INSERT INTO p VALUES (1, '2020-01-01', 'q') ON DUPLICATE KEY UPDATE s = 'aa';
+REPLACE INTO p VALUES (2, '2020-05-05', 'bb');
+UPDATE p SET d = '2021-01-01' WHERE id = 1 AND d = '2020-01-01';
+ERROR 23000: Duplicate entry '1-2021-01-01' for key 'p.PRIMARY'
+SELECT * FROM p ORDER BY id, d;
+id	d	s
+1	2020-01-01	aa
+1	2021-01-01	a
+2	2020-05-05	bb
+CREATE TABLE bad (id INT PRIMARY KEY, d DATE) ENGINE=WARP PARTITION BY RANGE (YEAR(d)) (PARTITION p VALUES LESS THAN MAXVALUE);
+ERROR HY000: A PRIMARY KEY must include all columns in the table's partitioning function (prefixed columns are not considered).
+# The keys are checked after a restart
+# restart
+INSERT INTO t VALUES (3, 'new', 0);
+ERROR 23000: Duplicate entry '3' for key 't.PRIMARY'
+INSERT INTO p VALUES (1, '2021-01-01', 'z');
+ERROR 23000: Duplicate entry '1-2021-01-01' for key 'p.PRIMARY'
+INSERT INTO big VALUES (6500, 1);
+ERROR 23000: Duplicate entry '6500' for key 'big.PRIMARY'
+SELECT COUNT(*) FROM t;
+COUNT(*)
+17
+DROP TABLE t, m, big, a, p;

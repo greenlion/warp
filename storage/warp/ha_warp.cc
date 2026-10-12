@@ -763,6 +763,10 @@ static void forget_partitions(const char *table_name) {
     mysql_mutex_lock(&it->second->mutex);
     it->second->partitions_loaded = false;
     mysql_mutex_unlock(&it->second->mutex);
+    /* the values of the UNIQUE indexes are read from disk again */
+    std::lock_guard<std::mutex> unique_guard(it->second->unique_mtx);
+    it->second->unique_cache_built = false;
+    it->second->unique_caches.clear();
   }
   mysql_mutex_unlock(&warp_mutex);
 }
@@ -830,7 +834,21 @@ int ha_warp::set_column_set() {
 /* store the binary data for each returned value into the MySQL buffer
    using field->store()
 */
+/* Reads the row of the cursor into buf.  The fields of the table point to
+   record[0]: a row that is read into another buffer (record[1] for the row
+   of a duplicate key that REPLACE replaces, for example) is read through
+   fields that point to it. */
 int ha_warp::find_current_row(uchar *buf, ibis::table::cursor *cursor) {
+  if(buf == table->record[0]) {
+    return find_current_row_impl(buf, cursor);
+  }
+  repoint_field_to_record(table, table->record[0], buf);
+  const int rc = find_current_row_impl(buf, cursor);
+  repoint_field_to_record(table, buf, table->record[0]);
+  return rc;
+}
+
+int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
   DBUG_ENTER("ha_warp::find_current_row");
   int rc = 0;
   memset(buf, 0, table->s->null_bytes);
@@ -846,7 +864,8 @@ int ha_warp::find_current_row(uchar *buf, ibis::table::cursor *cursor) {
 
   for (Field **field = table->field; *field; field++) {
     buffer.length(0);
-    if(bitmap_is_set(table->read_set, (*field)->field_index()) || current_thd->lex->sql_command == SQLCOM_UPDATE ||  current_thd->lex->sql_command == SQLCOM_UPDATE_MULTI  || current_thd->lex->sql_command == SQLCOM_DELETE || current_thd->lex->sql_command == SQLCOM_DELETE_MULTI ) {
+    if(decode_only != nullptr ? bitmap_is_set(decode_only, (*field)->field_index()) :
+       (bitmap_is_set(table->read_set, (*field)->field_index()) || current_thd->lex->sql_command == SQLCOM_UPDATE ||  current_thd->lex->sql_command == SQLCOM_UPDATE_MULTI  || current_thd->lex->sql_command == SQLCOM_DELETE || current_thd->lex->sql_command == SQLCOM_DELETE_MULTI )) {
       
       bool is_unsigned = (*field)->all_flags() & UNSIGNED_FLAG;
       std::string cname = "c" + std::to_string((*field)->field_index());
@@ -1408,6 +1427,7 @@ int ha_warp::write_buffered_rows_to_disk() {
     writer->clearData();
   } catch(...) {
   }
+  buffered_rowids.clear();
   return rc;
 }
 
@@ -1435,6 +1455,7 @@ int ha_warp::write_row(uchar *buf) {
     } catch(...) {
     }
   }
+  buffered_rowids.clear();
   DBUG_RETURN(HA_ERR_OUT_OF_MEM);
 }
 
@@ -1471,6 +1492,12 @@ int ha_warp::write_row_impl(uchar *buf) {
     if((error = update_auto_increment())) DBUG_RETURN(error);
   }
 
+  /* UNIQUE and PRIMARY KEY: no other row may have the keys of this one */
+  if(has_unique_keys()) {
+    const int error = check_unique_keys(buf);
+    if(error != 0) DBUG_RETURN(error);
+  }
+
   /* This encodes the data from the row buffer into a CSV string which
     is processed by Fastbit...  It is probably faster to construct a
     Fastbit row object but this is fast enough for now/ALPHA release.
@@ -1484,6 +1511,18 @@ int ha_warp::write_row_impl(uchar *buf) {
   */
   writer->appendRow(buffer.c_ptr(), ",");
   stats.records++;
+  if(has_unique_keys()) {
+    remember_unique_keys(buf);
+    buffered_rowids.insert(current_rowid);
+  }
+  /* the inserts of a statement that is rolled back alone are deleted, see
+     warp_trx::rollback */
+  {
+    auto current_trx = warp_get_trx(warp_hton, table->in_use);
+    if(current_trx != NULL && !current_trx->autocommit) {
+      current_trx->write_insert_log_rowid(current_rowid);
+    }
+  }
   
   /* In order to check for duplicate keys in a single insert
      statement the writer has to be flushed for each insert
@@ -1510,7 +1549,7 @@ int ha_warp::write_row_impl(uchar *buf) {
 // InnoDB.  A history lock is also taken on the row.  During future
 // scans this verion of the row will not be visible to this or 
 // newer transactions and will be visible to older transactions.
-int ha_warp::update_row(const uchar *, uchar *new_data) {
+int ha_warp::update_row(const uchar *old_data, uchar *new_data) {
   DBUG_ENTER("ha_warp::update_row");
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
@@ -1532,11 +1571,24 @@ int ha_warp::update_row(const uchar *, uchar *new_data) {
   // current_rowid will be changed by write_row so save the 
   // value now
   uint64_t deleted_rowid = current_rowid;
+
+  /* the keys of the old row stay locked until the transaction ends: a row
+     with one of them can only be inserted once the update is committed or
+     rolled back */
+  if(has_unique_keys()) {
+    const int rc = lock_unique_keys(old_data);
+    if(rc != 0) {
+      DBUG_RETURN(rc);
+    }
+  }
   
   // if the write fails (for example due to duplicate key then
   // the statement will be rolled back and the deleted row 
   // will be 
+  /* the old row is replaced, it is not a duplicate of the new one */
+  unique_exclude_rowid = deleted_rowid;
   int retval = write_row(new_data);
+  unique_exclude_rowid = 0;
     
   if(retval == 0) {
     // only log the delete and create the history lock 
@@ -1563,7 +1615,7 @@ int ha_warp::update_row(const uchar *, uchar *new_data) {
   The table will then be deleted/positioned based on the ORDER (so RANDOM,
   DESC, ASC).
 */
-int ha_warp::delete_row(const uchar *) {
+int ha_warp::delete_row(const uchar *buf) {
   DBUG_ENTER("ha_warp::delete_row");
   
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
@@ -1572,6 +1624,14 @@ int ha_warp::delete_row(const uchar *) {
   /* if deadlock or lock timeout return the error*/
   if(lock_taken != LOCK_EX) {
     DBUG_RETURN(lock_taken);
+  }
+  /* the keys of the deleted row stay locked until the transaction ends, see
+     update_row */
+  if(has_unique_keys()) {
+    const int rc = lock_unique_keys(buf);
+    if(rc != 0) {
+      DBUG_RETURN(rc);
+    }
   }
   warp_state->create_lock(current_rowid, current_trx, LOCK_HISTORY);
   current_trx->write_delete_log_rowid(current_rowid);
@@ -1618,9 +1678,14 @@ WARP_SHARE* ha_warp::get_warp_share() {
   Currently this table handler doesn't implement most of the fields
   really needed. SHOW also makes use of this data
 */
-int ha_warp::info(uint) {
+int ha_warp::info(uint flag) {
   DBUG_ENTER("ha_warp::info");
   close_in_extra = true;
+  if(flag & HA_STATUS_ERRKEY) {
+    /* the key of the last duplicate, see check_unique_keys */
+    errkey = dup_key_nr;
+    DBUG_RETURN(0);
+  }
 
   /* The fact table is the WARP table of the statement with the most rows
      (the one with the first data directory if several have as many).  The
@@ -2009,6 +2074,13 @@ int ha_warp::extra(enum ha_extra_function xtra) {
   if(xtra == 0) {
     return -1;
   }
+  /* REPLACE and INSERT ... ON DUPLICATE KEY UPDATE read the row of a
+     duplicate key, see check_unique_keys */
+  if(xtra == HA_EXTRA_WRITE_CAN_REPLACE || xtra == HA_EXTRA_INSERT_WITH_UPDATE) {
+    dup_row_is_read = true;
+  } else if(xtra == HA_EXTRA_WRITE_CANNOT_REPLACE) {
+    dup_row_is_read = false;
+  }
   /* if not bulk insert, and there are buffered inserts, write them out
      to disk.  This will destroy the writer.
   */
@@ -2325,11 +2397,12 @@ int ha_warp::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *,
   /* the indexes are declarations, see ha_warp::make_key_condition */
   for(uint k = 0; k < table_arg->s->keys; ++k) {
     const KEY *key = &table_arg->key_info[k];
-    if(key->flags & (HA_NOSAME | HA_FULLTEXT | HA_SPATIAL)) {
+    /* UNIQUE and PRIMARY KEY are checked when rows are written, see
+       check_unique_keys */
+    if(key->flags & (HA_FULLTEXT | HA_SPATIAL)) {
       my_error(ER_ILLEGAL_HA_CREATE_OPTION, MYF(0), "WARP",
-               (key->flags & HA_NOSAME)  ? "UNIQUE or PRIMARY KEY"
-               : (key->flags & HA_FULLTEXT) ? "FULLTEXT index"
-                                            : "SPATIAL index");
+               (key->flags & HA_FULLTEXT) ? "FULLTEXT index"
+                                          : "SPATIAL index");
       DBUG_RETURN(-1);
     }
     for(uint p = 0; p < key->user_defined_key_parts; ++p) {
@@ -2458,8 +2531,11 @@ bool ha_warp::check_if_incompatible_data(HA_CREATE_INFO *, uint) {
 enum_alter_inplace_result ha_warp::check_if_supported_inplace_alter(
     TABLE *altered_table, Alter_inplace_info *ha_alter_info) {
   DBUG_ENTER("ha_warp::check_if_supported_inplace_alter");
+  /* A UNIQUE or PRIMARY KEY that is added is not in the list: the table is
+     copied, the copy checks that the rows have different keys */
   static const Alter_inplace_info::HA_ALTER_FLAGS index_changes =
       Alter_inplace_info::ADD_INDEX | Alter_inplace_info::DROP_INDEX |
+      Alter_inplace_info::DROP_UNIQUE_INDEX | Alter_inplace_info::DROP_PK_INDEX |
       Alter_inplace_info::RENAME_INDEX | Alter_inplace_info::ALTER_INDEX_COMMENT;
   const Alter_inplace_info::HA_ALTER_FLAGS flags = ha_alter_info->handler_flags;
 
@@ -2471,7 +2547,7 @@ enum_alter_inplace_result ha_warp::check_if_supported_inplace_alter(
      ones that stay were checked when the table was created) */
   for(uint k = 0; k < altered_table->s->keys; ++k) {
     const KEY *key = &altered_table->key_info[k];
-    if(key->flags & (HA_NOSAME | HA_FULLTEXT | HA_SPATIAL)) {
+    if(key->flags & (HA_FULLTEXT | HA_SPATIAL)) {
       DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
     }
     for(uint p = 0; p < key->user_defined_key_parts; ++p) {
@@ -3699,10 +3775,10 @@ int ha_warp::rnd_pos(uchar *buf, uchar *pos) {
   
   ha_statistic_increment(&System_status_var::ha_read_rnd_count);
   current_rowid = my_get_ptr(pos, ref_length);
-  /* rnd_pos can be used without a preceding table scan in this handler */
-  if(column_set.empty()) {
-    set_column_set();
-  }
+  /* The columns of the statement: rnd_pos can be used without a scan of
+     this handler, or after a scan that read other columns (INSERT ... ON
+     DUPLICATE KEY UPDATE reads every column of the duplicate) */
+  set_column_set();
   rc = HA_ERR_KEY_NOT_FOUND;
   warp_table_read_lock data_lock(share->data_dir_name);
   base_table = ibis::mensa::create(share->data_dir_name);
@@ -4014,6 +4090,317 @@ bool ha_warp::make_key_condition(const key_range *start_key,
                                 end_key->flag != HA_READ_BEFORE_KEY);
   }
   return true;
+}
+
+/* ---------------------------------------------------------------------
+   UNIQUE and PRIMARY KEY
+
+   A row may not have the key of another row that exists: one that is
+   committed, or that this transaction wrote, and that is not deleted.  This
+   is the latest state of the table, not the one that the transaction reads
+   (a row that was committed after the transaction began is a duplicate
+   too), like InnoDB checks.
+
+   Two transactions must not insert the same key at the same time, so the
+   key is locked before it is looked for: a lock on a number made from the
+   table, the index and the value of the key (the row locks are on row ids,
+   which are below 2^63, the key locks have the high bit set).  The lock is
+   held until the transaction ends.  A delete or an update locks the keys of
+   the row that it removes too, so a row with one of them is inserted once
+   the change is committed (the key is free) or rolled back (it is not).
+   With the key locked, a row with the key is either committed or of this
+   transaction.
+
+   NULL is not equal to NULL: a key with a NULL part is never a duplicate.
+   --------------------------------------------------------------------- */
+
+bool ha_warp::has_unique_keys() const {
+  for(uint k = 0; k < table->s->keys; ++k) {
+    if(table->key_info[k].flags & HA_NOSAME) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/* The values of an index are kept by the columns of the index, the number
+   of an index changes when an index is added or dropped in place */
+std::string ha_warp::unique_key_columns(uint key_nr) const {
+  const KEY *key = &table->key_info[key_nr];
+  std::string columns;
+  for(uint p = 0; p < key->user_defined_key_parts; ++p) {
+    columns += std::to_string(key->key_part[p].field->field_index()) + ",";
+  }
+  return columns;
+}
+
+bool ha_warp::unique_key_is_null(uint key_nr, const uchar *record) const {
+  const KEY *key = &table->key_info[key_nr];
+  const ptrdiff_t diff = record - table->record[0];
+  for(uint p = 0; p < key->user_defined_key_parts; ++p) {
+    if(key->key_part[p].field->is_null(diff)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/* The key of a row as a string that compares byte by byte like the values
+   compare in the collations of the columns ('a' and 'a ' are the same in a
+   PAD SPACE collation): the sort key of every part, then its length, like
+   the write sets of replication make them.  Returns false for a key with a
+   NULL part, which is never a duplicate. */
+bool ha_warp::unique_key_image(uint key_nr, const uchar *record,
+                               std::string *image) const {
+  const KEY *key = &table->key_info[key_nr];
+  const ptrdiff_t diff = record - table->record[0];
+  image->clear();
+  std::vector<uchar> part;
+  for(uint p = 0; p < key->user_defined_key_parts; ++p) {
+    const KEY_PART_INFO *kp = &key->key_part[p];
+    Field *f = kp->field;
+    if(f->is_null(diff)) {
+      return false;
+    }
+    const CHARSET_INFO *cs = f->charset();
+    const size_t max_length = cs->coll->strnxfrmlen(cs, kp->length);
+    part.assign(max_length + 1, 0);
+    f->move_field_offset(diff);
+    const size_t length =
+        f->make_sort_key(part.data(), max_length, kp->length / cs->mbmaxlen);
+    f->move_field_offset(-diff);
+    image->append(pointer_cast<const char *>(part.data()), length);
+    const uint16_t length16 = static_cast<uint16_t>(length);
+    image->append(pointer_cast<const char *>(&length16), sizeof(length16));
+  }
+  return true;
+}
+
+/* The lock of a key: a hash of the data directory, the index and the
+   values of the key, which the collations of the columns hash (equal
+   strings, 'a' and 'a ' in a PAD SPACE collation for example, have the same
+   hash) */
+uint64_t ha_warp::unique_key_lock(uint key_nr, const uchar *record) const {
+  uint64_t nr1 = 1, nr2 = 4;
+  my_charset_bin.coll->hash_sort(&my_charset_bin,
+                                 pointer_cast<const uchar *>(share->data_dir_name),
+                                 strlen(share->data_dir_name), &nr1, &nr2);
+  ulong h1 = static_cast<ulong>(nr1) ^ (key_nr + 1) * 0x9E3779B97F4A7C15ULL;
+  ulong h2 = static_cast<ulong>(nr2);
+  const KEY *key = &table->key_info[key_nr];
+  const ptrdiff_t diff = record - table->record[0];
+  for(uint p = 0; p < key->user_defined_key_parts; ++p) {
+    Field *f = key->key_part[p].field;
+    f->move_field_offset(diff);
+    f->hash(&h1, &h2);
+    f->move_field_offset(-diff);
+  }
+  const uint64_t h = static_cast<uint64_t>(h1) * 0xC2B2AE3D27D4EB4FULL ^
+                     static_cast<uint64_t>(h2);
+  return (1ULL << 63) | (h & ((1ULL << 63) - 1));
+}
+
+static int warp_key_lock_error(int lock_taken) {
+  if(lock_taken == LOCK_DEADLOCK) return HA_ERR_LOCK_DEADLOCK;
+  return HA_ERR_LOCK_WAIT_TIMEOUT;
+}
+
+int ha_warp::lock_unique_keys(const uchar *record) {
+  auto current_trx = warp_get_trx(warp_hton, table->in_use);
+  assert(current_trx != NULL);
+  for(uint k = 0; k < table->s->keys; ++k) {
+    if(!(table->key_info[k].flags & HA_NOSAME) ||
+       unique_key_is_null(k, record)) {
+      continue;
+    }
+    const int lock_taken = warp_state->create_lock(unique_key_lock(k, record),
+                                                   current_trx, LOCK_EX);
+    if(lock_taken != LOCK_EX) {
+      return warp_key_lock_error(lock_taken);
+    }
+  }
+  return 0;
+}
+
+/* Does the row with the key exist (see above)?  The key is locked, so the
+   transaction that inserted it is this one or it has ended. */
+bool ha_warp::unique_row_exists(uint64_t rowid, uint64_t trx_id) {
+  auto current_trx = warp_get_trx(warp_hton, table->in_use);
+  assert(current_trx != NULL);
+  /* the row that an update replaces */
+  if(rowid == unique_exclude_rowid) return false;
+  /* committed deletes, and the inserts of rolled back statements */
+  if(warp_state->delete_bitmap->is_set(rowid)) return false;
+  /* deleted by this transaction */
+  if(warp_state->get_history_lock(rowid) == current_trx->trx_id) return false;
+  /* the rows of rolled back transactions do not exist */
+  return trx_id == current_trx->trx_id ||
+         (trx_id != 0 && warp_state->is_trx_committed(trx_id));
+}
+
+/* Reads the keys of the UNIQUE indexes of every row on disk into the cache
+   of the share.  Called with unique_mtx held. */
+bool ha_warp::build_unique_cache() {
+  share->unique_caches.clear();
+  MY_BITMAP key_columns;
+  if(bitmap_init(&key_columns, nullptr, table->s->fields)) {
+    return false;
+  }
+  std::string columns = "r,t";
+  for(uint k = 0; k < table->s->keys; ++k) {
+    const KEY *key = &table->key_info[k];
+    if(!(key->flags & HA_NOSAME)) continue;
+    share->unique_caches[unique_key_columns(k)];
+    for(uint p = 0; p < key->user_defined_key_parts; ++p) {
+      const Field *f = key->key_part[p].field;
+      if(bitmap_test_and_set(&key_columns, f->field_index())) continue;
+      columns += ",c" + std::to_string(f->field_index());
+      if(f->is_nullable()) columns += ",n" + std::to_string(f->field_index());
+    }
+  }
+  std::vector<uchar> scratch(table->s->rec_buff_length);
+  memcpy(scratch.data(), table->s->default_values, table->s->reclength);
+  bool ok = true;
+  std::string image;
+  try {
+    warp_table_read_lock data_lock(share->data_dir_name);
+    ibis::table *base = ibis::mensa::create(share->data_dir_name);
+    if(base != NULL && base->nRows() > 0) {
+      ibis::table *rows = base->select(columns.c_str(), "1=1");
+      ibis::table::cursor *cursor = rows != NULL ? rows->createCursor() : NULL;
+      ok = cursor != NULL;
+      decode_only = &key_columns;
+      while(ok && cursor->fetch() == 0) {
+        uint64_t r = 0, t = 0;
+        cursor->getColumnAsULong("r", r);
+        cursor->getColumnAsULong("t", t);
+        /* the committed deletes are not keys of any row */
+        if(warp_state->delete_bitmap->is_set(r)) continue;
+        if(find_current_row(scratch.data(), cursor) != 0) {
+          ok = false;
+          break;
+        }
+        for(uint k = 0; k < table->s->keys; ++k) {
+          if((table->key_info[k].flags & HA_NOSAME) &&
+             unique_key_image(k, scratch.data(), &image)) {
+            share->unique_caches[unique_key_columns(k)].sorted.push_back(
+                warp_unique_entry{image, r, t});
+          }
+        }
+      }
+      decode_only = nullptr;
+      delete cursor;
+      delete rows;
+    }
+    delete base;
+  } catch(...) {
+    decode_only = nullptr;
+    ok = false;
+  }
+  bitmap_free(&key_columns);
+  if(!ok) {
+    share->unique_caches.clear();
+    return false;
+  }
+  for(auto &cache : share->unique_caches) {
+    std::sort(cache.second.sorted.begin(), cache.second.sorted.end());
+  }
+  share->unique_cache_built = true;
+  return true;
+}
+
+/* The rows that are written are added to the cache, buffered or not */
+void ha_warp::remember_unique_keys(const uchar *record) {
+  auto current_trx = warp_get_trx(warp_hton, table->in_use);
+  std::string image;
+  std::lock_guard<std::mutex> guard(share->unique_mtx);
+  if(!share->unique_cache_built) {
+    return; /* it is read from disk, the row is there */
+  }
+  for(uint k = 0; k < table->s->keys; ++k) {
+    if(!(table->key_info[k].flags & HA_NOSAME) ||
+       !unique_key_image(k, record, &image)) {
+      continue;
+    }
+    warp_unique_cache &cache = share->unique_caches[unique_key_columns(k)];
+    cache.recent.emplace(image, std::make_pair(current_rowid,
+                                               current_trx->trx_id));
+    /* the recent keys are merged into the sorted ones from time to time */
+    if(cache.recent.size() >= 65536) {
+      const size_t old_size = cache.sorted.size();
+      for(const auto &entry : cache.recent) {
+        cache.sorted.push_back(warp_unique_entry{entry.first,
+                                                 entry.second.first,
+                                                 entry.second.second});
+      }
+      std::inplace_merge(cache.sorted.begin(), cache.sorted.begin() + old_size,
+                         cache.sorted.end());
+      cache.recent.clear();
+    }
+  }
+}
+
+/* ---------------------------------------------------------------------
+   UNIQUE and PRIMARY KEY, the check
+
+   The key of the row is looked for in the cache of the values of the index
+   (a binary search), which has the rows on disk and the ones that are
+   buffered: nothing is read from disk and no row is written to look for a
+   key.  The rows that have the key are looked at, the first one that
+   exists is the duplicate.
+   --------------------------------------------------------------------- */
+int ha_warp::check_unique_keys(uchar *record) {
+  int rc = lock_unique_keys(record);
+  if(rc != 0) {
+    return rc;
+  }
+  std::string image;
+  std::unique_lock<std::mutex> guard(share->unique_mtx);
+  if(!share->unique_cache_built && !build_unique_cache()) {
+    return HA_ERR_INTERNAL_ERROR;
+  }
+  for(uint k = 0; k < table->s->keys; ++k) {
+    const KEY *key = &table->key_info[k];
+    if(!(key->flags & HA_NOSAME) || !unique_key_image(k, record, &image)) {
+      continue;
+    }
+    warp_unique_cache &cache = share->unique_caches[unique_key_columns(k)];
+    bool found = false;
+    uint64_t dup_rowid = 0;
+    const warp_unique_entry probe{image, 0, 0};
+    auto range = std::equal_range(cache.sorted.begin(), cache.sorted.end(),
+                                  probe);
+    for(auto it = range.first; !found && it != range.second; ++it) {
+      if(unique_row_exists(it->rowid, it->trx_id)) {
+        found = true;
+        dup_rowid = it->rowid;
+      }
+    }
+    auto recent = cache.recent.equal_range(image);
+    for(auto it = recent.first; !found && it != recent.second; ++it) {
+      if(unique_row_exists(it->second.first, it->second.second)) {
+        found = true;
+        dup_rowid = it->second.first;
+      }
+    }
+    if(found) {
+      guard.unlock();
+      errkey = dup_key_nr = k;
+      my_store_ptr(dup_ref, ref_length, dup_rowid);
+      /* The server reads the row of the duplicate by its position (see
+         HA_DUPLICATE_POS) for REPLACE and INSERT ... ON DUPLICATE KEY
+         UPDATE: a row of this statement that is still buffered is written
+         so that it can be read. */
+      if(dup_row_is_read && buffered_rowids.count(dup_rowid) != 0) {
+        rc = write_buffered_rows_to_disk();
+        if(rc != 0) {
+          return rc;
+        }
+      }
+      return HA_ERR_FOUND_DUPP_KEY;
+    }
+  }
+  return 0;
 }
 
 /* Starts the scan for a lookup.  The scan of an earlier lookup is ended
@@ -5667,7 +6054,13 @@ int ha_warp::bitmap_merge_join() {
 //interface documentation.  Note: Those docs are outdated and
 //I think this function is no longer used...
 //external_lock seems to handle it?
-int ha_warp::start_stmt(THD *, thr_lock_type) {
+int ha_warp::start_stmt(THD *thd, thr_lock_type) {
+  /* a statement under LOCK TABLES, see external_lock */
+  auto current_trx = warp_get_trx(warp_hton, thd);
+  if(current_trx != NULL && current_trx->dirty && !current_trx->autocommit &&
+     current_trx->savepoint_query_id != (uint64_t)thd->query_id) {
+    current_trx->write_savepoint(thd->query_id);
+  }
   return 0;
 }
 
@@ -5728,6 +6121,12 @@ int ha_warp::external_lock(THD *thd, int lock_type){
         warp_state->register_open_trx(current_trx->trx_id);
         current_trx->open_registered = true;
         current_trx->dirty = true;
+      }
+      /* the statement can be rolled back alone (see warp_trx::rollback),
+         one savepoint for all the tables of the statement */
+      if(!current_trx->autocommit &&
+         current_trx->savepoint_query_id != (uint64_t)thd->query_id) {
+        current_trx->write_savepoint(thd->query_id);
       }
     } 
   } else {
@@ -5807,6 +6206,19 @@ void warp_trx::write_insert_log_rowid(uint64_t rowid) {
     sql_print_error("failed to write rowid into insert log: %s", log_filename.c_str());
     assert(false);
   }
+}
+
+void warp_trx::write_savepoint(uint64_t query_id) {
+  if(log == NULL) {
+    return;
+  }
+  if(fwrite(&savepoint_marker, sizeof(savepoint_marker), 1, log) != 1 ||
+     ferror(log) != 0) {
+    sql_print_error("failed to write a savepoint into transaction log: %s",
+                    log_filename.c_str());
+    assert(false);
+  }
+  savepoint_query_id = query_id;
 }
 
 void warp_trx::write_delete_log_rowid(uint64_t rowid) {
@@ -6018,92 +6430,87 @@ void warp_trx::commit() {
 // used when a transaction or statement rolls back
 void warp_trx::rollback(bool all) {
   commit_mtx.lock();
-  size_t savepoint_at = 0;
-  uint64_t rowid = 0;
-  char marker;
   if(dirty) {
     if(warp_state->open_trx.find(trx_id) == warp_state->open_trx.end()) {
       sql_print_error("Open transaction is not registered as open");
       assert(false);
     }
-    int sz;
     if(all != ROLLBACK_STATEMENT) {
-      sz = fwrite(&rollback_marker, sizeof(rollback_marker), 1, log);
+      const int sz = fwrite(&rollback_marker, sizeof(rollback_marker), 1, log);
       if(sz != 1) {
         sql_print_error("failed to write rollback marker into transaction log");
       }
-    } 
+    }
     fflush(log);
     fsync(fileno(log));
-    fseek(log, 0, SEEK_SET);
-    clearerr(log);
-  
-    while((sz = fread(&marker, sizeof(marker), 1, log))) {
-      switch(marker) {
-        case rollback_marker:
-          // nothing to do - end of log
-        break;
-
-        case savepoint_marker:
-          savepoint_at = ftell(log) - sizeof(marker);
+    if(all == ROLLBACK_STATEMENT) {
+      /* The statement is what the log has after the last savepoint (a
+         statement of a transaction that is not autocommit writes one before
+         it changes anything, see write_savepoint).  Its inserts are undone
+         by deleting the rows, its deletes by removing their history locks:
+         the deletes of the log are only applied when the transaction
+         commits.  An autocommit statement is rolled back with its
+         transaction, its rows are never committed. */
+      fseek(log, 0, SEEK_SET);
+      clearerr(log);
+      long savepoint_at = -1;
+      std::vector<std::pair<char, uint64_t>> statement_changes;
+      char marker;
+      while(fread(&marker, sizeof(marker), 1, log) == 1) {
+        if(marker == savepoint_marker) {
+          savepoint_at = ftell(log) - (long)sizeof(marker);
+          statement_changes.clear();
           continue;
-        break;
-
-        case insert_marker:
-          if(all == ROLLBACK_STATEMENT && savepoint_at == 0) {
-            fseek(log, sizeof(uint64_t), SEEK_CUR);
+        }
+        if(marker == insert_marker || marker == delete_marker) {
+          uint64_t rowid = 0;
+          if(fread(&rowid, sizeof(uint64_t), 1, log) != 1) {
+            sql_print_error("could not read from transaction log %s",
+                            log_filename.c_str());
+            break;
           }
-          if(all == ROLLBACK_STATEMENT) {
-            sz = fread(&rowid, sizeof(uint64_t), 1, log);
-            if(feof(log)) {
-              break;
-            }
-            if(sz != 1) {
-              sql_print_error("could not read from transaction log");
-              assert(false);
-            }
-            // delete this insert, which is equivalent to rolling it back
-            if(warp_state->delete_bitmap->set_bit(rowid) != 0) {
+          statement_changes.emplace_back(marker, rowid);
+        }
+      }
+      if(savepoint_at >= 0) {
+        for(const auto &change : statement_changes) {
+          if(change.first == insert_marker) {
+            if(warp_state->delete_bitmap->set_bit(change.second) != 0) {
               sql_print_error("could not set bit in deleted bitmap");
               assert(false);
             }
+          } else {
+            warp_state->remove_history_lock(change.second, trx_id);
           }
-          // do not have to roll back insertions as they will not be
-          // in the commit bitmap
-        break;
-
-        case delete_marker:
-          //row will be unlocked at trx delete
-          //seek past the rowid
-          fseek(log, sizeof(uint64_t), SEEK_CUR);
-        break;
+        }
+        if(warp_state->delete_bitmap->is_dirty()) {
+          if(warp_state->delete_bitmap->commit() != 0) {
+            sql_print_error("could not commit delete bitmap for rollback of statement");
+            assert(false);
+          }
+        }
+        /* the log ends where the statement began, the next statement writes
+           a savepoint again */
+        fflush(log);
+        if(ftruncate(fileno(log), savepoint_at) != 0) {
+          sql_print_error("could not truncate transaction log %s",
+                          log_filename.c_str());
+        }
+        fsync(fileno(log));
+        savepoint_query_id = 0;
       }
-    } 
-    /* was dirty */
+      fseek(log, 0, SEEK_END);
+      clearerr(log);
+    }
   }
 
-  // need to commit the rolled back inserts to the delete bitmap
-  if(all==ROLLBACK_STATEMENT) {
-    if(warp_state->delete_bitmap->is_dirty()) {
-      if(warp_state->delete_bitmap->commit() != 0) {
-        sql_print_error("could not commit delete bitmap for rollback of statement");
-        assert(false);
-      }
-    }
-  
-    // remove the savepoint data
-    if(savepoint_at > 0) {
-      fflush(log);
-      ftruncate(fileno(log), savepoint_at);
-      fsync(fileno(log));
-    }
-  } else {
+  if(all != ROLLBACK_STATEMENT) {
     /* a rolled back transaction is not open any more and its bit in the
        commit bitmap is never set, so its rows are not visible */
     warp_state->open_trx.erase(trx_id);
     open_registered = false;
     close_log();
-  } 
+  }
 
   commit_mtx.unlock();
 }
@@ -6959,6 +7366,15 @@ void warp_global_data::add_history_lock(uint64_t rowid, uint64_t trx_id) {
   history_locks.emplace(std::pair<uint64_t, uint64_t>(rowid, trx_id));
   ++history_lock_inserts;
   history_lock_count.store(history_locks.size(), std::memory_order_release);
+}
+
+void warp_global_data::remove_history_lock(uint64_t rowid, uint64_t trx_id) {
+  std::unique_lock<std::shared_mutex> guard(history_lock_mtx);
+  auto it = history_locks.find(rowid);
+  if(it != history_locks.end() && it->second == trx_id) {
+    history_locks.erase(it);
+    history_lock_count.store(history_locks.size(), std::memory_order_release);
+  }
 }
 
 void warp_global_data::register_active_trx(uint64_t trx_id) {

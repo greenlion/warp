@@ -517,6 +517,15 @@ int ha_warp_part::info(uint flag) {
   if (m_parts_closed || m_part_info == nullptr) {
     return 0;
   }
+  if ((flag & HA_STATUS_ERRKEY) && m_last_part < m_parts.size()) {
+    /* the duplicate key of the last write: the key, and the position of the
+       row that has it (the partition, then the row in the partition) */
+    ha_warp *part = m_parts[m_last_part].get();
+    errkey = part->dup_key_nr;
+    int2store(dup_ref, m_last_part);
+    memcpy(dup_ref + PARTITION_BYTES_IN_POS, part->dup_ref, part->ref_length);
+    return 0;
+  }
   ha_rows records = 0;
   ha_rows deleted = 0;
   ulonglong data_file_length = 0;
