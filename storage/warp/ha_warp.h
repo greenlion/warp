@@ -484,6 +484,13 @@ struct WARP_SHARE {
   std::mutex unique_mtx;
   bool unique_cache_built = false;
   std::map<std::string, warp_unique_cache> unique_caches;
+  /* AUTO_INCREMENT: the next value, see ha_warp::get_auto_increment.  Read
+     when it is first needed: the value of the auto_increment file of the
+     data directory, or the largest value of the column plus one if that is
+     larger.  Protected by mutex. */
+  bool autoinc_loaded = false;
+  bool autoinc_dirty = false;
+  uint64_t autoinc_next = 1;
   mysql_mutex_t mutex;
   THR_LOCK lock;
 };
@@ -909,7 +916,7 @@ struct warp_table_lock_set;
 
 /* The flags of the WARP tables, partitioned (ha_warp_part) or not */
 static inline handler::Table_flags warp_table_flags() {
-  return (HA_BINLOG_ROW_CAPABLE | HA_NO_AUTO_INCREMENT | HA_CAN_REPAIR |
+  return (HA_BINLOG_ROW_CAPABLE | HA_CAN_REPAIR |
           HA_NULL_IN_KEY | HA_GENERATED_COLUMNS |
           HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN | HA_DUPLICATE_POS);
 }
@@ -1147,6 +1154,18 @@ class ha_warp : public handler {
   /* the columns that find_current_row reads instead of the ones of the
      statement, when it is set */
   const MY_BITMAP *decode_only = nullptr;
+
+  /* AUTO_INCREMENT, see get_auto_increment */
+  uint64_t autoinc_reserved_end = 0;
+  void load_autoinc();
+  void save_autoinc();
+  void autoinc_value_written(const uchar *record);
+  uint64_t autoinc_next_value();
+  void get_auto_increment(ulonglong offset, ulonglong increment,
+                          ulonglong nb_desired_values, ulonglong *first_value,
+                          ulonglong *nb_reserved_values) override;
+  void release_auto_increment() override;
+  void update_create_info(HA_CREATE_INFO *create_info) override;
 
   ha_warp(handlerton *hton, TABLE_SHARE *table_arg);
   handlerton* warp_hton;

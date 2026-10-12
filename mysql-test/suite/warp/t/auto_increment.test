@@ -1,0 +1,134 @@
+--echo #
+--echo # AUTO_INCREMENT.  The next value is kept for the table: it is given out
+--echo # to the statements, moves after the values that are written, survives a
+--echo # restart (values are not used again after a delete), and TRUNCATE
+--echo # starts again at 1.
+--echo #
+
+CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, v VARCHAR(10), PRIMARY KEY (id))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t (v) VALUES ('a');
+SELECT LAST_INSERT_ID();
+INSERT INTO t VALUES (NULL, 'b'), (0, 'c'), (NULL, 'd');
+SELECT LAST_INSERT_ID();
+INSERT INTO t VALUES (10, 'e');
+INSERT INTO t (v) VALUES ('f');
+INSERT INTO t VALUES (5, 'g');
+INSERT INTO t (v) VALUES ('h');
+SELECT * FROM t ORDER BY id;
+SHOW CREATE TABLE t;
+--echo # a value that is updated moves the next one too
+UPDATE t SET id = 100 WHERE v = 'h';
+INSERT INTO t (v) VALUES ('i');
+--echo # the deleted values are not given again
+DELETE FROM t WHERE id >= 100;
+INSERT INTO t (v) VALUES ('j');
+SELECT * FROM t ORDER BY id;
+--echo # INSERT ... SELECT, and a duplicate that fails
+INSERT INTO t (v) SELECT CONCAT(v, v) FROM t WHERE id < 5;
+--error ER_DUP_ENTRY
+INSERT INTO t VALUES (102, 'dup');
+INSERT INTO t (v) VALUES ('k');
+SELECT * FROM t ORDER BY id;
+--echo # REPLACE and INSERT ... ON DUPLICATE KEY UPDATE
+REPLACE INTO t VALUES (1, 'A');
+INSERT INTO t VALUES (2, 'x') ON DUPLICATE KEY UPDATE v = 'B', id = LAST_INSERT_ID(id);
+SELECT LAST_INSERT_ID();
+INSERT INTO t (v) VALUES ('l');
+SELECT * FROM t ORDER BY id;
+
+--echo #
+--echo # auto_increment_increment and auto_increment_offset
+--echo #
+SET SESSION auto_increment_increment = 10, auto_increment_offset = 3;
+INSERT INTO t (v) VALUES ('m'), ('n');
+INSERT INTO t (v) VALUES ('o');
+SET SESSION auto_increment_increment = 1, auto_increment_offset = 1;
+INSERT INTO t (v) VALUES ('p');
+SELECT * FROM t WHERE id > 100 ORDER BY id;
+
+--echo #
+--echo # NO_AUTO_VALUE_ON_ZERO, negative values, a BIGINT UNSIGNED column
+--echo #
+SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_AUTO_VALUE_ON_ZERO');
+CREATE TABLE z (id INT AUTO_INCREMENT, KEY (id)) ENGINE=WARP;
+INSERT INTO z VALUES (0), (-5), (NULL);
+SET SESSION sql_mode = DEFAULT;
+INSERT INTO z VALUES (NULL);
+SELECT * FROM z ORDER BY id;
+CREATE TABLE u (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY) ENGINE=WARP;
+INSERT INTO u VALUES (18446744073709551610);
+INSERT INTO u VALUES (NULL), (NULL);
+SELECT * FROM u ORDER BY id;
+
+--echo #
+--echo # CREATE TABLE ... AUTO_INCREMENT = n, ALTER TABLE ... AUTO_INCREMENT = n
+--echo #
+CREATE TABLE s (id INT AUTO_INCREMENT PRIMARY KEY, v INT) ENGINE=WARP AUTO_INCREMENT = 1000;
+INSERT INTO s (v) VALUES (1);
+ALTER TABLE s AUTO_INCREMENT = 2000;
+INSERT INTO s (v) VALUES (2);
+--echo # a value below the largest one is not taken
+ALTER TABLE s AUTO_INCREMENT = 5;
+INSERT INTO s (v) VALUES (3);
+ALTER TABLE s ADD COLUMN w INT;
+INSERT INTO s (v) VALUES (4);
+SELECT * FROM s ORDER BY id;
+SHOW CREATE TABLE s;
+
+--echo #
+--echo # Two connections take values at the same time
+--echo #
+CREATE TABLE c (id INT AUTO_INCREMENT PRIMARY KEY, who INT) ENGINE=WARP;
+connect (con1, localhost, root,,);
+connect (con2, localhost, root,,);
+connection con1;
+BEGIN;
+INSERT INTO c (who) VALUES (1), (1);
+connection con2;
+BEGIN;
+INSERT INTO c (who) VALUES (2), (2);
+connection con1;
+INSERT INTO c (who) VALUES (1);
+COMMIT;
+connection con2;
+INSERT INTO c (who) VALUES (2);
+COMMIT;
+disconnect con1;
+disconnect con2;
+connection default;
+SELECT COUNT(*), COUNT(DISTINCT id), MIN(id), MAX(id) FROM c;
+
+--echo #
+--echo # A partitioned table
+--echo #
+CREATE TABLE p (id INT AUTO_INCREMENT, k INT, PRIMARY KEY (id, k)) ENGINE=WARP
+  PARTITION BY HASH (k) PARTITIONS 3;
+INSERT INTO p (k) VALUES (1), (2), (3), (4), (5);
+INSERT INTO p VALUES (50, 1);
+INSERT INTO p (k) VALUES (2);
+SELECT * FROM p ORDER BY id;
+SHOW CREATE TABLE p;
+
+--echo #
+--echo # The next value survives a restart, the deleted values are not used
+--echo # again
+--echo #
+DELETE FROM t WHERE id > 100;
+DELETE FROM p WHERE id > 50;
+--source include/restart_mysqld.inc
+INSERT INTO t (v) VALUES ('restart');
+INSERT INTO p (k) VALUES (3);
+INSERT INTO s (v) VALUES (5);
+SELECT * FROM t WHERE id > 100 ORDER BY id;
+SELECT * FROM p WHERE id > 50 ORDER BY id;
+SELECT MAX(id) FROM s;
+--echo # TRUNCATE starts again at 1
+TRUNCATE TABLE t;
+INSERT INTO t (v) VALUES ('first');
+SELECT * FROM t;
+ALTER TABLE p TRUNCATE PARTITION p0, p1, p2;
+INSERT INTO p (k) VALUES (7);
+SELECT * FROM p;
+
+DROP TABLE t, z, u, s, c, p;
