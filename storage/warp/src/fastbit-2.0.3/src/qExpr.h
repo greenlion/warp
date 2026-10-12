@@ -573,7 +573,9 @@ private:
 /// with one bound (<, <=, >, >=) or with two inclusive bounds (BETWEEN).
 /// Strings are compared the way MySQL compares utf8mb4_bin strings,
 /// byte by byte, with trailing spaces insignificant (see
-/// ibis::util::padSpaceCompare).  It does not
+/// ibis::util::padSpaceCompare).  A comparison with a collation other
+/// than the default one compares the strings with
+/// ibis::util::collationCompare, also for the equality.  It does not
 /// ensure the names are valid in any way.  When the check does happen,
 /// the left side will be checked first.  If it matches the name of a
 /// ibis::column, the right side will be assumed to be the value one is
@@ -590,14 +592,18 @@ public:
 
     // construct the qString from two strings
     qString() : qExpr(STRING), lstr(0), rstr(0), ustr(0), cmp_(STR_EQ),
-                dec_(false) {};
+                dec_(false), coll_(0) {};
     qString(const char* ls, const char* rs);
     /// Column ls compared with the string rs, "ls op rs".  If dec is true
     /// the strings are decimal numbers that are compared by value (see
-    /// ibis::util::decimalCompare), also for STR_EQ.
-    qString(const char* ls, COMPARE op, const char* rs, bool dec=false);
+    /// ibis::util::decimalCompare), also for STR_EQ.  Otherwise the
+    /// strings are compared in the collation coll (see
+    /// ibis::util::collationCompare), 0 is the default one.
+    qString(const char* ls, COMPARE op, const char* rs, bool dec=false,
+            uint32_t coll=0);
     /// Column ls between the strings lo and hi, both inclusive.
-    qString(const char* ls, const char* lo, const char* hi, bool dec=false);
+    qString(const char* ls, const char* lo, const char* hi, bool dec=false,
+            uint32_t coll=0);
     virtual ~qString() {delete [] ustr; delete [] rstr; delete [] lstr;}
 
     const char* leftString() const {return lstr;}
@@ -607,9 +613,12 @@ public:
     COMPARE comparison() const {return cmp_;}
     /// Are the strings decimal numbers compared by value?
     bool isDecimal() const {return dec_;}
+    /// The collation of the comparison, 0 for the default one.
+    uint32_t collation() const {return coll_;}
     /// Is it a comparison other than the equality of strings?  The
-    /// equality of decimal numbers is one, because "1.0" equals "1.00".
-    bool isRange() const {return cmp_ != STR_EQ || dec_;}
+    /// equality of decimal numbers is one, because "1.0" equals "1.00",
+    /// and so is the equality in a collation ('a' may equal 'A').
+    bool isRange() const {return cmp_ != STR_EQ || dec_ || coll_ != 0;}
     /// The two sides are exchanged.  The comparison is mirrored so that
     /// the expression keeps its meaning.
     void swapLeftRight() {
@@ -631,13 +640,14 @@ private:
     char* ustr; ///< Upper bound of BETWEEN.
     COMPARE cmp_;
     bool dec_; ///< The strings are decimal numbers.
+    uint32_t coll_; ///< The collation, 0 for the default one.
 
     /// Copy Constructor.  Deep copy.
     qString(const qString& rhs) : qExpr(STRING),
 	lstr(ibis::util::strnewdup(rhs.lstr)),
 	rstr(ibis::util::strnewdup(rhs.rstr)),
 	ustr(rhs.ustr ? ibis::util::strnewdup(rhs.ustr) : 0),
-	cmp_(rhs.cmp_), dec_(rhs.dec_) {}
+	cmp_(rhs.cmp_), dec_(rhs.dec_), coll_(rhs.coll_) {}
     qString& operator=(const qString&);
     static char* unescape(const char* str);
 }; // ibis::qString
@@ -673,8 +683,11 @@ private:
 /// 'bbb', ...).
 class FASTBIT_CXX_DLLSPEC ibis::qAnyString : public ibis::qExpr {
 public:
-    qAnyString() : qExpr(ANYSTRING) {};
-    qAnyString(const char *col, const char *sval);
+    qAnyString() : qExpr(ANYSTRING), coll_(0) {};
+    /// The column col is one of the strings in sval, compared in the
+    /// collation coll (see ibis::util::collationCompare), 0 is the
+    /// default one.
+    qAnyString(const char *col, const char *sval, uint32_t coll=0);
     virtual ~qAnyString() {}; // name and values are automatically destroyed
 
     /// Duplicate the object.  Using the compiler generated copy constructor.
@@ -686,6 +699,8 @@ public:
     const char* colName() const {return name.c_str();}
     /// Return the string values in the parentheses as a vector.
     const std::vector<std::string>& valueList() const {return values;}
+    /// The collation of the comparison, 0 for the default one.
+    uint32_t collation() const {return coll_;}
     /// Convert into a sequence of qString objects.
     ibis::qExpr* convert() const;
     virtual void getTableNames(std::set<std::string>& plist) const;
@@ -693,6 +708,7 @@ public:
 private:
     std::string name;
     std::vector<std::string> values;
+    uint32_t coll_; ///< The collation, 0 for the default one.
 }; // ibis::qAnyString
 
 /// Representing the operator 'LIKE'.

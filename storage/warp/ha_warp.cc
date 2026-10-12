@@ -282,7 +282,76 @@ mysql_declare_plugin(warp){
   0,                /* flags                           */
 } mysql_declare_plugin_end;
 
- 
+/* The collations of the strings, by number, looked up once */
+static std::atomic<const CHARSET_INFO *> warp_collations[MY_ALL_CHARSETS_SIZE];
+
+static const CHARSET_INFO *warp_collation(uint32_t coll) {
+  if(coll >= MY_ALL_CHARSETS_SIZE) {
+    return NULL;
+  }
+  const CHARSET_INFO *cs = warp_collations[coll].load(std::memory_order_acquire);
+  if(cs == NULL) {
+    cs = get_charset(coll, MYF(0));
+    warp_collations[coll].store(cs, std::memory_order_release);
+  }
+  return cs;
+}
+
+/* Compares two strings in a collation with the comparison function of the
+   server, the way MySQL compares the strings of a column (with the PAD
+   attribute of the collation).  FastBit calls it for the conditions that
+   name a collation, see warp_collate_prefix. */
+static int warp_string_compare(uint32_t coll, const char *a, size_t alen,
+                               const char *b, size_t blen) {
+  const CHARSET_INFO *cs = warp_collation(coll);
+  if(cs == NULL) {
+    /* not a collation of the server, the conditions do not name one */
+    return ibis::util::padSpaceCompare(a, alen, b, blen);
+  }
+  return cs->coll->strnncollsp(cs, pointer_cast<const uchar *>(a), alen,
+                               pointer_cast<const uchar *>(b), blen);
+}
+
+/* Hashes a string in a collation with the hash function of the server: the
+   strings that warp_string_compare finds equal have the same hash value */
+static uint64_t warp_string_hash(uint32_t coll, const char *a, size_t alen) {
+  const CHARSET_INFO *cs = warp_collation(coll);
+  if(cs == NULL) {
+    return ibis::util::collationHash(0, a, alen);
+  }
+  uint64_t nr1 = 1, nr2 = 4;
+  cs->coll->hash_sort(cs, pointer_cast<const uchar *>(a), alen, &nr1, &nr2);
+  return nr1;
+}
+
+/* The collations of the string columns.  FastBit stores a string with a NUL
+   at the end, so only the character sets in which a character other than
+   NUL has no 0 byte can be stored (not ucs2, utf16 or utf32), and binary
+   strings, which may contain any byte, can not.  utf8mb4_bin is compared
+   by FastBit itself, the other collations with warp_string_compare.  Only
+   the case sensitive and the binary collations are supported. */
+static bool warp_collation_supported(const CHARSET_INFO *cs) {
+  if(cs == NULL || cs == &my_charset_bin || cs->mbminlen != 1) {
+    return false;
+  }
+  if(cs->number == 46) {
+    return true; /* utf8mb4_bin */
+  }
+  return (cs->state & (MY_CS_BINSORT | MY_CS_CSSORT)) != 0;
+}
+
+/* What a FastBit condition on a string column is prefixed with, so that
+   FastBit compares the strings in the collation of the column: nothing for
+   utf8mb4_bin, which FastBit compares itself (byte by byte, PAD SPACE), and
+   collate_N for the collation number N, which FastBit compares with
+   warp_string_compare. */
+static std::string warp_collate_prefix(const CHARSET_INFO *cs) {
+  if(cs->number == 46) {
+    return "";
+  }
+  return "collate_" + std::to_string(cs->number) + " ";
+}
+
 static int warp_init_func(void *p) {
   DBUG_ENTER("warp_init_func");
   sql_print_information("WARP storage engine initialization started");
@@ -302,6 +371,9 @@ static int warp_init_func(void *p) {
   ibis::util::setVerboseLevel(0);
   warp_apply_compression();
   ibis::column::setMinIndexRows(my_index_min_rows);
+  /* the strings of the collations other than utf8mb4_bin are compared by
+     the server */
+  ibis::util::setCollationFunctions(warp_string_compare, warp_string_hash);
 #ifdef HAVE_PSI_INTERFACE
   init_warp_psi_keys();
 #endif
@@ -2034,16 +2106,10 @@ int ha_warp::create_writer(TABLE *table_arg) {
       case MYSQL_TYPE_LONG_BLOB:
       case MYSQL_TYPE_BLOB:
       case MYSQL_TYPE_JSON:
-        /*CHARSET NUMBER:46
-          CHARSET M_COL_NAME:utf8mb4_bin*/
-        if((*field)->charset()->number != 46) {
-          std::string errmsg = "Unsupported character set or collation for column (only utf8mb4/utf8mb4_bin supported): " +
-                             std::string((*field)->field_name);
-          my_error(1031, MYF(0), errmsg.c_str());
-          return 1;
-        }
-        if(strcmp((*field)->charset()->m_coll_name, "utf8mb4_bin")) {
-          std::string errmsg = "Unsupported character set or collation for column (only utf8mb4/utf8mb4_bin supported): " +
+        /* the strings are compared in the collation of the column, see
+           warp_collation_supported */
+        if(!warp_collation_supported((*field)->charset())) {
+          std::string errmsg = "Unsupported character set or collation for column (only case sensitive and binary collations of character sets without NUL bytes are supported): " +
                              std::string((*field)->field_name);
           my_error(1031, MYF(0), errmsg.c_str());
           return 1;
@@ -3636,8 +3702,8 @@ static bool warp_key_part_supported(const KEY_PART_INFO *kp) {
       if(kp->length < f->field_length) {
         return false;
       }
-      /* utf8mb4_bin, which FastBit compares in the same way (PAD SPACE) */
-      return f->charset()->number == 46;
+      /* FastBit compares the strings in the collation of the column */
+      return warp_collation_supported(f->charset());
     default:
       return false;
   }
@@ -3753,7 +3819,13 @@ static std::string warp_key_part_condition(const Field *f,
     if(op == ">") return null_marker + " = 0";
     return "1=0"; /* nothing is smaller than NULL */
   }
-  const std::string cmp = "c" + pos + " " + op + " " + v.text;
+  /* a string is compared in the collation of the column */
+  const std::string collate =
+      (f->real_type() == MYSQL_TYPE_VARCHAR ||
+       f->real_type() == MYSQL_TYPE_STRING)
+          ? warp_collate_prefix(f->charset())
+          : "";
+  const std::string cmp = collate + "c" + pos + " " + op + " " + v.text;
   if(!f->is_nullable()) {
     return "(" + cmp + ")";
   }
@@ -4347,12 +4419,15 @@ static bool warp_is_temporal_const(Item *item, int kind) {
          item->result_type() == STRING_RESULT;
 }
 
-/* Writes a string constant as a quoted FastBit string literal.  Returns false
-   if the constant is not a plain string that FastBit compares like MySQL:
-   a constant that is not a string, a NULL, a string with a NUL character
-   (FastBit strings end at a NUL) and a string of another character set that
-   is not ASCII. */
-static bool warp_quote_string_const(const Item *item, std::string &quoted) {
+/* Writes a string constant as a quoted FastBit string literal in the
+   character set cs of the column it is compared with, the way MySQL
+   converts the constant to compare it in the collation of the column.
+   Returns false if the constant is not a plain string that FastBit compares
+   like MySQL: a constant that is not a string, a NULL, a string that can not
+   be converted to the character set without a loss and a string with a NUL
+   character (FastBit strings end at a NUL). */
+static bool warp_quote_string_const(const Item *item, const CHARSET_INFO *cs,
+                                    std::string &quoted) {
   if(item->type() != Item::Type::STRING_ITEM) {
     return false;
   }
@@ -4362,20 +4437,21 @@ static bool warp_quote_string_const(const Item *item, std::string &quoted) {
   if(val == NULL) {
     return false;
   }
-  const char *ptr = val->ptr();
-  bool ascii = true;
-  for(size_t j = 0; j < val->length(); ++j) {
-    const char c = ptr[j];
-    if(c == 0) {
+  String converted;
+  if(!my_charset_same(val->charset(), cs)) {
+    uint errors = 0;
+    if(converted.copy(val->ptr(), val->length(), val->charset(), cs,
+                      &errors) ||
+       errors != 0) {
       return false;
     }
-    if(static_cast<unsigned char>(c) >= 0x80) {
-      ascii = false;
-    }
+    val = &converted;
   }
-  /* a constant in another character set would have to be converted */
-  if(!ascii && strncmp(citem->collation.collation->csname, "utf8mb4", 7)) {
-    return false;
+  const char *ptr = val->ptr();
+  for(size_t j = 0; j < val->length(); ++j) {
+    if(ptr[j] == 0) {
+      return false;
+    }
   }
   std::string escaped;
   for(size_t j = 0; j < val->length(); ++j) {
@@ -4392,19 +4468,41 @@ static bool warp_quote_string_const(const Item *item, std::string &quoted) {
   return true;
 }
 
-/* Pushes a comparison of a string column with string constants (<, <=, >, >=
-   and BETWEEN) down to FastBit.  The result must be the same as MySQL's:
-   WARP strings are utf8mb4_bin, which MySQL compares byte by byte with the
-   trailing spaces not counting (PAD SPACE), and FastBit compares the same
-   way (ibis::util::padSpaceCompare).  A pushed condition is not evaluated
-   by MySQL again, so the conditions that can not be pushed are left to it:
-   other collations (an explicit COLLATE, for example), binary strings,
-   constants that are not plain strings and strings with a NUL character.
+/* Is a comparison of the string column fld evaluated by FastBit in the
+   same way as by MySQL?  MySQL compares the column and the constants in the
+   collation of the comparison, which has to be the collation of the column:
+   FastBit compares the strings in that collation (see
+   warp_collate_prefix).  With another collation (an explicit COLLATE, for
+   example) MySQL has to do it. */
+static bool warp_string_column_pushable(Item_func *func, const Field *fld) {
+  const enum_field_types rt = fld->real_type();
+  if(rt != MYSQL_TYPE_VARCHAR && rt != MYSQL_TYPE_STRING &&
+     rt != MYSQL_TYPE_VAR_STRING) {
+    return false;
+  }
+  if(!warp_collation_supported(fld->charset())) {
+    return false;
+  }
+  const CHARSET_INFO *cmp_cs = func->compare_collation();
+  return cmp_cs != NULL && cmp_cs == fld->charset();
+}
+
+/* Pushes a comparison of a string column with string constants (=, <, <=,
+   >, >= and BETWEEN) down to FastBit.  The result must be the same as
+   MySQL's: FastBit compares the strings in the collation of the column,
+   utf8mb4_bin byte by byte with the trailing spaces not counting (PAD SPACE,
+   ibis::util::padSpaceCompare) and the other collations with the comparison
+   function of the server (warp_string_compare).  A pushed condition is not
+   evaluated by MySQL again, so the conditions that can not be pushed are
+   left to it: the comparisons in another collation (see
+   warp_string_column_pushable), binary strings, constants that are not
+   plain strings and strings with a NUL character.
 
    op is the operator of the comparison (not used for BETWEEN).  Returns true
    and appends the FastBit condition to out if the condition was pushed. */
-static bool warp_push_string_range(Item_func *func, Item **args, bool is_between,
-                                   const std::string &op, std::string &out) {
+static bool warp_push_string_compare(Item_func *func, Item **args,
+                                     bool is_between, const std::string &op,
+                                     std::string &out) {
   const uint nargs = func->arg_count;
   const Item_field *col_item = NULL;
   std::string fb_op = op;
@@ -4434,7 +4532,7 @@ static bool warp_push_string_range(Item_func *func, Item **args, bool is_between
       else if(op == " <= ") fb_op = " >= ";
       else if(op == " > ") fb_op = " < ";
       else if(op == " >= ") fb_op = " <= ";
-      else return false;
+      else if(op != " = ") return false;
     } else {
       return false;
     }
@@ -4442,24 +4540,13 @@ static bool warp_push_string_range(Item_func *func, Item **args, bool is_between
   }
 
   const Field *fld = col_item->field;
-  const enum_field_types rt = fld->real_type();
-  if(rt != MYSQL_TYPE_VARCHAR && rt != MYSQL_TYPE_STRING &&
-     rt != MYSQL_TYPE_VAR_STRING) {
-    return false;
-  }
-  /* only the utf8mb4_bin collation of WARP columns, for the column and for
-     the comparison */
-  if(fld->charset()->number != 46) {
-    return false;
-  }
-  const CHARSET_INFO *cmp_cs = func->compare_collation();
-  if(cmp_cs == NULL || cmp_cs->number != 46) {
+  if(!warp_string_column_pushable(func, fld)) {
     return false;
   }
 
   std::string values[2];
   for(uint i = 0; i < nconsts; ++i) {
-    if(!warp_quote_string_const(consts[i], values[i])) {
+    if(!warp_quote_string_const(consts[i], fld->charset(), values[i])) {
       return false;
     }
   }
@@ -4469,7 +4556,7 @@ static bool warp_push_string_range(Item_func *func, Item **args, bool is_between
   if(fld->is_nullable()) {
     cond = "(n" + field_index + " = 0 AND ";
   }
-  cond += "c" + field_index;
+  cond += warp_collate_prefix(fld->charset()) + "c" + field_index;
   if(is_between) {
     cond += " BETWEEN " + values[0] + " AND " + values[1];
   } else {
@@ -4482,13 +4569,14 @@ static bool warp_push_string_range(Item_func *func, Item **args, bool is_between
   return true;
 }
 
-/* Can the equality of a column with a string constant be evaluated by
+/* Can the equality of an ENUM column with a string constant be evaluated by
    FastBit?  FastBit compares the bytes of the strings, with the spaces at
    the end not counting, which is how MySQL compares utf8mb4_bin strings.
    MySQL compares the column and the constant in the collation of the
    comparison, which has to be utf8mb4_bin too: with another collation
-   ('A' = 'a') or for a column that is not a string, MySQL has to do it.
-   Binary strings and strings with a NUL character are left to MySQL too. */
+   ('A' = 'a') MySQL has to do it.  Binary strings and strings with a NUL
+   character are left to MySQL too.  The equality of the other string
+   columns is pushed by warp_push_string_compare. */
 static bool warp_string_eq_pushable(Item_func *func, Item **args) {
   if(func->arg_count != 2) {
     return false;
@@ -4505,9 +4593,7 @@ static bool warp_string_eq_pushable(Item_func *func, Item **args) {
     return false;
   }
   const Field *fld = col_item->field;
-  const enum_field_types rt = fld->real_type();
-  if(rt != MYSQL_TYPE_VARCHAR && rt != MYSQL_TYPE_STRING &&
-     rt != MYSQL_TYPE_VAR_STRING && rt != MYSQL_TYPE_ENUM) {
+  if(fld->real_type() != MYSQL_TYPE_ENUM) {
     return false;
   }
   if(fld->charset()->number != 46) {
@@ -4518,11 +4604,11 @@ static bool warp_string_eq_pushable(Item_func *func, Item **args) {
     return false;
   }
   std::string quoted;
-  return warp_quote_string_const(constant, quoted);
+  return warp_quote_string_const(constant, fld->charset(), quoted);
 }
 
 /* Pushes IN (...) of a string column with string constants down to FastBit.
-   The same conditions as for the comparisons of warp_push_string_range
+   The same conditions as for the comparisons of warp_push_string_compare
    hold.  Returns true and appends the FastBit condition to out if the
    condition was pushed. */
 static bool warp_push_string_in(Item_func *func, Item **args, std::string &out) {
@@ -4531,16 +4617,7 @@ static bool warp_push_string_in(Item_func *func, Item **args, std::string &out) 
     return false;
   }
   const Field *fld = down_cast<Item_field *>(args[0])->field;
-  const enum_field_types rt = fld->real_type();
-  if(rt != MYSQL_TYPE_VARCHAR && rt != MYSQL_TYPE_STRING &&
-     rt != MYSQL_TYPE_VAR_STRING) {
-    return false;
-  }
-  if(fld->charset()->number != 46) {
-    return false;
-  }
-  const CHARSET_INFO *cmp_cs = func->compare_collation();
-  if(cmp_cs == NULL || cmp_cs->number != 46) {
+  if(!warp_string_column_pushable(func, fld)) {
     return false;
   }
   const std::string field_index = std::to_string(fld->field_index());
@@ -4548,10 +4625,10 @@ static bool warp_push_string_in(Item_func *func, Item **args, std::string &out) 
   if(fld->is_nullable()) {
     cond = "(n" + field_index + " = 0 AND ";
   }
-  cond += "c" + field_index + " IN (";
+  cond += warp_collate_prefix(fld->charset()) + "c" + field_index + " IN (";
   for(uint i = 1; i < nargs; ++i) {
     std::string quoted;
-    if(!warp_quote_string_const(args[i], quoted)) {
+    if(!warp_quote_string_const(args[i], fld->charset(), quoted)) {
       return false;
     }
     if(i > 1) {
@@ -5001,11 +5078,12 @@ int ha_warp::append_column_filter(const Item *cond,
       }
     }
 
-    /* Strings compared with <, <=, >, >= and BETWEEN */
-    if(is_between || op == " < " || op == " <= " || op == " > " ||
+    /* Strings compared with =, <, <=, >, >= and BETWEEN */
+    if(is_between || is_eq || op == " < " || op == " <= " || op == " > " ||
        op == " >= ") {
       std::string string_condition;
-      if(warp_push_string_range(tmp, arg, is_between, op, string_condition)) {
+      if(warp_push_string_compare(tmp, arg, is_between, op,
+                                  string_condition)) {
         where_clause += string_condition;
         return 1;
       }

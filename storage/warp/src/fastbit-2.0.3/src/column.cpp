@@ -7153,10 +7153,19 @@ long ibis::column::stringSearch(const char*, ibis::bitvector&) const {
 }
 
 long ibis::column::stringRangeSearch(const char*, bool, const char*, bool,
-                                     ibis::bitvector&) const {
+                                     ibis::bitvector&, uint32_t) const {
     LOGGER(ibis::gVerbose > 0)
         << "Warning -- column[" << (thePart ? thePart->name() : "") << '.'
         << m_name << "]::stringRangeSearch is not supported on column type "
+        << ibis::TYPESTRING[(int)m_type];
+    return -1;
+}
+
+long ibis::column::collatedSearch(const std::vector<std::string>&, uint32_t,
+                                  ibis::bitvector&) const {
+    LOGGER(ibis::gVerbose > 0)
+        << "Warning -- column[" << (thePart ? thePart->name() : "") << '.'
+        << m_name << "]::collatedSearch is not supported on column type "
         << ibis::TYPESTRING[(int)m_type];
     return -1;
 }
