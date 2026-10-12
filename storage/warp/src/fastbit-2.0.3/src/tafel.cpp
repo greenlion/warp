@@ -11,6 +11,7 @@
 #include "blob.h"       // ibis::opaque
 
 #include <fstream>      // std::ofstream
+#include <sstream>      // std::ostringstream
 #include <limits>       // std::numeric_limits
 #include <typeinfo>     // typeid
 #include <memory>       // std::unique_ptr
@@ -2106,17 +2107,15 @@ int ibis::tafel::writeData(const char* dir, const char* tname,
     std::string mdfile = mydir;
     mdfile += FASTBIT_DIRSEP;
     mdfile += "-part.txt";
-    // The metadata file is written beside the old one and takes its place
-    // when it is complete: a crash leaves the old one or the new one, never
-    // a part of a file.
-    const std::string mdtmp = mdfile + ".tmp";
-    std::ofstream md(mdtmp.c_str());
-    if (! md) {
-        LOGGER(ibis::gVerbose > 0)
-            << "tafel::writeData(" << mydir << ") failed to open metadata file "
-            "\"-part.txt\"";
-        return -3; // metadata file not ready
-    }
+    // The metadata file is written over the old one when the columns are on
+    // disk.  It is not written beside the old one and renamed: a new file at
+    // every write is a change of the file system, which waits for the
+    // journal of the file system, where the syncs of the other files (the
+    // binary log of the server) commit, and the writers of the partition
+    // wait for it.  The number of rows is in the first sector of the file,
+    // which a crash leaves old or new (the recovery of WARP counts the rows
+    // of the columns again).
+    std::ostringstream md;
 
     md << "# meta data for data partition " << tname
        << " written by ibis::tafel::writeData on " << stamp << "\n\n"
@@ -2445,13 +2444,33 @@ int ibis::tafel::writeData(const char* dir, const char* tname,
     }
     // the data of the columns is on disk before the metadata file says so
     (void) ibis::zfile::commitDeferred();
-    md.close(); // close the metadata file
-    if (rename(mdtmp.c_str(), mdfile.c_str()) != 0) {
-        LOGGER(ibis::gVerbose >= 0)
-            << "Warning -- tafel::writeData failed to rename " << mdtmp
-            << " to " << mdfile << " ... " << strerror(errno);
-        (void) remove(mdtmp.c_str());
-        return -3;
+    {
+        const std::string mdtext = md.str();
+        int mdes = UnixOpen(mdfile.c_str(), OPEN_READWRITE, OPEN_FILEMODE);
+        if (mdes < 0) {
+            LOGGER(ibis::gVerbose > 0)
+                << "tafel::writeData(" << mydir << ") failed to open "
+                "metadata file \"-part.txt\"";
+            return -3; // metadata file not ready
+        }
+        IBIS_BLOCK_GUARD(UnixClose, mdes);
+        Stat_T mst;
+        size_t done = 0;
+        while (done < mdtext.size()) {
+            const ssize_t w = ::pwrite(mdes, mdtext.data() + done,
+                                       mdtext.size() - done, done);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) break;
+            done += w;
+        }
+        if (done != mdtext.size() || fstat(mdes, &mst) != 0 ||
+            ((uint64_t)mst.st_size > mdtext.size() &&
+             ftruncate(mdes, mdtext.size()) != 0)) {
+            LOGGER(ibis::gVerbose >= 0)
+                << "Warning -- tafel::writeData failed to write " << mdfile
+                << " ... " << strerror(errno);
+            return -3;
+        }
     }
     ibis::fileManager::instance().flushDir(mydir);
     if (ibis::gVerbose > 0) {
