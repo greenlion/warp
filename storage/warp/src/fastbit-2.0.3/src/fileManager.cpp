@@ -3622,18 +3622,13 @@ int ibis::zfile::commitDeferred() {
     pending.swap(gDefer.pending);
     if (pending.empty()) return 0;
     std::vector<int> failed(pending.size(), 0);
-    if (pending.size() == 1) {
-        failed[0] = (fdatasync(pending[0].fd) != 0);
-    }
-    else { // the disk works on all of them together
-        std::vector<std::thread> workers;
-        for (size_t i = 1; i < pending.size(); ++ i) {
-            workers.emplace_back([&pending, &failed, i]() {
-                failed[i] = (fdatasync(pending[i].fd) != 0);
-            });
-        }
-        failed[0] = (fdatasync(pending[0].fd) != 0);
-        for (auto &w : workers) w.join();
+    // One after the other: a thread for each file (the files are synced
+    // together to let the disk work on all of them) costs more than it
+    // saves.  The writers that sync at the same time share the journal
+    // commits of the file system, and creating and joining the threads of
+    // every write was a large part of the time of a statement.
+    for (size_t i = 0; i < pending.size(); ++ i) {
+        failed[i] = (fdatasync(pending[i].fd) != 0);
     }
     int nfail = 0;
     for (size_t i = 0; i < pending.size(); ++ i) {

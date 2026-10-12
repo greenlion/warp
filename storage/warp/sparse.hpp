@@ -63,7 +63,10 @@ private:
   struct read_map {
     const uint64_t *base;
     size_t len;          /* bytes, a multiple of BLOCK_SIZE */
-    uint64_t generation; /* read_generation when the map was made */
+    std::atomic<uint64_t> generation; /* read_generation when the map was last checked */
+    ino_t inode;
+    read_map(const uint64_t *b, size_t l, uint64_t g, ino_t i)
+        : base(b), len(l), generation(g), inode(i) {}
   };
   std::atomic<read_map*> rmap{NULL};
   std::atomic<uint64_t> read_generation{1};
@@ -73,21 +76,33 @@ private:
   std::atomic<bool> rmap_failed{false}; /* mmap did not work, use the FILE */
   std::mutex slow_mtx;                  /* the FILE path is shared by all threads */
 
-  /* Make a new map of the file if the file changed since the last one. */
+  /* Make a new map of the file if the file grew (or is another file) since
+     the last one.  The map is shared with the page cache: what a writer
+     writes to the blocks that are mapped is seen through the old map, so a
+     file that changed without growing needs no new map.  (A map for every
+     commit would be a map for every write transaction, and they are all kept
+     until the object goes away.) */
   const read_map *refresh_read_map() {
     std::lock_guard<std::mutex> guard(rmap_mtx);
     const uint64_t gen = read_generation.load(std::memory_order_acquire);
     read_map *cur = rmap.load(std::memory_order_acquire);
-    if(cur != NULL && cur->generation == gen) {
+    if(cur != NULL && cur->generation.load(std::memory_order_acquire) == gen) {
       return cur;
     }
     const uint64_t *base = NULL;
     size_t len = 0;
+    ino_t inode = 0;
     int fd = ::open(fname.c_str(), O_RDONLY);
     if(fd >= 0) {
       struct stat st;
       if(fstat(fd, &st) == 0 && st.st_size >= (off_t)BLOCK_SIZE) {
         len = ((size_t)st.st_size / BLOCK_SIZE) * BLOCK_SIZE;
+        inode = st.st_ino;
+        if(cur != NULL && !rmap_failed && cur->len == len && cur->inode == inode) {
+          ::close(fd);
+          cur->generation.store(gen, std::memory_order_release);
+          return cur;
+        }
         void *addr = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
         if(addr == MAP_FAILED) {
           len = 0;
@@ -101,7 +116,7 @@ private:
     } else {
       rmap_failed = true;
     }
-    read_map *fresh = new read_map{base, len, gen};
+    read_map *fresh = new read_map(base, len, gen, inode);
     rmap_all.push_back(fresh);
     rmap.store(fresh, std::memory_order_release);
     return fresh;
@@ -469,7 +484,7 @@ public:
     assert(bitnum > 0);
     const read_map *m = rmap.load(std::memory_order_acquire);
     if(m == NULL ||
-       m->generation != read_generation.load(std::memory_order_acquire)) {
+       m->generation.load(std::memory_order_acquire) != read_generation.load(std::memory_order_acquire)) {
       m = refresh_read_map();
     }
     if(rmap_failed) {
@@ -490,7 +505,7 @@ public:
   inline bool may_have_bits() {
     const read_map *m = rmap.load(std::memory_order_acquire);
     if(m == NULL ||
-       m->generation != read_generation.load(std::memory_order_acquire)) {
+       m->generation.load(std::memory_order_acquire) != read_generation.load(std::memory_order_acquire)) {
       m = refresh_read_map();
     }
     return rmap_failed || m->len > 0;
