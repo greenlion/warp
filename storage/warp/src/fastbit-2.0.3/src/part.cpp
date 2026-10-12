@@ -3390,7 +3390,7 @@ long ibis::part::stringSearch(const ibis::qString &cmp,
             lo = cmp.rightString();
             loIncl = true;
             break;
-        case ibis::qString::STR_EQ: // decimal numbers only
+        case ibis::qString::STR_EQ: // decimal numbers and collations
             lo = cmp.rightString();
             loIncl = true;
             hi = lo;
@@ -3405,7 +3405,8 @@ long ibis::part::stringSearch(const ibis::qString &cmp,
         }
         const long ierr = (cmp.isDecimal() ?
             col->decimalRangeSearch(lo, loIncl, hi, hiIncl, low) :
-            col->stringRangeSearch(lo, loIncl, hi, hiIncl, low));
+            col->stringRangeSearch(lo, loIncl, hi, hiIncl, low,
+                                   cmp.collation()));
         if (ierr > 0) { // the null values do not match
             ibis::bitvector mskc;
             col->getNullMask(mskc);
@@ -3481,7 +3482,9 @@ long ibis::part::stringSearch(const ibis::qAnyString &cmp,
     if (col != 0) {
         if (col->type() == ibis::TEXT ||
             col->type() == ibis::CATEGORY) {
-            ierr = col->stringSearch(cmp.valueList(), low);
+            ierr = (cmp.collation() != 0 ?
+                    col->collatedSearch(cmp.valueList(), cmp.collation(), low) :
+                    col->stringSearch(cmp.valueList(), low));
             if (ierr > 0) {
                 ibis::bitvector mskc;
                 col->getNullMask(mskc);
@@ -3505,6 +3508,8 @@ long ibis::part::stringSearch(const ibis::qAnyString &cmp) const {
     if (col != 0) {
         if (col->type() == ibis::TEXT ||
             col->type() == ibis::CATEGORY) {
+            if (cmp.collation() != 0) // any row may be equal in it
+                return static_cast<long>(nEvents);
             ret = col->stringSearch(cmp.valueList());
             return ret;
         }

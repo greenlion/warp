@@ -817,23 +817,27 @@ void ibis::dictionary::patternSearch(const char* pat,
 } // ibis::dictionary::patternSearch
 
 /// Find the codes of the strings in the range between lo and hi.  The
-/// strings are compared with ibis::util::padSpaceCompare.  A null bound
-/// means no bound on that side.
+/// strings are compared in the collation coll with
+/// ibis::util::collationCompare, the default one is
+/// ibis::util::padSpaceCompare.  A null bound means no bound on that side.
 void ibis::dictionary::rangeSearch(const char* lo, bool loIncl,
                                    const char* hi, bool hiIncl,
-                                   array_t<uint32_t>& matches) const {
+                                   array_t<uint32_t>& matches,
+                                   uint32_t coll) const {
     if (key_.size() == 0) return;
     const size_t llen = (lo != 0 ? std::strlen(lo) : 0);
     const size_t hlen = (hi != 0 ? std::strlen(hi) : 0);
     for (MYMAP::const_iterator j = key_.begin(); j != key_.end(); ++ j) {
         const size_t len = std::strlen(j->first);
         if (lo != 0) {
-            const int c = ibis::util::padSpaceCompare(j->first, len, lo, llen);
+            const int c = ibis::util::collationCompare(coll, j->first, len,
+                                                       lo, llen);
             if (c < 0 || (c == 0 && ! loIncl))
                 continue;
         }
         if (hi != 0) {
-            const int c = ibis::util::padSpaceCompare(j->first, len, hi, hlen);
+            const int c = ibis::util::collationCompare(coll, j->first, len,
+                                                       hi, hlen);
             if (c > 0 || (c == 0 && ! hiIncl))
                 continue;
         }

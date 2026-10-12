@@ -1,0 +1,303 @@
+--echo #
+--echo # String columns of case sensitive and binary collations other than
+--echo # utf8mb4_bin.  FastBit compares the strings of these columns with the
+--echo # comparison function of the server, in the collation of the column, so
+--echo # the comparisons of the columns with string constants (=, <, <=, >,
+--echo # >=, BETWEEN and IN) are pushed down.  Every condition is also run
+--echo # against an identical InnoDB table and the results must match.
+--echo #
+--echo # utf8mb4_0900_as_cs orders 'a' < 'A' < 'b' and does not ignore the
+--echo # spaces at the end (NO PAD), utf8mb4_0900_bin compares the code points
+--echo # (NO PAD), latin1_general_cs and latin1_bin are latin1 collations that
+--echo # ignore the spaces at the end (PAD SPACE).
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE pool (k INT, s VARCHAR(20)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO pool VALUES
+  (1, ''),
+  (2, ' '),
+  (3, 'a'),
+  (4, 'a '),
+  (5, 'A'),
+  (6, 'b'),
+  (7, 'B'),
+  (8, 'ab'),
+  (9, 'Ab'),
+  (10, 'aB'),
+  (11, 'abc'),
+  (12, 'abc '),
+  (13, 'e'),
+  (14, 'E'),
+  (15, 'é'),
+  (16, 'É'),
+  (17, 'ß'),
+  (18, 'ss'),
+  (19, 'SS'),
+  (20, 'ä'),
+  (21, 'Ä'),
+  (22, 'ae'),
+  (23, 'Æ'),
+  (24, 'z'),
+  (25, 'Z'),
+  (26, 'ÿ'),
+  (27, 'a	'),
+  (28, '~'),
+  (29, 'MFGR#22'),
+  (30, 'mfgr#22'),
+  (31, 'a\''),
+  (32, 'a\\');
+
+CREATE TABLE w (
+  id INT,
+  cs VARCHAR(20) COLLATE utf8mb4_0900_as_cs,
+  csc CHAR(10) COLLATE utf8mb4_0900_as_cs,
+  csn VARCHAR(20) COLLATE utf8mb4_0900_as_cs NULL,
+  b9 VARCHAR(20) COLLATE utf8mb4_0900_bin,
+  l VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_general_cs,
+  lb VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_bin,
+  p INT
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO w WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 4000)
+  SELECT x, pool.s, pool.s, IF(x % 5 = 0, NULL, pool.s), pool.s,
+         CONVERT(pool.s USING latin1), CONVERT(pool.s USING latin1), x % 100
+  FROM seq JOIN pool ON pool.k = 1 + (x * 7) % 32;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO i SELECT * FROM w;
+SELECT COUNT(*), COUNT(csn), COUNT(DISTINCT cs), COUNT(DISTINCT l) FROM w;
+
+--echo #
+--echo # Every column compared with every string of the pool (the strings with
+--echo # a quote and a back slash are checked after the loops)
+--echo #
+let $checked = 0;
+let $wrong = 0;
+let $c = 0;
+while ($c < 6)
+{
+  inc $c;
+  if ($c == 1) { let $col = cs; }
+  if ($c == 2) { let $col = csc; }
+  if ($c == 3) { let $col = csn; }
+  if ($c == 4) { let $col = b9; }
+  if ($c == 5) { let $col = l; }
+  if ($c == 6) { let $col = lb; }
+  let $v = 0;
+  while ($v < 30)
+  {
+    inc $v;
+    let $lit = `SELECT QUOTE(s) FROM pool WHERE k = $v`;
+    let $o = 0;
+    while ($o < 7)
+    {
+      inc $o;
+      if ($o == 1) { let $cond = $col = $lit; }
+      if ($o == 2) { let $cond = $col < $lit; }
+      if ($o == 3) { let $cond = $col <= $lit; }
+      if ($o == 4) { let $cond = $col > $lit; }
+      if ($o == 5) { let $cond = $col >= $lit; }
+      if ($o == 6) { let $cond = $lit < $col; }
+      if ($o == 7) { let $cond = $col <=> $lit; }
+      let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $cond`;
+      let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $cond`;
+      inc $checked;
+      if ($w != $i)
+      {
+        inc $wrong;
+        --echo MISMATCH for WHERE $cond: WARP $w, InnoDB $i
+      }
+    }
+  }
+}
+--echo $checked comparisons checked, $wrong mismatches
+
+--echo #
+--echo # BETWEEN, IN lists of 1 to 5 strings, and comparisons combined with
+--echo # other conditions
+--echo #
+let $checked = 0;
+let $wrong = 0;
+let $c = 0;
+while ($c < 6)
+{
+  inc $c;
+  if ($c == 1) { let $col = cs; }
+  if ($c == 2) { let $col = csc; }
+  if ($c == 3) { let $col = csn; }
+  if ($c == 4) { let $col = b9; }
+  if ($c == 5) { let $col = l; }
+  if ($c == 6) { let $col = lb; }
+  let $a = 0;
+  while ($a < 30)
+  {
+    inc $a;
+    let $b = `SELECT 1 + ($a * 5) % 30`;
+    let $d = `SELECT 1 + ($a * 11) % 30`;
+    let $e = `SELECT 1 + ($a * 17) % 30`;
+    let $f = `SELECT 1 + ($a * 23) % 30`;
+    let $la = `SELECT QUOTE(s) FROM pool WHERE k = $a`;
+    let $lb = `SELECT QUOTE(s) FROM pool WHERE k = $b`;
+    let $k = 0;
+    while ($k < 9)
+    {
+      inc $k;
+      if ($k == 1) { let $cond = $col BETWEEN $la AND $lb; }
+      if ($k == 2) { let $cond = $col BETWEEN $lb AND $la; }
+      if ($k == 3) { let $cond = `SELECT CONCAT('$col IN (', GROUP_CONCAT(QUOTE(s) ORDER BY k), ')') FROM pool WHERE k IN ($a)`; }
+      if ($k == 4) { let $cond = `SELECT CONCAT('$col IN (', GROUP_CONCAT(QUOTE(s) ORDER BY k), ')') FROM pool WHERE k IN ($a, $b)`; }
+      if ($k == 5) { let $cond = `SELECT CONCAT('$col IN (', GROUP_CONCAT(QUOTE(s) ORDER BY k), ')') FROM pool WHERE k IN ($a, $b, $d)`; }
+      if ($k == 6) { let $cond = `SELECT CONCAT('$col IN (', GROUP_CONCAT(QUOTE(s) ORDER BY k), ')') FROM pool WHERE k IN ($a, $b, $d, $e, $f)`; }
+      if ($k == 7) { let $cond = `SELECT CONCAT('$col NOT IN (', GROUP_CONCAT(QUOTE(s) ORDER BY k), ')') FROM pool WHERE k IN ($a, $b, $d)`; }
+      if ($k == 8) { let $cond = $col >= $la AND $col < $lb AND p < 50; }
+      if ($k == 9) { let $cond = $col = $la OR $col = $lb OR p = 7; }
+      let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $cond`;
+      let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $cond`;
+      inc $checked;
+      if ($w != $i)
+      {
+        inc $wrong;
+        --echo MISMATCH for WHERE $cond: WARP $w, InnoDB $i
+      }
+    }
+  }
+}
+--echo $checked conditions checked, $wrong mismatches
+
+--echo # A quote and a back slash
+SELECT COUNT(*) > 0 AS quote_and_backslash,
+       COUNT(*) = (SELECT COUNT(*) FROM i WHERE cs IN ('a\'', 'a\\')) AS same_as_innodb
+  FROM w WHERE cs IN ('a\'', 'a\\');
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE l > 'a\'' AND lb <= 'a\\') AS same_as_innodb
+  FROM w WHERE l > 'a\'' AND lb <= 'a\\';
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE csn = 'a\\' OR b9 < 'a\'') AS same_as_innodb
+  FROM w WHERE csn = 'a\\' OR b9 < 'a\'';
+--echo # The collation decides: 'a' < 'A' < 'b' in utf8mb4_0900_as_cs, 'A' < 'B' < 'a' in utf8mb4_0900_bin
+SELECT COUNT(*) AS as_cs, COUNT(*) = (SELECT COUNT(*) FROM i WHERE cs > 'a' AND cs < 'b') AS same_as_innodb FROM w WHERE cs > 'a' AND cs < 'b';
+SELECT COUNT(*) AS bin, COUNT(*) = (SELECT COUNT(*) FROM i WHERE b9 > 'a' AND b9 < 'b') AS same_as_innodb FROM w WHERE b9 > 'a' AND b9 < 'b';
+SELECT DISTINCT cs FROM w WHERE cs > 'a' AND cs < 'b' ORDER BY cs;
+SELECT DISTINCT b9 FROM w WHERE b9 > 'A' AND b9 < 'b' ORDER BY b9;
+--echo # NO PAD: 'a ' is not 'a' in utf8mb4_0900_as_cs, PAD SPACE: it is in latin1_general_cs
+SELECT COUNT(DISTINCT id) = (SELECT COUNT(*) FROM i WHERE cs = 'a') AS no_pad FROM w WHERE cs = 'a';
+SELECT COUNT(*) = (SELECT COUNT(*) FROM w WHERE l = 'a') AS pad_space FROM w WHERE l IN ('a', 'a ');
+SELECT DISTINCT HEX(cs) FROM w WHERE cs IN ('a', 'a ') ORDER BY 1;
+
+--echo # Conditions in another collation than the one of the column are evaluated by
+--echo # MySQL, and strings that are not in the pool
+let $checked = 0;
+let $wrong = 0;
+let $k = 0;
+while ($k < 10)
+{
+  inc $k;
+  if ($k == 1) { let $cond = cs COLLATE utf8mb4_0900_ai_ci = 'A'; }
+  if ($k == 2) { let $cond = cs = 'A' COLLATE utf8mb4_0900_ai_ci; }
+  if ($k == 3) { let $cond = cs COLLATE utf8mb4_bin < 'b'; }
+  if ($k == 4) { let $cond = l COLLATE latin1_swedish_ci = 'A'; }
+  if ($k == 5) { let $cond = cs < '中'; }
+  if ($k == 6) { let $cond = b9 IN ('a', '中', 'ÿ'); }
+  if ($k == 7) { let $cond = cs = x'61'; }
+  if ($k == 8) { let $cond = cs BETWEEN 'a' AND 'b' COLLATE utf8mb4_0900_ai_ci; }
+  if ($k == 9) { let $cond = cs = b9; }
+  if ($k == 10) { let $cond = l = _latin1 'ä'; }
+  let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM w WHERE $cond`;
+  let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM i WHERE $cond`;
+  inc $checked;
+  if ($w != $i)
+  {
+    inc $wrong;
+    --echo MISMATCH for WHERE $cond: WARP $w, InnoDB $i
+  }
+}
+--echo $checked conditions checked, $wrong mismatches
+
+--echo # The conditions that FastBit evaluates have no Filter in the plan, the others do
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE cs = 'a';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE cs BETWEEN 'a' AND 'b';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE csn IN ('a', 'b', 'c');
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE 'B' > csc;
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE l >= 'ä' AND lb < 'b';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE cs COLLATE utf8mb4_0900_ai_ci = 'A';
+--replace_regex /\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE cs < '中';
+--echo # MySQL can not convert the constant to the character set of the column
+--error ER_CANNOT_CONVERT_STRING
+SELECT COUNT(*) FROM w WHERE l = '中';
+
+--echo #
+--echo # Indexes on columns of these collations: lookups and ranges are
+--echo # compared in the collation of the column
+--echo #
+CREATE TABLE wk (
+  id INT,
+  cs VARCHAR(20) COLLATE utf8mb4_0900_as_cs,
+  l VARCHAR(20) CHARACTER SET latin1 COLLATE latin1_general_cs NULL,
+  KEY (cs),
+  KEY (l, id)
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO wk SELECT id, cs, IF(id % 7 = 0, NULL, l) FROM w;
+CREATE TABLE ik LIKE wk;
+ALTER TABLE ik ENGINE=InnoDB;
+INSERT INTO ik SELECT * FROM wk;
+let $checked = 0;
+let $wrong = 0;
+let $v = 0;
+while ($v < 30)
+{
+  inc $v;
+  let $lit = `SELECT QUOTE(s) FROM pool WHERE k = $v`;
+  let $lit2 = `SELECT QUOTE(s) FROM pool WHERE k = 1 + ($v * 5) % 30`;
+  let $k = 0;
+  while ($k < 6)
+  {
+    inc $k;
+    if ($k == 1) { let $ix = cs; let $cond = cs = $lit; }
+    if ($k == 2) { let $ix = cs; let $cond = cs > $lit; }
+    if ($k == 3) { let $ix = cs; let $cond = cs BETWEEN $lit AND $lit2; }
+    if ($k == 4) { let $ix = l; let $cond = l = $lit AND id > 100; }
+    if ($k == 5) { let $ix = l; let $cond = l <= $lit; }
+    if ($k == 6) { let $ix = cs; let $cond = cs LIKE CONCAT($lit, '%'); }
+    let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM wk FORCE INDEX ($ix) WHERE $cond`;
+    let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(id), 0)) FROM ik FORCE INDEX ($ix) WHERE $cond`;
+    inc $checked;
+    if ($w != $i)
+    {
+      inc $wrong;
+      --echo MISMATCH for FORCE INDEX ($ix) WHERE $cond: WARP $w, InnoDB $i
+    }
+  }
+}
+--echo $checked index reads checked, $wrong mismatches
+--echo # A join that looks up the rows of wk by the value of another table
+SELECT COUNT(*) = (SELECT COUNT(*) FROM pool JOIN ik ON ik.cs = pool.s COLLATE utf8mb4_0900_as_cs)
+  AS join_matches FROM pool JOIN wk FORCE INDEX (cs) ON wk.cs = pool.s COLLATE utf8mb4_0900_as_cs;
+
+--echo #
+--echo # The collations that WARP can not compare like MySQL are refused:
+--echo # case insensitive collations, binary strings and character sets in
+--echo # which a character may have a 0 byte
+--echo #
+--error ER_ILLEGAL_HA
+CREATE TABLE bad (v VARCHAR(10) COLLATE utf8mb4_0900_ai_ci) ENGINE=WARP;
+--error ER_ILLEGAL_HA
+CREATE TABLE bad (v VARCHAR(10) CHARACTER SET latin1 COLLATE latin1_swedish_ci) ENGINE=WARP;
+--error ER_ILLEGAL_HA
+CREATE TABLE bad (v VARCHAR(10) CHARACTER SET utf16 COLLATE utf16_bin) ENGINE=WARP;
+--error ER_ILLEGAL_HA
+CREATE TABLE bad (v VARBINARY(10)) ENGINE=WARP;
+CREATE TABLE good (a VARCHAR(10) CHARACTER SET ascii COLLATE ascii_bin,
+                   b TEXT COLLATE utf8mb4_0900_as_cs,
+                   c CHAR(5) CHARACTER SET latin1 COLLATE latin1_general_cs) ENGINE=WARP;
+INSERT INTO good VALUES ('x', 'Ab', 'Äb'), ('X', 'ab', 'äb');
+SELECT * FROM good WHERE a = 'X';
+SELECT * FROM good WHERE c > 'Äb' ORDER BY a;
+SELECT * FROM good WHERE b = 'ab';
+
+DROP TABLE w, i, wk, ik, good, pool;

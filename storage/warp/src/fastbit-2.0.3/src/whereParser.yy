@@ -58,6 +58,7 @@
 %token <integerVal> BETWEENOP	"between"
 %token <integerVal> CONTAINSOP	"contains"
 %token <integerVal> DECIMALOP	"decimal_cmp"
+%token <integerVal> COLLATEOP	"collate_N"
 %token <integerVal> EXISTSOP	"exists"
 %token <integerVal> INOP	"in"
 %token <integerVal> LIKEOP	"like"
@@ -126,13 +127,27 @@ static std::string listValue(const std::string &lit) {
     return res;
 }
 
+/* The number of a collation, collate_N, that the strings are compared in.
+   The program has to give FastBit the functions that compare the strings
+   of the collations (ibis::util::setCollationFunctions). */
+static uint32_t collationNumber(int coll) {
+    if (coll <= 0 || ! ibis::util::haveCollations()) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "whereParser.yy: can not compare strings in the collation "
+            << coll;
+        throw "Unknown collation";
+    }
+    return static_cast<uint32_t>(coll);
+}
+
 /* Builds the comparison of a column with string literals, "name op 'lo'" or
-   "name between 'lo' and 'hi'".  The expression on the left has to be the
-   name of a column.  It and the strings are deleted. */
+   "name between 'lo' and 'hi'", in the collation coll (0 is the default
+   one).  The expression on the left has to be the name of a column.  It and
+   the strings are deleted. */
 static ibis::qExpr* stringCompare(ibis::qExpr *left,
                                   ibis::qString::COMPARE op,
                                   std::string *lo, std::string *hi,
-                                  bool dec=false) {
+                                  bool dec=false, uint32_t coll=0) {
     ibis::math::variable *var = dynamic_cast<ibis::math::variable*>(left);
     if (var == 0) {
         LOGGER(ibis::gVerbose >= 0)
@@ -155,8 +170,9 @@ static ibis::qExpr* stringCompare(ibis::qExpr *left,
         throw "decimal_cmp expects decimal numbers";
     }
     ibis::qExpr *ret = (hi != 0 ?
-        new ibis::qString(var->variableName(), lo->c_str(), hi->c_str(), dec) :
-        new ibis::qString(var->variableName(), op, lo->c_str(), dec));
+        new ibis::qString(var->variableName(), lo->c_str(), hi->c_str(), dec,
+                          coll) :
+        new ibis::qString(var->variableName(), op, lo->c_str(), dec, coll));
     delete hi;
     delete lo;
     delete var;
@@ -412,6 +428,29 @@ EXISTSOP NOUNSTR {
     $$ = new ibis::qAnyString($1->c_str(), val.c_str());
     delete $4;
     delete $1;
+}
+| COLLATEOP NOUNSTR INOP STRSEQ {
+    const uint32_t coll = collationNumber($1);
+    $$ = new ibis::qAnyString($2->c_str(), $4->c_str(), coll);
+    delete $4;
+    delete $2;
+}
+| COLLATEOP NOUNSTR INOP '(' STRLIT ',' STRLIT ')' {
+    const uint32_t coll = collationNumber($1);
+    std::string val;
+    val = listValue(*$5) + ", " + listValue(*$7);
+    $$ = new ibis::qAnyString($2->c_str(), val.c_str(), coll);
+    delete $7;
+    delete $5;
+    delete $2;
+}
+| COLLATEOP NOUNSTR INOP '(' STRLIT ')' {
+    const uint32_t coll = collationNumber($1);
+    std::string val;
+    val = listValue(*$5);
+    $$ = new ibis::qAnyString($2->c_str(), val.c_str(), coll);
+    delete $5;
+    delete $2;
 }
 | NOUNSTR LIKEOP NOUNSTR {
 #if defined(DEBUG) && DEBUG + 0 > 1
@@ -1010,6 +1049,30 @@ mathExpr LTOP INT64 {
 }
 | DECIMALOP mathExpr BETWEENOP STRLIT ANDOP STRLIT {
     $$ = stringCompare($2, ibis::qString::STR_BETWEEN, $4, $6, true);
+}
+| COLLATEOP mathExpr EQOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_EQ, $4, 0, false,
+                       collationNumber($1));
+}
+| COLLATEOP mathExpr LTOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_LT, $4, 0, false,
+                       collationNumber($1));
+}
+| COLLATEOP mathExpr LEOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_LE, $4, 0, false,
+                       collationNumber($1));
+}
+| COLLATEOP mathExpr GTOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_GT, $4, 0, false,
+                       collationNumber($1));
+}
+| COLLATEOP mathExpr GEOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_GE, $4, 0, false,
+                       collationNumber($1));
+}
+| COLLATEOP mathExpr BETWEENOP STRLIT ANDOP STRLIT {
+    $$ = stringCompare($2, ibis::qString::STR_BETWEEN, $4, $6, false,
+                       collationNumber($1));
 }
 ;
 

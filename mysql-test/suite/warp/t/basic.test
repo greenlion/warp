@@ -5,7 +5,7 @@
 SELECT ENGINE, SUPPORT, TRANSACTIONS FROM INFORMATION_SCHEMA.ENGINES
 WHERE ENGINE = 'WARP';
 
---echo # String columns must use utf8mb4_bin
+--echo # String columns must use a case sensitive or binary collation
 --error ER_ILLEGAL_HA
 CREATE TABLE t_bad (c VARCHAR(10)) ENGINE=WARP
   DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;

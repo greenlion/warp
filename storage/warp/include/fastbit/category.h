@@ -45,7 +45,10 @@ public:
     virtual long stringSearch(const std::vector<std::string>& strs) const;
     virtual long stringRangeSearch(const char* lo, bool loIncl,
                                    const char* hi, bool hiIncl,
-                                   ibis::bitvector& hits) const;
+                                   ibis::bitvector& hits,
+                                   uint32_t coll=0) const;
+    virtual long collatedSearch(const std::vector<std::string>& strs,
+                                uint32_t coll, ibis::bitvector& hits) const;
     virtual long decimalRangeSearch(const char* lo, bool loIncl,
                                     const char* hi, bool hiIncl,
                                     ibis::bitvector& hits) const;
@@ -103,10 +106,10 @@ public:
 
 protected:
 
-    /// Scan the strings for those in the range, compared as strings or as
-    /// decimal numbers.
+    /// Scan the strings for those in the range, compared as strings in
+    /// the collation coll or as decimal numbers.
     long scanRange(const char* lo, bool loIncl, const char* hi, bool hiIncl,
-                   bool decimal, ibis::bitvector& hits) const;
+                   bool decimal, uint32_t coll, ibis::bitvector& hits) const;
     /// Mark the rows of the strings that the function accepts.
     long scanStrings(const std::function<bool(const char*, size_t)>& match,
                      const char* what, ibis::bitvector& hits) const;
@@ -158,7 +161,10 @@ public:
     virtual long stringSearch(const std::vector<std::string>& vals) const;
     virtual long stringRangeSearch(const char* lo, bool loIncl,
                                    const char* hi, bool hiIncl,
-                                   ibis::bitvector& hits) const;
+                                   ibis::bitvector& hits,
+                                   uint32_t coll=0) const;
+    virtual long collatedSearch(const std::vector<std::string>& strs,
+                                uint32_t coll, ibis::bitvector& hits) const;
 
     virtual long patternSearch(const char* pat) const;
     virtual long patternSearch(const char* pat, ibis::bitvector &hits) const;

@@ -772,11 +772,12 @@ long ibis::category::stringSearch(const char* str) const {
 } // ibis::category::stringSearch
 
 /// Find the strings in the range between lo and hi by comparing them with
-/// the strings of the dictionary, then adding up the bitmaps of the
-/// qualified codes.  See ibis::text::stringRangeSearch.
+/// the strings of the dictionary in the collation coll, then adding up the
+/// bitmaps of the qualified codes.  See ibis::text::stringRangeSearch.
 long ibis::category::stringRangeSearch(const char* lo, bool loIncl,
                                        const char* hi, bool hiIncl,
-                                       ibis::bitvector& hits) const {
+                                       ibis::bitvector& hits,
+                                       uint32_t coll) const {
     hits.clear();
     if (thePart == 0) return -1;
     if (idx == 0) prepareMembers();
@@ -796,7 +797,7 @@ long ibis::category::stringRangeSearch(const char* lo, bool loIncl,
     }
 
     ibis::array_t<uint32_t> tmp;
-    dic.rangeSearch(lo, loIncl, hi, hiIncl, tmp);
+    dic.rangeSearch(lo, loIncl, hi, hiIncl, tmp, coll);
     if (tmp.empty()) {
         hits.set(0, thePart->nRows());
         return 0;
@@ -804,6 +805,28 @@ long ibis::category::stringRangeSearch(const char* lo, bool loIncl,
     rlc->sumBins(tmp, hits);
     return hits.sloppyCount();
 } // ibis::category::stringRangeSearch
+
+/// Find the strings that are equal to one of strs in the collation coll:
+/// the strings of the dictionary that are equal to one of them.
+long ibis::category::collatedSearch(const std::vector<std::string>& strs,
+                                    uint32_t coll,
+                                    ibis::bitvector& hits) const {
+    hits.clear();
+    if (thePart == 0) return -1;
+    hits.set(0, thePart->nRows());
+    for (size_t i = 0; i < strs.size(); ++ i) {
+        ibis::bitvector one;
+        const long ierr = stringRangeSearch(strs[i].c_str(), true,
+                                            strs[i].c_str(), true, one, coll);
+        if (ierr < 0) {
+            hits.clear();
+            return ierr;
+        }
+        if (ierr > 0)
+            hits |= one;
+    }
+    return hits.sloppyCount();
+} // ibis::category::collatedSearch
 
 double ibis::category::estimateCost(const ibis::qString& qstr) const {
     double ret;
@@ -2034,8 +2057,9 @@ long ibis::text::stringSearch(const char* str, ibis::bitvector& hits) const {
 /// negative number.  The null mask of the column is not applied.
 long ibis::text::stringRangeSearch(const char* lo, bool loIncl,
                                    const char* hi, bool hiIncl,
-                                   ibis::bitvector& hits) const {
-    return scanRange(lo, loIncl, hi, hiIncl, false, hits);
+                                   ibis::bitvector& hits,
+                                   uint32_t coll) const {
+    return scanRange(lo, loIncl, hi, hiIncl, false, coll, hits);
 }
 
 /// Find the decimal numbers, stored as text, in the range between lo and
@@ -2046,12 +2070,12 @@ long ibis::text::decimalRangeSearch(const char* lo, bool loIncl,
                                     ibis::bitvector& hits) const {
     hits.clear();
     if (m_type != ibis::TEXT) return -1L; // category is dictionary coded
-    return scanRange(lo, loIncl, hi, hiIncl, true, hits);
+    return scanRange(lo, loIncl, hi, hiIncl, true, 0, hits);
 }
 
 long ibis::text::scanRange(const char* lo, bool loIncl,
                            const char* hi, bool hiIncl, bool decimal,
-                           ibis::bitvector& hits) const {
+                           uint32_t coll, ibis::bitvector& hits) const {
     const size_t llen = (lo != 0 ? std::strlen(lo) : 0);
     const size_t hlen = (hi != 0 ? std::strlen(hi) : 0);
     return scanStrings(
@@ -2059,14 +2083,14 @@ long ibis::text::scanRange(const char* lo, bool loIncl,
             if (lo != 0) {
                 const int c = (decimal ?
                     ibis::util::decimalCompare(str, len, lo, llen) :
-                    ibis::util::padSpaceCompare(str, len, lo, llen));
+                    ibis::util::collationCompare(coll, str, len, lo, llen));
                 if (c < 0 || (c == 0 && ! loIncl))
                     return false;
             }
             if (hi != 0) {
                 const int c = (decimal ?
                     ibis::util::decimalCompare(str, len, hi, hlen) :
-                    ibis::util::padSpaceCompare(str, len, hi, hlen));
+                    ibis::util::collationCompare(coll, str, len, hi, hlen));
                 if (c > 0 || (c == 0 && ! hiIncl))
                     return false;
             }
@@ -2212,6 +2236,47 @@ long ibis::text::stringSearch(const std::vector<std::string>& strs,
             return wanted.find(std::string_view(str, len)) != wanted.end();
         }, "stringSearch", hits);
 } // ibis::text::stringSearch
+
+/// Locate the rows that match any of the given strings in the collation
+/// coll (see ibis::util::collationCompare).  The strings are looked up by
+/// their hash value in the collation, then compared in it, so the column is
+/// read once, whatever the number of strings.
+long ibis::text::collatedSearch(const std::vector<std::string>& strs,
+                                uint32_t coll, ibis::bitvector& hits) const {
+    if (strs.empty()) {
+        hits.clear();
+        if (thePart != 0)
+            hits.set(0, thePart->nRows());
+        return 0;
+    }
+    if (strs.size() == 1)
+        return stringRangeSearch(strs[0].c_str(), true, strs[0].c_str(), true,
+                                 hits, coll);
+
+    struct hasher {
+        uint32_t coll;
+        size_t operator()(const std::string_view& s) const {
+            return static_cast<size_t>
+                (ibis::util::collationHash(coll, s.data(), s.size()));
+        }
+    };
+    struct equal {
+        uint32_t coll;
+        bool operator()(const std::string_view& a,
+                        const std::string_view& b) const {
+            return ibis::util::collationCompare(coll, a.data(), a.size(),
+                                                b.data(), b.size()) == 0;
+        }
+    };
+    std::unordered_set<std::string_view, hasher, equal>
+        wanted(strs.size(), hasher{coll}, equal{coll});
+    for (size_t i = 0; i < strs.size(); ++ i)
+        wanted.insert(std::string_view(strs[i].data(), strs[i].size()));
+    return scanStrings(
+        [&wanted](const char* str, size_t len) {
+            return wanted.find(std::string_view(str, len)) != wanted.end();
+        }, "collatedSearch", hits);
+} // ibis::text::collatedSearch
 
 long ibis::text::patternSearch(const char*) const {
     return (thePart ? thePart->nRows() : INT_MAX);

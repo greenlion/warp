@@ -724,6 +724,35 @@ namespace ibis {
         FASTBIT_CXX_DLLSPEC int padSpaceCompare(const char* a, size_t alen,
                                                 const char* b, size_t blen);
 
+        /// A function that compares two strings in a collation, which is
+        /// identified by a number that FastBit does not interpret (MySQL
+        /// uses the number of the collation).  Returns a negative, zero or
+        /// positive value if a is less than, equal to or greater than b.
+        typedef int (*collationCompareFn)(uint32_t coll,
+                                          const char* a, size_t alen,
+                                          const char* b, size_t blen);
+        /// A function that hashes a string in a collation: the strings
+        /// that the compare function finds equal have the same hash value.
+        typedef uint64_t (*collationHashFn)(uint32_t coll,
+                                            const char* a, size_t alen);
+        /// Set the functions that compare and hash the strings of the
+        /// collations other than the default one.  The program that uses
+        /// FastBit provides them, before any query uses a collation.
+        FASTBIT_CXX_DLLSPEC void setCollationFunctions(collationCompareFn cmp,
+                                                       collationHashFn hash);
+        /// Have the collation functions been set?
+        FASTBIT_CXX_DLLSPEC bool haveCollations();
+        /// Compare two strings in the collation coll.  The collation 0 is
+        /// the default one, padSpaceCompare.  The others are compared by
+        /// the function given to setCollationFunctions.
+        FASTBIT_CXX_DLLSPEC int collationCompare(uint32_t coll,
+                                                 const char* a, size_t alen,
+                                                 const char* b, size_t blen);
+        /// Hash a string in the collation coll, consistently with
+        /// collationCompare: equal strings have the same hash value.
+        FASTBIT_CXX_DLLSPEC uint64_t collationHash(uint32_t coll,
+                                                   const char* a, size_t alen);
+
         /// Compare two decimal numbers written as text, such as "-5.25",
         /// "10.50" or "9": an optional sign, digits, and optionally a
         /// decimal point followed by digits.  The numbers are compared by

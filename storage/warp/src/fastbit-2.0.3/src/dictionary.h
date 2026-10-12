@@ -55,7 +55,8 @@ public:
     const char* find(const char* str) const;
     void patternSearch(const char* pat, array_t<uint32_t>& matches) const;
     void rangeSearch(const char* lo, bool loIncl, const char* hi,
-                     bool hiIncl, array_t<uint32_t>& matches) const;
+                     bool hiIncl, array_t<uint32_t>& matches,
+                     uint32_t coll=0) const;
 
     uint32_t insert(const char*, uint32_t);
     uint32_t insert(const char*);

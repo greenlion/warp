@@ -87,6 +87,10 @@ NAME	[_a-zA-Z]((->)?[0-9A-Za-z_:.]+)*(\[[^\]]+\])?
 [bB][eE][tT][wW][eE][eE][nN] {return token::BETWEENOP;}
 [cC][oO][nN][tT][aA][iI][nN][sS] {return token::CONTAINSOP;}
 [dD][eE][cC][iI][mM][aA][lL]_[cC][mM][pP] {return token::DECIMALOP;}
+[cC][oO][lL][lL][aA][tT][eE]_[0-9]+ { /* collate_N, the collation N */
+    yylval->integerVal = atoi(yytext + 8);
+    return token::COLLATEOP;
+}
 [iI][sS][oO]_[tT][oO]_[uU][nN][iI][xX][tT][iI][mM][eE]_[gG][mM][tT] {return token::ISO_TO_UNIXTIME_GMT;}
 [iI][sS][oO]_[tT][oO]_[uU][nN][iI][xX][tT][iI][mM][eE]_[lL][oO][cC][aA][lL] {return token::ISO_TO_UNIXTIME_LOCAL;}
 [tT][oO]_[uU][nN][iI][xX][tT][iI][mM][eE]_[gG][mM][tT] {return token::TO_UNIXTIME_GMT;}

@@ -942,6 +942,46 @@ int ibis::util::padSpaceCompare(const char* a, size_t alen,
 } // ibis::util::padSpaceCompare
 
 namespace {
+    // set once by the program, before the queries that use collations
+    std::atomic<ibis::util::collationCompareFn> collation_cmp(nullptr);
+    std::atomic<ibis::util::collationHashFn> collation_hash(nullptr);
+}
+
+void ibis::util::setCollationFunctions(collationCompareFn cmp,
+                                       collationHashFn hash) {
+    collation_cmp.store(cmp);
+    collation_hash.store(hash);
+}
+
+bool ibis::util::haveCollations() {
+    return collation_cmp.load() != nullptr && collation_hash.load() != nullptr;
+}
+
+int ibis::util::collationCompare(uint32_t coll, const char* a, size_t alen,
+                                 const char* b, size_t blen) {
+    const collationCompareFn cmp = (coll != 0 ? collation_cmp.load() : nullptr);
+    if (cmp == nullptr)
+        return padSpaceCompare(a, alen, b, blen);
+    const int c = cmp(coll, a, alen, b, blen);
+    return (c < 0 ? -1 : (c > 0 ? 1 : 0));
+} // ibis::util::collationCompare
+
+uint64_t ibis::util::collationHash(uint32_t coll, const char* a,
+                                   size_t alen) {
+    const collationHashFn hash = (coll != 0 ? collation_hash.load() : nullptr);
+    if (hash != nullptr)
+        return hash(coll, a, alen);
+    // padSpaceCompare: the spaces at the end do not count (FNV-1a)
+    while (alen > 0 && a[alen-1] == ' ') -- alen;
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < alen; ++ i) {
+        h ^= static_cast<unsigned char>(a[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+} // ibis::util::collationHash
+
+namespace {
     // a decimal number split into the sign and the significant digits
     struct DecimalParts {
         bool neg;

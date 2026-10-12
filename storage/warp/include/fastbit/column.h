@@ -239,11 +239,18 @@ public:
     virtual long stringSearch(const std::vector<std::string>&,
 			      ibis::bitvector&) const;
     virtual long stringSearch(const char*) const;
-    /// Find the strings in the range between lo and hi, compared like
-    /// ibis::util::padSpaceCompare.  A null bound is no bound.
+    /// Find the strings in the range between lo and hi, compared in the
+    /// collation coll (see ibis::util::collationCompare), the default
+    /// one compares like ibis::util::padSpaceCompare.  A null bound is no
+    /// bound.
     virtual long stringRangeSearch(const char* lo, bool loIncl,
                                    const char* hi, bool hiIncl,
-                                   ibis::bitvector& hits) const;
+                                   ibis::bitvector& hits,
+                                   uint32_t coll=0) const;
+    /// Find the strings that are equal to one of strs in the collation
+    /// coll (see ibis::util::collationCompare).
+    virtual long collatedSearch(const std::vector<std::string>& strs,
+                                uint32_t coll, ibis::bitvector& hits) const;
     /// Find the decimal numbers, stored as text, in the range between lo
     /// and hi, compared by value (ibis::util::decimalCompare).  A null
     /// bound is no bound.  Only the text columns support it.

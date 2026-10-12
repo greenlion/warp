@@ -1829,16 +1829,18 @@ bool ibis::qContinuousRange::overlap(double lo, double hi) const {
 /// passing the second argument to later operations.
 ibis::qString::qString(const char* ls, const char* rs) :
     qExpr(ibis::qExpr::STRING), lstr(ibis::util::strnewdup(ls)),
-    rstr(unescape(rs)), ustr(0), cmp_(STR_EQ), dec_(false) {}
+    rstr(unescape(rs)), ustr(0), cmp_(STR_EQ), dec_(false), coll_(0) {}
 
-ibis::qString::qString(const char* ls, COMPARE op, const char* rs, bool dec) :
+ibis::qString::qString(const char* ls, COMPARE op, const char* rs, bool dec,
+                       uint32_t coll) :
     qExpr(ibis::qExpr::STRING), lstr(ibis::util::strnewdup(ls)),
-    rstr(unescape(rs)), ustr(0), cmp_(op), dec_(dec) {}
+    rstr(unescape(rs)), ustr(0), cmp_(op), dec_(dec), coll_(coll) {}
 
 ibis::qString::qString(const char* ls, const char* lo, const char* hi,
-                       bool dec) :
+                       bool dec, uint32_t coll) :
     qExpr(ibis::qExpr::STRING), lstr(ibis::util::strnewdup(ls)),
-    rstr(unescape(lo)), ustr(unescape(hi)), cmp_(STR_BETWEEN), dec_(dec) {}
+    rstr(unescape(lo)), ustr(unescape(hi)), cmp_(STR_BETWEEN), dec_(dec),
+    coll_(coll) {}
 
 /// Returns a copy of the string without the back slashes that are used as
 /// escape characters.
@@ -1864,6 +1866,7 @@ char* ibis::qString::unescape(const char* rs) {
 void ibis::qString::print(std::ostream& out) const {
     if (lstr && rstr) {
         if (dec_) out << "decimal_cmp ";
+        if (coll_ != 0) out << "collate_" << coll_ << ' ';
         switch (cmp_) {
         default:
         case STR_EQ:
@@ -3973,8 +3976,9 @@ void ibis::qExists::printFull(std::ostream& out) const {
     out << "EXISTS(" << name << ')';
 } // ibis::qExists::printFull
 
-ibis::qAnyString::qAnyString(const char *col, const char *sval)
-    : ibis::qExpr(ibis::qExpr::ANYSTRING) {
+ibis::qAnyString::qAnyString(const char *col, const char *sval,
+                             uint32_t coll)
+    : ibis::qExpr(ibis::qExpr::ANYSTRING), coll_(coll) {
     if (col == 0 || *col == 0) return;
     name = col;
     if (sval == 0 || *sval == 0) return;
@@ -4025,6 +4029,7 @@ ibis::qAnyString::qAnyString(const char *col, const char *sval)
 
 void ibis::qAnyString::print(std::ostream& out) const {
     if (name.empty()) return;
+    if (coll_ != 0) out << "collate_" << coll_ << ' ';
     out << name << " IN (";
     //     std::copy(values.begin(), values.end(),
     //        std::ostream_iterator<std::string>(out, ", "));
@@ -4050,9 +4055,16 @@ ibis::qExpr* ibis::qAnyString::convert() const {
             esc[i] += *c;
         }
     }
-    ibis::qExpr *ret = new ibis::qString(name.c_str(), esc[0].c_str());
+    // in a collation the equality is a comparison of its own
+    ibis::qExpr *ret = (coll_ == 0 ?
+        new ibis::qString(name.c_str(), esc[0].c_str()) :
+        new ibis::qString(name.c_str(), ibis::qString::STR_EQ,
+                          esc[0].c_str(), false, coll_));
     for (uint32_t i = 1; i < values.size(); ++ i) {
-        ibis::qExpr *rhs = new ibis::qString(name.c_str(), esc[i].c_str());
+        ibis::qExpr *rhs = (coll_ == 0 ?
+            new ibis::qString(name.c_str(), esc[i].c_str()) :
+            new ibis::qString(name.c_str(), ibis::qString::STR_EQ,
+                              esc[i].c_str(), false, coll_));
         ibis::qExpr *op = new ibis::qExpr(ibis::qExpr::LOGICAL_OR);
         op->setRight(rhs);
         op->setLeft(ret);
