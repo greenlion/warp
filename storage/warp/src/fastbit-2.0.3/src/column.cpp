@@ -6253,7 +6253,10 @@ long ibis::column::evaluateRange(const ibis::qContinuousRange& cmp,
                     LOGGER(ibis::gVerbose > 2)
                         << evt << " -- estimated cost with index = "
                         << icost << ", with sequential scan = " << scost;
-                    if (icost < scost) {
+                    // The data files are compressed and the cost of the
+                    // scan is the size of the column in memory, so the
+                    // index is used unless it is much larger than the data.
+                    if (icost < 5.0 * scost) {
                         idx->estimate(cmp, low, high);
                     }
                 }
