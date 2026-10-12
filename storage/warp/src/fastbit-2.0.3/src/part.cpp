@@ -21014,6 +21014,11 @@ unsigned ibis::util::gatherParts(ibis::partList &tlist, const char *dir1,
             continue;
         }
 
+#if defined(DT_REG) && defined(DT_DIR)
+        // the directory entry knows what it is: do not stat the (many) files
+        // of a data partition to find out that they are not directories
+        if (ent->d_type == DT_REG) continue;
+#endif
         sprintf(nm1, "%s%c%s", dir1, FASTBIT_DIRSEP, ent->d_name);
         Stat_T st1;
         if (UnixStat(nm1, &st1)==0) {
