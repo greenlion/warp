@@ -3746,9 +3746,8 @@ int ha_warp::rnd_pos(uchar *buf, uchar *pos) {
    can be turned into an exact FastBit condition. */
 static bool warp_key_part_supported(const KEY_PART_INFO *kp) {
   const Field *f = kp->field;
-  if(f->is_virtual_gcol()) {
-    return false;
-  }
+  /* a virtual generated column (the hidden column of a functional index,
+     for example) is stored like the other columns, see table_flags */
   /* no prefix keys */
   if(kp->key_part_flag & HA_PART_KEY_SEG) {
     return false;
@@ -4928,17 +4927,12 @@ int ha_warp::append_column_filter(const Item *cond,
         
         if(arg[arg_num]->used_tables() == 0) continue;
         
-        auto str = ItemToString(arg[arg_num]);
-        const char* dot_pos = strstr(str.c_str(), ".");
-        const char* dot_pos2 = strstr(dot_pos+1, ".");
-        std::string alias;
-        //ssb.lineorder.LO_Quantity
-        if(dot_pos2 != NULL) {
-          alias=str.substr(dot_pos - str.c_str()+1, dot_pos2 - dot_pos -1);
-        } else {
-          alias=str.substr(0, dot_pos - str.c_str());
-        }
-        if(std::string(table->alias) != alias) {
+        /* the alias of the table of the column (the name of the column, as
+           it is printed, is not always qualified: the hidden column of a
+           functional index is printed as its expression) */
+        const Field *col = down_cast<Item_field *>(arg[arg_num])->field;
+        if(col == nullptr || col->table == nullptr ||
+           strcmp(table->alias, col->table->alias) != 0) {
           return 0;
         }
       }

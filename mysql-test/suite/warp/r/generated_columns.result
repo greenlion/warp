@@ -1,0 +1,125 @@
+#
+# Generated columns (stored and virtual) and functional indexes.  WARP
+# stores the generated columns like the other columns; the server
+# computes them for an insert, and for an update the ones that change.
+# The conditions on generated columns are pushed down, and the indexes
+# on them (the hidden column of a functional index included) are
+# evaluated on the stored values.  Every result is compared with an
+# identical InnoDB table.
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE w (
+id INT NOT NULL,
+a INT,
+s VARCHAR(20),
+p INT,
+g INT AS (a * 2) STORED,
+v INT AS (a + p) VIRTUAL,
+vs VARCHAR(30) AS (CONCAT(s, '-', a)) VIRTUAL,
+vn INT AS (IF(a % 3 = 0, NULL, a)) VIRTUAL,
+gd DATE AS (DATE_ADD('2020-01-01', INTERVAL a DAY)) STORED,
+KEY (v),
+KEY (vs),
+KEY f1 ((a * 3)),
+KEY f2 ((LEFT(s, 2)), p),
+KEY f3 ((p - a))
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+SHOW CREATE TABLE w;
+Table	Create Table
+w	CREATE TABLE `w` (
+  `id` int NOT NULL,
+  `a` int DEFAULT NULL,
+  `s` varchar(20) COLLATE utf8mb4_bin DEFAULT NULL,
+  `p` int DEFAULT NULL,
+  `g` int GENERATED ALWAYS AS ((`a` * 2)) STORED,
+  `v` int GENERATED ALWAYS AS ((`a` + `p`)) VIRTUAL,
+  `vs` varchar(30) COLLATE utf8mb4_bin GENERATED ALWAYS AS (concat(`s`,_utf8mb4'-',`a`)) VIRTUAL,
+  `vn` int GENERATED ALWAYS AS (if(((`a` % 3) = 0),NULL,`a`)) VIRTUAL,
+  `gd` date GENERATED ALWAYS AS ((_utf8mb4'2020-01-01' + interval `a` day)) STORED,
+  KEY `v` (`v`),
+  KEY `vs` (`vs`),
+  KEY `f1` (((`a` * 3))),
+  KEY `f2` ((left(`s`,2)),`p`),
+  KEY `f3` (((`p` - `a`)))
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+INSERT INTO w (id, a, s, p) WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 3000)
+SELECT x, x % 97, CONCAT(CHAR(97 + x % 26), CHAR(65 + x % 7), x % 13), x % 50 FROM seq;
+CREATE TABLE i LIKE w;
+ALTER TABLE i ENGINE=InnoDB;
+INSERT INTO i (id, a, s, p) SELECT id, a, s, p FROM w;
+same rows: 1
+SELECT * FROM w ORDER BY id LIMIT 5;
+id	a	s	p	g	v	vs	vn	gd
+1	1	bB1	1	2	2	bB1-1	1	2020-01-02
+2	2	cC2	2	4	4	cC2-2	2	2020-01-03
+3	3	dD3	3	6	6	dD3-3	NULL	2020-01-04
+4	4	eE4	4	8	8	eE4-4	4	2020-01-05
+5	5	fF5	5	10	10	fF5-5	5	2020-01-06
+# Conditions on generated columns, and lookups through their indexes
+24 conditions checked, 0 mismatches
+# A condition on the expression of a functional index is evaluated by
+# FastBit on its hidden column (no Filter in the plan)
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE a * 3 = 30;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w IGNORE INDEX (f1) WHERE g = 40 AND v > 10;
+EXPLAIN
+-> Aggregate: count(0)  
+    -> Table scan on w  
+
+#
+# Updates: of a base column (the generated columns change), and of a
+# column that no generated column depends on (the stored values of the
+# generated columns must stay right)
+#
+UPDATE w SET a = a + 1 WHERE id % 10 = 0;
+UPDATE i SET a = a + 1 WHERE id % 10 = 0;
+UPDATE w SET id = id + 10000 WHERE id % 7 = 0;
+UPDATE i SET id = id + 10000 WHERE id % 7 = 0;
+UPDATE w SET p = p + 3 WHERE id % 11 = 0;
+UPDATE i SET p = p + 3 WHERE id % 11 = 0;
+UPDATE w SET s = UPPER(s) WHERE id % 13 = 0;
+UPDATE i SET s = UPPER(s) WHERE id % 13 = 0;
+DELETE FROM w WHERE id % 17 = 0;
+DELETE FROM i WHERE id % 17 = 0;
+same rows: 1
+8 conditions checked, 0 mismatches
+#
+# ALTER TABLE: a new virtual column and an index on it, a new functional
+# index, and an index on an existing virtual column added in place
+#
+ALTER TABLE w ADD COLUMN v2 INT AS (a * p) VIRTUAL;
+ALTER TABLE i ADD COLUMN v2 INT AS (a * p) VIRTUAL;
+ALTER TABLE w ADD INDEX f4 ((a + 1000));
+ALTER TABLE i ADD INDEX f4 ((a + 1000));
+ALTER TABLE w ADD INDEX (v2), ALGORITHM=INPLACE;
+ALTER TABLE i ADD INDEX (v2);
+ALTER TABLE w DROP INDEX f3;
+ALTER TABLE i DROP INDEX f3;
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i FORCE INDEX (v2) WHERE v2 BETWEEN 100 AND 200)
+AS v2_index FROM w FORCE INDEX (v2) WHERE v2 BETWEEN 100 AND 200;
+v2_index
+1
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE a + 1000 = 1050)
+AS f4_index FROM w FORCE INDEX (f4) WHERE a + 1000 = 1050;
+f4_index
+1
+# The values survive a restart
+# restart
+same rows: 1
+SELECT COUNT(*) = (SELECT COUNT(*) FROM i WHERE a * 3 = 30) AS f1_index
+FROM w FORCE INDEX (f1) WHERE a * 3 = 30;
+f1_index
+1
+#
+# The generated columns follow the rules of the other columns: a string
+# in a case insensitive collation is refused, and so is a multi-valued
+# index
+#
+CREATE TABLE bad (s VARCHAR(10), v VARCHAR(10) AS (LOWER(s)) COLLATE utf8mb4_0900_ai_ci) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+ERROR HY000: Table storage engine for 'Unsupported character set or collation for column (only binary strings and case sensitive and binary collations of character sets without NUL bytes are supported): v' doesn't have this option
+CREATE TABLE bad (j JSON, KEY ((CAST(j->'$.a' AS UNSIGNED ARRAY)))) ENGINE=WARP;
+ERROR 42000: The storage engine for the table doesn't support multi-valued indexes
+DROP TABLE w, i;
