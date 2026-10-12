@@ -2106,7 +2106,11 @@ int ibis::tafel::writeData(const char* dir, const char* tname,
     std::string mdfile = mydir;
     mdfile += FASTBIT_DIRSEP;
     mdfile += "-part.txt";
-    std::ofstream md(mdfile.c_str());
+    // The metadata file is written beside the old one and takes its place
+    // when it is complete: a crash leaves the old one or the new one, never
+    // a part of a file.
+    const std::string mdtmp = mdfile + ".tmp";
+    std::ofstream md(mdtmp.c_str());
     if (! md) {
         LOGGER(ibis::gVerbose > 0)
             << "tafel::writeData(" << mydir << ") failed to open metadata file "
@@ -2442,6 +2446,13 @@ int ibis::tafel::writeData(const char* dir, const char* tname,
     // the data of the columns is on disk before the metadata file says so
     (void) ibis::zfile::commitDeferred();
     md.close(); // close the metadata file
+    if (rename(mdtmp.c_str(), mdfile.c_str()) != 0) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- tafel::writeData failed to rename " << mdtmp
+            << " to " << mdfile << " ... " << strerror(errno);
+        (void) remove(mdtmp.c_str());
+        return -3;
+    }
     ibis::fileManager::instance().flushDir(mydir);
     if (ibis::gVerbose > 0) {
         timer.stop();

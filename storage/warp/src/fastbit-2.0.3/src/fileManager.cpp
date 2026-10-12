@@ -3323,8 +3323,14 @@ int fbzCompress(const char* src, size_t n, int lvl, std::string& out) {
         const size_t bound = ZSTD_compressBound(len);
         const size_t old = out.size();
         out.resize(old + bound);
-        const size_t csz = ZSTD_compressCCtx(cctx, &out[old], bound,
-                                             src + off, len, lvl);
+        /* the frames have a checksum of their content: after a crash of
+           the system the frames that were not written completely are found
+           (see zfile::recover) */
+        ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, lvl);
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);
+        const size_t csz = ZSTD_compress2(cctx, &out[old], bound,
+                                          src + off, len);
         if (ZSTD_isError(csz)) {
             LOGGER(ibis::gVerbose >= 0)
                 << "Warning -- zfile failed to compress " << len
@@ -3336,6 +3342,35 @@ int fbzCompress(const char* src, size_t n, int lvl, std::string& out) {
         ++ nframes;
     }
     return nframes;
+}
+
+static_assert(sizeof(ibis::zfile::header) == ibis::zfile::HEADER_SIZE,
+              "the header of a compressed file has 64 bytes");
+
+/* the appends of the thread are synced (see zfile::setSyncAppends): a
+   thread that writes rows which may be lost by a crash says so for its
+   writes only, the other writers (a rewrite of a partition, a copy of a
+   table) sync theirs */
+thread_local bool fbz_sync_appends = true;
+
+/* The content of a file without durable fields was synced before its header
+   was written (the files written before the fields existed): all of it is
+   durable */
+void fbzKeepDurable(ibis::zfile::header& hdr) {
+    if (hdr.durable_magic != ibis::zfile::DURABLE_MAGIC) {
+        hdr.durable_comp = hdr.comp_size;
+        hdr.durable_raw = hdr.raw_size;
+        hdr.durable_frames = hdr.nframes;
+        hdr.durable_magic = ibis::zfile::DURABLE_MAGIC;
+    }
+}
+
+/* all the frames of the header are on disk */
+void fbzMarkDurable(ibis::zfile::header& hdr) {
+    hdr.durable_comp = hdr.comp_size;
+    hdr.durable_raw = hdr.raw_size;
+    hdr.durable_frames = hdr.nframes;
+    hdr.durable_magic = ibis::zfile::DURABLE_MAGIC;
 }
 
 int fbzEffectiveLevel() {
@@ -3633,6 +3668,7 @@ int ibis::zfile::commitDeferred() {
     int nfail = 0;
     for (size_t i = 0; i < pending.size(); ++ i) {
         // the header refers to frames that are on disk now
+        if (failed[i] == 0) fbzMarkDurable(pending[i].hdr);
         if (failed[i] == 0 &&
             fbzPwrite(pending[i].fd, &(pending[i].hdr), sizeof(pending[i].hdr), 0)
             == (int64_t)sizeof(pending[i].hdr)) {
@@ -3672,6 +3708,7 @@ int ibis::zfile::append(int fdes, const void* buf, size_t n, uint32_t elem) {
             << fdes << " because it is not a compressed data file";
         return -4;
     }
+    fbzKeepDurable(hdr);
     if (n == 0 && st.st_size != 0) return 0;
 
     std::string comp;
@@ -3687,6 +3724,17 @@ int ibis::zfile::append(int fdes, const void* buf, size_t n, uint32_t elem) {
         return -6;
     if ((uint64_t)st.st_size > pos + comp.size()) {
         if (ftruncate(fdes, pos + comp.size()) != 0) return -7;
+    }
+    if (!fbz_sync_appends && !comp.empty()) {
+        // the frames are not synced: the header refers to them at once, its
+        // durable fields stay the ones of the frames that are on disk (see
+        // makeDurable and recover)
+        hdr.raw_size += n;
+        hdr.comp_size += comp.size();
+        hdr.nframes += nf;
+        if (fbzPwrite(fdes, &hdr, sizeof(hdr), 0) != (int64_t)sizeof(hdr))
+            return -9;
+        return 0;
     }
     if (gDefer.depth > 0 && !comp.empty()) {
         // the frames are synced with the ones of the other files, the header
@@ -3710,9 +3758,127 @@ int ibis::zfile::append(int fdes, const void* buf, size_t n, uint32_t elem) {
     hdr.raw_size += n;
     hdr.comp_size += comp.size();
     hdr.nframes += nf;
+    fbzMarkDurable(hdr);
     if (fbzPwrite(fdes, &hdr, sizeof(hdr), 0) != (int64_t)sizeof(hdr))
         return -9;
     return 0;
+}
+
+void ibis::zfile::setSyncAppends(bool sync) {
+    fbz_sync_appends = sync;
+}
+
+bool ibis::zfile::syncAppends() {
+    return fbz_sync_appends;
+}
+
+int ibis::zfile::makeDurable(const char* fname) {
+    int fdes = UnixOpen(fname, O_RDWR);
+    if (fdes < 0) return (errno == ENOENT ? 0 : -1);
+    IBIS_BLOCK_GUARD(UnixClose, fdes);
+    if (fdatasync(fdes) != 0) return -2;
+    ibis::zfile::header hdr;
+    if (readHeader(fdes, hdr) != 0) return 0; // a plain file
+    if (hdr.durable_magic == DURABLE_MAGIC &&
+        hdr.durable_comp == hdr.comp_size)
+        return 0;
+    fbzMarkDurable(hdr);
+    if (fbzPwrite(fdes, &hdr, sizeof(hdr), 0) != (int64_t)sizeof(hdr))
+        return -3;
+    if (fdatasync(fdes) != 0) return -4;
+    return 0;
+}
+
+int64_t ibis::zfile::recover(const char* fname) {
+    int fdes = UnixOpen(fname, O_RDWR);
+    if (fdes < 0) return -1;
+    IBIS_BLOCK_GUARD(UnixClose, fdes);
+    Stat_T st;
+    if (fstat(fdes, &st) != 0) return -2;
+    ibis::zfile::header hdr;
+    const int ierr = readHeader(fdes, hdr);
+    if (ierr > 0) return st.st_size; // a plain file
+    if (ierr < 0) return -3;
+    // the frames that are on disk, then the ones after them that are valid
+    uint64_t comp = hdr.comp_size, raw = hdr.raw_size;
+    uint32_t frames = hdr.nframes;
+    if (hdr.durable_magic == DURABLE_MAGIC) {
+        comp = hdr.durable_comp;
+        raw = hdr.durable_raw;
+        frames = hdr.durable_frames;
+    }
+    const uint64_t end = (uint64_t)st.st_size;
+    if (HEADER_SIZE + comp > end) {
+        // the durable frames are not all there, the file can not be read
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- zfile::recover finds " << fname
+            << " shorter than its durable content";
+        return -4;
+    }
+    std::string rest(end - HEADER_SIZE - comp, '\0');
+    if (!rest.empty() &&
+        fbzPread(fdes, &rest[0], rest.size(), HEADER_SIZE + comp)
+        != (int64_t)rest.size())
+        return -5;
+    ZSTD_DCtx *dctx = fbz_ctx.d();
+    if (dctx == 0) return -6;
+    std::vector<char> tmp;
+    size_t cpos = 0;
+    while (cpos < rest.size()) {
+        const size_t fcsz =
+            ZSTD_findFrameCompressedSize(rest.data()+cpos, rest.size()-cpos);
+        const unsigned long long flsz =
+            ZSTD_getFrameContentSize(rest.data()+cpos, rest.size()-cpos);
+        if (ZSTD_isError(fcsz) || flsz == ZSTD_CONTENTSIZE_ERROR ||
+            flsz == ZSTD_CONTENTSIZE_UNKNOWN || flsz > FRAME_SIZE)
+            break;
+        tmp.resize(flsz);
+        const size_t dsz = ZSTD_decompressDCtx(dctx, tmp.data(), flsz,
+                                               rest.data()+cpos, fcsz);
+        if (ZSTD_isError(dsz) || dsz != flsz)
+            break; // not written completely: its checksum does not match
+        cpos += fcsz;
+        comp += fcsz;
+        raw += flsz;
+        ++ frames;
+    }
+    if (hdr.comp_size != comp || hdr.raw_size != raw ||
+        hdr.nframes != frames || end != HEADER_SIZE + comp ||
+        hdr.durable_magic != DURABLE_MAGIC || hdr.durable_comp != comp) {
+        hdr.comp_size = comp;
+        hdr.raw_size = raw;
+        hdr.nframes = frames;
+        fbzMarkDurable(hdr);
+        if (ftruncate(fdes, HEADER_SIZE + comp) != 0) return -7;
+        if (fbzPwrite(fdes, &hdr, sizeof(hdr), 0) != (int64_t)sizeof(hdr))
+            return -8;
+        if (fdatasync(fdes) != 0) return -9;
+    }
+    return raw;
+}
+
+int ibis::zfile::truncateLogical(const char* fname, uint64_t size) {
+    const int64_t lsz = logicalSize(fname);
+    if (lsz < 0) return -1;
+    if ((uint64_t)lsz <= size) return 0;
+    if (! isCompressed(fname)) {
+        if (truncate(fname, size) != 0) return -2;
+        int fdes = UnixOpen(fname, O_RDWR);
+        if (fdes >= 0) {
+            (void) fdatasync(fdes);
+            UnixClose(fdes);
+        }
+        return 0;
+    }
+    int fdes = UnixOpen(fname, OPEN_READONLY);
+    if (fdes < 0) return -3;
+    ibis::zfile::header hdr;
+    const int ierr = readHeader(fdes, hdr);
+    std::vector<char> buf(size);
+    const int64_t got = (ierr == 0 ? readRange(fdes, 0, size, buf.data()) : -4);
+    UnixClose(fdes);
+    if (got != (int64_t)size) return -5;
+    return writeWhole(fname, buf.data(), size, hdr.elem_size, true);
 }
 
 int ibis::zfile::writeWhole(const char* fname, const void* buf, size_t n,

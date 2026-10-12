@@ -1,0 +1,144 @@
+#
+# warp_sync_commit = OFF: the transactions that only insert are committed
+# without waiting for the disk and made durable every warp_sync_interval
+# milliseconds.  A crash of the system loses the transactions that were
+# not made durable, whole, and the tables stay consistent: every
+# partition is cut back to the rows that are on disk in all its columns.
+#
+# The crash of the system is simulated: the server is killed, then every
+# column file loses what was not made durable (its frames after the
+# durable ones that its header records), like the cache of a disk that
+# loses its power, and so does the log of the pending commits (which
+# would be of another boot of the system).  The columns lose different
+# amounts.
+#
+call mtr.add_suppression("WARP: recovery cuts the partition");
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE t (id INT NOT NULL, s VARCHAR(20), v BIGINT, PRIMARY KEY (id))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d (id INT, k INT) ENGINE=WARP;
+# durable rows
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000)
+SELECT x, CONCAT('durable', x), x * 10 FROM seq;
+INSERT INTO d VALUES (1, 1), (2, 2);
+# rows that are committed but not durable yet: the syncer waits a minute
+SET GLOBAL warp_sync_interval = 60000;
+SET GLOBAL warp_sync_commit = OFF;
+INSERT INTO t VALUES (1001, 'early1', 1);
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 1002 UNION ALL SELECT x + 1 FROM seq WHERE x < 1500)
+SELECT x, CONCAT('early', x), x FROM seq;
+BEGIN;
+INSERT INTO t VALUES (1501, 'early-trx', 1);
+INSERT INTO t VALUES (1502, 'early-trx', 2);
+COMMIT;
+# they are visible, and their keys are taken
+SELECT COUNT(*), MAX(id) FROM t;
+COUNT(*)	MAX(id)
+1502	1502
+INSERT INTO t VALUES (1001, 'dup', 0);
+ERROR 23000: Duplicate entry '1001' for key 't.PRIMARY'
+# a transaction that deletes is durable when it commits, and the commits
+# before it are made durable first
+DELETE FROM d WHERE id = 2;
+# the commits after it are not durable
+INSERT INTO d VALUES (3, 3);
+INSERT INTO t VALUES (1600, 'lost', 1);
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 1601 UNION ALL SELECT x + 1 FROM seq WHERE x < 1900)
+SELECT x, CONCAT('lost', x), x FROM seq;
+BEGIN;
+INSERT INTO t VALUES (1901, 'lost-trx', 1);
+INSERT INTO t VALUES (1902, 'lost-trx', 2);
+COMMIT;
+SELECT COUNT(*), MAX(id) FROM t;
+COUNT(*)	MAX(id)
+1805	1902
+SELECT * FROM d ORDER BY id;
+id	k
+1	1
+3	3
+# the system crashes
+# Kill the server
+column files that lost their last frames: some
+# restart
+# only the durable transactions are there, and the table works
+SELECT COUNT(*), MIN(id), MAX(id), SUM(v) FROM t;
+COUNT(*)	MIN(id)	MAX(id)	SUM(v)
+1502	1	1502	5629253
+SELECT COUNT(*) FROM t WHERE s LIKE 'lost%';
+COUNT(*)
+0
+SELECT * FROM t WHERE id IN (1, 500, 1000, 1001, 1501, 1502, 1600, 1902);
+id	s	v
+1	durable1	10
+500	durable500	5000
+1000	durable1000	10000
+1001	early1	1
+1501	early-trx	1
+1502	early-trx	2
+SELECT * FROM d ORDER BY id;
+id	k
+1	1
+# the keys of the lost rows are free, the others are not
+INSERT INTO t VALUES (1600, 'after', 1);
+INSERT INTO t VALUES (1502, 'dup', 0);
+ERROR 23000: Duplicate entry '1502' for key 't.PRIMARY'
+SELECT * FROM t WHERE id > 1499 ORDER BY id;
+id	s	v
+1500	early1500	1500
+1501	early-trx	1
+1502	early-trx	2
+1600	after	1
+SELECT COUNT(*) FROM t WHERE s = 'durable77';
+COUNT(*)
+1
+#
+# The syncer makes the commits durable: nothing is lost after it ran
+#
+SET GLOBAL warp_sync_interval = 50;
+SET GLOBAL warp_sync_commit = OFF;
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 2000 UNION ALL SELECT x + 1 FROM seq WHERE x < 2499)
+SELECT x, CONCAT('synced', x), x FROM seq;
+INSERT INTO t VALUES (2500, 'synced2500', 1);
+# Kill the server
+column files that were not durable: 0
+# restart
+SELECT COUNT(*) FROM t WHERE id >= 2000;
+COUNT(*)
+501
+# warp_sync_commit = ON is durable at once
+SET GLOBAL warp_sync_commit = ON;
+INSERT INTO t VALUES (3000, 'on', 1);
+# Kill the server
+# restart
+SELECT * FROM t WHERE id = 3000;
+id	s	v
+3000	on	1
+# the metadata of a partition that is lost is made again from the
+# metadata of the table
+# Kill the server
+# restart
+SELECT * FROM d ORDER BY id;
+id	k
+1	1
+INSERT INTO d VALUES (4, 4);
+SELECT * FROM d ORDER BY id;
+id	k
+1	1
+4	4
+#
+# A crash of the server alone loses nothing: the system has its writes,
+# and the pending commits are made durable when it starts
+#
+SET GLOBAL warp_sync_interval = 60000;
+SET GLOBAL warp_sync_commit = OFF;
+INSERT INTO t VALUES (4000, 'server crash', 1);
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 4001 UNION ALL SELECT x + 1 FROM seq WHERE x < 4100)
+SELECT x, 'server crash', x FROM seq;
+# Kill the server
+# restart
+SELECT COUNT(*), MIN(id), MAX(id) FROM t WHERE s = 'server crash';
+COUNT(*)	MIN(id)	MAX(id)
+101	4000	4100
+INSERT INTO t VALUES (4050, 'dup', 0);
+ERROR 23000: Duplicate entry '4050' for key 't.PRIMARY'
+DROP TABLE t, d;

@@ -1,0 +1,186 @@
+--echo #
+--echo # warp_sync_commit = OFF: the transactions that only insert are committed
+--echo # without waiting for the disk and made durable every warp_sync_interval
+--echo # milliseconds.  A crash of the system loses the transactions that were
+--echo # not made durable, whole, and the tables stay consistent: every
+--echo # partition is cut back to the rows that are on disk in all its columns.
+--echo #
+--echo # The crash of the system is simulated: the server is killed, then every
+--echo # column file loses what was not made durable (its frames after the
+--echo # durable ones that its header records), like the cache of a disk that
+--echo # loses its power, and so does the log of the pending commits (which
+--echo # would be of another boot of the system).  The columns lose different
+--echo # amounts.
+--echo #
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+call mtr.add_suppression("WARP: recovery cuts the partition");
+let $old_sync_commit= `SELECT @@global.warp_sync_commit`;
+let $old_sync_interval= `SELECT @@global.warp_sync_interval`;
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE t (id INT NOT NULL, s VARCHAR(20), v BIGINT, PRIMARY KEY (id))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d (id INT, k INT) ENGINE=WARP;
+
+--echo # durable rows
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000)
+  SELECT x, CONCAT('durable', x), x * 10 FROM seq;
+INSERT INTO d VALUES (1, 1), (2, 2);
+
+--echo # rows that are committed but not durable yet: the syncer waits a minute
+SET GLOBAL warp_sync_interval = 60000;
+SET GLOBAL warp_sync_commit = OFF;
+INSERT INTO t VALUES (1001, 'early1', 1);
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 1002 UNION ALL SELECT x + 1 FROM seq WHERE x < 1500)
+  SELECT x, CONCAT('early', x), x FROM seq;
+BEGIN;
+INSERT INTO t VALUES (1501, 'early-trx', 1);
+INSERT INTO t VALUES (1502, 'early-trx', 2);
+COMMIT;
+--echo # they are visible, and their keys are taken
+SELECT COUNT(*), MAX(id) FROM t;
+--error ER_DUP_ENTRY
+INSERT INTO t VALUES (1001, 'dup', 0);
+--echo # a transaction that deletes is durable when it commits, and the commits
+--echo # before it are made durable first
+DELETE FROM d WHERE id = 2;
+--echo # the commits after it are not durable
+INSERT INTO d VALUES (3, 3);
+INSERT INTO t VALUES (1600, 'lost', 1);
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 1601 UNION ALL SELECT x + 1 FROM seq WHERE x < 1900)
+  SELECT x, CONCAT('lost', x), x FROM seq;
+BEGIN;
+INSERT INTO t VALUES (1901, 'lost-trx', 1);
+INSERT INTO t VALUES (1902, 'lost-trx', 2);
+COMMIT;
+SELECT COUNT(*), MAX(id) FROM t;
+SELECT * FROM d ORDER BY id;
+
+--echo # the system crashes
+--source include/kill_mysqld.inc
+--perl
+use strict;
+my $dir = "$ENV{MYSQLD_DATADIR}/test";
+unlink("$ENV{MYSQLD_DATADIR}/pending_commits.warp");
+my $cut = 0;
+foreach my $table ("t.data", "d.data") {
+  opendir(my $td, "$dir/$table") or die;
+  foreach my $part (grep { /^p\d+$/ } readdir($td)) {
+    opendir(my $pd, "$dir/$table/$part") or die;
+    foreach my $file (sort grep { -f "$dir/$table/$part/$_" } readdir($pd)) {
+      next unless $file =~ /^(c\d+|n\d+|r|t)$/;
+      my $path = "$dir/$table/$part/$file";
+      open(my $fh, "+<", $path) or die "$path: $!";
+      binmode($fh);
+      my $hdr;
+      read($fh, $hdr, 64) == 64 or next;
+      my ($magic, $version, $flags, $raw, $comp, $nframes, $elem,
+          $dcomp, $draw, $dframes, $dmagic) =
+        unpack("a8 V V Q< Q< V V Q< Q< V V", $hdr);
+      next unless $magic eq "#FBZSTD\x01" && $dmagic == 0x42525544;
+      next if $dcomp == $comp;
+      # the column c0 keeps what was written, the strings get garbage instead
+      # of their last frames, the others lose them: the header stays the one
+      # that refers to them
+      next if $file eq "c0";
+      if ($file eq "c1") {
+        seek($fh, 64 + $dcomp, 0);
+        print $fh "\x28\xb5\x2f\xfd" . ("x" x 40);
+      } else {
+        truncate($fh, 64 + $dcomp);
+      }
+      $cut++;
+      close($fh);
+    }
+  }
+}
+print "column files that lost their last frames: " . ($cut > 0 ? "some" : "none") . "\n";
+EOF
+--source include/start_mysqld.inc
+
+--echo # only the durable transactions are there, and the table works
+SELECT COUNT(*), MIN(id), MAX(id), SUM(v) FROM t;
+SELECT COUNT(*) FROM t WHERE s LIKE 'lost%';
+SELECT * FROM t WHERE id IN (1, 500, 1000, 1001, 1501, 1502, 1600, 1902);
+SELECT * FROM d ORDER BY id;
+--echo # the keys of the lost rows are free, the others are not
+INSERT INTO t VALUES (1600, 'after', 1);
+--error ER_DUP_ENTRY
+INSERT INTO t VALUES (1502, 'dup', 0);
+SELECT * FROM t WHERE id > 1499 ORDER BY id;
+SELECT COUNT(*) FROM t WHERE s = 'durable77';
+
+--echo #
+--echo # The syncer makes the commits durable: nothing is lost after it ran
+--echo #
+SET GLOBAL warp_sync_interval = 50;
+SET GLOBAL warp_sync_commit = OFF;
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 2000 UNION ALL SELECT x + 1 FROM seq WHERE x < 2499)
+  SELECT x, CONCAT('synced', x), x FROM seq;
+INSERT INTO t VALUES (2500, 'synced2500', 1);
+--sleep 1
+--source include/kill_mysqld.inc
+--perl
+use strict;
+my $dir = "$ENV{MYSQLD_DATADIR}/test/t.data";
+unlink("$ENV{MYSQLD_DATADIR}/pending_commits.warp");
+my $notdurable = 0;
+opendir(my $td, $dir) or die;
+foreach my $part (grep { /^p\d+$/ } readdir($td)) {
+  opendir(my $pd, "$dir/$part") or die;
+  foreach my $file (grep { -f "$dir/$part/$_" } readdir($pd)) {
+    open(my $fh, "+<", "$dir/$part/$file") or die;
+    binmode($fh);
+    my $hdr;
+    read($fh, $hdr, 64) == 64 or next;
+    my ($magic, $version, $flags, $raw, $comp, $nframes, $elem,
+        $dcomp, $draw, $dframes, $dmagic) = unpack("a8 V V Q< Q< V V Q< Q< V V", $hdr);
+    next unless $magic eq "#FBZSTD\x01" && $dmagic == 0x42525544;
+    if ($dcomp != $comp) { $notdurable++; truncate($fh, 64 + $dcomp); }
+    close($fh);
+  }
+}
+print "column files that were not durable: $notdurable\n";
+EOF
+--source include/start_mysqld.inc
+SELECT COUNT(*) FROM t WHERE id >= 2000;
+
+--echo # warp_sync_commit = ON is durable at once
+SET GLOBAL warp_sync_commit = ON;
+INSERT INTO t VALUES (3000, 'on', 1);
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT * FROM t WHERE id = 3000;
+
+--echo # the metadata of a partition that is lost is made again from the
+--echo # metadata of the table
+--source include/kill_mysqld.inc
+--perl
+unlink("$ENV{MYSQLD_DATADIR}/test/d.data/p0/-part.txt") or die;
+EOF
+--source include/start_mysqld.inc
+SELECT * FROM d ORDER BY id;
+INSERT INTO d VALUES (4, 4);
+SELECT * FROM d ORDER BY id;
+
+--echo #
+--echo # A crash of the server alone loses nothing: the system has its writes,
+--echo # and the pending commits are made durable when it starts
+--echo #
+SET GLOBAL warp_sync_interval = 60000;
+SET GLOBAL warp_sync_commit = OFF;
+INSERT INTO t VALUES (4000, 'server crash', 1);
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 4001 UNION ALL SELECT x + 1 FROM seq WHERE x < 4100)
+  SELECT x, 'server crash', x FROM seq;
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*), MIN(id), MAX(id) FROM t WHERE s = 'server crash';
+--error ER_DUP_ENTRY
+INSERT INTO t VALUES (4050, 'dup', 0);
+
+--disable_query_log
+eval SET GLOBAL warp_sync_commit = $old_sync_commit;
+eval SET GLOBAL warp_sync_interval = $old_sync_interval;
+--enable_query_log
+DROP TABLE t, d;
