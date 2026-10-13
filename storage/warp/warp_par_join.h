@@ -52,6 +52,7 @@ static inline bool warp_pj_no(int line) {
 
 static const int WARP_PJ_MAX_LEVELS = 16;  // tables of one join, the probe table included
 static const int WARP_PJ_MAX_KEY = 4;      // columns of a join key
+static const uint32_t WARP_PJ_NULL_ROW = 0xFFFFFFFFU;  // a row of the null supplying table of a left join without a match
 
 struct warp_pj_key {
   int64_t v[WARP_PJ_MAX_KEY] = {0, 0, 0, 0};
@@ -168,6 +169,11 @@ struct warp_pj_table {
   TABLE *table = nullptr;
   ha_warp *handler = nullptr;
   warp_pj_edge edge;
+  /* The table is the inner table of a LEFT JOIN: a row of its parent that has
+     no match is returned with a row of NULLs.  The conditions of the join
+     that are about this table only are checked when its rows are read. */
+  bool null_side = false;
+  std::vector<Item *> filters;
   std::vector<uint> own_key_fields;   // columns of this table in the key of its edge
   std::vector<uint> value_fields;     // columns kept as integers
   std::vector<std::vector<int64_t>> vals;
@@ -263,7 +269,43 @@ static bool warp_pj_int_key(Field *field) {
 
 typedef std::pair<Field *, Field *> warp_pj_pair;
 
-static bool warp_pj_add_equality(Item_eq_base *condition, std::vector<warp_pj_pair> *pairs) {
+/* an equality of two columns of two tables; null_table is the inner table of
+   the LEFT JOIN that the equality is a condition of, if it is */
+struct warp_pj_pair_info {
+  Field *a = nullptr;
+  Field *b = nullptr;
+  TABLE *null_table = nullptr;
+  Item *item = nullptr;      // the condition (of a filter), to leave it to MySQL
+};
+
+struct warp_pj_collector {
+  std::vector<TABLE *> tables;
+  std::vector<warp_pj_pair_info> pairs;       // the join conditions
+  std::vector<warp_pj_pair_info> candidates;  // equalities of filters, join keys if no outer join is involved
+  std::vector<Item *> residual;               // conditions that MySQL evaluates for the result rows
+  std::set<TABLE *> null_side;
+  std::map<TABLE *, std::vector<Item *>> leaf_filters;  // conditions of the null side tables
+};
+
+/* An integer column that the engine can join on, without a trace */
+static bool warp_pj_int_field(const Field *field) {
+  if(field == nullptr) {
+    return false;
+  }
+  switch(field->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+      return true;
+    case MYSQL_TYPE_LONGLONG:
+      return !field->is_flag_set(UNSIGNED_FLAG);
+    default:
+      return false;
+  }
+}
+
+static bool warp_pj_add_equality(Item_eq_base *condition, warp_pj_collector &collector, TABLE *null_table) {
   if(condition->functype() != Item_func::EQ_FUNC) {
     return warp_pj_no(__LINE__);  // <=> is NULL safe
   }
@@ -277,30 +319,124 @@ static bool warp_pj_add_equality(Item_eq_base *condition, std::vector<warp_pj_pa
   if(lf == nullptr || rf == nullptr || lf->table == rf->table) {
     return warp_pj_no(__LINE__);
   }
-  pairs->push_back(warp_pj_pair(lf, rf));
+  warp_pj_pair_info pair;
+  pair.a = lf;
+  pair.b = rf;
+  pair.null_table = null_table;
+  collector.pairs.push_back(pair);
   return true;
 }
 
-static void warp_pj_add_residual(Item *item, std::vector<Item *> *residual) {
-  if(item != nullptr) {
-    residual->push_back(item);
+/* A condition of the block that MySQL has not made a join condition of (the
+   FILTER of an inner table of a nested loop, for example): an equality of two
+   integer columns of two tables is a candidate for a join key, the tables of
+   the block can be joined along it (see warp_pj_make_plan).  The other
+   conditions are evaluated by MySQL for the result rows.  A condition joined
+   by AND is taken apart. */
+static void warp_pj_add_filter(Item *item, warp_pj_collector &collector) {
+  if(item == nullptr) {
+    return;
   }
+  if(item->type() == Item::COND_ITEM &&
+     down_cast<Item_cond *>(item)->functype() == Item_func::COND_AND_FUNC) {
+    List_iterator_fast<Item> it(*down_cast<Item_cond *>(item)->argument_list());
+    for(Item *part = it++; part != nullptr; part = it++) {
+      warp_pj_add_filter(part, collector);
+    }
+    return;
+  }
+  if(item->type() == Item::FUNC_ITEM &&
+     down_cast<Item_func *>(item)->functype() == Item_func::EQ_FUNC) {
+    Item_func *eq = down_cast<Item_func *>(item);
+    Item *left = eq->arguments()[0]->real_item();
+    Item *right = eq->arguments()[1]->real_item();
+    if(left->type() == Item::FIELD_ITEM && right->type() == Item::FIELD_ITEM) {
+      Field *lf = down_cast<Item_field *>(left)->field;
+      Field *rf = down_cast<Item_field *>(right)->field;
+      if(lf != nullptr && rf != nullptr && lf->table != rf->table &&
+         warp_pj_int_field(lf) && warp_pj_int_field(rf)) {
+        warp_pj_pair_info pair;
+        pair.a = lf;
+        pair.b = rf;
+        pair.item = item;
+        collector.candidates.push_back(pair);
+        return;
+      }
+    }
+  }
+  collector.residual.push_back(item);
+}
+
+/* The tables of the table map of the condition: is it about this table only? */
+static bool warp_pj_only_table(Item *condition, TABLE *table) {
+  const table_map used = condition->used_tables() & ~(OUTER_REF_TABLE_BIT | RAND_TABLE_BIT);
+  return used == table->pos_in_table_list->map() && !condition->has_subquery() &&
+         !condition->has_stored_program();
+}
+
+/* The inner side of a LEFT JOIN: one table, read with its conditions (the part
+   of a condition of the join that the engine did not push down is evaluated
+   when the rows are read, before the join) */
+static bool warp_pj_collect_null_side(AccessPath *path, warp_pj_collector &collector) {
+  std::vector<Item *> filters;
+  while(path->type == AccessPath::FILTER) {
+    filters.push_back(path->filter().condition);
+    path = path->filter().child;
+  }
+  TABLE *table = nullptr;
+  if(path->type == AccessPath::TABLE_SCAN) {
+    table = path->table_scan().table;
+  } else if(path->type == AccessPath::REF || path->type == AccessPath::EQ_REF) {
+    table = path->type == AccessPath::REF ? path->ref().table : path->eq_ref().table;
+    Index_lookup *ref = path->type == AccessPath::REF ? path->ref().ref : path->eq_ref().ref;
+    if(table == nullptr || ref == nullptr || ref->key_parts != 1) {
+      return warp_pj_no(__LINE__);
+    }
+    Item *value = ref->items[0]->real_item();
+    if(value->type() != Item::FIELD_ITEM) {
+      return warp_pj_no(__LINE__);
+    }
+    Field *outer_field = down_cast<Item_field *>(value)->field;
+    Field *key_field = table->key_info[ref->key].key_part[0].field;
+    if(outer_field == nullptr || key_field == nullptr || outer_field->table == table) {
+      return warp_pj_no(__LINE__);
+    }
+    warp_pj_pair_info pair;
+    pair.a = outer_field;
+    pair.b = key_field;
+    pair.null_table = table;
+    collector.pairs.push_back(pair);
+  } else {
+    return warp_pj_no(__LINE__);
+  }
+  if(table == nullptr || dynamic_cast<ha_warp *>(table->file) == nullptr) {
+    return warp_pj_no(__LINE__);
+  }
+  for(Item *filter : filters) {
+    if(!warp_pj_only_table(filter, table)) {
+      return warp_pj_no(__LINE__);
+    }
+  }
+  collector.tables.push_back(table);
+  collector.null_side.insert(table);
+  collector.leaf_filters[table] = filters;
+  return true;
 }
 
 /* The tables, the equalities between two columns and the other conditions of a
-   tree of inner joins.  A FILTER in the tree (the part of a condition that
-   the engine did not take over) or a condition that is not an equality is not
-   given up: it is evaluated by MySQL for the result rows, which is the same for
-   inner joins. */
-static bool warp_pj_collect(AccessPath *path, std::vector<TABLE *> *tables,
-                            std::vector<warp_pj_pair> *pairs, std::vector<Item *> *residual) {
+   tree of joins.  Inner joins: a FILTER in the tree (the part of a condition
+   that the engine did not take over) or a condition that is not an equality
+   is not given up: it is evaluated by MySQL for the result rows, which is the
+   same for inner joins.  A LEFT JOIN whose inner side is one table is joined
+   by the engine too (the table that has no match gets a row of NULLs). */
+static bool warp_pj_collect(AccessPath *path, warp_pj_collector &collector) {
   switch(path->type) {
     case AccessPath::TABLE_SCAN: {
       TABLE *table = path->table_scan().table;
       if(table == nullptr || dynamic_cast<ha_warp *>(table->file) == nullptr) {
         return warp_pj_no(__LINE__);
       }
-      tables->push_back(table);
+      collector.tables.push_back(table);
       return true;
     }
     case AccessPath::REF:
@@ -320,49 +456,103 @@ static bool warp_pj_collect(AccessPath *path, std::vector<TABLE *> *tables,
       if(outer_field == nullptr || key_field == nullptr || outer_field->table == table) {
         return warp_pj_no(__LINE__);
       }
-      tables->push_back(table);
-      pairs->push_back(warp_pj_pair(outer_field, key_field));
+      collector.tables.push_back(table);
+      warp_pj_pair_info pair;
+      pair.a = outer_field;
+      pair.b = key_field;
+      collector.pairs.push_back(pair);
       return true;
     }
     case AccessPath::FILTER:
-      warp_pj_add_residual(path->filter().condition, residual);
-      return warp_pj_collect(path->filter().child, tables, pairs, residual);
+      warp_pj_add_filter(path->filter().condition, collector);
+      return warp_pj_collect(path->filter().child, collector);
     case AccessPath::NESTED_LOOP_JOIN: {
       const auto &join = path->nested_loop_join();
-      if(join.join_type != JoinType::INNER) {
+      if(join.join_type != JoinType::INNER && join.join_type != JoinType::OUTER) {
         return warp_pj_no(__LINE__);
+      }
+      const bool outer_join = join.join_type == JoinType::OUTER;
+      if(outer_join) {
+        if(!warp_pj_collect(join.outer, collector)) {
+          return false;
+        }
+        TABLE *null_table = nullptr;
+        const size_t before = collector.tables.size();
+        if(!warp_pj_collect_null_side(join.inner, collector)) {
+          return false;
+        }
+        null_table = collector.tables[before];
+        /* the conditions of the join are the ones of the inner table's filters
+           (the reference of an index lookup was added above) */
+        if(join.join_predicate != nullptr && join.join_predicate->expr != nullptr) {
+          const RelationalExpression *expr = join.join_predicate->expr;
+          for(Item *condition : expr->join_conditions) {
+            if(!warp_pj_only_table(condition, null_table)) {
+              return warp_pj_no(__LINE__);
+            }
+            collector.leaf_filters[null_table].push_back(condition);
+          }
+          for(Item_eq_base *condition : expr->equijoin_conditions) {
+            if(!warp_pj_add_equality(condition, collector, null_table)) {
+              return false;
+            }
+          }
+        }
+        return true;
       }
       if(join.join_predicate != nullptr && join.join_predicate->expr != nullptr) {
         const RelationalExpression *expr = join.join_predicate->expr;
         for(Item *condition : expr->join_conditions) {
-          warp_pj_add_residual(condition, residual);
+          warp_pj_add_filter(condition, collector);
         }
         for(Item_eq_base *condition : expr->equijoin_conditions) {
-          if(!warp_pj_add_equality(condition, pairs)) {
+          if(!warp_pj_add_equality(condition, collector, nullptr)) {
             return false;
           }
         }
       }
-      return warp_pj_collect(join.outer, tables, pairs, residual) &&
-             warp_pj_collect(join.inner, tables, pairs, residual);
+      return warp_pj_collect(join.outer, collector) && warp_pj_collect(join.inner, collector);
     }
     case AccessPath::HASH_JOIN: {
       const JoinPredicate *predicate = path->hash_join().join_predicate;
       if(predicate == nullptr || predicate->expr == nullptr ||
-         predicate->expr->type != RelationalExpression::INNER_JOIN ||
+         (predicate->expr->type != RelationalExpression::INNER_JOIN &&
+          predicate->expr->type != RelationalExpression::LEFT_JOIN) ||
          path->hash_join().rewrite_semi_to_inner) {
         return warp_pj_no(__LINE__);
       }
+      if(predicate->expr->type == RelationalExpression::LEFT_JOIN) {
+        if(!warp_pj_collect(path->hash_join().outer, collector)) {
+          return false;
+        }
+        const size_t before = collector.tables.size();
+        if(!warp_pj_collect_null_side(path->hash_join().inner, collector)) {
+          return false;
+        }
+        TABLE *null_table = collector.tables[before];
+        for(Item *condition : predicate->expr->join_conditions) {
+          if(!warp_pj_only_table(condition, null_table)) {
+            return warp_pj_no(__LINE__);
+          }
+          collector.leaf_filters[null_table].push_back(condition);
+        }
+        for(Item_eq_base *condition : predicate->expr->equijoin_conditions) {
+          if(!warp_pj_add_equality(condition, collector, null_table)) {
+            return false;
+          }
+        }
+        return true;
+      }
       for(Item *condition : predicate->expr->join_conditions) {
-        warp_pj_add_residual(condition, residual);
+        warp_pj_add_filter(condition, collector);
       }
       for(Item_eq_base *condition : predicate->expr->equijoin_conditions) {
-        if(!warp_pj_add_equality(condition, pairs)) {
+        if(!warp_pj_add_equality(condition, collector, nullptr)) {
           return false;
         }
       }
-      return warp_pj_collect(path->hash_join().outer, tables, pairs, residual) &&
-             warp_pj_collect(path->hash_join().inner, tables, pairs, residual);
+      return warp_pj_collect(path->hash_join().outer, collector) &&
+             warp_pj_collect(path->hash_join().inner, collector);
     }
     default:
       return warp_pj_no(__LINE__);
@@ -398,10 +588,22 @@ static uint64_t warp_pj_rows_of(ha_warp *handler) {
 static std::shared_ptr<warp_pj_plan> warp_pj_make_plan(THD *thd, AccessPath *path,
                                                        std::vector<Item *> *residual) {
   std::shared_ptr<warp_pj_plan> none;
-  std::vector<TABLE *> tables;
-  std::vector<warp_pj_pair> pairs;
-  if(!warp_pj_collect(path, &tables, &pairs, residual)) {
+  warp_pj_collector collector;
+  if(!warp_pj_collect(path, collector)) {
     return none;
+  }
+  std::vector<TABLE *> &tables = collector.tables;
+  /* the equalities of the filters join the tables of the block, unless a table
+     of an outer join is one of them (MySQL evaluates the condition: it is
+     about rows that may have NULLs) */
+  std::vector<warp_pj_pair_info> pairs = collector.pairs;
+  *residual = collector.residual;
+  for(const warp_pj_pair_info &candidate : collector.candidates) {
+    if(collector.null_side.count(candidate.a->table) || collector.null_side.count(candidate.b->table)) {
+      residual->push_back(candidate.item);
+    } else {
+      pairs.push_back(candidate);
+    }
   }
   if(tables.size() < 2 || tables.size() > (size_t)WARP_PJ_MAX_LEVELS) {
     return (warp_pj_no(__LINE__), none);
@@ -415,20 +617,24 @@ static std::shared_ptr<warp_pj_plan> warp_pj_make_plan(THD *thd, AccessPath *pat
   }
   const uint64_t min_rows = THDVAR(thd, parallel_join_min_rows);
 
-  /* the probe table is the largest one */
+  /* the probe table is the largest one that is not the inner table of a LEFT
+     JOIN (the rows of the outer table are all returned) */
   std::vector<uint64_t> rows(tables.size());
-  size_t probe_index = 0;
+  size_t probe_index = tables.size();
+  uint64_t largest = 0;
   for(size_t i = 0; i < tables.size(); ++i) {
     ha_warp *ha = dynamic_cast<ha_warp *>(tables[i]->file);
     if(ha->locks_rows_on_read() || ha->is_partition_child) {
       return (warp_pj_no(__LINE__), none);
     }
     rows[i] = warp_pj_rows_of(ha);
-    if(rows[i] > rows[probe_index]) {
+    largest = std::max(largest, rows[i]);
+    if(collector.null_side.count(tables[i]) == 0 &&
+       (probe_index == tables.size() || rows[i] > rows[probe_index])) {
       probe_index = i;
     }
   }
-  if(rows[probe_index] < min_rows) {
+  if(probe_index == tables.size() || largest < min_rows) {
     return (warp_pj_no(__LINE__), none);
   }
   {
@@ -450,30 +656,47 @@ static std::shared_ptr<warp_pj_plan> warp_pj_make_plan(THD *thd, AccessPath *pat
   struct join_edge {
     int a, b;
     std::vector<std::pair<Field *, Field *>> columns;  // a's column, b's column
+    int null_index = -1;                               // the inner table of the LEFT JOIN, a or b
   };
   std::vector<join_edge> edges;
-  for(const warp_pj_pair &pair : pairs) {
-    const int a = index_of(pair.first->table);
-    const int b = index_of(pair.second->table);
-    if(a < 0 || b < 0 || !warp_pj_int_key(pair.first) || !warp_pj_int_key(pair.second)) {
+  for(const warp_pj_pair_info &pair : pairs) {
+    const int a = index_of(pair.a->table);
+    const int b = index_of(pair.b->table);
+    if(a < 0 || b < 0 || !warp_pj_int_key(pair.a) || !warp_pj_int_key(pair.b)) {
+      return (warp_pj_no(__LINE__), none);
+    }
+    const int null_index = pair.null_table != nullptr ? index_of(pair.null_table) : -1;
+    if(pair.null_table != nullptr && a != null_index && b != null_index) {
       return (warp_pj_no(__LINE__), none);
     }
     bool found = false;
     for(auto &edge : edges) {
-      if(edge.a == a && edge.b == b) {
-        edge.columns.push_back({pair.first, pair.second});
+      if((edge.a == a && edge.b == b) || (edge.a == b && edge.b == a)) {
+        const bool same = edge.a == a;
+        Field *edge_a = same ? pair.a : pair.b;
+        Field *edge_b = same ? pair.b : pair.a;
+        /* a condition can be seen twice (the reference of a lookup and the
+           condition of the join) */
+        bool duplicate = false;
+        for(const auto &column : edge.columns) {
+          if(column.first == edge_a && column.second == edge_b) duplicate = true;
+        }
+        if(!duplicate) {
+          edge.columns.push_back({edge_a, edge_b});
+        }
+        if(null_index >= 0) {
+          edge.null_index = null_index;
+        }
         found = true;
-      } else if(edge.a == b && edge.b == a) {
-        edge.columns.push_back({pair.second, pair.first});
-        found = true;
+        break;
       }
-      if(found) break;
     }
     if(!found) {
       join_edge edge;
       edge.a = a;
       edge.b = b;
-      edge.columns.push_back({pair.first, pair.second});
+      edge.columns.push_back({pair.a, pair.b});
+      edge.null_index = null_index;
       edges.push_back(edge);
     }
   }
@@ -485,8 +708,16 @@ static std::shared_ptr<warp_pj_plan> warp_pj_make_plan(THD *thd, AccessPath *pat
   for(size_t at = 0; at < order.size(); ++at) {
     const int current = order[at];
     std::vector<int> found;
+    /* the tables of the inner side of a LEFT JOIN have no tables below them */
+    if(collector.null_side.count(tables[current])) {
+      continue;
+    }
     for(size_t e = 0; e < edges.size(); ++e) {
       const int other = edges[e].a == current ? edges[e].b : (edges[e].b == current ? edges[e].a : -1);
+      /* the inner table of a LEFT JOIN is reached from the other side only */
+      if(other >= 0 && edges[e].null_index >= 0 && edges[e].null_index == current) {
+        continue;
+      }
       if(other >= 0 && depth[other] < 0) {
         depth[other] = depth[current] + 1;
         parent[other] = current;
@@ -534,6 +765,11 @@ static std::shared_ptr<warp_pj_plan> warp_pj_make_plan(THD *thd, AccessPath *pat
     plan->tables[l].table = tables[t];
     plan->tables[l].handler = dynamic_cast<ha_warp *>(tables[t]->file);
     plan->tables[l].estimate = rows[t];
+    plan->tables[l].null_side = collector.null_side.count(tables[t]) != 0;
+    auto filters = collector.leaf_filters.find(tables[t]);
+    if(filters != collector.leaf_filters.end()) {
+      plan->tables[l].filters = filters->second;
+    }
   }
 
   auto root_slot = [&](uint field) -> int {
@@ -588,6 +824,10 @@ static std::shared_ptr<warp_pj_plan> warp_pj_make_plan(THD *thd, AccessPath *pat
       warp_pj_extra extra;
       extra.a = ref_of(column.first);
       extra.b = ref_of(column.second);
+      /* a condition of an outer join with a second table is not supported */
+      if(plan->tables[extra.a.level].null_side || plan->tables[extra.b.level].null_side) {
+        return (warp_pj_no(__LINE__), none);
+      }
       plan->extras[std::max(extra.a.level, extra.b.level)].push_back(extra);
     }
   }
@@ -668,7 +908,9 @@ static bool warp_pj_build(warp_pj_table &t, std::string *error) {
     t.arena.reserve(std::min<uint64_t>(t.estimate, 1ULL << 26) * t.image_len);
   }
 
+  handler->pj_plain_scan = true;
   int rc = handler->ha_rnd_init(true);
+  handler->pj_plain_scan = false;
   if(rc != 0) {
     *error = "could not scan a table of the join";
     return false;
@@ -689,6 +931,17 @@ static bool warp_pj_build(warp_pj_table &t, std::string *error) {
     }
     for(int s : own_slots) {
       if(row_nulls[s]) joinable = false;  // NULL does not join
+    }
+    if(!joinable) {
+      continue;
+    }
+    /* the conditions of the join about this table: a row that does not pass
+       them does not match (and is not read by the joins above) */
+    for(Item *filter : t.filters) {
+      if(filter->val_int() == 0 || filter->null_value) {
+        joinable = false;
+        break;
+      }
     }
     if(!joinable) {
       continue;
@@ -759,9 +1012,15 @@ struct warp_pj_prober {
       ref.level = t.edge.parent;
       ref.slot = t.edge.slot[c];
       if(!value(ref, &key[c])) {
-        return true;  // NULL does not join
+        /* NULL does not join: the row of the table of a LEFT JOIN is a row of NULLs */
+        if(t.null_side) {
+          chosen[level] = WARP_PJ_NULL_ROW;
+          return expand(level + 1);
+        }
+        return true;
       }
     }
+    bool matched = false;
     for(uint32_t at = t.hash.head(key); at != 0; at = t.hash.next[at - 1]) {
       chosen[level] = at - 1;
       bool ok = true;
@@ -772,12 +1031,20 @@ struct warp_pj_prober {
           break;
         }
       }
-      if(ok && !expand(level + 1)) {
+      if(!ok) {
+        continue;
+      }
+      matched = true;
+      if(!expand(level + 1)) {
         return false;
       }
       if(out->size() > ((size_t)1 << 31)) {
         return false;  // the result is too large
       }
+    }
+    if(!matched && t.null_side) {
+      chosen[level] = WARP_PJ_NULL_ROW;
+      return expand(level + 1);
     }
     return true;
   }
@@ -1183,6 +1450,11 @@ int ha_warp::pj_follower_next(uchar *buf) {
   pj_follower_pending = false;
   warp_pj_table &t = pj_follower->tables[pj_follower_level];
   const uint32_t row = pj_follower->current[pj_follower_level];
+  if(row == WARP_PJ_NULL_ROW) {
+    /* the inner table of a LEFT JOIN has no match: the join of MySQL (a left
+       join with this scan as its inner side) makes the row of NULLs */
+    return HA_ERR_END_OF_FILE;
+  }
   pj_set_rowid(t.rowids[row]);
   position(buf);  // see pj_next
   const uchar *image = &t.arena[(size_t)row * t.image_len];
@@ -1215,7 +1487,8 @@ static bool warp_pj_replace(THD *thd, AccessPath *path) {
     nested->type = AccessPath::NESTED_LOOP_JOIN;
     nested->nested_loop_join().outer = top;
     nested->nested_loop_join().inner = follower;
-    nested->nested_loop_join().join_type = JoinType::INNER;
+    nested->nested_loop_join().join_type =
+        plan->tables[l].null_side ? JoinType::OUTER : JoinType::INNER;
     nested->nested_loop_join().pfs_batch_mode = false;
     nested->nested_loop_join().already_expanded_predicates = false;
     nested->nested_loop_join().join_predicate = nullptr;

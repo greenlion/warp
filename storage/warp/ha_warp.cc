@@ -1705,6 +1705,197 @@ int ha_warp::delete_all_rows() {
 WARP_SHARE* ha_warp::get_warp_share() {
   return share;
 }
+static void warp_release_partition(const char *partition_dir);
+
+/* The number of distinct values of the integer columns of a table, for the
+   optimizer: the join of two columns that have no statistics is estimated with
+   a default selectivity (10 percent of the pairs of rows), which makes joins of
+   large tables hundreds of thousands of times larger than they are.  With
+   statistics of an index (the average number of rows per key value) the
+   estimate is one over the number of distinct values.  They are estimated from
+   a sample of the rows and kept as long as the table does not change. */
+struct warp_column_ndv_cache {
+  std::string signature;
+  uint64_t rows = 0;
+  std::map<uint, double> ndv;   // -1: the column has no estimate
+  std::chrono::steady_clock::time_point checked;  // the signature was the same then
+};
+/* The number of distinct values is an estimate that is used for plans: it is
+   not checked against the table more often than this */
+static const int WARP_NDV_CHECK_SECONDS = 10;
+
+static const size_t WARP_NDV_SAMPLE_ROWS = 1000000;
+
+template <typename T>
+static void warp_ndv_collect(const ibis::column *col, size_t stride, std::unordered_map<int64_t, uint32_t> *seen,
+                             uint64_t *taken) {
+  ibis::array_t<T> values;
+  if(col->getValuesArray(&values) != 0) {
+    throw std::runtime_error("could not read a column");
+  }
+  for(size_t i = 0; i < values.size(); i += stride) {
+    ++(*seen)[(int64_t)values[i]];
+    ++(*taken);
+  }
+}
+
+/* distinct values of the column, -1.0 if it can not be estimated */
+static double warp_estimate_ndv(const std::string &datadir, uint field_index, uint64_t *total_rows) {
+  *total_rows = 0;
+  ibis::partList parts;
+  ibis::util::gatherParts(parts, datadir.c_str(), true);
+  std::vector<ibis::part *> work;
+  uint64_t rows = 0;
+  for(ibis::part *part : parts) {
+    if(part != nullptr && part->nRows() > 0 && std::string(part->currentDataDir()) != datadir) {
+      work.push_back(part);
+      rows += part->nRows();
+    }
+  }
+  *total_rows = rows;
+  double result = -1.0;
+  if(!work.empty() && rows > 0) {
+    /* the partitions that are read: at most eight, spread over the table; the
+       rows that are taken: evenly from them, one million at most */
+    std::vector<ibis::part *> picked;
+    const size_t want = std::min<size_t>(work.size(), 8);
+    for(size_t i = 0; i < want; ++i) {
+      picked.push_back(work[want == 1 ? 0 : i * (work.size() - 1) / (want - 1)]);
+    }
+    uint64_t picked_rows = 0;
+    for(ibis::part *part : picked) picked_rows += part->nRows();
+    const size_t stride = std::max<uint64_t>(1, picked_rows / WARP_NDV_SAMPLE_ROWS);
+    std::unordered_map<int64_t, uint32_t> seen;
+    uint64_t taken = 0;
+    bool supported = true;
+    const std::string name = "c" + std::to_string(field_index);
+    try {
+      for(ibis::part *part : picked) {
+        const ibis::column *col = part->getColumn(name.c_str());
+        if(col == nullptr) {
+          supported = false;
+          break;
+        }
+        switch(col->type()) {
+          case ibis::BYTE:   warp_ndv_collect<signed char>(col, stride, &seen, &taken); break;
+          case ibis::UBYTE:  warp_ndv_collect<unsigned char>(col, stride, &seen, &taken); break;
+          case ibis::SHORT:  warp_ndv_collect<int16_t>(col, stride, &seen, &taken); break;
+          case ibis::USHORT: warp_ndv_collect<uint16_t>(col, stride, &seen, &taken); break;
+          case ibis::INT:    warp_ndv_collect<int32_t>(col, stride, &seen, &taken); break;
+          case ibis::UINT:   warp_ndv_collect<uint32_t>(col, stride, &seen, &taken); break;
+          case ibis::LONG:   warp_ndv_collect<int64_t>(col, stride, &seen, &taken); break;
+          case ibis::ULONG:  warp_ndv_collect<uint64_t>(col, stride, &seen, &taken); break;
+          default: supported = false; break;
+        }
+        if(!supported) break;
+      }
+    } catch(...) {
+      supported = false;
+    }
+    if(supported && taken > 0) {
+      const double n = (double)taken;
+      const double d = (double)seen.size();
+      double f1 = 0;
+      for(const auto &entry : seen) {
+        if(entry.second == 1) f1 += 1;
+      }
+      const double table_rows = (double)rows;
+      if(d == n) {
+        result = table_rows;                       // no value was seen twice: a key
+      } else {
+        /* the estimator of Charikar et al. (GEE) */
+        result = std::sqrt(table_rows / n) * f1 + (d - f1);
+        result = std::min(std::max(result, d), table_rows);
+      }
+    }
+  }
+  for(ibis::part *part : work) {
+    warp_release_partition(part->currentDataDir());
+  }
+  for(auto &part : parts) {
+    delete part;
+    part = nullptr;
+  }
+  return result;
+}
+
+/* the number of distinct values of the column of the table (-1.0: unknown) and
+   the rows of the table */
+static double warp_column_ndv(const std::string &datadir, uint field_index, uint64_t *rows) {
+  static std::mutex mtx;
+  static std::unordered_map<std::string, warp_column_ndv_cache> registry;
+  const auto now = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> guard(mtx);
+    auto it = registry.find(datadir);
+    if(it != registry.end() && now - it->second.checked < std::chrono::seconds(WARP_NDV_CHECK_SECONDS)) {
+      auto found = it->second.ndv.find(field_index);
+      if(found != it->second.ndv.end()) {
+        *rows = it->second.rows;
+        return found->second;
+      }
+    }
+  }
+  const std::string signature = warp_table_signature(datadir);
+  if(!signature.empty()) {
+    std::lock_guard<std::mutex> guard(mtx);
+    auto it = registry.find(datadir);
+    if(it != registry.end() && it->second.signature == signature) {
+      it->second.checked = now;
+      auto found = it->second.ndv.find(field_index);
+      if(found != it->second.ndv.end()) {
+        *rows = it->second.rows;
+        return found->second;
+      }
+    }
+  }
+  const double result = warp_estimate_ndv(datadir, field_index, rows);
+  if(!signature.empty() && warp_table_signature(datadir) == signature) {
+    std::lock_guard<std::mutex> guard(mtx);
+    auto &entry = registry[datadir];
+    if(entry.signature != signature) {
+      entry.signature = signature;
+      entry.ndv.clear();
+    }
+    entry.checked = now;
+    entry.rows = *rows;
+    entry.ndv[field_index] = result;
+  }
+  return result;
+}
+
+/* the average number of rows per value of the first parts of the keys of the
+   table, for the optimizer */
+static void warp_set_records_per_key(TABLE *table, const char *datadir) {
+  for(uint k = 0; k < table->s->keys; ++k) {
+    KEY *key = &table->key_info[k];
+    if(!key->supports_records_per_key() || (key->flags & (HA_FULLTEXT | HA_SPATIAL))) {
+      continue;
+    }
+    double distinct = 1.0;
+    bool known = true;
+    uint64_t rows = 0;
+    for(uint j = 0; j < key->actual_key_parts; ++j) {
+      if(!known || j >= key->user_defined_key_parts) {
+        key->set_records_per_key(j, REC_PER_KEY_UNKNOWN);
+        continue;
+      }
+      const double ndv = warp_column_ndv(datadir, key->key_part[j].field->field_index(), &rows);
+      if(ndv < 1.0) {
+        known = false;
+        key->set_records_per_key(j, REC_PER_KEY_UNKNOWN);
+        continue;
+      }
+      distinct = std::min(distinct * ndv, (double)std::max<uint64_t>(rows, 1));
+      float per_key = (float)std::max(1.0, (double)rows / distinct);
+      if((key->flags & HA_NOSAME) && j + 1 == key->user_defined_key_parts) {
+        per_key = 1.0f;
+      }
+      key->set_records_per_key(j, per_key);
+    }
+  }
+}
+
 /*
   ::info() is used to return information to the optimizer.
   Currently this table handler doesn't implement most of the fields
@@ -1723,6 +1914,18 @@ int ha_warp::info(uint flag) {
      (the one with the first data directory if several have as many).  The
      other tables of the statement are the ones it has open; a table that is
      not a WARP table is not a candidate. */
+  /* the optimizer has the number of rows per key value of the indexes (a
+     join of two columns is estimated with them) */
+  if((flag & (HA_STATUS_CONST | HA_STATUS_VARIABLE)) && table->s->keys > 0 && !is_partition_child &&
+     table->in_use != nullptr && table->in_use->lex->sql_command == SQLCOM_SELECT) {
+    try {
+      warp_table_read_lock stats_lock(share->data_dir_name);
+      warp_set_records_per_key(table, share->data_dir_name);
+    } catch(...) {
+      // the keys have no statistics
+    }
+  }
+
   const uint64_t own_rows = table_row_count();
   uint64_t least_row_count = own_rows;
   bool is_fact_table = true;
@@ -2784,7 +2987,10 @@ int ha_warp::rnd_init(bool) {
        appends to a partition rewrites.  A partition whose metadata is read
        at that moment is not found, the scan then returns no rows at all. */
     warp_table_read_lock partitions_lock(share->data_dir_name);
-    if( (!is_partition_child && get_pushdown_info_count(current_thd) > 1 &&
+    /* a scan that the join of the engine makes of a table (warp_par_join.h) is a
+       plain scan: the join pushdown of the largest table of the statement
+       (which it would be here) computes a join of its own */
+    if( (!is_partition_child && !pj_plain_scan && get_pushdown_info_count(current_thd) > 1 &&
          pushdown_info->is_fact_table) || partition_filter_partition_name != "" ) {
       partitions = new ibis::partList;
     
@@ -4883,7 +5089,14 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
     remainder = ha->cond_push(cond);
   }
   auto save_where = ha->push_where_clause;
-  if (join->where_cond) {
+  /* The WHERE clause is applied to the rows of the join.  A condition on the
+     inner table of an outer join (WHERE d.k IS NULL, the usual anti join) is
+     not a condition of the rows of the table: they are read with the ON clause
+     only, a row without a match gets NULLs and then the condition decides. */
+  const Table_ref *table_ref = table->pos_in_table_list;
+  const bool inner_of_outer_join =
+      table_ref != nullptr && table_ref->is_inner_table_of_outer_join();
+  if (join->where_cond && !inner_of_outer_join) {
     ha->push_where_clause = "";
     ha->cond_push(join->where_cond);
   }
