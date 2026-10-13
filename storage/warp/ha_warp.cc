@@ -1977,7 +1977,7 @@ bool ha_warp::start_prefetch(const std::string& datadir) {
     field_indexes.push_back((*field)->field_index());
   }
   const std::string columns = column_set;
-  const std::string where = push_where_clause;
+  const std::string where = scan_where;
   const std::string table_dir = share->data_dir_name;
   try {
     prefetched_partitions.emplace(datadir, std::async(std::launch::async,
@@ -2164,6 +2164,8 @@ void ha_warp::cleanup_pushdown_info() {
 
   /* end of the statement: nothing pushed down for it may be used again */
   push_where_clause = "";
+  scan_where = "";
+  outer_params.clear();
   current_matching_dim_ridset = NULL;
   current_matching_ridset = NULL;
 
@@ -2729,6 +2731,7 @@ int ha_warp::rnd_init(bool) {
   if(push_where_clause == "") {
     push_where_clause = "1=1";
   }
+  make_scan_where();
   
   /* The dimension tables of a star join are read from the pushdown
      information only if the join of the fact table has made its filters;
@@ -2751,7 +2754,7 @@ int ha_warp::rnd_init(bool) {
  
     for(auto filter_it = pushdown_info->fact_table_filters->begin(); filter_it != pushdown_info->fact_table_filters->end(); ++filter_it) {
  
-      if((filter_it->first)->dim_alias == std::string(table->alias)) {
+      if((filter_it->first)->dim_alias == pd_alias()) {
         auto tmp = (filter_it->first);
         current_matching_dim_ridset_it = tmp->get_rownums()->begin();
  
@@ -3391,7 +3394,7 @@ fetch_again:
             
         // this will do some IO to read in projected columns that where not used for filters
         maintain_indexes(find_it->first.c_str());
-        filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
+        filtered_table = base_table->select(column_set.c_str(), scan_where.c_str());
         release_scanned_table();
       }
       prefetch_following_partitions();
@@ -3438,7 +3441,7 @@ fetch_again:
         assert(base_table != NULL);
       
         maintain_indexes((*part_it)->currentDataDir());
-        filtered_table = base_table->select(column_set.c_str(), push_where_clause.c_str());
+        filtered_table = base_table->select(column_set.c_str(), scan_where.c_str());
         release_scanned_table();
       }
       prefetch_following_partitions();
@@ -3736,8 +3739,11 @@ int ha_warp::end_scan(bool finish) {
   join_error = 0;
   
   blobroot.Clear();
-   
-  push_where_clause = "";
+
+  /* The condition that was pushed down stays: the table of a subquery or of
+     the inner side of a nested loop is scanned again for every outer row, and
+     MySQL has removed the pushed condition from its own filter.  It is reset
+     when the statement ends (ha_warp::reset). */
 
   if(!scan_uses_pushdown_tables) {
     if(cursor) delete cursor;
@@ -4837,6 +4843,7 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
      an earlier statement whose scan did not finish (an error, for example)
      must not be applied to a statement that has no condition. */
   ha->push_where_clause = "";
+  ha->outer_params.clear();
   ha->star_agg.reset();
   if (part_ha != nullptr) part_ha->set_pushed_condition("");
 
@@ -4865,6 +4872,12 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
   ha->push_where_clause += save_where;
   pushdown_info->filter = ha->push_where_clause;
   if (part_ha != nullptr) part_ha->set_pushed_condition(ha->push_where_clause);
+  if (part_ha == nullptr) {
+    /* the values of the query block around a subquery are known when the
+       scan starts, see ha_warp::make_scan_where */
+    ha->collect_outer_params(cond);
+    ha->collect_outer_params(join->where_cond);
+  }
 
   if (filter == nullptr) return;
 
@@ -4912,6 +4925,22 @@ static bool warp_path_reads_warp_table(AccessPath *path, const JOIN *join) {
                     return found;
                   });
   return found;
+}
+
+/* Is the query block executed again and again, like a subquery that depends
+   on the query block around it?  Its tables are scanned once for every
+   execution, which the join pushdown does not support (it computes the join
+   when the fact table is scanned first and leaves its state on the dimension
+   tables, so the next execution reads them with the rows of the last one). */
+static bool warp_block_is_executed_again(const JOIN *join) {
+  for(const Query_block *block = join->query_block; block != nullptr;
+      block = block->outer_query_block()) {
+    const Query_expression *unit = block->master_query_expression();
+    if(block->is_dependent() || (unit != nullptr && unit->uncacheable != 0)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /* Is a WARP table the inner (rescanned) side of a nested loop join? */
@@ -4966,7 +4995,8 @@ int warp_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
     return false;
   };
   warp_inner_nested_loop_table =
-      warp_has_inner_nested_loop_table(root_path, join);
+      warp_has_inner_nested_loop_table(root_path, join) ||
+      warp_block_is_executed_again(join);
   WalkAccessPaths(root_path, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
                   func);
   warp_inner_nested_loop_table = false;
@@ -5464,6 +5494,121 @@ static bool warp_push_decimal(Item_func *func, Item **args, bool is_between,
   return true;
 }
 
+/* The integer columns whose comparisons with a value of the query block around
+   a subquery are given to the scan (see warp_outer_param) */
+static bool warp_outer_param_column(const Field *field) {
+  switch(field->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/* Collects the conditions of cond that the scan can use with the values of the
+   outer query block: column OP value, with the value made of columns of the
+   query blocks around the subquery only.  Only the conditions that are joined
+   with AND count.  Nothing is removed from the condition, MySQL still
+   evaluates it for the rows that the scan returns. */
+void ha_warp::collect_outer_params(const Item *cond) {
+  if(cond == nullptr) return;
+  if(cond->type() == Item::Type::COND_ITEM) {
+    Item_cond *item_cond = down_cast<Item_cond *>(const_cast<Item *>(cond));
+    if(item_cond->functype() != Item_func::Functype::COND_AND_FUNC) return;
+    List_iterator_fast<Item> it(*item_cond->argument_list());
+    for(Item *item = it++; item != nullptr; item = it++) {
+      collect_outer_params(item);
+    }
+    return;
+  }
+  if(cond->type() != Item::Type::FUNC_ITEM) return;
+  const Item_func *func = down_cast<const Item_func *>(cond);
+  if(func->arg_count != 2) return;
+  const char *op = nullptr;
+  const char *flipped = nullptr;
+  switch(func->functype()) {
+    case Item_func::Functype::EQ_FUNC: op = " = ";  flipped = " = ";  break;
+    case Item_func::Functype::LT_FUNC: op = " < ";  flipped = " > ";  break;
+    case Item_func::Functype::LE_FUNC: op = " <= "; flipped = " >= "; break;
+    case Item_func::Functype::GT_FUNC: op = " > ";  flipped = " < ";  break;
+    case Item_func::Functype::GE_FUNC: op = " >= "; flipped = " <= "; break;
+    default: return;
+  }
+  Item *a0 = func->arguments()[0];
+  Item *a1 = func->arguments()[1];
+  /* the column of this table is on either side; the value may be a column of
+     the query block around the subquery (also an Item_field) */
+  auto is_column_of_table = [this](Item *item) {
+    if(item->type() != Item::Type::FIELD_ITEM) return false;
+    const Field *f = down_cast<Item_field *>(item)->field;
+    return f != nullptr && f->table == table;
+  };
+  Item *column = a0;
+  Item *value = a1;
+  if(!is_column_of_table(a0)) {
+    column = a1;
+    value = a0;
+    op = flipped;
+  }
+  if(!is_column_of_table(column) || is_column_of_table(value)) return;
+  const Field *field = down_cast<Item_field *>(column)->field;
+  if(!warp_outer_param_column(field)) {
+    return;
+  }
+  /* a value that only depends on the query blocks around the subquery: it
+     does not change while the subquery is executed once */
+  const table_map used = value->used_tables();
+  if((used & OUTER_REF_TABLE_BIT) == 0 || (used & ~OUTER_REF_TABLE_BIT) != 0 ||
+     value->result_type() != INT_RESULT || value->has_subquery() ||
+     value->has_stored_program()) {
+    return;
+  }
+  warp_outer_param param;
+  param.field_index = field->field_index();
+  param.nullable = field->is_nullable();
+  param.col_unsigned = (field->all_flags() & UNSIGNED_FLAG) != 0;
+  param.bigint = field->real_type() == MYSQL_TYPE_LONGLONG;
+  param.op = op;
+  param.value = value;
+  outer_params.push_back(param);
+}
+
+/* The condition of the scan that is started: the pushed down condition and the
+   parameters with the values that they have now.  A value that can not be
+   written exactly is left out, the scan then returns more rows. */
+void ha_warp::make_scan_where() {
+  scan_where = push_where_clause;
+  for(const warp_outer_param &param : outer_params) {
+    std::string cond;
+    param.value->val_int();
+    if(param.value->null_value) {
+      /* a comparison with NULL is not true for any row */
+      cond = "1=0";
+    } else {
+      const bool exact = param.bigint && !warp_int_is_exact_double(param.value);
+      std::string val;
+      if(!warp_format_int(param.value, exact, param.col_unsigned, val)) {
+        continue;
+      }
+      const std::string index = std::to_string(param.field_index);
+      if(param.nullable) {
+        cond = "(n" + index + " = 0 AND c" + index + param.op + val + ")";
+      } else {
+        cond = "c" + index + param.op + val;
+      }
+    }
+    if(scan_where == "" || scan_where == "1=1") {
+      scan_where = cond;
+    } else {
+      scan_where = "(" + scan_where + ") AND (" + cond + ")";
+    }
+  }
+}
+
 int ha_warp::append_column_filter(const Item *cond,
                                    std::string &where_clause) {
   bool field_may_be_null = false;
@@ -5619,8 +5764,10 @@ int ha_warp::append_column_filter(const Item *cond,
       }
 
       // Get the pushdown information - something is quite broken if these are NULL
-      auto f0_info = get_pushdown_info(table->in_use, f0->m_table_ref->alias);
-      auto f1_info = get_pushdown_info(table->in_use, f1->m_table_ref->alias);
+      const std::string f0_key = warp_pd_key(f0->m_table_ref, f0->m_table_ref->alias);
+      const std::string f1_key = warp_pd_key(f1->m_table_ref, f1->m_table_ref->alias);
+      auto f0_info = get_pushdown_info(table->in_use, f0_key.c_str());
+      auto f1_info = get_pushdown_info(table->in_use, f1_key.c_str());
       
       if(f0_info == NULL || f1_info == NULL) {
         return 0;
@@ -5632,7 +5779,7 @@ int ha_warp::append_column_filter(const Item *cond,
       }
       const char* dim_field_mysql_name;
       const char* fact_field_mysql_name;
-      const char* dim_alias;
+      std::string dim_alias;  // the key of the dimension table (warp_pd_key)
       //const char* fact_alias;
       
       // Used later translate the MySQL table column names into
@@ -5654,7 +5801,7 @@ int ha_warp::append_column_filter(const Item *cond,
 
         dim_table = f1_info;
         dim_field_mysql_name = f1->field_name;
-        dim_alias = f1->table_name;
+        dim_alias = f1_key;
       } else {
         fact_table = f1_info;
         fact_field_mysql_name = f1->field_name;
@@ -5662,7 +5809,7 @@ int ha_warp::append_column_filter(const Item *cond,
         
         dim_table = f0_info;
         dim_field_mysql_name = f0->field_name;
-        dim_alias = f0->table_name;
+        dim_alias = f0_key;
       }
 
       // find the field in the fact table
@@ -6076,7 +6223,7 @@ int ha_warp::bitmap_merge_join() {
     }
     
     Field* dim_field = join_it->second.field;
-    auto dim_pushdown_info = get_pushdown_info(table->in_use, join_it->second.alias);
+    auto dim_pushdown_info = get_pushdown_info(table->in_use, join_it->second.alias.c_str());
     if(dim_pushdown_info == NULL) {
       continue;
     }
@@ -8154,6 +8301,13 @@ std::string ha_warp::explain_extra() const {
     return ", with pushed condition: " + ItemToString(pushed_cond);
   }
   return "";
+}
+
+std::string warp_pd_key(const Table_ref *ref, const char *alias) {
+  if(ref == nullptr || ref->query_block == nullptr) {
+    return std::string(alias);
+  }
+  return std::string(alias) + "@" + std::to_string(ref->query_block->select_number);
 }
 
 uint64_t get_pushdown_info_count(THD* thd) {

@@ -542,7 +542,9 @@ struct WARP_SHARE {
 
 class warp_join_info {
   public:
-  const char* alias;
+  /* the key of the pushdown information of the dimension table, see
+     warp_pd_key */
+  std::string alias;
   Field* field;
 };
 
@@ -607,6 +609,13 @@ std::unordered_map<THD*, std::unordered_map<std::string, warp_pushdown_informati
 std::mutex pushdown_mtx;
 std::mutex fact_filter_mutex;
 std::mutex parallel_join_mutex;
+
+/* The name under which the pushdown information of a table is kept.  It is
+   made from the alias of the table and the number of the query block that the
+   table belongs to: a subquery that uses the same table names as the query
+   around it (TPC-H Q2 reads partsupp, supplier, nation and region in both)
+   must not share the conditions and joins of the other query block. */
+std::string warp_pd_key(const Table_ref *ref, const char *alias);
 
 // initializes or returns the pushdown information for a table used in a query
 warp_pushdown_information* get_or_create_pushdown_info(THD* thd, const char* alias, const char* data_dir_name);
@@ -1133,6 +1142,26 @@ class ha_warp : public handler {
  public:
   std::string          push_where_clause  = "";
 
+  /* A comparison of an integer column of the table with a value of the query
+     block around a subquery (WHERE ps_partkey = p_partkey in a correlated
+     subquery).  The value is the same for all the rows of one execution of
+     the subquery, so a scan that starts for an execution only has to look for
+     the rows that have it.  MySQL keeps evaluating the condition: the
+     parameters only make the scan return fewer rows. */
+  struct warp_outer_param {
+    uint field_index;
+    bool nullable;
+    bool col_unsigned;
+    bool bigint;
+    const char *op;
+    Item *value;
+  };
+  std::vector<warp_outer_param> outer_params;
+  /* push_where_clause and the parameters for the scan that is started */
+  std::string          scan_where         = "";
+  void collect_outer_params(const Item *cond);
+  void make_scan_where();
+
  private:
   int64_t pushdown_table_count = 0;
   
@@ -1213,7 +1242,7 @@ class ha_warp : public handler {
   bool is_partition_child = false;
   std::string pd_alias_suffix;
   std::string pd_alias() const {
-    return std::string(table->alias) + pd_alias_suffix;
+    return warp_pd_key(table->pos_in_table_list, table->alias) + pd_alias_suffix;
   }
   friend class ha_warp_part;
 
@@ -1340,6 +1369,11 @@ class ha_warp : public handler {
   int extra(enum ha_extra_function operation);
   int reset() override {
     dup_row_is_read = false;
+    /* end of the statement: what was pushed down for it is not valid for the
+       next one */
+    push_where_clause = "";
+    scan_where = "";
+    outer_params.clear();
     return 0;
   }
   int delete_all_rows(void);
