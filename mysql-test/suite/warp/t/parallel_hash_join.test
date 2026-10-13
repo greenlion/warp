@@ -1,0 +1,230 @@
+
+--echo #
+--echo # The engine joins WARP tables itself (warp_parallel_hash_join): hash tables
+--echo # are made of the smaller tables and the partitions of the largest one are
+--echo # probed.  The result must be what MySQL gives.  Every query is run against
+--echo # the WARP tables (suffix w) and against InnoDB copies of them (suffix i) and
+--echo # a checksum of the rows is compared.
+--echo #
+
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 10000;
+SET SESSION join_buffer_size = 2048;
+
+--let $engines = w,i
+CREATE TABLE f_w (id INT, k1 INT, k2 INT, k3 BIGINT, u INT UNSIGNED, t TINYINT, s VARCHAR(10), n INT NULL, v INT)
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d1_w (k INT, a VARCHAR(8), b INT, kk INT NULL) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d2_w (k BIGINT, c VARCHAR(8), flag INT, k1 INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d3_w (x INT, y INT, z VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d4_w (m INT, w INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+INSERT INTO f_w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 3000)
+  SELECT x, 1 + x % 40, 1 + x % 25, 1 + x % 17, x % 9, x % 5, CONCAT('s', x % 11), IF(x % 7 = 0, NULL, x % 13), x % 100 FROM s;
+INSERT INTO d1_w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 45)
+  SELECT x, CONCAT('A', x % 4), x % 6, IF(x % 10 = 0, NULL, 1 + x % 20) FROM s;
+INSERT INTO d1_w VALUES (3, 'dup', 99, 3), (3, 'dup2', 98, 4);
+INSERT INTO d2_w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 20)
+  SELECT x, CONCAT('C', x % 3), x % 2, 1 + x % 40 FROM s;
+INSERT INTO d3_w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 60)
+  SELECT 1 + x % 40, 1 + x % 25, CONCAT('Z', x % 5) FROM s;
+INSERT INTO d4_w VALUES (0, 10), (1, 11), (2, 12), (3, 13), (4, 14), (NULL, 15);
+CREATE TABLE f_i LIKE f_w;
+CREATE TABLE d1_i LIKE d1_w;
+CREATE TABLE d2_i LIKE d2_w;
+CREATE TABLE d3_i LIKE d3_w;
+CREATE TABLE d4_i LIKE d4_w;
+ALTER TABLE f_i ENGINE=InnoDB;
+ALTER TABLE d1_i ENGINE=InnoDB;
+ALTER TABLE d2_i ENGINE=InnoDB;
+ALTER TABLE d3_i ENGINE=InnoDB;
+ALTER TABLE d4_i ENGINE=InnoDB;
+INSERT INTO f_i SELECT * FROM f_w;
+INSERT INTO d1_i SELECT * FROM d1_w;
+INSERT INTO d2_i SELECT * FROM d2_w;
+INSERT INTO d3_i SELECT * FROM d3_w;
+INSERT INTO d4_i SELECT * FROM d4_w;
+
+--echo # case 1: star, two dimensions, one key matches several rows
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d1.b AS c2, d2.c AS c3 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d1.b AS c2, d2.c AS c3 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE d2.flag = 1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 1
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d1.b, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 1;
+--echo # case 2: filters on dimensions, a dimension with a condition on both sides
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f, d1_w d1, d2_w d2 WHERE f.k1 = d1.k AND f.k2 = d2.k AND d1.b > 2 AND d2.c = 'C1' AND f.v < 50) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f, d1_i d1, d2_i d2 WHERE f.k1 = d1.k AND f.k2 = d2.k AND d1.b > 2 AND d2.c = 'C1' AND f.v < 50) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 2
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f, d1_w d1, d2_w d2 WHERE f.k1 = d1.k AND f.k2 = d2.k AND d1.b > 2 AND d2.c = 'C1' AND f.v < 50;
+--echo # case 3: snowflake: a dimension of a dimension
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON d1.kk = d2.k WHERE d2.flag = 0) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON d1.kk = d2.k WHERE d2.flag = 0) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 3
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON d1.kk = d2.k WHERE d2.flag = 0;
+--echo # case 4: composite key
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d3.z AS c1 FROM f_w f JOIN d3_w d3 ON f.k1 = d3.x AND f.k2 = d3.y) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d3.z AS c1 FROM f_i f JOIN d3_i d3 ON f.k1 = d3.x AND f.k2 = d3.y) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 4
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d3.z FROM f_w f JOIN d3_w d3 ON f.k1 = d3.x AND f.k2 = d3.y;
+--echo # case 5: a join condition that closes a cycle
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k AND d1.kk = d2.k1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k AND d1.kk = d2.k1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 5
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k AND d1.kk = d2.k1;
+--echo # case 6: columns of different integer types and an unsigned column
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1, d4.w AS c2 FROM f_w f JOIN d2_w d2 ON f.k3 = d2.k JOIN d4_w d4 ON f.u = d4.m) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1, d4.w AS c2 FROM f_i f JOIN d2_i d2 ON f.k3 = d2.k JOIN d4_i d4 ON f.u = d4.m) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 6
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d2.c, d4.w FROM f_w f JOIN d2_w d2 ON f.k3 = d2.k JOIN d4_w d4 ON f.u = d4.m;
+--echo # case 7: NULL keys do not join
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d4.w AS c1 FROM f_w f JOIN d4_w d4 ON f.t = d4.m JOIN d1_w d1 ON f.n = d1.kk) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d4.w AS c1 FROM f_i f JOIN d4_i d4 ON f.t = d4.m JOIN d1_i d1 ON f.n = d1.kk) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 7
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d4.w FROM f_w f JOIN d4_w d4 ON f.t = d4.m JOIN d1_w d1 ON f.n = d1.kk;
+--echo # case 8: a condition of two tables that the engine does not evaluate
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.v + d1.b > 60 OR d2.c = 'C0') q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE f.v + d1.b > 60 OR d2.c = 'C0') q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 8
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.v + d1.b > 60 OR d2.c = 'C0';
+--echo # case 9: the same table twice
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT a.id AS c0, b.id AS c1 FROM f_w a JOIN f_w b ON a.k1 = b.k1 AND a.id = b.id + 40 WHERE a.v < 30) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT a.id AS c0, b.id AS c1 FROM f_i a JOIN f_i b ON a.k1 = b.k1 AND a.id = b.id + 40 WHERE a.v < 30) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 9
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT a.id, b.id FROM f_w a JOIN f_w b ON a.k1 = b.k1 AND a.id = b.id + 40 WHERE a.v < 30;
+--echo # case 10: no row matches
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE d1.b > 1000) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k WHERE d1.b > 1000) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 10
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE d1.b > 1000;
+--echo # case 11: a string column of a dimension and a COUNT
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT d1.a AS c0, d2.c AS c1, COUNT(*) AS c2, SUM(f.v) AS c3 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k GROUP BY d1.a, d2.c) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT d1.a AS c0, d2.c AS c1, COUNT(*) AS c2, SUM(f.v) AS c3 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k GROUP BY d1.a, d2.c) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 11
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT d1.a, d2.c, COUNT(*), SUM(f.v) FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k GROUP BY d1.a, d2.c;
+--echo # case 12: an expression of the joined rows
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, f.v * d1.b + d2.flag AS c1 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3')) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, f.v * d1.b + d2.flag AS c1 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3')) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 12
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, f.v * d1.b + d2.flag FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3');
+--echo # case 13: an anti join over the joined rows: MySQL buffers the rows of all the tables (the join buffer is small, so it spills them to disk)
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_w g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id)) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_i g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 13
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_w g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id);
+--echo # case 14: a semi join over the joined rows
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_w g WHERE g.k2 = f.k2 AND g.v = d1.b + 40)) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_i g WHERE g.k2 = f.k2 AND g.v = d1.b + 40)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 14
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_w g WHERE g.k2 = f.k2 AND g.v = d1.b + 40);
+--echo # case 15: a sort of the joined rows by columns of every table
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2, d1.b AS c3 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 400 ORDER BY d2.c DESC, d1.a, d1.b, f.id) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2, d1.b AS c3 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE f.id < 400 ORDER BY d2.c DESC, d1.a, d1.b, f.id) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 15
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c, d1.b FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 400 ORDER BY d2.c DESC, d1.a, d1.b, f.id;
+
+--echo # the join is done by the engine: the tables of the join are replaced by one scan
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 1;
+SET SESSION warp_parallel_hash_join = 0;
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 1;
+SET SESSION warp_parallel_hash_join = 1;
+
+--echo # rows that a transaction can not see are not joined
+BEGIN;
+DELETE FROM f_w WHERE id % 2 = 0;
+DELETE FROM f_i WHERE id % 2 = 0;
+INSERT INTO f_w VALUES (5000, 1, 1, 1, 1, 1, 'new', 1, 1);
+INSERT INTO f_i VALUES (5000, 1, 1, 1, 1, 1, 'new', 1, 1);
+let $w = `SELECT CONCAT(COUNT(*), ':', SUM(CRC32(CONCAT_WS('|', f.id, d1.a)))) FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k`;
+let $i = `SELECT CONCAT(COUNT(*), ':', SUM(CRC32(CONCAT_WS('|', f.id, d1.a)))) FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in the transaction
+}
+ROLLBACK;
+let $w = `SELECT CONCAT(COUNT(*), ':', SUM(CRC32(CONCAT_WS('|', f.id, d1.a)))) FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k`;
+let $i = `SELECT CONCAT(COUNT(*), ':', SUM(CRC32(CONCAT_WS('|', f.id, d1.a)))) FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH after the rollback
+}
+
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
+DROP TABLE f_w, d1_w, d2_w, d3_w, d4_w, f_i, d1_i, d2_i, d3_i, d4_i;

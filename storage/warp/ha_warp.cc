@@ -2128,6 +2128,7 @@ int ha_warp::extra(enum ha_extra_function xtra) {
 
 void ha_warp::cleanup_pushdown_info() {
   star_agg.reset();
+  par_join.reset();
   if(index_scan_open) {
     end_scan(true);
   }
@@ -2668,6 +2669,16 @@ int ha_warp::rnd_init(bool) {
     /* the query is aggregated by the engine, the rows are the groups */
     DBUG_RETURN(star_agg_run() ? HA_ERR_INTERNAL_ERROR : 0);
   }
+  if(par_join) {
+    /* the tables of the query are joined by the engine, the rows are the
+       joined rows */
+    DBUG_RETURN(pj_run());
+  }
+  if(pj_following()) {
+    /* a table of the join of the engine: one row for every probe row */
+    pj_follower_pending = true;
+    DBUG_RETURN(0);
+  }
   if(!index_scan_mode && index_scan_open) {
     /* the scan of an index lookup that the statement left open */
     end_scan(false);
@@ -3086,6 +3097,12 @@ void ha_warp::wait_for_join_threads() {
    escape into the server, which would terminate it. */
 int ha_warp::rnd_next(uchar *buf) {
   DBUG_ENTER("ha_warp::rnd_next");
+  if(par_join) {
+    DBUG_RETURN(pj_next(buf));
+  }
+  if(pj_following()) {
+    DBUG_RETURN(pj_follower_next(buf));
+  }
   if(star_agg) {
     DBUG_RETURN(star_agg_next(buf));
   }
@@ -3732,6 +3749,9 @@ int ha_warp::rnd_end() {
    scan without finishing: what the statement wrote stays in the writer. */
 int ha_warp::end_scan(bool finish) {
   DBUG_ENTER("ha_warp::end_scan");
+
+  /* the scan of the joined rows has nothing else to release */
+  pj_close();
 
   /* workers use members of this handler (and the part objects freed below) */
   wait_for_join_threads();
@@ -4845,6 +4865,8 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
   ha->push_where_clause = "";
   ha->outer_params.clear();
   ha->star_agg.reset();
+  ha->par_join.reset();
+  ha->pj_follower.reset();
   if (part_ha != nullptr) part_ha->set_pushed_condition("");
 
   const Item *cond = (filter != nullptr) ? filter->filter().condition : nullptr;
@@ -4968,6 +4990,7 @@ static bool warp_has_inner_nested_loop_table(AccessPath *root_path,
 }
 
 #include "warp_star_agg.h"
+#include "warp_par_join.h"
 
 /**
  * handlerton::push_to_engine implementation.  Walks the AccessPath tree and
@@ -5002,6 +5025,7 @@ int warp_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
   warp_inner_nested_loop_table = false;
   /* the star joins that the engine can evaluate and aggregate itself */
   warp_try_star_aggregation(thd, root_path, join);
+  warp_try_parallel_join(thd, root_path, join);
   return 0;
 }
 

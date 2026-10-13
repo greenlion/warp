@@ -396,6 +396,24 @@ static MYSQL_THDVAR_BOOL(star_aggregation, PLUGIN_VAR_NOCMDARG,
                           "aggregate (SUM ... GROUP BY) inside the engine, in parallel by partition",
                           nullptr, nullptr, true);
 
+static MYSQL_THDVAR_BOOL(parallel_hash_join, PLUGIN_VAR_NOCMDARG,
+                          "Join the tables of a query that joins WARP tables with equalities (inner joins) inside the "
+                          "engine: hash tables are made of the smaller tables and the partitions of the largest one are "
+                          "probed in parallel",
+                          nullptr, nullptr, true);
+
+static MYSQL_THDVAR_ULONG(parallel_join_min_rows, PLUGIN_VAR_RQCMDARG,
+                          "The engine only joins the tables of a query (warp_parallel_hash_join) if the largest of "
+                          "them has at least this many rows.",
+                          nullptr, nullptr, 100000, 0, ULONG_MAX, 0);
+
+static MYSQL_THDVAR_ULONG(scan_rows_per_cost, PLUGIN_VAR_RQCMDARG,
+                          "The optimizer's cost of scanning a table is its number of rows divided by this "
+                          "value.  0 (the default) makes a scan nearly free (1 / rows), which favors scans over "
+                          "indexes and star joins; a table that a nested loop scans again for every row of the "
+                          "other tables is then not expensive for the optimizer.",
+                          nullptr, nullptr, 0, 0, ULONG_MAX, 0);
+
 static MYSQL_THDVAR_ULONG(parallel_min_rows, PLUGIN_VAR_RQCMDARG,
                           "Smallest number of rows of a piece of a partition that is processed by a thread of its own "
                           "(see warp_max_degree_of_parallelism).",
@@ -450,6 +468,9 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(partition_filter),
   MYSQL_SYSVAR(adjust_table_stats_for_joins),
   MYSQL_SYSVAR(star_aggregation),
+  MYSQL_SYSVAR(parallel_hash_join),
+  MYSQL_SYSVAR(scan_rows_per_cost),
+  MYSQL_SYSVAR(parallel_join_min_rows),
   MYSQL_SYSVAR(max_degree_of_parallelism),
   MYSQL_SYSVAR(parallel_min_rows),
   NULL
@@ -1006,6 +1027,7 @@ warp_trx* warp_get_trx(handlerton* hton, THD* thd);
 //creating and dropping tables, TRUNCATE table, reading from indexes,
 //scanning tables, inserts, updates, deletes, engine condition pushdown
 struct warp_star_agg;  /* warp_star_agg.h */
+struct warp_pj_plan;   /* warp_par_join.h */
 
 struct warp_table_lock_set;
 
@@ -1321,6 +1343,11 @@ class ha_warp : public handler {
    */
   virtual double scan_time() {
     //return (double)(stats.records + stats.deleted) / 20.0 + 10;
+    const ulong per_cost = table != nullptr && table->in_use != nullptr
+                               ? THDVAR(table->in_use, scan_rows_per_cost) : 0;
+    if(per_cost > 0) {
+      return (double)stats.records / (double)per_cost;
+    }
     return 1.0/(stats.records > 0 ? stats.records : 1);
   }
 
@@ -1349,6 +1376,27 @@ class ha_warp : public handler {
   bool locks_rows_on_read() const { return lock_in_share_mode || lock_for_update; }
   bool star_agg_run();
   int star_agg_next(uchar *buf);
+  /* join of tables inside the engine, see warp_par_join.h.  The plan is made
+     in push_to_engine, the result is computed by rnd_init and returned one
+     joined row per call of rnd_next (the rows of the other tables are
+     written to their records). */
+  std::shared_ptr<warp_pj_plan> par_join;
+  int pj_run();
+  int pj_next(uchar *buf);
+  void pj_close();
+  /* A table that the engine joins to the probe table is still a table of the
+     plan that MySQL runs (it reads the columns of the rows that it buffers,
+     for example when a hash join spills to disk, from the tables of the
+     plan): it is scanned, and the scan returns the row that the join has
+     chosen (one row for every row of the probe table). */
+  std::shared_ptr<warp_pj_plan> pj_follower;
+  int pj_follower_level = 0;
+  bool pj_follower_pending = false;
+  int pj_follower_next(uchar *buf);
+  bool pj_following() const;
+  /* the identity of the row that the handler returned last (position, rnd_pos) */
+  uint64_t pj_rowid() const { return current_rowid; }
+  void pj_set_rowid(uint64_t rowid) { current_rowid = rowid; }
   int rnd_next(uchar *buf);
   int rnd_pos(uchar *buf, uchar *pos);
   bool check_and_repair(THD *thd);
@@ -1374,6 +1422,9 @@ class ha_warp : public handler {
     push_where_clause = "";
     scan_where = "";
     outer_params.clear();
+    par_join.reset();
+    pj_follower.reset();
+    pj_follower_pending = false;
     return 0;
   }
   int delete_all_rows(void);
