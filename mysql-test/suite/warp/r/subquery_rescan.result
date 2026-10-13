@@ -1,0 +1,90 @@
+#
+# A table of a subquery is scanned again for every row of the query
+# around it.  The condition that was pushed down for it (and removed from
+# the filter of MySQL) must be applied by every scan, not only by the
+# first one, a subquery that uses the same table names as the query
+# around it must not share its conditions with it, and the join pushdown
+# (which scans every table once) must not be used in it.  Every query is
+# also run against InnoDB.
+#
+CREATE TABLE pt (partkey INT, size INT) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE ps (partkey INT, suppkey INT, cost INT) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE su (suppkey INT, region INT) ENGINE=WARP
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE pt_i LIKE pt;
+ALTER TABLE pt_i ENGINE=InnoDB;
+CREATE TABLE ps_i LIKE ps;
+ALTER TABLE ps_i ENGINE=InnoDB;
+CREATE TABLE su_i LIKE su;
+ALTER TABLE su_i ENGINE=InnoDB;
+INSERT INTO pt VALUES (10, 15), (20, 15), (30, 15), (40, 7);
+INSERT INTO su VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 1);
+INSERT INTO ps VALUES
+(10, 1, 500), (10, 3, 100), (10, 5, 300),
+(20, 2, 700), (20, 4, 50),
+(30, 1, 200), (30, 2, 200), (30, 3, 10),
+(40, 1, 5);
+INSERT INTO pt_i SELECT * FROM pt;
+INSERT INTO ps_i SELECT * FROM ps;
+INSERT INTO su_i SELECT * FROM su;
+# the cheapest offer of every part among the suppliers of region 1
+# (the subquery reads ps and su, like the query around it)
+SELECT pt.partkey, ps.suppkey, ps.cost
+FROM pt, ps, su
+WHERE pt.partkey = ps.partkey AND ps.suppkey = su.suppkey
+AND su.region = 1 AND pt.size = 15
+AND ps.cost = (SELECT MIN(ps.cost) FROM ps, su
+WHERE pt.partkey = ps.partkey AND ps.suppkey = su.suppkey
+AND su.region = 1);
+partkey	suppkey	cost
+10	5	300
+20	2	700
+30	1	200
+30	2	200
+SELECT pt_i.partkey, ps_i.suppkey, ps_i.cost
+FROM pt_i, ps_i, su_i
+WHERE pt_i.partkey = ps_i.partkey AND ps_i.suppkey = su_i.suppkey
+AND su_i.region = 1 AND pt_i.size = 15
+AND ps_i.cost = (SELECT MIN(ps_i.cost) FROM ps_i, su_i
+WHERE pt_i.partkey = ps_i.partkey AND ps_i.suppkey = su_i.suppkey
+AND su_i.region = 1);
+partkey	suppkey	cost
+10	5	300
+20	2	700
+30	1	200
+30	2	200
+# a subquery that is evaluated once for every row of the query around it
+SELECT pt.partkey, (SELECT COUNT(*) FROM ps WHERE ps.partkey = pt.partkey AND ps.cost > 100) AS expensive
+FROM pt;
+partkey	expensive
+10	2
+20	1
+30	2
+40	0
+SELECT pt_i.partkey, (SELECT COUNT(*) FROM ps_i WHERE ps_i.partkey = pt_i.partkey AND ps_i.cost > 100) AS expensive
+FROM pt_i;
+partkey	expensive
+10	2
+20	1
+30	2
+40	0
+# an outer value that is NULL matches nothing
+INSERT INTO pt VALUES (NULL, 15);
+INSERT INTO pt_i VALUES (NULL, 15);
+SELECT pt.partkey, (SELECT COUNT(*) FROM ps WHERE ps.partkey = pt.partkey) AS offers FROM pt;
+partkey	offers
+10	3
+20	2
+30	3
+40	1
+NULL	0
+SELECT pt_i.partkey, (SELECT COUNT(*) FROM ps_i WHERE ps_i.partkey = pt_i.partkey) AS offers FROM pt_i;
+partkey	offers
+10	3
+20	2
+30	3
+40	1
+NULL	0
+DROP TABLE pt, ps, su, pt_i, ps_i, su_i;

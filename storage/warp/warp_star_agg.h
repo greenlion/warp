@@ -644,7 +644,7 @@ static std::shared_ptr<warp_star_agg> warp_star_make_plan(THD *thd, AccessPath *
   /* the fact table is the largest one */
   TABLE *fact = nullptr;
   for(TABLE *table : tables) {
-    auto info = get_pushdown_info(thd, table->alias);
+    auto info = get_pushdown_info(thd, warp_pd_key(table->pos_in_table_list, table->alias).c_str());
     if(info != nullptr && info->is_fact_table) {
       if(fact != nullptr) {
         return (warp_star_no(__LINE__), none);
