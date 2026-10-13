@@ -4,6 +4,8 @@
 #
 call mtr.add_suppression("WARP: aggregation of");
 SET SESSION cte_max_recursion_depth = 1000000;
+# the joins that the engine does not aggregate are left to MySQL here (see parallel_hash_join)
+SET SESSION warp_parallel_hash_join = 0;
 CREATE TABLE f (id INT NOT NULL, k1 INT NOT NULL, k2 INT NOT NULL, k3 INT NOT NULL,
 a INT NOT NULL, b INT, c BIGINT NOT NULL, t TINYINT NOT NULL)
 ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
