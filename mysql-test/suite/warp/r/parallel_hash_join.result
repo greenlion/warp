@@ -201,6 +201,68 @@ EXPLAIN
                 -> Table scan on d2
             -> Table scan on d1
 
+# case 16: a LEFT JOIN: rows without a match get NULLs
+499:1059878015669
+EXPLAIN FORMAT=TREE SELECT f.id, d2.c, d2.flag FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 500;
+EXPLAIN
+-> Nested loop left join
+    -> Table scan on f
+    -> Table scan on d2
+
+# case 17: a LEFT JOIN with a condition of the inner table in the ON clause
+499:1044670539468
+EXPLAIN FORMAT=TREE SELECT f.id, d2.c FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.flag = 1 WHERE f.id < 500;
+EXPLAIN
+-> Nested loop left join
+    -> Table scan on f
+    -> Table scan on d2
+
+# case 18: an inner join and a LEFT JOIN with a condition on a string column
+960:2053539217041
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.c = 'C1' WHERE f.v < 30;
+EXPLAIN
+-> Nested loop inner join
+    -> Nested loop left join
+        -> Table scan on f
+        -> Table scan on d2
+    -> Table scan on d1
+
+# case 19: a LEFT JOIN used as an anti join
+600:1288186545268
+EXPLAIN FORMAT=TREE SELECT f.id FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.k IS NULL;
+EXPLAIN
+-> Filter: (d2.k is null)
+    -> Nested loop left join
+        -> Table scan on f
+        -> Table scan on d2
+
+# case 20: the small table is the outer table of the LEFT JOIN, a COUNT of the inner table
+45:109640937587
+EXPLAIN FORMAT=TREE SELECT d1.k, COUNT(f.id), SUM(f.v) FROM d1_w d1 LEFT JOIN f_w f ON f.k1 = d1.k AND f.v > 50 GROUP BY d1.k;
+EXPLAIN
+-> Table scan on <temporary>
+    -> Aggregate using temporary table
+        -> Nested loop left join
+            -> Table scan on d1
+            -> Table scan on f
+
+# case 21: NULL keys of the outer table
+851:1832393546893
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f LEFT JOIN d1_w d1 ON f.n = d1.kk WHERE f.id < 400;
+EXPLAIN
+-> Nested loop left join
+    -> Table scan on f
+    -> Table scan on d1
+
+# case 22: a LEFT JOIN with a condition of the WHERE clause on the inner table
+1800:3864456740923
+EXPLAIN FORMAT=TREE SELECT f.id, d2.c FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 0 OR d2.c IS NULL;
+EXPLAIN
+-> Filter: ((d2.flag = 0) or (d2.c is null))
+    -> Nested loop left join
+        -> Table scan on f
+        -> Table scan on d2
+
 # the join is done by the engine: the tables of the join are replaced by one scan
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 1;
 EXPLAIN

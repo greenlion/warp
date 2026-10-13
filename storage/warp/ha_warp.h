@@ -409,10 +409,19 @@ static MYSQL_THDVAR_ULONG(parallel_join_min_rows, PLUGIN_VAR_RQCMDARG,
 
 static MYSQL_THDVAR_ULONG(scan_rows_per_cost, PLUGIN_VAR_RQCMDARG,
                           "The optimizer's cost of scanning a table is its number of rows divided by this "
-                          "value.  0 (the default) makes a scan nearly free (1 / rows), which favors scans over "
-                          "indexes and star joins; a table that a nested loop scans again for every row of the "
-                          "other tables is then not expensive for the optimizer.",
-                          nullptr, nullptr, 0, 0, ULONG_MAX, 0);
+                          "value (a page of a table of the size of a row of a typical table has about 100 rows).  "
+                          "Reading rows through an index costs twice as much as scanning the table: an index of "
+                          "WARP is a bitmap of the column that is evaluated like a scan, and a lookup for every "
+                          "row of another table is much slower than a hash join.  0 gives the old costs: a scan "
+                          "is nearly free (1 / rows) and an index costs what the handler default says.",
+                          nullptr, nullptr, 100, 0, ULONG_MAX, 0);
+
+static MYSQL_THDVAR_ULONG(index_cost_factor, PLUGIN_VAR_RQCMDARG,
+                          "The optimizer's cost of an access through an index of WARP is this many times the cost "
+                          "of scanning the table (warp_scan_rows_per_cost).  The optimizer prefers an index when "
+                          "it finds the rows through it with a lookup for every row of the other tables, even if "
+                          "a hash join would be faster.",
+                          nullptr, nullptr, 2, 1, 1000000, 0);
 
 static MYSQL_THDVAR_ULONG(parallel_min_rows, PLUGIN_VAR_RQCMDARG,
                           "Smallest number of rows of a piece of a partition that is processed by a thread of its own "
@@ -470,6 +479,7 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(star_aggregation),
   MYSQL_SYSVAR(parallel_hash_join),
   MYSQL_SYSVAR(scan_rows_per_cost),
+  MYSQL_SYSVAR(index_cost_factor),
   MYSQL_SYSVAR(parallel_join_min_rows),
   MYSQL_SYSVAR(max_degree_of_parallelism),
   MYSQL_SYSVAR(parallel_min_rows),
@@ -1341,6 +1351,45 @@ class ha_warp : public handler {
   /*
      Called in test_quick_select to determine if indexes should be used.
    */
+  /* An index is read at twice the cost of a scan of the table, whatever the
+     number of rows: the engine evaluates the index like a scan, see
+     warp_scan_rows_per_cost. */
+  virtual double read_time(uint index, uint ranges, ha_rows rows) override {
+    const ulong per_cost = table != nullptr && table->in_use != nullptr
+                               ? THDVAR(table->in_use, scan_rows_per_cost) : 0;
+    if(per_cost == 0) {
+      return handler::read_time(index, ranges, rows);
+    }
+    return (double)THDVAR(table->in_use, index_cost_factor) * scan_time();
+  }
+  /* A lookup through an index (the optimizer asks for the cost of a number of
+     separate accesses, and for the most that a lookup can cost) costs two
+     scans of the table, however few rows it finds: it is evaluated like a
+     scan, and a join with a lookup for every row is slower than a hash join. */
+  virtual double page_read_cost(uint index, double reads) override {
+    const ulong per_cost = table != nullptr && table->in_use != nullptr
+                               ? THDVAR(table->in_use, scan_rows_per_cost) : 0;
+    if(per_cost == 0) {
+      return handler::page_read_cost(index, reads);
+    }
+    return std::max(reads, 1.0) * (double)THDVAR(table->in_use, index_cost_factor) * scan_time();
+  }
+  virtual double worst_seek_times(double reads) override {
+    const ulong per_cost = table != nullptr && table->in_use != nullptr
+                               ? THDVAR(table->in_use, scan_rows_per_cost) : 0;
+    if(per_cost == 0) {
+      return handler::worst_seek_times(reads);
+    }
+    return std::max(reads, 1.0) * (double)THDVAR(table->in_use, index_cost_factor) * scan_time();
+  }
+  virtual double index_only_read_time(uint index, double records) override {
+    const ulong per_cost = table != nullptr && table->in_use != nullptr
+                               ? THDVAR(table->in_use, scan_rows_per_cost) : 0;
+    if(per_cost == 0) {
+      return handler::index_only_read_time(index, records);
+    }
+    return (double)THDVAR(table->in_use, index_cost_factor) * scan_time();
+  }
   virtual double scan_time() {
     //return (double)(stats.records + stats.deleted) / 20.0 + 10;
     const ulong per_cost = table != nullptr && table->in_use != nullptr
@@ -1394,6 +1443,8 @@ class ha_warp : public handler {
   bool pj_follower_pending = false;
   int pj_follower_next(uchar *buf);
   bool pj_following() const;
+  /* the engine join reads the table for its hash table (see rnd_init) */
+  bool pj_plain_scan = false;
   /* the identity of the row that the handler returned last (position, rnd_pos) */
   uint64_t pj_rowid() const { return current_rowid; }
   void pj_set_rowid(uint64_t rowid) { current_rowid = rowid; }
