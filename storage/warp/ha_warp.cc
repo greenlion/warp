@@ -253,6 +253,16 @@ static int show_warp_active_transactions(MYSQL_THD, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
+/* Warp_semi_key_scans: the scans that were limited to the keys of another
+   table (see ha_warp::semi_key_condition) */
+static std::atomic<unsigned long long> warp_semi_key_scans{0};
+static int show_warp_semi_key_scans(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) = (longlong)warp_semi_key_scans.load();
+  return 0;
+}
+
 static int show_warp_purged_rows(MYSQL_THD, SHOW_VAR *var, char *buff);
 static int show_warp_purged_partitions(MYSQL_THD, SHOW_VAR *var, char *buff);
 static int show_warp_purge_failures(MYSQL_THD, SHOW_VAR *var, char *buff);
@@ -263,6 +273,7 @@ static SHOW_VAR warp_status_variables[] = {
     {"Warp_purge_failures", (char *)&show_warp_purge_failures, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_history_locks", (char *)&show_warp_history_locks, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_active_transactions", (char *)&show_warp_active_transactions, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Warp_semi_key_scans", (char *)&show_warp_semi_key_scans, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}};
 
 mysql_declare_plugin(warp){
@@ -2373,6 +2384,7 @@ void ha_warp::cleanup_pushdown_info() {
   push_where_clause = "";
   scan_where = "";
   outer_params.clear();
+  semi_in.reset();
   current_matching_dim_ridset = NULL;
   current_matching_ridset = NULL;
 
@@ -5237,6 +5249,103 @@ static bool warp_has_inner_nested_loop_table(AccessPath *root_path,
  *
  * @return Possible error code, '0' if no errors.
  */
+
+/* An inner join of the block with a subquery that MySQL materializes once
+   (the semijoin of an EXISTS or IN: a temporary table of the distinct values
+   of one column of a WARP table, read by the key of a column of another WARP
+   table): the table of the subquery is read for the keys that the other table
+   has, not entirely.  Keys that the other table does not have are not looked
+   up, MySQL still makes the join. */
+static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
+  if(!THDVAR(thd, semi_key_pushdown) ||
+     (thd->lex->sql_command != SQLCOM_SELECT && thd->lex->sql_command != SQLCOM_CREATE_TABLE &&
+      thd->lex->sql_command != SQLCOM_INSERT_SELECT)) {
+    return;
+  }
+  if(warp_block_is_executed_again(join)) {
+    return;
+  }
+  WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK, [&](AccessPath *path, const JOIN *) {
+    if(path->type != AccessPath::NESTED_LOOP_JOIN || path->nested_loop_join().join_type != JoinType::INNER) {
+      return false;
+    }
+    AccessPath *inner = path->nested_loop_join().inner;
+    if(inner->type != AccessPath::MATERIALIZE || inner->materialize().param == nullptr ||
+       inner->materialize().param->rematerialize || inner->materialize().param->m_operands.size() != 1) {
+      return false;
+    }
+    AccessPath *table_path = inner->materialize().table_path;
+    if(table_path == nullptr || (table_path->type != AccessPath::REF && table_path->type != AccessPath::EQ_REF)) {
+      return false;
+    }
+    const bool is_ref = table_path->type == AccessPath::REF;
+    TABLE *derived = is_ref ? table_path->ref().table : table_path->eq_ref().table;
+    Index_lookup *ref = is_ref ? table_path->ref().ref : table_path->eq_ref().ref;
+    if(derived == nullptr || ref == nullptr || ref->key_parts != 1) {
+      return false;
+    }
+    Item *value = ref->items[0]->real_item();
+    if(value->type() != Item::FIELD_ITEM) {
+      return false;
+    }
+    Field *outer = down_cast<Item_field *>(value)->field;
+    Field *key = derived->key_info[ref->key].key_part[0].field;
+    if(outer == nullptr || key == nullptr || outer->table == derived || dynamic_cast<ha_warp *>(outer->table->file) == nullptr) {
+      return false;
+    }
+    /* the subquery: a scan of one WARP table with conditions */
+    const MaterializePathParameters::Operand &operand = inner->materialize().param->m_operands[0];
+    AccessPath *scan = operand.subquery_path;
+    while(scan != nullptr && scan->type == AccessPath::FILTER) {
+      scan = scan->filter().child;
+    }
+    if(scan == nullptr || scan->type != AccessPath::TABLE_SCAN) {
+      return false;
+    }
+    TABLE *inner_table = scan->table_scan().table;
+    ha_warp *inner_handler = dynamic_cast<ha_warp *>(inner_table->file);
+    /* the expression of the subquery that the column of the temporary table has */
+    Item *source = nullptr;
+    if(operand.temp_table_param != nullptr && operand.temp_table_param->items_to_copy != nullptr) {
+      for(const Func_ptr &entry : *operand.temp_table_param->items_to_copy) {
+        if(entry.result_field() == key) {
+          source = entry.func()->real_item();
+        }
+      }
+    }
+    if(source == nullptr) {
+      return false;
+    }
+    if(inner_handler == nullptr || source->type() != Item::FIELD_ITEM) {
+      return false;
+    }
+    Field *inner_field = down_cast<Item_field *>(source)->field;
+    auto integer = [](Field *f) {
+      switch(f->real_type()) {
+        case MYSQL_TYPE_TINY:
+        case MYSQL_TYPE_SHORT:
+        case MYSQL_TYPE_INT24:
+        case MYSQL_TYPE_LONG:
+          return true;
+        case MYSQL_TYPE_LONGLONG:
+          return !f->is_flag_set(UNSIGNED_FLAG);
+        default:
+          return false;
+      }
+    };
+    if(inner_field == nullptr || inner_field->table != inner_table || inner_table == outer->table ||
+       !integer(inner_field) || !integer(outer)) {
+      return false;
+    }
+    auto semi = std::make_shared<ha_warp::warp_semi_in>();
+    semi->outer_table = outer->table;
+    semi->outer_col = outer->field_index();
+    semi->inner_col = inner_field->field_index();
+    inner_handler->semi_in = semi;
+    return false;
+  });
+}
+
 int warp_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
   auto func = [thd](AccessPath *subpath, const JOIN *join_arg) {
     if (subpath->type == AccessPath::FILTER) {
@@ -5261,6 +5370,7 @@ int warp_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
   WalkAccessPaths(root_path, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
                   func);
   warp_inner_nested_loop_table = false;
+  warp_try_semi_keys(thd, root_path, join);
   /* the star joins that the engine can evaluate and aggregate itself */
   warp_try_star_aggregation(thd, root_path, join);
   warp_try_parallel_aggregation(thd, root_path, join);
@@ -5870,6 +5980,84 @@ void ha_warp::make_scan_where() {
       scan_where = "(" + scan_where + ") AND (" + cond + ")";
     }
   }
+  if(semi_in) {
+    const std::string cond = semi_key_condition();
+    if(cond != "") {
+      scan_where = (scan_where == "" || scan_where == "1=1") ? cond : "(" + scan_where + ") AND (" + cond + ")";
+    }
+  }
+}
+
+/* The values of a column of the table whose pushed down condition is known:
+   the values of the rows that may be returned (rows that are not visible to
+   the statement are included, the keys are only used to leave rows out).  The
+   condition that limits the scan of this table, or none if the keys are not
+   known or are too many to help. */
+std::string ha_warp::semi_key_condition() {
+  ha_warp *outer = dynamic_cast<ha_warp *>(semi_in->outer_table->file);
+  if(outer == nullptr) {
+    return "";
+  }
+  const uint64_t inner_rows = table_row_count();
+  const uint64_t max_keys = std::min<uint64_t>(500000, inner_rows / 4);
+  std::vector<int64_t> keys;
+  try {
+    warp_table_read_lock data_lock(outer->share->data_dir_name);
+    ibis::partList parts;
+    ibis::util::gatherParts(parts, outer->share->data_dir_name, true);
+    bool failed = false;
+    const std::string where = outer->push_where_clause == "" ? "1=1" : outer->push_where_clause;
+    const std::string column = "c" + std::to_string(semi_in->outer_col);
+    for(ibis::part *part : parts) {
+      if(failed || part == nullptr || part->nRows() == 0 ||
+         std::string(part->currentDataDir()) == std::string(outer->share->data_dir_name)) {
+        continue;
+      }
+      ibis::query query((const char *)0, part, (const char *)0);
+      query.addConditions(where.c_str());
+      if(query.evaluate() < 0) {
+        failed = true;
+        continue;
+      }
+      if(query.getNumHits() == 0) {
+        continue;
+      }
+      ibis::array_t<int64_t> *values = query.getQualifiedLongs(column.c_str());
+      if(values == nullptr) {
+        failed = true;
+        continue;
+      }
+      keys.insert(keys.end(), values->begin(), values->end());
+      delete values;
+      if(keys.size() > 4 * max_keys + 1024) {
+        failed = true;   // too many to help
+      }
+    }
+    for(ibis::part *part : parts) {
+      delete part;
+    }
+    if(failed) {
+      return "";
+    }
+  } catch(...) {
+    return "";
+  }
+  std::sort(keys.begin(), keys.end());
+  keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+  if(keys.size() > max_keys) {
+    return "";
+  }
+  ++warp_semi_key_scans;
+  std::string cond = "c" + std::to_string(semi_in->inner_col) + " IN (";
+  if(keys.empty()) {
+    return "1=0";
+  }
+  for(size_t i = 0; i < keys.size(); ++i) {
+    if(i > 0) cond += ",";
+    cond += std::to_string(keys[i]);
+  }
+  cond += ")";
+  return cond;
 }
 
 int ha_warp::append_column_filter(const Item *cond,
