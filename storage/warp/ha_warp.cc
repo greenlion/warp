@@ -5555,6 +5555,11 @@ int warp_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
 
    This code is called from ha_warp::engine_push in 8.0.20+
 */
+/* The depth of the OR conditions that cond_push is inside: an equality of two
+   columns of two tables in an OR is not a condition of the join of the tables
+   (the rows that satisfy the other branches are rows of the join too) */
+static thread_local int warp_cond_or_depth = 0;
+
 const Item *ha_warp::cond_push(const Item *cond) {
   /* This state belongs to the statement that is being planned, it must not be
      shared: every connection has a thread and pushes its conditions at the
@@ -5610,11 +5615,14 @@ const Item *ha_warp::cond_push(const Item *cond) {
          and pushdown evaluation will be abandoned.
       */
       ++depth;
+      const bool in_or = item_cond->functype() == Item_func::Functype::COND_OR_FUNC;
+      if(in_or) ++warp_cond_or_depth;
       
       if(cond_push(item) != NULL) {
         unpushed_condition_count++;
         //items->push_back(item);
       }
+      if(in_or) --warp_cond_or_depth;
       //items->push_front(item);
       --depth;
     }
@@ -6421,6 +6429,40 @@ static bool warp_push_column_compare(const Field *f0, const Field *f1, const std
   return true;
 }
 
+/* A constant that is an expression (0.06 - 0.01, 12 * 2, a cached value) is the
+   number that it has: the conditions with it are pushed down like the ones with
+   a literal.  Returns NULL if the item is not such a constant. */
+static Item *warp_fold_constant(Item *item) {
+  THD *thd = current_thd;
+  if(item->type() == Item::Type::FIELD_ITEM || item->type() == Item::Type::PARAM_ITEM || !item->const_item() ||
+     item->has_subquery() || item->has_stored_program() || item->is_non_deterministic() ||
+     is_temporal_type(item->data_type()) || (item->type() != Item::Type::FUNC_ITEM && item->type() != Item::Type::CACHE_ITEM)) {
+    return nullptr;
+  }
+  switch(item->result_type()) {
+    case INT_RESULT: {
+      const longlong value = item->val_int();
+      if(item->null_value || thd->is_error()) return nullptr;
+      Item_int *folded = new (thd->mem_root) Item_int(value);
+      folded->unsigned_flag = item->unsigned_flag;
+      return folded;
+    }
+    case DECIMAL_RESULT: {
+      my_decimal buffer;
+      my_decimal *value = item->val_decimal(&buffer);
+      if(value == nullptr || item->null_value || thd->is_error()) return nullptr;
+      return new (thd->mem_root) Item_decimal(value);
+    }
+    case REAL_RESULT: {
+      const double value = item->val_real();
+      if(item->null_value || thd->is_error() || std::isnan(value) || std::isinf(value)) return nullptr;
+      return new (thd->mem_root) Item_float(NAME_STRING(""), value, item->decimals, 25);
+    }
+    default:
+      return nullptr;
+  }
+}
+
 int ha_warp::append_column_filter(const Item *cond,
                                    std::string &where_clause) {
   bool field_may_be_null = false;
@@ -6533,6 +6575,11 @@ int ha_warp::append_column_filter(const Item *cond,
         if(value != nullptr) {
           condition_arg = value;
         }
+      } else {
+        Item *folded = warp_fold_constant(condition_arg);
+        if(folded != nullptr) {
+          condition_arg = folded;
+        }
       }
     }
     Item **arg = condition_args.data();
@@ -6612,7 +6659,11 @@ int ha_warp::append_column_filter(const Item *cond,
       // only support equijoin right now
       if(!is_eq) {
         return 0;
-      }      
+      }
+      // not in an OR: the other branches have rows of the join as well
+      if(warp_cond_or_depth > 0) {
+        return 0;
+      }
 
       // the join pushdown does not support tables that are scanned more
       // than once (see warp_inner_nested_loop_table)
@@ -6882,6 +6933,7 @@ int ha_warp::append_column_filter(const Item *cond,
     }
 
     /* BETWEEN AND IN() need some special syntax handling */
+    size_t last_in_value = 0;
     for (uint i = 0; i < tmp->arg_count; ++i, ++arg) {
       if(i > 0) {
         if(!is_between && !is_in) { /* normal <, >, =, LIKE, etc */
@@ -6900,6 +6952,7 @@ int ha_warp::append_column_filter(const Item *cond,
               } else {
                 build_where_clause += ", ";
               }
+              last_in_value = build_where_clause.size();
             }
           }
         }
@@ -7049,6 +7102,12 @@ int ha_warp::append_column_filter(const Item *cond,
     }
 
     if(is_in) {
+      /* FastBit reads a list of two numbers of which the second one is negative
+         as something else, three or more values are a list: the last one twice
+         does not change the condition */
+      if(tmp->arg_count == 3 && last_in_value > 0) {
+        build_where_clause += ", " + build_where_clause.substr(last_in_value);
+      }
       build_where_clause += ')';
     }
 
