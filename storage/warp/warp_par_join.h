@@ -880,7 +880,20 @@ static std::shared_ptr<warp_pj_plan> warp_pj_make_plan(THD *thd, AccessPath *pat
       plan->root_nulls.push_back(plan->root_cols[i]);
     }
   }
-  /* the probe table's key and filter columns are read by the engine, not by MySQL */
+  /* a condition about one build table of an inner join is evaluated when the
+     table is read: the rows that do not pass it never join, so the probe rows
+     that would be dropped later are not produced */
+  for(auto it = residual->begin(); it != residual->end();) {
+    bool moved = false;
+    for(size_t l = 1; l < n && !moved; ++l) {
+      warp_pj_table &t = plan->tables[l];
+      if(!t.null_side && warp_pj_only_table(*it, t.table)) {
+        t.filters.push_back(*it);
+        moved = true;
+      }
+    }
+    it = moved ? residual->erase(it) : it + 1;
+  }
   return plan;
 }
 
