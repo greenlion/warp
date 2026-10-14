@@ -1,0 +1,58 @@
+--echo #
+--echo # LIKE and NOT LIKE of a VARCHAR column in utf8mb4_bin and a string constant are
+--echo # evaluated by FastBit.  Every pattern is run against the WARP table and an
+--echo # InnoDB copy.
+--echo #
+
+CREATE TABLE t_w (id INT, v VARCHAR(60) NOT NULL, n VARCHAR(60) NULL, ci VARCHAR(60) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_cs NOT NULL)
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t_w VALUES
+ (1, '', NULL, ''), (2, 'a', 'a', 'a'), (3, 'A', 'A', 'A'), (4, 'ab', 'ab', 'ab'), (5, 'ba', 'ba', 'ba'), (6, 'a ', 'a ', 'a '),
+ (7, ' a', ' a', ' a'), (8, 'abc', NULL, 'abc'), (9, 'aXc', 'aXc', 'aXc'), (10, 'a_c', 'a_c', 'a_c'), (11, 'a%c', 'a%c', 'a%c'),
+ (12, 'a\\c', 'a\\c', 'a\\c'), (13, 'été', 'été', 'été'), (14, 'é', 'é', 'é'), (15, 'x😀y', 'x😀y', 'x😀y'), (16, '😀', '😀', '😀'),
+ (17, 'special requests', 'special requests', 'special requests'), (18, 'requests special', NULL, 'requests special'),
+ (19, 'very special long requests here', 'very special long requests here', 'very special long requests here'),
+ (20, 'aaa', 'aaa', 'aaa'), (21, 'ababab', 'ababab', 'ababab'), (22, 'ABC', 'ABC', 'ABC'), (23, 'a''b', 'a''b', 'a''b');
+CREATE TABLE t_i LIKE t_w;
+ALTER TABLE t_i ENGINE=InnoDB;
+INSERT INTO t_i SELECT * FROM t_w;
+
+CREATE TABLE preds (i INT, p VARCHAR(200));
+INSERT INTO preds VALUES
+ (1, 'v LIKE ''a%'''), (2, 'v LIKE ''%a'''), (3, 'v LIKE ''%a%'''), (4, 'v LIKE ''a%c'''), (5, 'v LIKE ''%'''), (6, 'v LIKE '''''),
+ (7, 'v LIKE ''a'''), (8, 'v LIKE ''a '''), (9, 'v LIKE ''_'''), (10, 'v LIKE ''a_'''), (11, 'v LIKE ''a_c'''), (12, 'v LIKE ''%_'''),
+ (13, 'v LIKE ''a\\\\_c'''), (14, 'v LIKE ''a\\\\%c'''), (15, 'v LIKE ''a\\\\\\\\c'''), (16, 'v LIKE ''_t_'''), (17, 'v LIKE ''%special%requests%'''),
+ (18, 'v NOT LIKE ''%special%requests%'''), (19, 'v NOT LIKE ''a%'''), (20, 'v NOT LIKE '''''), (21, 'v NOT LIKE ''%'''), (22, 'v LIKE ''%a%a%'''),
+ (23, 'v LIKE ''%ab%ab%'''), (24, 'v LIKE ''x_y'''), (25, 'v LIKE ''x__y'''), (26, 'v LIKE ''%😀%'''), (27, 'v LIKE ''_'''), (28, 'v LIKE ''a''''b'''),
+ (29, 'n LIKE ''a%'''), (30, 'n NOT LIKE ''a%'''), (31, 'n NOT LIKE ''%special%requests%'''), (32, 'n LIKE ''%'''), (33, 'n NOT LIKE ''%'''),
+ (34, 'ci LIKE ''a%'''), (35, 'ci NOT LIKE ''a%'''), (36, 'v LIKE ''A%'' COLLATE utf8mb4_0900_as_cs'), (37, 'v COLLATE utf8mb4_0900_as_cs LIKE ''a%'''),
+ (38, 'NOT (v LIKE ''a%'')'), (39, 'v LIKE ''a%'' AND n NOT LIKE ''%c'''), (40, 'v NOT LIKE ''a%'' OR n LIKE ''b%'''), (41, 'v LIKE ''%'' AND id < 5'),
+ (42, 'v LIKE CONCAT(''a'', ''%'')'), (43, 'v LIKE ''a%'' ESCAPE ''|'''), (44, 'v LIKE ''a|%c'' ESCAPE ''|''');
+
+--let $i = 1
+while ($i <= 44)
+{
+  --let $p = `SELECT p FROM preds WHERE i = $i`
+  --disable_query_log
+  --let $rows = `SELECT COUNT(*) FROM t_w WHERE $p`
+  --let $same = `SELECT (SELECT CONCAT(COUNT(*), '/', COALESCE(SUM(id), 0)) FROM t_w WHERE $p) = (SELECT CONCAT(COUNT(*), '/', COALESCE(SUM(id), 0)) FROM t_i WHERE $p)`
+  --enable_query_log
+  --echo # $p: $rows rows, same as InnoDB: $same
+  --inc $i
+}
+
+--echo # the engine evaluates the pattern: no Filter above the scan
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE v LIKE '%special%requests%';
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE n NOT LIKE '%special%requests%';
+--echo # a column in another collation is left to MySQL
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE ci LIKE 'a%';
+
+--echo # prepared
+PREPARE s FROM 'SELECT COUNT(*) FROM t_w WHERE v NOT LIKE ?';
+SET @p = '%a%';
+EXECUTE s USING @p;
+SET @p = 'a%';
+EXECUTE s USING @p;
+DEALLOCATE PREPARE s;
+
+DROP TABLE t_w, t_i, preds;

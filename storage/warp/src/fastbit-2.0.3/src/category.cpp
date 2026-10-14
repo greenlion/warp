@@ -2282,219 +2282,57 @@ long ibis::text::patternSearch(const char*) const {
     return (thePart ? thePart->nRows() : INT_MAX);
 } // ibis::text::patternSearch
 
+/// A string matches a pattern like the one of the operator LIKE of MySQL: %
+/// is any number of characters, _ one character (of UTF-8) and the
+/// character that follows a backslash is itself.  The characters are compared as
+/// bytes, so upper and lower case letters differ.
+static bool likeMatch(const char *s, size_t n, const char *p, size_t m) {
+    auto charlen = [](unsigned char c) -> size_t {
+        return c < 0x80 ? 1 : (c >= 0xF0 && c < 0xF8) ? 4 : (c >= 0xE0 && c < 0xF0) ? 3 : (c >= 0xC0 && c < 0xE0) ? 2 : 1;
+    };
+    size_t si = 0, pi = 0;
+    size_t star_p = std::string::npos, star_s = 0;
+    while (si < n) {
+        if (pi < m && p[pi] == '%') {
+            star_p = ++ pi;
+            star_s = si;
+            continue;
+        }
+        if (pi < m) {
+            if (p[pi] == '_') {
+                si += charlen(static_cast<unsigned char>(s[si]));
+                if (si > n) si = n;
+                ++ pi;
+                continue;
+            }
+            size_t q = pi;
+            if (p[q] == '\\' && q + 1 < m) ++ q;
+            if (s[si] == p[q]) {
+                ++ si;
+                pi = q + 1;
+                continue;
+            }
+        }
+        if (star_p == std::string::npos || star_s >= n)
+            return false;
+        star_s += charlen(static_cast<unsigned char>(s[star_s]));
+        if (star_s > n) star_s = n;
+        si = star_s;
+        pi = star_p;
+    }
+    while (pi < m && p[pi] == '%') ++ pi;
+    return pi == m;
+} // likeMatch
+
+/// Mark the rows of the strings that match the pattern (see likeMatch).
 long ibis::text::patternSearch(const char* pat, ibis::bitvector& hits) const {
     hits.clear(); // clear the existing content of hits
-    if (thePart == 0 || pat == 0 || *pat == 0) return -1L;
-
-    std::string evt = "text[";
-    if (thePart != 0 && thePart->name() != 0) {
-        evt += thePart->name();
-        evt += '.';
-    }
-    evt += m_name;
-    evt += "]::patternSearch";
-    ibis::util::timer mytimer(evt.c_str(), 4);
-    std::string data = thePart->currentDataDir();
-    data += FASTBIT_DIRSEP;
-    data += m_name;
-    FILE *fdata = ibis::zfile::fopenRead(data.c_str());
-    if (fdata == 0) {
-        LOGGER(ibis::gVerbose >= 0)
-            << "Warning -- " << evt << " can not open data file \"" << data
-            << "\" for reading";
-        return -2L;
-    }
-
-    IBIS_BLOCK_GUARD(fclose, fdata);
-#if defined(DEBUG) || defined(_DEBUG) // DEBUG+0 > 0 || _DEBUG+0 > 0
-    ibis::fileManager::buffer<char> mybuf(5000);
-#else
-    ibis::fileManager::buffer<char> mybuf;
-#endif
-    char *buf = mybuf.address();
-    uint32_t nbuf = mybuf.size();
-    if (buf == 0 || nbuf == 0) return -3L;
-
-    std::string sp = data;
-    sp += ".sp";
-    FILE *fsp = ibis::zfile::fopenRead(sp.c_str());
-    if (fsp == 0) { // try again
-        startPositions(thePart->currentDataDir(), buf, nbuf);
-        fsp = ibis::zfile::fopenRead(sp.c_str());
-        if (fsp == 0) { // really won't work out
-            LOGGER(ibis::gVerbose >= 0)
-                << "Warning -- " << evt << " can not create or open file \""
-                << sp << "\"";
-            return -4L;
-        }
-    }
-
-#if defined(DEBUG) || defined(_DEBUG) // DEBUG+0 > 0 || _DEBUG+0 > 0
-    ibis::fileManager::buffer<int64_t> spbuf(100);
-#else
-    ibis::fileManager::buffer<int64_t> spbuf;
-#endif
-    uint32_t irow = 0; // row index
-    long jbuf = 0; // number of bytes in buffer
-    int64_t begin = 0; // beginning position (file offset) of the bytes in buf
-    int64_t next = 0;
-    int64_t curr, ierr;
-    if (1 > fread(&curr, sizeof(curr), 1, fsp)) {
-        // odd to be sure, but try again anyway
-        fclose(fsp);
-        startPositions(thePart->currentDataDir(), buf, nbuf);
-        fsp = ibis::zfile::fopenRead(sp.c_str());
-        if (fsp == 0) { // really won't work out
-            LOGGER(ibis::gVerbose >= 0)
-                << "Warning -- " << evt <<  " can not open or read file \""
-                << sp << "\"";
-            return -5L;
-        }
-    }
-    IBIS_BLOCK_GUARD(fclose, fsp);
-    if (spbuf.size() > 1)  { // use the second buffer, spbuf
-        uint32_t jsp, nsp;
-        ierr = fread(spbuf.address(), sizeof(int64_t), spbuf.size(), fsp);
-        if (ierr <= 0) {
-            LOGGER(ibis::gVerbose >= 0)
-                << "Warning -- " << evt << " failed to read file " << sp;
-            return -7L;
-        }
-        jsp = 1;
-        nsp = ierr;
-        next = spbuf[0];
-        while ((jbuf = fread(buf, 1, nbuf, fdata)) > 0) {
-            bool moresp = true;
-            if (next > begin+jbuf) {
-                LOGGER(ibis::gVerbose >= 0)
-                    << "Warning -- " << evt
-                    << " expects string # " << irow << " in file \""
-                    << data << "\" to be " << (next-begin) << "-byte long, but "
-                    << (jbuf<(long)nbuf ? "can only read " :
-                        "the internal buffer is only ")
-                    << jbuf << ", skipping " << jbuf
-                    << (jbuf > 1 ? " bytes" : " byte");
-                curr += jbuf;
-            }
-            while (begin+jbuf >= next) { // whole string
-                const bool match = ibis::util::strMatch(buf+(curr-begin), pat);
-                if (match)
-                    hits.setBit(irow, 1);
-#if _DEBUG+0 > 1 || DEBUG+0 > 1
-                if (ibis::gVerbose > 5) {
-                    ibis::util::logger lg(4);
-                    lg()
-                        << "DEBUG -- " << evt << " processing string "
-                        << irow << " \'";
-                    for (long i = curr; i < next-1; ++ i)
-                        lg() << buf[i-begin];
-                    lg() << "\'";
-                    if (match)
-                        lg() << " matches ";
-                    else
-                        lg() << " does not match ";
-                    lg() << pat;
-                }
-#endif
-                ++ irow;
-                LOGGER(ibis::gVerbose > 2 && irow % 1000000 == 0)
-                    << evt << " -- processed " << irow
-                    << " strings from file " << data;
-
-                curr = next;
-                if (moresp) {
-                    if (jsp >= nsp) {
-                        if (feof(fsp) == 0) {
-                            ierr = fread(spbuf.address(), sizeof(int64_t),
-                                         spbuf.size(), fsp);
-                            if (ierr <= 0) {
-                                LOGGER(ierr < 0 && ibis::gVerbose >= 0)
-                                    << "Warning -- " << evt
-                                    << " failed to read " << sp;
-                                moresp = false;
-                                break;
-                            }
-                            else {
-                                nsp = ierr;
-                            }
-                        }
-                        else { // end of sp file
-                            moresp = false;
-                            break;
-                        }
-                        jsp = 0;
-                    }
-                    moresp = (jsp < nsp);
-                    next = spbuf[jsp];
-                    ++ jsp;
-                }
-            }
-            if (moresp) {// move back file pointer in fdata
-                fseek(fdata, curr, SEEK_SET);
-                begin = curr;
-            }
-            else
-                break; // avoid reading the data file
-        } // while (jbuf > 0) -- as long as there are bytes to examine
-    }
-    else { // normal null-terminated strings, no spbuf
-        ierr = fread(&next, sizeof(next), 1, fsp);
-        while ((jbuf = fread(buf, 1, nbuf, fdata)) > 0) {
-            bool moresp = true;
-            if (next > begin+jbuf) {
-                LOGGER(ibis::gVerbose >= 0)
-                    << "Warning -- " << evt
-                    << " expects string # " << irow << " in file \""
-                    << data << "\" to be " << (next-begin) << "-byte long, but "
-                    << (jbuf<(long)nbuf ? "can only read " :
-                        "the internal buffer is only ")
-                    << jbuf << ", skipping " << jbuf
-                    << (jbuf > 1 ? " bytes" : " byte");
-                curr += jbuf;
-            }
-            while (begin+jbuf >= next) { // has a whole string
-                const bool match = ibis::util::strMatch(buf+(curr-begin), pat);
-                if (match)
-                    hits.setBit(irow, 1);
-                ++ irow;
-                LOGGER(ibis::gVerbose > 2 && irow % 1000000 == 0)
-                    << evt << " -- processed " << irow
-                    << " strings from file " << data;
-
-                curr = next;
-                moresp = (feof(fsp) == 0);
-                if (moresp)
-                    moresp = (1 == fread(&next, sizeof(next), 1, fsp));
-                if (! moresp)
-                    break;
-            }
-            if (moresp) {// move back file pointer for fdata
-                // fseek(fsp, -static_cast<long>(sizeof(next)), SEEK_CUR);
-                fseek(fdata, curr, SEEK_SET);
-                begin = curr;
-            }
-            else
-                break; // avoid reading the data file
-        } // while (jbuf > 0) -- as long as there are bytes to examine
-    }
-
-    ibis::fileManager::instance().recordPages(0, next);
-    ibis::fileManager::instance().recordPages
-        (0, sizeof(uint64_t)*thePart->nRows());
-    if (hits.size() != thePart->nRows()) {
-        LOGGER(irow != thePart->nRows() && ibis::gVerbose >= 0)
-            << "Warning -- " << evt << "data file \"" << data
-            << "\" contains " << irow << " string" << (irow>1?"s":"")
-            << ", but expected " << thePart->nRows();
-        if (irow < thePart->nRows())
-            startPositions(thePart->currentDataDir(), buf, nbuf);
-        hits.adjustSize(0, thePart->nRows());
-    }
-
-    LOGGER(ibis::gVerbose > 4)
-        << evt << " found " << hits.cnt() << " string" << (hits.cnt()>1?"s":"")
-        << " in \"" << data << "\" matching " << pat;
-    return hits.cnt();
+    if (thePart == 0 || pat == 0) return -1L;
+    const size_t m = std::strlen(pat);
+    return scanStrings(
+        [pat, m](const char* str, size_t len) {
+            return likeMatch(str, len, pat, m);
+        }, "patternSearch", hits);
 } // ibis::text::patternSearch
 
 /// Write the current metadata to -part.txt of the data partition.

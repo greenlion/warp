@@ -273,9 +273,7 @@ EXPLAIN FORMAT=TREE SELECT d1.k, COUNT(f.id), SUM(f.v) FROM d1_w d1 LEFT JOIN f_
 EXPLAIN
 -> Table scan on <temporary>
     -> Aggregate using temporary table
-        -> Nested loop left join
-            -> Table scan on d1, with parallel hash join
-            -> Table scan on f, joined by the parallel hash join
+        -> Table scan on d1, with parallel aggregation
 
 # case 23: NULL keys of the outer table
 851:1832393546893

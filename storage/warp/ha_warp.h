@@ -1113,6 +1113,10 @@ class ha_warp : public handler {
   int write_row_impl(uchar *buf);
   void foreground_write();
   int append_column_filter(const Item* cond, std::string& push_where_clause); 
+ public:
+  /* the condition as a FastBit condition, true if it was pushed */
+  bool push_filter(const Item *cond, std::string &where) { return append_column_filter(cond, where) == 1; }
+ private:
 
   /* Index lookups.  An index of a WARP table is only declared: a lookup
      restarts the scan of the table with the condition of the statement

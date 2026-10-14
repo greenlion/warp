@@ -1,0 +1,193 @@
+#
+# COUNT, SUM, MIN and MAX of integer columns of the tables of a join that the
+# engine makes (warp_parallel_hash_join), grouped by integer columns of the
+# probe table, are made by the engine (warp_parallel_aggregation): the rows of
+# the join are not made.  Every query is run against the WARP tables and
+# InnoDB copies.
+#
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE f_w (id INT, k INT, g INT, gn INT NULL, v INT, vn INT NULL, b BIGINT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d_w (k INT, x INT, xn INT NULL, s VARCHAR(30), kk INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE e_w (k INT, y INT, yn INT NULL) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 6000)
+SELECT i, 1 + i % 600, i % 7, IF(i % 5 = 0, NULL, i % 4), i % 100, IF(i % 3 = 0, NULL, i % 50), i * 1000000 FROM s;
+INSERT INTO d_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1500)
+SELECT 1 + i % 500, i % 40, IF(i % 4 = 0, NULL, i % 30), CONCAT(IF(i % 6 = 0, 'special ', 'x '), IF(i % 4 = 0, 'requests', 'none'), i), 1 + i % 600 FROM s;
+INSERT INTO e_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 800)
+SELECT 1 + i % 300, i % 13, IF(i % 3 = 0, NULL, i % 9) FROM s;
+CREATE TABLE f_i LIKE f_w;
+CREATE TABLE d_i LIKE d_w;
+CREATE TABLE e_i LIKE e_w;
+ALTER TABLE f_i ENGINE=InnoDB;
+ALTER TABLE d_i ENGINE=InnoDB;
+ALTER TABLE e_i ENGINE=InnoDB;
+INSERT INTO f_i SELECT * FROM f_w;
+INSERT INTO d_i SELECT * FROM d_w;
+INSERT INTO e_i SELECT * FROM e_w;
+CREATE TABLE queries (i INT, q TEXT);
+INSERT INTO queries VALUES
+(1, 'SELECT f.g, COUNT(*), COUNT(d.x), COUNT(d.xn), SUM(d.x), MIN(d.x), MAX(d.xn) FROM f_# f LEFT JOIN d_# d ON f.k = d.k GROUP BY f.g'),
+(2, 'SELECT f.g, COUNT(*), COUNT(d.x), SUM(d.x), MIN(d.x), MAX(d.x) FROM f_# f LEFT JOIN d_# d ON f.k = d.k AND d.s NOT LIKE ''%special%requests%'' GROUP BY f.g'),
+(3, 'SELECT c, COUNT(*) AS n FROM (SELECT f.id, COUNT(d.x) AS c FROM f_# f LEFT JOIN d_# d ON f.k = d.k AND d.s NOT LIKE ''%special%requests%'' GROUP BY f.id) t GROUP BY c'),
+(4, 'SELECT f.gn, COUNT(*), SUM(d.x), MIN(f.v), MAX(f.vn), SUM(f.v) FROM f_# f JOIN d_# d ON f.k = d.k WHERE d.s LIKE ''x %'' GROUP BY f.gn'),
+(5, 'SELECT f.g, f.gn, COUNT(*), COUNT(e.yn), SUM(e.y) FROM f_# f JOIN d_# d ON f.k = d.k LEFT JOIN e_# e ON d.kk = e.k GROUP BY f.g, f.gn'),
+(6, 'SELECT f.id, COUNT(*), SUM(d.x) FROM f_# f JOIN d_# d ON f.k = d.k AND d.xn > 10 GROUP BY f.id'),
+(7, 'SELECT f.g, SUM(f.b) FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY f.g'),
+(8, 'SELECT COUNT(*), SUM(d.x) FROM f_# f LEFT JOIN d_# d ON f.k = d.k GROUP BY f.k % 3'),
+(9, 'SELECT f.g, COUNT(*), MAX(d.s) FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY f.g'),
+(10, 'SELECT f.g, COUNT(*) FROM f_# f LEFT JOIN d_# d ON f.k = d.k WHERE d.x IS NULL GROUP BY f.g'),
+(11, 'SELECT f.g, COUNT(DISTINCT d.x), COUNT(*) FROM f_# f LEFT JOIN d_# d ON f.k = d.k GROUP BY f.g'),
+(12, 'SELECT f.g, COUNT(*) FROM f_# f LEFT JOIN d_# d ON f.k = d.k GROUP BY f.g HAVING COUNT(*) > 800');
+# query 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 2
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 3
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 4
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 5
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 6
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 7
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 8
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 9
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 10
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 11
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 12
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+SET SESSION warp_parallel_aggregation = ON;
+# the engine joins and aggregates
+EXPLAIN FORMAT=TREE SELECT f.g, COUNT(*), COUNT(d.x), SUM(d.x) FROM f_w f LEFT JOIN d_w d ON f.k = d.k AND d.s NOT LIKE '%special%requests%' GROUP BY f.g;
+EXPLAIN
+-> Table scan on <temporary>
+    -> Aggregate using temporary table
+        -> Table scan on f, with parallel aggregation  (cost=225604 rows=2.26e+6)
+
+EXPLAIN FORMAT=TREE SELECT f.g, COUNT(DISTINCT d.x) FROM f_w f LEFT JOIN d_w d ON f.k = d.k GROUP BY f.g;
+EXPLAIN
+-> Group aggregate: count(distinct d_w.x)
+    -> Sort: f.g
+        -> Stream results  (cost=225604 rows=2.26e+6)
+            -> Nested loop left join  (cost=225604 rows=2.26e+6)
+                -> Table scan on f, with parallel hash join  (cost=225604 rows=2.26e+6)
+                -> Table scan on d, joined by the parallel hash join  (cost=0 rows=1)
+
+SET SESSION warp_parallel_aggregation = DEFAULT;
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
+DROP TABLE queries, f_w, d_w, e_w, f_i, d_i, e_i;

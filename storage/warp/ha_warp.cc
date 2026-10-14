@@ -5466,6 +5466,7 @@ int warp_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
   warp_try_star_aggregation(thd, root_path, join);
   warp_try_parallel_aggregation(thd, root_path, join);
   warp_try_parallel_join(thd, root_path, join);
+  warp_try_parallel_join_aggregation(thd, root_path, join);
   return 0;
 }
 
@@ -5813,6 +5814,48 @@ static bool warp_string_eq_pushable(Item_func *func, Item **args) {
   }
   std::string quoted;
   return warp_quote_string_const(constant, fld->charset(), quoted);
+}
+
+/* Pushes LIKE and NOT LIKE of a VARCHAR column and a string constant down to
+   FastBit (ibis::text::patternSearch compares the bytes of the strings, % is
+   any number of characters, _ one character of UTF-8 and a backslash makes the
+   next character itself).  That is how MySQL matches the strings of the
+   collation utf8mb4_bin, the other collations (case insensitive ones, for
+   example) are matched by MySQL.  A condition with the escape character
+   that is not the default one is not pushed either.  Returns true and appends
+   the condition to out if it was pushed. */
+static bool warp_push_like(Item_func *func, Item **args, bool negated, std::string &out) {
+  if(func->arg_count != 2 || args[0]->type() != Item::Type::FIELD_ITEM) {
+    return false;
+  }
+  const Field *fld = down_cast<Item_field *>(args[0])->field;
+  if(fld == nullptr || (fld->real_type() != MYSQL_TYPE_VARCHAR && fld->real_type() != MYSQL_TYPE_VAR_STRING) ||
+     fld->binary() || (fld->all_flags() & BLOB_FLAG) || fld->charset()->number != 46) {
+    return false;
+  }
+  const CHARSET_INFO *cmp_cs = func->compare_collation();
+  if(cmp_cs == nullptr || cmp_cs != fld->charset()) {
+    return false;
+  }
+  if(current_thd->variables.sql_mode & MODE_NO_BACKSLASH_ESCAPES) {
+    return false;
+  }
+  std::string pattern;
+  if(!warp_quote_string_const(args[1], fld->charset(), pattern)) {
+    return false;
+  }
+  const std::string index = std::to_string(fld->field_index());
+  /* a NULL value is not LIKE any pattern, and not NOT LIKE any */
+  std::string cond;
+  if(fld->is_nullable()) {
+    cond = "(n" + index + " = 0 AND ";
+  }
+  cond += negated ? "NOT (c" + index + " LIKE " + pattern + ")" : "c" + index + " LIKE " + pattern;
+  if(fld->is_nullable()) {
+    cond += ")";
+  }
+  out += cond;
+  return true;
 }
 
 /* Pushes IN (...) of a string column with string constants down to FastBit.
@@ -6294,6 +6337,31 @@ int ha_warp::append_column_filter(const Item *cond,
          syntax of the given function differs from the "regular"
          functions.
       */
+      /* NOT LIKE */
+      case Item_func::Functype::NOT_FUNC: {
+        if(tmp->arg_count != 1 || tmp->arguments()[0]->type() != Item::Type::FUNC_ITEM ||
+           down_cast<Item_func *>(tmp->arguments()[0])->functype() != Item_func::Functype::LIKE_FUNC) {
+          return 0;
+        }
+        Item_func *like = down_cast<Item_func *>(tmp->arguments()[0]);
+        std::vector<Item *> like_args(like->arguments(), like->arguments() + like->arg_count);
+        for(Item *&a : like_args) {
+          if(a->type() == Item::Type::PARAM_ITEM) {
+            Item *value = down_cast<Item_param *>(a)->clone_item();
+            if(value != nullptr) a = value;
+          }
+        }
+        std::string cond;
+        if(like_args.size() == 2 && like_args[0]->type() == Item::Type::FIELD_ITEM &&
+           down_cast<Item_field *>(like_args[0])->field != nullptr &&
+           down_cast<Item_field *>(like_args[0])->field->table == table &&
+           warp_push_like(like, like_args.data(), true, cond)) {
+          where_clause += cond;
+          return 1;
+        }
+        return 0;
+      }
+
       case Item_func::Functype::BETWEEN:
         is_between = true;
         break;
@@ -6361,6 +6429,16 @@ int ha_warp::append_column_filter(const Item *cond,
       }
     }
     Item **arg = condition_args.data();
+    if(tmp->functype() == Item_func::Functype::LIKE_FUNC) {
+      std::string cond;
+      if(tmp->arg_count == 2 && arg[0]->type() == Item::Type::FIELD_ITEM &&
+         down_cast<Item_field *>(arg[0])->field != nullptr && down_cast<Item_field *>(arg[0])->field->table == table &&
+         warp_push_like(tmp, arg, false, cond)) {
+        where_clause += cond;
+        return 1;
+      }
+      return 0;
+    }
     //This is a fix for queries that have CONST filters on more than one table conjoined in an AND or an OR
     //when this happens, the field item will have a different alias from the table we are currently working
     //on (table->alias).  
