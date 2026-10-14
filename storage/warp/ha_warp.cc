@@ -2425,6 +2425,8 @@ void ha_warp::cleanup_pushdown_info() {
   scan_where = "";
   outer_params.clear();
   semi_in.reset();
+  semi_candidates.clear();
+  semi_pick_keys.reset();
   current_matching_dim_ridset = NULL;
   current_matching_ridset = NULL;
 
@@ -3052,7 +3054,7 @@ int ha_warp::rnd_init(bool) {
        (which it would be here) computes a join of its own */
     /* a scan that is limited to the keys of another table (semi_in) is a plain
        scan too: its keys are the join that the pushdown would make */
-    if( (!is_partition_child && !pj_plain_scan && !semi_in && get_pushdown_info_count(current_thd) > 1 &&
+    if( (!is_partition_child && !pj_plain_scan && semi_candidates.empty() && get_pushdown_info_count(current_thd) > 1 &&
          pushdown_info->is_fact_table) || partition_filter_partition_name != "" ) {
       partitions = new ibis::partList;
     
@@ -5297,21 +5299,12 @@ static bool warp_has_inner_nested_loop_table(AccessPath *root_path,
  * @return Possible error code, '0' if no errors.
  */
 
-/* An inner join of the block with a subquery that MySQL materializes once
-   (the semijoin of an EXISTS or IN: a temporary table of the distinct values
-   of one column of a WARP table, read by the key of a column of another WARP
-   table): the table of the subquery is read for the keys that the other table
-   has, not entirely.  Keys that the other table does not have are not looked
-   up, MySQL still makes the join. */
-static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
-  if(!THDVAR(thd, semi_key_pushdown) ||
-     (thd->lex->sql_command != SQLCOM_SELECT && thd->lex->sql_command != SQLCOM_CREATE_TABLE &&
-      thd->lex->sql_command != SQLCOM_INSERT_SELECT)) {
-    return;
-  }
-  if(warp_block_is_executed_again(join)) {
-    return;
-  }
+/* A scan of a table that is limited to the keys of a column of another WARP table:
+   inner_field is a column of the table that the scan reads, outer_field a
+   column of the other table, they are equal in the rows of the join that the
+   scan is read for.  The keys that the other table has are known when the
+   scan starts (ha_warp::semi_pick). */
+static void warp_add_semi_candidate(ha_warp *inner_handler, Field *inner_field, Field *outer_field) {
   auto integer = [](Field *f) {
     switch(f->real_type()) {
       case MYSQL_TYPE_TINY:
@@ -5325,11 +5318,112 @@ static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
         return false;
     }
   };
+  if(inner_handler == nullptr || inner_field == nullptr || outer_field == nullptr ||
+     inner_field->table == outer_field->table || dynamic_cast<ha_warp *>(outer_field->table->file) == nullptr ||
+     !integer(inner_field) || !integer(outer_field)) {
+    return;
+  }
+  for(const auto &known : inner_handler->semi_candidates) {
+    if(known->outer_table == outer_field->table && known->outer_col == outer_field->field_index() &&
+       known->inner_col == inner_field->field_index()) {
+      return;
+    }
+  }
+  auto semi = std::make_shared<ha_warp::warp_semi_in>();
+  semi->outer_table = outer_field->table;
+  semi->outer_col = outer_field->field_index();
+  semi->inner_table = inner_field->table;
+  semi->inner_col = inner_field->field_index();
+  inner_handler->semi_candidates.push_back(semi);
+  warp_semi_registry.push_back(semi);
+}
+
+/* The column of a table that a column of a derived table is made of, if the
+   derived table is made of a scan of one WARP table with conditions, or of an
+   aggregation of such a scan and the column is one of the columns that the
+   rows are grouped by. */
+static bool warp_derived_source(const MaterializePathParameters::Operand &operand, const Field *derived_field,
+                                Field **source_field, ha_warp **source_handler) {
+  Item *source = nullptr;
+  if(operand.temp_table_param != nullptr && operand.temp_table_param->items_to_copy != nullptr) {
+    for(const Func_ptr &entry : *operand.temp_table_param->items_to_copy) {
+      if(entry.result_field() == derived_field) {
+        source = entry.func()->real_item();
+      }
+    }
+  }
+  if(source == nullptr || source->type() != Item::FIELD_ITEM) {
+    return false;
+  }
+  Field *field = down_cast<Item_field *>(source)->field;
+  AccessPath *scan = operand.subquery_path;
+  if(scan != nullptr && scan->type == AccessPath::TEMPTABLE_AGGREGATE) {
+    /* the column is one of the columns of the temporary table of the groups */
+    Field *grouped = nullptr;
+    for(ORDER *group = scan->temptable_aggregate().table->group; group != nullptr; group = group->next) {
+      Item *item = (*group->item)->real_item();
+      if(item->type() != Item::FIELD_ITEM) continue;
+      /* the field of the temporary table, or the column that the rows are grouped by itself */
+      Field *group_field = down_cast<Item_field *>(item)->field;
+      if(group->field_in_tmp_table == field || group_field == field) {
+        grouped = group_field;
+      }
+    }
+    /* the temporary table that the path has is not the one of the groups: the
+       column has the name of the column that it is made of (the name has to be
+       one of one group only) */
+    if(grouped == nullptr) {
+      int same_name = 0;
+      for(ORDER *group = scan->temptable_aggregate().table->group; group != nullptr; group = group->next) {
+        Item *item = (*group->item)->real_item();
+        if(item->type() == Item::FIELD_ITEM &&
+           my_strcasecmp(system_charset_info, down_cast<Item_field *>(item)->field->field_name, field->field_name) == 0) {
+          grouped = down_cast<Item_field *>(item)->field;
+          ++same_name;
+        }
+      }
+      if(same_name != 1) grouped = nullptr;
+    }
+    if(grouped == nullptr) {
+      return false;
+    }
+    field = grouped;
+    scan = scan->temptable_aggregate().subquery_path;
+  }
+  while(scan != nullptr && scan->type == AccessPath::FILTER) {
+    scan = scan->filter().child;
+  }
+  if(scan == nullptr || scan->type != AccessPath::TABLE_SCAN || field == nullptr ||
+     field->table != scan->table_scan().table) {
+    return false;
+  }
+  *source_handler = dynamic_cast<ha_warp *>(scan->table_scan().table->file);
+  *source_field = field;
+  return *source_handler != nullptr;
+}
+
+/* The scans of the block that are read for the keys of other tables: the table
+   of a subquery that MySQL materializes once and reads by a key (the semijoin
+   of EXISTS and IN, a derived table that is a scan or an aggregation of one
+   table), or that builds the hash table of a hash join.  The keys that the
+   other table has are not known now, the scan chooses among the candidates when
+   it starts.  Keys that the other table does not have are not looked up, MySQL
+   still makes the join. */
+static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
+  if(!THDVAR(thd, semi_key_pushdown) ||
+     (thd->lex->sql_command != SQLCOM_SELECT && thd->lex->sql_command != SQLCOM_CREATE_TABLE &&
+      thd->lex->sql_command != SQLCOM_INSERT_SELECT)) {
+    return;
+  }
+  if(warp_block_is_executed_again(join)) {
+    return;
+  }
+  if((long)warp_semi_registry_query != (long)thd->query_id) {
+    warp_semi_registry.clear();
+    warp_semi_registry_query = thd->query_id;
+  }
   WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK, [&](AccessPath *path, const JOIN *) {
     if(path->type == AccessPath::HASH_JOIN && path->hash_join().join_predicate != nullptr) {
-      /* the table that is read to build the hash table is read for the keys of
-         the rows that are probed: the semijoin and the antijoin of EXISTS and
-         NOT EXISTS, an inner join */
       const RelationalExpression *expr = path->hash_join().join_predicate->expr;
       if(expr->type != RelationalExpression::INNER_JOIN && expr->type != RelationalExpression::SEMIJOIN &&
          expr->type != RelationalExpression::ANTIJOIN) {
@@ -5344,9 +5438,6 @@ static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
       }
       TABLE *build_table = build->table_scan().table;
       ha_warp *build_handler = dynamic_cast<ha_warp *>(build_table->file);
-      if(build_handler == nullptr || build_handler->semi_in) {
-        return false;
-      }
       for(Item_eq_base *eq : expr->equijoin_conditions) {
         if(eq->argument_count() != 2 || eq->arguments()[0]->real_item()->type() != Item::FIELD_ITEM ||
            eq->arguments()[1]->real_item()->type() != Item::FIELD_ITEM) {
@@ -5354,85 +5445,72 @@ static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
         }
         Field *f0 = down_cast<Item_field *>(eq->arguments()[0]->real_item())->field;
         Field *f1 = down_cast<Item_field *>(eq->arguments()[1]->real_item())->field;
-        Field *inner_field = f0->table == build_table ? f0 : f1;
-        Field *outer_field = f0->table == build_table ? f1 : f0;
-        if(inner_field->table != build_table || outer_field->table == build_table ||
-           dynamic_cast<ha_warp *>(outer_field->table->file) == nullptr || !integer(inner_field) ||
-           !integer(outer_field)) {
-          continue;
-        }
-        auto semi = std::make_shared<ha_warp::warp_semi_in>();
-        semi->outer_table = outer_field->table;
-        semi->outer_col = outer_field->field_index();
-        semi->inner_col = inner_field->field_index();
-        build_handler->semi_in = semi;
-        break;
+        if(f0 == nullptr || f1 == nullptr) continue;
+        warp_add_semi_candidate(build_handler, f0->table == build_table ? f0 : f1, f0->table == build_table ? f1 : f0);
       }
       return false;
     }
     if(path->type != AccessPath::NESTED_LOOP_JOIN || path->nested_loop_join().join_type != JoinType::INNER) {
       return false;
     }
+    /* the conditions on top of the derived table: derived.column = column of another table */
     AccessPath *inner = path->nested_loop_join().inner;
+    std::vector<Item *> conditions;
+    while(inner->type == AccessPath::FILTER) {
+      conditions.push_back(inner->filter().condition);
+      inner = inner->filter().child;
+    }
     if(inner->type != AccessPath::MATERIALIZE || inner->materialize().param == nullptr ||
        inner->materialize().param->rematerialize || inner->materialize().param->m_operands.size() != 1) {
       return false;
     }
     AccessPath *table_path = inner->materialize().table_path;
-    if(table_path == nullptr || (table_path->type != AccessPath::REF && table_path->type != AccessPath::EQ_REF)) {
-      return false;
-    }
-    const bool is_ref = table_path->type == AccessPath::REF;
-    TABLE *derived = is_ref ? table_path->ref().table : table_path->eq_ref().table;
-    Index_lookup *ref = is_ref ? table_path->ref().ref : table_path->eq_ref().ref;
-    if(derived == nullptr || ref == nullptr || ref->key_parts != 1) {
-      return false;
-    }
-    Item *value = ref->items[0]->real_item();
-    if(value->type() != Item::FIELD_ITEM) {
-      return false;
-    }
-    Field *outer = down_cast<Item_field *>(value)->field;
-    Field *key = derived->key_info[ref->key].key_part[0].field;
-    if(outer == nullptr || key == nullptr || outer->table == derived || dynamic_cast<ha_warp *>(outer->table->file) == nullptr) {
-      return false;
-    }
-    /* the subquery: a scan of one WARP table with conditions */
-    const MaterializePathParameters::Operand &operand = inner->materialize().param->m_operands[0];
-    AccessPath *scan = operand.subquery_path;
-    while(scan != nullptr && scan->type == AccessPath::FILTER) {
-      scan = scan->filter().child;
-    }
-    if(scan == nullptr || scan->type != AccessPath::TABLE_SCAN) {
-      return false;
-    }
-    TABLE *inner_table = scan->table_scan().table;
-    ha_warp *inner_handler = dynamic_cast<ha_warp *>(inner_table->file);
-    /* the expression of the subquery that the column of the temporary table has */
-    Item *source = nullptr;
-    if(operand.temp_table_param != nullptr && operand.temp_table_param->items_to_copy != nullptr) {
-      for(const Func_ptr &entry : *operand.temp_table_param->items_to_copy) {
-        if(entry.result_field() == key) {
-          source = entry.func()->real_item();
+    TABLE *derived = nullptr;
+    std::vector<std::pair<Field *, Field *>> pairs;   // (column of the derived table, column of another table)
+    if(table_path != nullptr && (table_path->type == AccessPath::REF || table_path->type == AccessPath::EQ_REF)) {
+      const bool is_ref = table_path->type == AccessPath::REF;
+      derived = is_ref ? table_path->ref().table : table_path->eq_ref().table;
+      Index_lookup *ref = is_ref ? table_path->ref().ref : table_path->eq_ref().ref;
+      if(derived != nullptr && ref != nullptr) {
+        for(uint k = 0; k < ref->key_parts; ++k) {
+          Item *value = ref->items[k]->real_item();
+          if(value->type() == Item::FIELD_ITEM) {
+            pairs.push_back({derived->key_info[ref->key].key_part[k].field, down_cast<Item_field *>(value)->field});
+          }
         }
       }
     }
-    if(source == nullptr) {
+    if(derived == nullptr) {
       return false;
     }
-    if(inner_handler == nullptr || source->type() != Item::FIELD_ITEM) {
-      return false;
+    std::function<void(Item *)> collect = [&](Item *item) {
+      if(item->type() == Item::COND_ITEM && down_cast<Item_cond *>(item)->functype() == Item_func::COND_AND_FUNC) {
+        List_iterator_fast<Item> it(*down_cast<Item_cond *>(item)->argument_list());
+        for(Item *part = it++; part != nullptr; part = it++) collect(part);
+      } else if(item->type() == Item::FUNC_ITEM && down_cast<Item_func *>(item)->functype() == Item_func::EQ_FUNC) {
+        Item_func *eq = down_cast<Item_func *>(item);
+        Item *left = eq->arguments()[0]->real_item();
+        Item *right = eq->arguments()[1]->real_item();
+        if(left->type() == Item::FIELD_ITEM && right->type() == Item::FIELD_ITEM) {
+          Field *lf = down_cast<Item_field *>(left)->field;
+          Field *rf = down_cast<Item_field *>(right)->field;
+          if(lf != nullptr && rf != nullptr) {
+            if(lf->table == derived && rf->table != derived) pairs.push_back({lf, rf});
+            else if(rf->table == derived && lf->table != derived) pairs.push_back({rf, lf});
+          }
+        }
+      }
+    };
+    for(Item *condition : conditions) collect(condition);
+    const MaterializePathParameters::Operand &operand = inner->materialize().param->m_operands[0];
+    for(const auto &pair : pairs) {
+      Field *source_field = nullptr;
+      ha_warp *source_handler = nullptr;
+      const bool resolved = warp_derived_source(operand, pair.first, &source_field, &source_handler);
+      if(resolved) {
+        warp_add_semi_candidate(source_handler, source_field, pair.second);
+      }
     }
-    Field *inner_field = down_cast<Item_field *>(source)->field;
-    if(inner_field == nullptr || inner_field->table != inner_table || inner_table == outer->table ||
-       !integer(inner_field) || !integer(outer)) {
-      return false;
-    }
-    auto semi = std::make_shared<ha_warp::warp_semi_in>();
-    semi->outer_table = outer->table;
-    semi->outer_col = outer->field_index();
-    semi->inner_col = inner_field->field_index();
-    inner_handler->semi_in = semi;
     return false;
   });
 }
@@ -6115,25 +6193,24 @@ void ha_warp::make_scan_where() {
     }
   }
   semi_keys.reset();
-  if(semi_in) {
-    std::vector<int64_t> keys;
+  semi_pick();
+  if(semi_in && semi_pick_keys) {
+    const std::vector<int64_t> &keys = *semi_pick_keys;
     const uint64_t rows = table_row_count();
-    if(semi_key_values(&keys, rows / 2)) {
-      if(keys.size() <= std::min<uint64_t>(100000, rows / 4)) {
-        std::string cond = "c" + std::to_string(semi_in->inner_col) + " IN (";
-        if(keys.empty()) {
-          cond = "1=0";
-        } else {
-          for(size_t i = 0; i < keys.size(); ++i) {
-            if(i > 0) cond += ",";
-            cond += std::to_string(keys[i]);
-          }
-          cond += ")";
-        }
-        scan_where = (scan_where == "" || scan_where == "1=1") ? cond : "(" + scan_where + ") AND (" + cond + ")";
+    if(keys.size() <= std::min<uint64_t>(100000, rows / 4)) {
+      std::string cond = "c" + std::to_string(semi_in->inner_col) + " IN (";
+      if(keys.empty()) {
+        cond = "1=0";
       } else {
-        semi_keys = std::make_shared<std::vector<int64_t>>(std::move(keys));
+        for(size_t i = 0; i < keys.size(); ++i) {
+          if(i > 0) cond += ",";
+          cond += std::to_string(keys[i]);
+        }
+        cond += ")";
       }
+      scan_where = (scan_where == "" || scan_where == "1=1") ? cond : "(" + scan_where + ") AND (" + cond + ")";
+    } else {
+      semi_keys = semi_pick_keys;
     }
   }
 }
@@ -6181,20 +6258,19 @@ std::string ha_warp::where_for_partition(const std::string &dir) {
    the statement are included, the keys are only used to leave rows out).  The
    condition that limits the scan of this table, or none if the keys are not
    known or are too many to help. */
-bool ha_warp::semi_key_values(std::vector<int64_t> *keys_out, uint64_t max_keys) {
-  ha_warp *outer = dynamic_cast<ha_warp *>(semi_in->outer_table->file);
+bool ha_warp::semi_keys_of(const std::shared_ptr<warp_semi_in> &candidate, std::vector<int64_t> *keys_out, uint64_t max_keys) {
+  ha_warp *outer = dynamic_cast<ha_warp *>(candidate->outer_table->file);
   if(outer == nullptr) {
     return false;
   }
   /* the other table is the probe table of a join that the engine makes: the
      keys are the ones of the rows of the join (the join is made now) */
-  if(outer->par_join) {
+  if(outer->par_join || outer->pj_follower) {
     std::vector<int64_t> joined;
-    if(outer->pj_collect_keys(semi_in->outer_col, &joined)) {
+    if(outer->pj_collect_keys(candidate->outer_table, candidate->outer_col, &joined)) {
       if(joined.size() > max_keys) {
         return false;
       }
-      ++warp_semi_key_scans;
       *keys_out = std::move(joined);
       return true;
     }
@@ -6206,7 +6282,7 @@ bool ha_warp::semi_key_values(std::vector<int64_t> *keys_out, uint64_t max_keys)
     ibis::util::gatherParts(parts, outer->share->data_dir_name, true);
     bool failed = false;
     const std::string where = outer->push_where_clause == "" ? "1=1" : outer->push_where_clause;
-    const std::string column = "c" + std::to_string(semi_in->outer_col);
+    const std::string column = "c" + std::to_string(candidate->outer_col);
     for(ibis::part *part : parts) {
       if(failed || part == nullptr || part->nRows() == 0 ||
          std::string(part->currentDataDir()) == std::string(outer->share->data_dir_name)) {
@@ -6246,8 +6322,39 @@ bool ha_warp::semi_key_values(std::vector<int64_t> *keys_out, uint64_t max_keys)
   if(keys.size() > max_keys) {
     return false;
   }
-  ++warp_semi_key_scans;
   *keys_out = std::move(keys);
+  return true;
+}
+
+/* The keys that limit the scan: the candidate with the fewest keys. */
+void ha_warp::semi_pick() {
+  semi_in.reset();
+  semi_pick_keys.reset();
+  if(semi_candidates.empty()) {
+    return;
+  }
+  const uint64_t max_keys = std::min<uint64_t>(table_row_count() / 2, 200000000ULL);
+  std::shared_ptr<warp_semi_in> best;
+  std::shared_ptr<std::vector<int64_t>> best_keys;
+  for(const auto &candidate : semi_candidates) {
+    std::vector<int64_t> keys;
+    if(semi_keys_of(candidate, &keys, max_keys) && (!best_keys || keys.size() < best_keys->size())) {
+      best = candidate;
+      best_keys = std::make_shared<std::vector<int64_t>>(std::move(keys));
+    }
+  }
+  if(best) {
+    ++warp_semi_key_scans;
+    semi_in = best;
+    semi_pick_keys = best_keys;
+  }
+}
+
+bool ha_warp::semi_key_values(std::vector<int64_t> *keys_out, uint64_t max_keys) {
+  if(!semi_in || !semi_pick_keys || semi_pick_keys->size() > max_keys) {
+    return false;
+  }
+  *keys_out = *semi_pick_keys;
   return true;
 }
 

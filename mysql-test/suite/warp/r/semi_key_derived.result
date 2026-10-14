@@ -1,0 +1,123 @@
+#
+# A derived table that is an aggregation of one WARP table and is read by the
+# key that it is grouped by (a correlated subquery that is made a derived table,
+# DBT-3 Q17 and Q20) is aggregated for the keys of the other tables only
+# (warp_semi_key_pushdown).  The result must be the one of InnoDB.
+#
+SET SESSION optimizer_switch = 'subquery_to_derived=on';
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE p_w (id INT, flag INT, brand INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE l_w (partkey INT, suppkey INT, qty INT, price INT, d DATE) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE s_w (partkey INT, suppkey INT, avail INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO p_w WITH RECURSIVE x(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM x WHERE i < 2000) SELECT i, i % 17, i % 5 FROM x;
+INSERT INTO l_w WITH RECURSIVE x(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM x WHERE i < 40000)
+SELECT 1 + i % 2400, 1 + i % 50, 1 + i % 40, i % 1000, DATE_ADD('2022-01-01', INTERVAL i % 400 DAY) FROM x;
+INSERT INTO s_w WITH RECURSIVE x(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM x WHERE i < 3000)
+SELECT 1 + i % 2000, 1 + i % 50, i % 120 FROM x;
+CREATE TABLE p_i LIKE p_w;
+CREATE TABLE l_i LIKE l_w;
+CREATE TABLE s_i LIKE s_w;
+ALTER TABLE p_i ENGINE=InnoDB;
+ALTER TABLE l_i ENGINE=InnoDB;
+ALTER TABLE s_i ENGINE=InnoDB;
+INSERT INTO p_i SELECT * FROM p_w;
+INSERT INTO l_i SELECT * FROM l_w;
+INSERT INTO s_i SELECT * FROM s_w;
+CREATE TABLE queries (i INT, q TEXT);
+INSERT INTO queries VALUES
+(1, 'SELECT SUM(l.price) FROM l_# l, p_# p WHERE p.id = l.partkey AND p.flag = 1 AND l.qty < (SELECT 0.2 * AVG(l2.qty) FROM l_# l2 WHERE l2.partkey = p.id)'),
+(2, 'SELECT COUNT(*), SUM(s.partkey), SUM(s.suppkey) FROM s_# s WHERE s.avail > (SELECT 0.5 * SUM(l.qty) FROM l_# l WHERE l.partkey = s.partkey AND l.suppkey = s.suppkey AND l.d >= ''2022-03-01'' AND l.d < ''2022-09-01'')'),
+(3, 'SELECT COUNT(*), SUM(p.id) FROM p_# p WHERE p.brand = 2 AND p.id IN (SELECT l.partkey FROM l_# l GROUP BY l.partkey HAVING SUM(l.qty) > 400)'),
+(4, 'SELECT COUNT(*), SUM(x.n) FROM p_# p, (SELECT l.partkey, COUNT(*) AS n, MAX(l.price) AS m FROM l_# l GROUP BY l.partkey) x WHERE x.partkey = p.id AND p.flag = 3'),
+(5, 'SELECT p.id, x.n FROM p_# p JOIN (SELECT l.partkey, l.suppkey, COUNT(*) AS n FROM l_# l GROUP BY l.partkey, l.suppkey) x ON x.suppkey = p.brand AND x.partkey = p.id WHERE p.flag = 4 ORDER BY p.id, x.n'),
+(6, 'SELECT COUNT(*), SUM(x.n) FROM p_# p LEFT JOIN (SELECT l.partkey, COUNT(*) AS n FROM l_# l GROUP BY l.partkey) x ON x.partkey = p.id WHERE p.flag = 5'),
+(7, 'SELECT COUNT(*) FROM p_# p WHERE p.flag = 99 AND p.id IN (SELECT l.partkey FROM l_# l GROUP BY l.partkey HAVING COUNT(*) > 1)');
+# query 1
+# the aggregation was limited to the keys of the other table: 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 2
+# the aggregation was limited to the keys of the other table: 0
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 3
+# the aggregation was limited to the keys of the other table: 0
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 4
+# the aggregation was limited to the keys of the other table: 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 5
+# the aggregation was limited to the keys of the other table: 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 6
+# the aggregation was limited to the keys of the other table: 0
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 7
+# the aggregation was limited to the keys of the other table: 0
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+SET SESSION warp_semi_key_pushdown = DEFAULT;
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
+SET SESSION optimizer_switch = DEFAULT;
+DROP TABLE queries, p_w, l_w, s_w, p_i, l_i, s_i;

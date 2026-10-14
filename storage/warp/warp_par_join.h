@@ -203,7 +203,7 @@ struct warp_pj_result {
   std::string dir;
   size_t stride = 0;
   std::vector<uint32_t> data;     // stride values per row: ordinal of the probe row, rows of the other tables
-  std::vector<int64_t> keys;      // plan.export_slot: the value of the column for every row
+  std::vector<std::vector<int64_t>> keys;   // the values of the exported columns (warp_pj_plan::exports) for every row
   size_t rows() const { return stride == 0 ? 0 : data.size() / stride; }
 };
 
@@ -219,6 +219,24 @@ struct warp_pj_semi {
   Field *inner = nullptr;       // the column of the derived table
   int level = 0;                // the table of the plan that the column belongs to
   std::unordered_set<int64_t> keys;
+};
+
+/* The scans of the statement that are limited to the keys of a table (see
+   warp_try_semi_keys): the join of the engine exports the values of those
+   columns when it is made. */
+static thread_local std::vector<std::shared_ptr<ha_warp::warp_semi_in>> warp_semi_registry;
+static thread_local ulonglong warp_semi_registry_query = 0;
+
+/* The values of a column of one of the tables of the join in the rows of its result,
+   for the scans of other tables that are limited to them (see
+   ha_warp::pj_collect_keys): the join is made before those scans are read. */
+struct warp_pj_export {
+  TABLE *table = nullptr;
+  uint field = 0;
+  int level = 0;
+  int slot = 0;
+  std::vector<int64_t> keys;      // sorted and distinct
+  bool ready = false;
 };
 
 /* Where the rows of the result of the join go instead of the result: an
@@ -253,11 +271,9 @@ struct warp_pj_plan {
      the scans of other tables that are limited to them (see
      ha_warp::pj_collect_keys): the join is made before the tables of those
      scans are read. */
-  int export_slot = -1;              // the column in root_cols, none if < 0
+  std::vector<warp_pj_export> exports;
   std::shared_ptr<warp_pj_sink> sink;
   bool prefetched = false;           // the join was made, pj_run does not make it again
-  bool export_ready = false;
-  std::vector<int64_t> export_keys;  // sorted and distinct
   /* the failure is that the FastBit cache is too small for the columns that
      the join reads */
   std::atomic<bool> out_of_cache{false};
@@ -1562,15 +1578,26 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
     result->data.insert(result->data.end(), v.begin(), v.end());
     std::vector<uint32_t>().swap(v);
   }
-  if(plan.export_slot >= 0) {
-    const int null_slot = plan.root_null_slot[plan.export_slot];
-    result->keys.reserve(result->rows());
-    for(size_t r = 0; r < result->rows(); ++r) {
-      const size_t row = hit_rows[result->data[r * result->stride]];
-      if(null_slot >= 0 && nulls[null_slot].get(row) != 0) {
-        continue;
+  if(!plan.exports.empty() && !plan.sink) {
+    result->keys.assign(plan.exports.size(), std::vector<int64_t>());
+    for(size_t x = 0; x < plan.exports.size(); ++x) {
+      const warp_pj_export &e = plan.exports[x];
+      std::vector<int64_t> &out = result->keys[x];
+      out.reserve(result->rows());
+      for(size_t r = 0; r < result->rows(); ++r) {
+        const uint32_t *tuple = &result->data[r * result->stride];
+        if(e.level == 0) {
+          const size_t row = hit_rows[tuple[0]];
+          const int null_slot = plan.root_null_slot[e.slot];
+          if(null_slot >= 0 && nulls[null_slot].get(row) != 0) continue;
+          out.push_back(cols[e.slot].get(row));
+        } else {
+          const uint32_t chosen = tuple[e.level];
+          const warp_pj_table &t = plan.tables[e.level];
+          if(chosen == WARP_PJ_NULL_ROW || t.nulls[e.slot][chosen]) continue;
+          out.push_back(t.vals[e.slot][chosen]);
+        }
       }
-      result->keys.push_back(cols[plan.export_slot].get(row));
     }
   }
   return true;
@@ -1609,6 +1636,10 @@ static bool warp_pj_read_semi(THD *thd, warp_pj_semi &semi, std::string *error) 
 
 static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
   THD *thd = plan.thd;
+  for(warp_pj_export &e : plan.exports) {
+    e.ready = false;
+    e.keys.clear();
+  }
   plan.serving = false;
   plan.results.clear();
   plan.close_output();
@@ -1740,6 +1771,20 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
     *error = first_error;
     return false;
   }
+  /* the values of the exported columns */
+  for(size_t x = 0; x < plan.exports.size(); ++x) {
+    warp_pj_export &e = plan.exports[x];
+    e.keys.clear();
+    for(warp_pj_result &r : plan.results) {
+      if(x < r.keys.size()) {
+        e.keys.insert(e.keys.end(), r.keys[x].begin(), r.keys[x].end());
+        std::vector<int64_t>().swap(r.keys[x]);
+      }
+    }
+    std::sort(e.keys.begin(), e.keys.end());
+    e.keys.erase(std::unique(e.keys.begin(), e.keys.end()), e.keys.end());
+    e.ready = !plan.sink;
+  }
   /* partitions without a result row are not opened again */
   plan.results.erase(std::remove_if(plan.results.begin(), plan.results.end(),
                                     [](const warp_pj_result &r) { return r.rows() == 0; }),
@@ -1794,42 +1839,35 @@ int ha_warp::pj_run() {
   return 0;
 }
 
-/* The values of a column of the probe table in the rows of the join (the join
-   is made now, the scan of the probe table uses the result later). */
-bool ha_warp::pj_collect_keys(uint field, std::vector<int64_t> *keys) {
-  warp_pj_plan &plan = *par_join;
-  if(plan.export_ready && plan.export_slot >= 0 && plan.root_cols[plan.export_slot] == field) {
-    *keys = plan.export_keys;
-    return true;
-  }
-  if(plan.computed || plan.prefetched) {
-    return false;   // made without the column: the join is not made again
-  }
-  int slot = -1;
-  for(size_t i = 0; i < plan.root_cols.size(); ++i) {
-    if(plan.root_cols[i] == field) slot = (int)i;
-  }
-  if(slot < 0) {
+/* The values of a column of a table of the join in the rows of its result (the
+   join is made now, if it was not, the scan of the probe table uses the
+   result later). */
+bool ha_warp::pj_collect_keys(TABLE *table, uint field, std::vector<int64_t> *keys) {
+  std::shared_ptr<warp_pj_plan> plan = par_join ? par_join : pj_follower;
+  if(!plan) {
     return false;
   }
-  plan.export_slot = slot;
-  if(pj_run() != 0) {
-    plan.export_slot = -1;
+  warp_pj_export *found = nullptr;
+  for(warp_pj_export &e : plan->exports) {
+    if(e.table == table && e.field == field) found = &e;
+  }
+  if(found == nullptr) {
     return false;
   }
-  plan.computed = true;
-  plan.prefetched = true;
-  plan.export_keys.clear();
-  for(const warp_pj_result &r : plan.results) {
-    plan.export_keys.insert(plan.export_keys.end(), r.keys.begin(), r.keys.end());
+  if(!found->ready) {
+    if(plan->computed || plan->prefetched) {
+      return false;
+    }
+    if(plan->probe_handler->pj_run() != 0) {
+      return false;
+    }
+    plan->computed = true;
+    plan->prefetched = true;
+    if(!found->ready) {
+      return false;
+    }
   }
-  for(warp_pj_result &r : plan.results) {
-    std::vector<int64_t>().swap(r.keys);
-  }
-  std::sort(plan.export_keys.begin(), plan.export_keys.end());
-  plan.export_keys.erase(std::unique(plan.export_keys.begin(), plan.export_keys.end()), plan.export_keys.end());
-  plan.export_ready = true;
-  *keys = plan.export_keys;
+  *keys = found->keys;
   return true;
 }
 
@@ -1932,8 +1970,37 @@ static bool warp_pj_replace(THD *thd, AccessPath *path, JOIN *join, const std::v
   /* the tables are joined by the engine now, not by the hash joins that the keys
      were meant for (and the scans of the engine's join read the tables) */
   plan->probe_handler->semi_in.reset();
+  plan->probe_handler->semi_candidates.clear();
   for(int l = 1; l <= plan->nbuild; ++l) {
     plan->tables[l].handler->semi_in.reset();
+    plan->tables[l].handler->semi_candidates.clear();
+  }
+  /* the scans of other tables that are limited to the values of columns of these
+     tables: the join exports them */
+  if((long)warp_semi_registry_query == (long)plan->thd->query_id) {
+    for(const auto &candidate : warp_semi_registry) {
+      int level = -1;
+      if(candidate->outer_table == plan->probe) {
+        level = 0;
+      } else {
+        for(int l = 1; l <= plan->nbuild; ++l) {
+          if(plan->tables[l].table == candidate->outer_table) level = l;
+        }
+      }
+      bool inside = candidate->inner_table == plan->probe;
+      for(int l = 1; l <= plan->nbuild; ++l) inside = inside || candidate->inner_table == plan->tables[l].table;
+      bool have = false;
+      for(const warp_pj_export &e : plan->exports) {
+        have = have || (e.table == candidate->outer_table && e.field == candidate->outer_col);
+      }
+      if(level < 0 || inside || have) continue;
+      warp_pj_export e;
+      e.table = candidate->outer_table;
+      e.field = candidate->outer_col;
+      e.level = level;
+      e.slot = level == 0 ? warp_pj_add_root(*plan, e.field) : warp_pj_add_value(*plan, level, e.field);
+      plan->exports.push_back(e);
+    }
   }
   for(const warp_pj_semi &candidate : semis) {
     for(int l = 1; l <= plan->nbuild; ++l) {

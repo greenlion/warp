@@ -991,13 +991,6 @@ static std::shared_ptr<warp_pa_plan> warp_pa_make_distinct_plan(THD *thd, Access
     }
   }
   plan->group_cols = plan->key_cols.size();
-  if(handler->semi_in) {
-    for(size_t i = 0; i < plan->cols.size(); ++i) {
-      if(plan->cols[i].field == handler->semi_in->inner_col && plan->cols[i].kind == PA_INT) {
-        plan->semi_slot = (int)i;
-      }
-    }
-  }
   /* MySQL reads the columns that are returned (and the ones of the conditions
      that the engine evaluates) */
   {
@@ -1986,7 +1979,15 @@ int ha_warp::pa_run() {
   plan.where = push_where_clause == "1=1" ? "" : push_where_clause;
   /* the keys of another table that limit the scan (see warp_try_semi_keys) */
   plan.semi_active = false;
+  plan.semi_slot = -1;
+  semi_pick();
   if(semi_in) {
+    for(size_t i = 0; i < plan.cols.size(); ++i) {
+      if(plan.cols[i].field == semi_in->inner_col && plan.cols[i].kind == PA_INT &&
+         std::find(plan.key_cols.begin(), plan.key_cols.end(), (int)i) != plan.key_cols.end()) {
+        plan.semi_slot = (int)i;
+      }
+    }
     if(plan.semi_slot >= 0) {
       /* a bit for every key: a row is looked up in it without parsing a list */
       std::vector<int64_t> keys;
