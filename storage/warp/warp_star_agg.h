@@ -1547,7 +1547,8 @@ static void warp_star_to_decimal(my_decimal *decimal_out, warp_i128 value) {
     if(negative) {
       *--at = '-';
     }
-    const char *parsed_end;
+    /* the end of the text goes in, the end of the number comes out */
+    const char *parsed_end = at + strlen(at);
     str2my_decimal(E_DEC_FATAL_ERROR, at, &decimal, &parsed_end);
   }
 }
