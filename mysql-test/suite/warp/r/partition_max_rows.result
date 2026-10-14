@@ -1,0 +1,24 @@
+#
+# A partition holds at most warp_partition_max_rows rows.  When the rows
+# that are buffered for a write (warp_write_cache_size) are more than that,
+# the rows that did not fit in a partition were lost.
+#
+SET @save_max = @@global.warp_partition_max_rows;
+SET GLOBAL warp_partition_max_rows = 64000;
+SET SESSION cte_max_recursion_depth = 400000;
+CREATE TABLE t (a INT, b INT) ENGINE=WARP;
+INSERT INTO t WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 300000)
+SELECT x, x % 7 FROM s;
+SELECT COUNT(*), COUNT(DISTINCT a), MIN(a), MAX(a), SUM(b) FROM t;
+COUNT(*)	COUNT(DISTINCT a)	MIN(a)	MAX(a)	SUM(b)
+300000	300000	1	300000	899998
+# the same in two statements, and with a delete
+INSERT INTO t WITH RECURSIVE s(x) AS (SELECT 300001 UNION ALL SELECT x + 1 FROM s WHERE x < 400000)
+SELECT x, x % 7 FROM s;
+DELETE FROM t WHERE a % 1000 = 0;
+SELECT COUNT(*), COUNT(DISTINCT a), MIN(a), MAX(a), SUM(b) FROM t;
+COUNT(*)	COUNT(DISTINCT a)	MIN(a)	MAX(a)	SUM(b)
+399600	399600	1	399999	1198800
+DROP TABLE t;
+SET GLOBAL warp_partition_max_rows = @save_max;
+SET SESSION cte_max_recursion_depth = DEFAULT;
