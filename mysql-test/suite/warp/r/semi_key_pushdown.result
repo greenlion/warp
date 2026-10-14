@@ -1,0 +1,115 @@
+#
+# A subquery that is materialized once (the semijoin of EXISTS and IN) and read
+# by the key of a column of another WARP table is only scanned for the keys
+# that the other table has (warp_semi_key_pushdown).  The result must be the
+# one of InnoDB, with the option on and off.
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE o_w (id INT, k BIGINT, d DATE, p VARCHAR(8), kn INT NULL) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE l_w (k BIGINT, a DATE, b DATE, v INT, kn INT NULL) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO o_w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 5000)
+SELECT x, x, DATE_ADD('2020-01-01', INTERVAL x % 400 DAY), CONCAT('p', x % 5), IF(x % 9 = 0, NULL, x % 700) FROM s;
+INSERT INTO l_w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 60000)
+SELECT 1 + x % 6000, DATE_ADD('2020-01-01', INTERVAL x % 300 DAY), DATE_ADD('2020-01-01', INTERVAL (x * 7) % 300 DAY),
+x % 11, IF(x % 13 = 0, NULL, x % 900) FROM s;
+CREATE TABLE o_i LIKE o_w;
+CREATE TABLE l_i LIKE l_w;
+ALTER TABLE o_i ENGINE=InnoDB;
+ALTER TABLE l_i ENGINE=InnoDB;
+INSERT INTO o_i SELECT * FROM o_w;
+INSERT INTO l_i SELECT * FROM l_w;
+CREATE TEMPORARY TABLE queries (i INT, q TEXT);
+INSERT INTO queries VALUES (1, 'SELECT p, COUNT(*) FROM o_@ WHERE d >= ''2020-03-01'' AND d < ''2020-04-01'' AND EXISTS (SELECT * FROM l_@ WHERE l_@.k = o_@.k AND l_@.a < l_@.b) GROUP BY p ORDER BY p');
+INSERT INTO queries VALUES (2, 'SELECT COUNT(*), SUM(id) FROM o_@ WHERE d < ''2020-01-20'' AND k IN (SELECT k FROM l_@ WHERE v > 3)');
+INSERT INTO queries VALUES (3, 'SELECT COUNT(*) FROM o_@ WHERE d < ''2020-01-10'' AND NOT EXISTS (SELECT * FROM l_@ WHERE l_@.k = o_@.k)');
+INSERT INTO queries VALUES (4, 'SELECT id FROM o_@ WHERE id < 40 AND kn IN (SELECT kn FROM l_@ WHERE v = 2) ORDER BY id');
+INSERT INTO queries VALUES (5, 'SELECT COUNT(*) FROM o_@ WHERE p = ''p3'' AND k IN (SELECT k FROM l_@ WHERE a = b)');
+INSERT INTO queries VALUES (6, 'SELECT COUNT(*) FROM o_@ WHERE d >= ''2030-01-01'' AND EXISTS (SELECT * FROM l_@ WHERE l_@.k = o_@.k)');
+INSERT INTO queries VALUES (7, 'SELECT COUNT(*) FROM o_@ LEFT JOIN (SELECT DISTINCT k FROM l_@ WHERE v = 5) x ON x.k = o_@.k WHERE d < ''2020-01-15''');
+# query 1
+# the scan was limited to the keys of the other table: 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 2
+# the scan was limited to the keys of the other table: 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 3
+# the scan was limited to the keys of the other table: 0
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 4
+# the scan was limited to the keys of the other table: 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 5
+# the scan was limited to the keys of the other table: 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 6
+# the scan was limited to the keys of the other table: 0
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 7
+# the scan was limited to the keys of the other table: 0
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+DROP TEMPORARY TABLE queries;
+SET SESSION warp_semi_key_pushdown = DEFAULT;
+DROP TABLE o_w, l_w, o_i, l_i;

@@ -428,6 +428,11 @@ static MYSQL_THDVAR_BOOL(parallel_aggregation, PLUGIN_VAR_NOCMDARG,
                           "GROUP BY) inside the engine, in parallel by partition",
                           nullptr, nullptr, true);
 
+static MYSQL_THDVAR_BOOL(semi_key_pushdown, PLUGIN_VAR_NOCMDARG,
+                          "Limit the scan of a subquery that is materialized and read by the key of a column of "
+                          "another WARP table to the keys that the table has",
+                          nullptr, nullptr, true);
+
 static MYSQL_THDVAR_ULONG(parallel_min_rows, PLUGIN_VAR_RQCMDARG,
                           "Smallest number of rows of a piece of a partition that is processed by a thread of its own "
                           "(see warp_max_degree_of_parallelism).",
@@ -484,6 +489,7 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(star_aggregation),
   MYSQL_SYSVAR(parallel_hash_join),
   MYSQL_SYSVAR(parallel_aggregation),
+  MYSQL_SYSVAR(semi_key_pushdown),
   MYSQL_SYSVAR(scan_rows_per_cost),
   MYSQL_SYSVAR(index_cost_factor),
   MYSQL_SYSVAR(parallel_join_min_rows),
@@ -1196,10 +1202,20 @@ class ha_warp : public handler {
     Item *value;
   };
   std::vector<warp_outer_param> outer_params;
+  /* A subquery that is materialized once and read by the key of a column of
+     another WARP table: the scan of this table is limited to the keys that the
+     other table has (see warp_try_semi_keys) */
+  struct warp_semi_in {
+    TABLE *outer_table = nullptr;   // the table whose column is the key of the lookup
+    uint outer_col = 0;             // its column
+    uint inner_col = 0;             // the column of this table that is materialized
+  };
+  std::shared_ptr<warp_semi_in> semi_in;
   /* push_where_clause and the parameters for the scan that is started */
   std::string          scan_where         = "";
   void collect_outer_params(const Item *cond);
   void make_scan_where();
+  std::string semi_key_condition();
 
  private:
   int64_t pushdown_table_count = 0;
@@ -1484,6 +1500,7 @@ class ha_warp : public handler {
     push_where_clause = "";
     scan_where = "";
     outer_params.clear();
+    semi_in.reset();
     par_join.reset();
     par_agg.reset();
     pj_follower.reset();
