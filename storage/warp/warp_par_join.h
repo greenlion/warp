@@ -202,6 +202,7 @@ struct warp_pj_result {
   std::string dir;
   size_t stride = 0;
   std::vector<uint32_t> data;     // stride values per row: ordinal of the probe row, rows of the other tables
+  std::vector<int64_t> keys;      // plan.export_slot: the value of the column for every row
   size_t rows() const { return stride == 0 ? 0 : data.size() / stride; }
 };
 
@@ -236,6 +237,14 @@ struct warp_pj_plan {
   /* the result */
   std::vector<warp_pj_result> results;
   bool computed = false;
+  /* The values of a column of the probe table in the result rows are kept, for
+     the scans of other tables that are limited to them (see
+     ha_warp::pj_collect_keys): the join is made before the tables of those
+     scans are read. */
+  int export_slot = -1;              // the column in root_cols, none if < 0
+  bool prefetched = false;           // the join was made, pj_run does not make it again
+  bool export_ready = false;
+  std::vector<int64_t> export_keys;  // sorted and distinct
   /* the failure is that the FastBit cache is too small for the columns that
      the join reads */
   std::atomic<bool> out_of_cache{false};
@@ -1245,6 +1254,17 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
     result->data.insert(result->data.end(), v.begin(), v.end());
     std::vector<uint32_t>().swap(v);
   }
+  if(plan.export_slot >= 0) {
+    const int null_slot = plan.root_null_slot[plan.export_slot];
+    result->keys.reserve(result->rows());
+    for(size_t r = 0; r < result->rows(); ++r) {
+      const size_t row = hit_rows[result->data[r * result->stride]];
+      if(null_slot >= 0 && nulls[null_slot].get(row) != 0) {
+        continue;
+      }
+      result->keys.push_back(cols[plan.export_slot].get(row));
+    }
+  }
   return true;
 }
 
@@ -1424,6 +1444,15 @@ int ha_warp::pj_run() {
   warp_pj_plan &plan = *par_join;
   /* the columns that MySQL reads from the probe table */
   set_column_set();
+  if(plan.prefetched) {
+    /* the join was made for the keys of a scan (pj_collect_keys) */
+    plan.prefetched = false;
+    plan.close_output();
+    plan.out_part = 0;
+    plan.out_pos = 0;
+    plan.serving = true;
+    return 0;
+  }
   std::string error;
   try {
     if(!warp_pj_execute(plan, &error)) {
@@ -1452,6 +1481,45 @@ int ha_warp::pj_run() {
   plan.computed = true;
   plan.serving = true;
   return 0;
+}
+
+/* The values of a column of the probe table in the rows of the join (the join
+   is made now, the scan of the probe table uses the result later). */
+bool ha_warp::pj_collect_keys(uint field, std::vector<int64_t> *keys) {
+  warp_pj_plan &plan = *par_join;
+  if(plan.export_ready && plan.export_slot >= 0 && plan.root_cols[plan.export_slot] == field) {
+    *keys = plan.export_keys;
+    return true;
+  }
+  if(plan.computed || plan.prefetched) {
+    return false;   // made without the column: the join is not made again
+  }
+  int slot = -1;
+  for(size_t i = 0; i < plan.root_cols.size(); ++i) {
+    if(plan.root_cols[i] == field) slot = (int)i;
+  }
+  if(slot < 0) {
+    return false;
+  }
+  plan.export_slot = slot;
+  if(pj_run() != 0) {
+    plan.export_slot = -1;
+    return false;
+  }
+  plan.computed = true;
+  plan.prefetched = true;
+  plan.export_keys.clear();
+  for(const warp_pj_result &r : plan.results) {
+    plan.export_keys.insert(plan.export_keys.end(), r.keys.begin(), r.keys.end());
+  }
+  for(warp_pj_result &r : plan.results) {
+    std::vector<int64_t>().swap(r.keys);
+  }
+  std::sort(plan.export_keys.begin(), plan.export_keys.end());
+  plan.export_keys.erase(std::unique(plan.export_keys.begin(), plan.export_keys.end()), plan.export_keys.end());
+  plan.export_ready = true;
+  *keys = plan.export_keys;
+  return true;
 }
 
 void ha_warp::pj_close() {
@@ -1549,6 +1617,12 @@ static bool warp_pj_replace(THD *thd, AccessPath *path, JOIN *join, const std::v
   std::shared_ptr<warp_pj_plan> plan = warp_pj_make_plan(thd, path, &residual);
   if(!plan) {
     return false;
+  }
+  /* the tables are joined by the engine now, not by the hash joins that the keys
+     were meant for (and the scans of the engine's join read the tables) */
+  plan->probe_handler->semi_in.reset();
+  for(int l = 1; l <= plan->nbuild; ++l) {
+    plan->tables[l].handler->semi_in.reset();
   }
   for(const warp_pj_semi &candidate : semis) {
     for(int l = 1; l <= plan->nbuild; ++l) {
