@@ -1,0 +1,257 @@
+#
+# The scan below the temporary table of a semijoin (EXISTS, IN) that removes
+# the duplicates returns the distinct rows, made in parallel by the engine
+# (warp_parallel_aggregation).  Every query is run against the WARP tables and
+# InnoDB copies, with the engine's distinct and the keys of the outer table on
+# and off.
+#
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE a_w (id INT, k INT, s VARCHAR(8), dd DECIMAL(10,2), n INT NULL, d DATE) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE b_w (k INT, s VARCHAR(8), dd DECIMAL(10,2), n INT NULL, v INT, d DATE) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO a_w WITH RECURSIVE x(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM x WHERE i < 3000)
+SELECT i, i % 800, CONCAT('s', i % 300), (i % 90) / 4, IF(i % 7 = 0, NULL, i % 120), DATE_ADD('2021-01-01', INTERVAL i % 60 DAY) FROM x;
+INSERT INTO b_w WITH RECURSIVE x(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM x WHERE i < 40000)
+SELECT i % 1000, CONCAT('s', i % 400), (i % 100) / 4, IF(i % 5 = 0, NULL, i % 150), i % 11, DATE_ADD('2021-01-01', INTERVAL i % 80 DAY) FROM x;
+CREATE TABLE a_i LIKE a_w;
+CREATE TABLE b_i LIKE b_w;
+ALTER TABLE a_i ENGINE=InnoDB;
+ALTER TABLE b_i ENGINE=InnoDB;
+INSERT INTO a_i SELECT * FROM a_w;
+INSERT INTO b_i SELECT * FROM b_w;
+CREATE TABLE queries (i INT, q TEXT);
+INSERT INTO queries VALUES
+(1, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_@ b WHERE b.v > 3)'),
+(2, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.s IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.s FROM b_@ b WHERE b.v < 5)'),
+(3, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.dd IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.dd FROM b_@ b WHERE b.v = 2)'),
+(4, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.n IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.n FROM b_@ b WHERE b.v > 6)'),
+(5, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE (a.k, a.s) IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k, b.s FROM b_@ b WHERE b.v = 1)'),
+(6, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.d >= ''2021-02-01'' AND EXISTS (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ 1 FROM b_@ b WHERE b.k = a.k AND b.d < b.d + INTERVAL 1 DAY AND b.v > 8)'),
+(7, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_@ b WHERE b.k < b.v * 100)'),
+(8, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_@ b WHERE b.v = 99)'),
+(9, 'SELECT COUNT(*) FROM a_@ a JOIN (SELECT DISTINCT b.k, b.s FROM b_@ b WHERE b.v < 3) x ON x.k = a.k AND x.s = a.s');
+# query 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k FROM b_w b WHERE b.v > 3)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k FROM b_w b WHERE b.v > 3)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k FROM b_w b WHERE b.v > 3)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'isq MATERIALIZATION) */ b.k FROM b_i b WHERE b.v > 3)' at line 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_on2	same_rows_off
+1	1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_on2 EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on2)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+SELECT * FROM r_i;
+COUNT(*)	SUM(a.id)
+3000	4501500
+DROP TABLE r_on, r_on2, r_off, r_i;
+# query 2
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.s FROM b_w b WHERE b.v < 5)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.s FROM b_w b WHERE b.v < 5)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.s FROM b_w b WHERE b.v < 5)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'isq MATERIALIZATION) */ b.s FROM b_i b WHERE b.v < 5)' at line 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_on2	same_rows_off
+1	1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_on2 EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on2)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+SELECT * FROM r_i;
+COUNT(*)	SUM(a.id)
+3000	4501500
+DROP TABLE r_on, r_on2, r_off, r_i;
+# query 3
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.dd FROM b_w b WHERE b.v = 2)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.dd FROM b_w b WHERE b.v = 2)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.dd FROM b_w b WHERE b.v = 2)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'isq MATERIALIZATION) */ b.dd FROM b_i b WHERE b.v = 2)' at line 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_on2	same_rows_off
+1	1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_on2 EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on2)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+SELECT * FROM r_i;
+COUNT(*)	SUM(a.id)
+3000	4501500
+DROP TABLE r_on, r_on2, r_off, r_i;
+# query 4
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.n FROM b_w b WHERE b.v > 6)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.n FROM b_w b WHERE b.v > 6)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.n FROM b_w b WHERE b.v > 6)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'isq MATERIALIZATION) */ b.n FROM b_i b WHERE b.v > 6)' at line 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_on2	same_rows_off
+1	1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_on2 EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on2)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+SELECT * FROM r_i;
+COUNT(*)	SUM(a.id)
+2057	3085283
+DROP TABLE r_on, r_on2, r_off, r_i;
+# query 5
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k, b.s FROM b_w b WHERE b.v = 1)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k, b.s FROM b_w b WHERE b.v = 1)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k, b.s FROM b_w b WHERE b.v = 1)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'isq MATERIALIZATION) */ b.k, b.s FROM b_i b WHERE b.v = 1)' at line 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_on2	same_rows_off
+1	1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_on2 EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on2)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+SELECT * FROM r_i;
+COUNT(*)	SUM(a.id)
+1500	2027250
+DROP TABLE r_on, r_on2, r_off, r_i;
+# query 6
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ 1 FROM b_w b WHERE b.k = a.k AND b.d < b.d + INTERVAL 1 ' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ 1 FROM b_w b WHERE b.k = a.k AND b.d < b.d + INTERVAL 1 ' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ 1 FROM b_w b WHERE b.k = a.k AND b.d < b.d + INTERVAL 1 ' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'isq MATERIALIZATION) */ 1 FROM b_i b WHERE b.k = a.k AND b.d < b.d + INTERVAL 1 ' at line 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_on2	same_rows_off
+1	1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_on2 EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on2)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+SELECT * FROM r_i;
+COUNT(*)	SUM(a.id)
+1450	2196750
+DROP TABLE r_on, r_on2, r_off, r_i;
+# query 7
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k FROM b_w b WHERE b.k < b.v * 100)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k FROM b_w b WHERE b.k < b.v * 100)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k FROM b_w b WHERE b.k < b.v * 100)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'isq MATERIALIZATION) */ b.k FROM b_i b WHERE b.k < b.v * 100)' at line 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_on2	same_rows_off
+1	1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_on2 EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on2)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+SELECT * FROM r_i;
+COUNT(*)	SUM(a.id)
+3000	4501500
+DROP TABLE r_on, r_on2, r_off, r_i;
+# query 8
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k FROM b_w b WHERE b.v = 99)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k FROM b_w b WHERE b.v = 99)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'wsq MATERIALIZATION) */ b.k FROM b_w b WHERE b.v = 99)' at line 1
+Warnings:
+Warning	1064	Optimizer hint syntax error near 'isq MATERIALIZATION) */ b.k FROM b_i b WHERE b.v = 99)' at line 1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_on2	same_rows_off
+1	1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_on2 EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on2)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+SELECT * FROM r_i;
+COUNT(*)	SUM(a.id)
+0	NULL
+DROP TABLE r_on, r_on2, r_off, r_i;
+# query 9
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_on2	same_rows_off
+1	1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_on2 EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on2)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+SELECT * FROM r_i;
+COUNT(*)
+1500
+DROP TABLE r_on, r_on2, r_off, r_i;
+SET SESSION warp_parallel_aggregation = ON;
+SET SESSION warp_semi_key_pushdown = OFF;
+# the engine makes the rows of the temporary table distinct
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM a_w a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_w b WHERE b.v > 3);
+EXPLAIN
+-> Aggregate: count(0)  (cost=993075 rows=1)
+    -> Nested loop inner join  (cost=300978 rows=3e+6)
+        -> Table scan on a  (cost=308 rows=3002)
+        -> Single-row index lookup on <subquery2> using <auto_distinct_key> (k = a.k)  (cost=539..539 rows=1)
+            -> Materialize with deduplication  (cost=538..538 rows=1001)
+                -> Filter: (b.k is not null)  (cost=308 rows=1001)
+                    -> Table scan on b, with parallel aggregation  (cost=308 rows=1001)
+
+SET SESSION warp_semi_key_pushdown = DEFAULT;
+SET SESSION warp_parallel_aggregation = DEFAULT;
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
+DROP TABLE queries, a_w, b_w, a_i, b_i;
