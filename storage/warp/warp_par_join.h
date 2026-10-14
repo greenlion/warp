@@ -175,6 +175,7 @@ struct warp_pj_table {
      that are about this table only are checked when its rows are read. */
   bool null_side = false;
   std::vector<Item *> filters;
+  std::string pushed_where;           // the conditions that FastBit evaluates when the table is read
   std::vector<std::pair<uint, const std::unordered_set<int64_t> *>> semi;   // column, the values that have a match
   std::vector<uint> own_key_fields;   // columns of this table in the key of its edge
   std::vector<uint> value_fields;     // columns kept as integers
@@ -220,6 +221,17 @@ struct warp_pj_semi {
   std::unordered_set<int64_t> keys;
 };
 
+/* Where the rows of the result of the join go instead of the result: an
+   aggregation of the rows (see warp_par_agg.h).  A slice of the rows of a
+   partition has its own local state. */
+struct warp_pj_prober;
+struct warp_pj_sink {
+  virtual ~warp_pj_sink() {}
+  virtual void *begin() = 0;
+  virtual void add(void *local, const warp_pj_prober &prober) = 0;
+  virtual void end(void *local) = 0;
+};
+
 struct warp_pj_plan {
   THD *thd = nullptr;
   TABLE *probe = nullptr;
@@ -242,6 +254,7 @@ struct warp_pj_plan {
      ha_warp::pj_collect_keys): the join is made before the tables of those
      scans are read. */
   int export_slot = -1;              // the column in root_cols, none if < 0
+  std::shared_ptr<warp_pj_sink> sink;
   bool prefetched = false;           // the join was made, pj_run does not make it again
   bool export_ready = false;
   std::vector<int64_t> export_keys;  // sorted and distinct
@@ -920,7 +933,52 @@ static std::shared_ptr<warp_pj_plan> warp_pj_make_plan(THD *thd, AccessPath *pat
     }
     it = moved ? residual->erase(it) : it + 1;
   }
+  /* the conditions of the tables that FastBit can evaluate are not evaluated by
+     MySQL for every row that is read */
+  for(size_t l = 1; l < n; ++l) {
+    warp_pj_table &t = plan->tables[l];
+    std::vector<Item *> remaining;
+    for(Item *filter : t.filters) {
+      std::string where;
+      if(filter->type() == Item::FUNC_ITEM && t.handler->push_filter(filter, where)) {
+        t.pushed_where += t.pushed_where.empty() ? "(" + where + ")" : " AND (" + where + ")";
+      } else {
+        remaining.push_back(filter);
+      }
+    }
+    t.filters = remaining;
+  }
   return plan;
+}
+
+/* Columns that an aggregation of the rows of the join (warp_par_agg.h) reads,
+   added to the plan after it was made: a column of the probe table is read from
+   every partition, a column of another table is kept with its values. */
+static int warp_pj_add_root(warp_pj_plan &plan, uint field) {
+  for(size_t i = 0; i < plan.root_cols.size(); ++i) {
+    if(plan.root_cols[i] == field) return (int)i;
+  }
+  plan.root_cols.push_back(field);
+  if(plan.probe->field[field]->is_nullable()) {
+    plan.root_null_slot.push_back((int)plan.root_nulls.size());
+    plan.root_nulls.push_back(field);
+  } else {
+    plan.root_null_slot.push_back(-1);
+  }
+  return (int)plan.root_cols.size() - 1;
+}
+
+static int warp_pj_add_value(warp_pj_plan &plan, int level, uint field) {
+  warp_pj_table &t = plan.tables[level];
+  int s = t.slot_of(field);
+  if(s < 0) {
+    t.value_fields.push_back(field);
+    s = (int)t.value_fields.size() - 1;
+    t.vals.resize(t.value_fields.size());
+    t.nulls.resize(t.value_fields.size());
+    bitmap_set_bit(t.table->read_set, field);
+  }
+  return s;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -948,7 +1006,14 @@ static bool warp_pj_build(warp_pj_table &t, std::string *error) {
   }
 
   handler->pj_plain_scan = true;
+  const std::string saved_where = handler->push_where_clause;
+  if(!t.pushed_where.empty()) {
+    handler->push_where_clause = (saved_where.empty() || saved_where == "1=1")
+                                     ? t.pushed_where
+                                     : "(" + saved_where + ") AND (" + t.pushed_where + ")";
+  }
   int rc = handler->ha_rnd_init(true);
+  handler->push_where_clause = saved_where;
   handler->pj_plain_scan = false;
   if(rc != 0) {
     *error = "could not scan a table of the join";
@@ -1028,6 +1093,8 @@ struct warp_pj_prober {
   uint32_t ordinal = 0;
   uint32_t chosen[WARP_PJ_MAX_LEVELS];
   std::vector<uint32_t> *out = nullptr;
+  warp_pj_sink *sink = nullptr;
+  void *local = nullptr;
 
   inline bool value(const warp_pj_ref &ref, int64_t *v) const {
     if(ref.level == 0) {
@@ -1038,13 +1105,17 @@ struct warp_pj_prober {
     }
     const warp_pj_table &t = plan.tables[ref.level];
     const uint32_t r = chosen[ref.level];
-    if(t.nulls[ref.slot][r]) return false;
+    if(r == WARP_PJ_NULL_ROW || t.nulls[ref.slot][r]) return false;
     *v = t.vals[ref.slot][r];
     return true;
   }
 
   bool expand(int level) {
     if(level > plan.nbuild) {
+      if(sink != nullptr) {
+        sink->add(local, *this);
+        return true;
+      }
       out->push_back(ordinal);
       for(int l = 1; l <= plan.nbuild; ++l) {
         out->push_back(chosen[l]);
@@ -1201,6 +1272,16 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
       const size_t hi = hit_rows.size() * (k + 1) / nslices;
       warp_pj_prober prober{plan, cols, nulls};
       prober.out = &slice_out[k];
+      /* the local state of the sink is ended when the slice is done */
+      struct sink_scope {
+        warp_pj_sink *sink;
+        void *local;
+        ~sink_scope() {
+          if(sink != nullptr) sink->end(local);
+        }
+      } scope{plan.sink.get(), plan.sink ? plan.sink->begin() : nullptr};
+      prober.sink = scope.sink;
+      prober.local = scope.local;
       for(size_t i = lo; i < hi; ++i) {
         const size_t row = hit_rows[i];
         if(!invisible.empty() && invisible[row]) {

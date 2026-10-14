@@ -181,6 +181,8 @@ struct warp_pa_plan {
 
   /* the result */
   std::vector<warp_pa_group> groups;
+  /* the rows come from the join of the engine (warp_pj_plan::sink) */
+  std::shared_ptr<warp_pj_plan> pj;
   size_t pos = 0;
   bool computed = false;
   /* NULL when the rows of the group have no value: the aggregates of the row being returned */
@@ -1659,7 +1661,157 @@ static void warp_pa_merge_into(const warp_pa_plan &plan, warp_pa_shared *shared,
   local->clear();
 }
 
+/* the groups of the shards are the result */
+static void warp_pa_collect(warp_pa_plan &plan, warp_pa_shared &shared) {
+  size_t total = 0;
+  for(size_t t = 0; t < warp_pa_shared::SHARDS; ++t) total += shared.table[t].size();
+  plan.groups.reserve(total);
+  if(plan.adjacent) {
+    /* the key of a group starts with the key of the GROUP BY columns, which
+       is not followed by anything that is not part of the key of the
+       columns: groups with the same prefix are next to each other in the
+       order of the keys */
+    std::vector<std::pair<uint32_t, uint32_t>> order;
+    order.reserve(total);
+    for(size_t t = 0; t < warp_pa_shared::SHARDS; ++t) {
+      for(size_t i = 0; i < shared.table[t].size(); ++i) order.push_back({(uint32_t)t, (uint32_t)i});
+    }
+    std::sort(order.begin(), order.end(), [&](const auto &a, const auto &b) {
+      return shared.table[a.first].key(a.second) < shared.table[b.first].key(b.second);
+    });
+    for(const auto &entry : order) {
+      plan.groups.push_back(std::move(shared.table[entry.first].groups[entry.second]));
+    }
+  } else {
+    for(size_t t = 0; t < warp_pa_shared::SHARDS; ++t) {
+      for(auto &group : shared.table[t].groups) {
+        plan.groups.push_back(std::move(group));
+      }
+    }
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+/* the aggregation of the rows of the join of the engine                  */
+/* ---------------------------------------------------------------------- */
+
+struct warp_pja_agg {
+  warp_pa_agg::Kind kind = warp_pa_agg::COUNT_ALL;
+  warp_pj_ref ref;
+};
+
+/* The rows of the result of the join are not made, they are added to the groups
+   of the aggregation (the groups of a slice of a partition are merged into the
+   shared ones when the slice is done). */
+struct warp_pja_sink : warp_pj_sink {
+  warp_pa_plan *pa = nullptr;
+  std::vector<warp_pj_ref> group;       // the columns of the groups, in the order of key_cols
+  std::vector<warp_pja_agg> aggs;       // in the order of the aggregates of the plan
+  std::unique_ptr<warp_pa_shared> shared;
+  std::atomic<bool> failed{false};
+
+  struct Local {
+    std::vector<warp_pa_worker> w;
+    std::string key;
+    std::vector<warp_pa_cell> cells;
+  };
+
+  void *begin() override {
+    Local *l = new Local;
+    l->w.resize(1);
+    l->cells.resize(group.size());
+    return l;
+  }
+
+  void add(void *local, const warp_pj_prober &p) override {
+    Local &l = *static_cast<Local *>(local);
+    l.key.clear();
+    for(size_t k = 0; k < group.size(); ++k) {
+      int64_t v;
+      warp_pa_cell &cell = l.cells[k];
+      if(p.value(group[k], &v)) {
+        cell.null = false;
+        cell.i = v;
+        l.key.push_back('\0');
+        l.key.append((const char *)&v, sizeof(v));
+      } else {
+        cell.null = true;
+        cell.i = 0;
+        l.key.push_back('\1');
+      }
+    }
+    bool added;
+    warp_pa_group *g = l.w[0].groups.find_or_add(l.key, &added);
+    if(added) {
+      g->states.resize(aggs.size());
+      g->cells = l.cells;
+    }
+    ++g->rows;
+    for(size_t m = 0; m < aggs.size(); ++m) {
+      warp_pa_state &st = g->states[m];
+      int64_t v;
+      switch(aggs[m].kind) {
+        case warp_pa_agg::COUNT_ALL:
+          break;
+        case warp_pa_agg::COUNT_COL:
+          if(p.value(aggs[m].ref, &v)) ++st.count;
+          break;
+        case warp_pa_agg::SUM:
+          if(p.value(aggs[m].ref, &v)) {
+            st.isum += v;
+            ++st.count;
+          }
+          break;
+        case warp_pa_agg::MIN:
+        case warp_pa_agg::MAX:
+          if(p.value(aggs[m].ref, &v)) {
+            ++st.count;
+            if(!st.have || (aggs[m].kind == warp_pa_agg::MIN ? v < st.ival : v > st.ival)) {
+              st.have = true;
+              st.ival = v;
+            }
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  void end(void *local) override {
+    Local *l = static_cast<Local *>(local);
+    try {
+      warp_pa_merge_into(*pa, shared.get(), &l->w);
+    } catch(...) {
+      failed = true;
+    }
+    delete l;
+  }
+};
+
+static bool warp_pja_execute(warp_pa_plan &plan, std::string *error) {
+  warp_pja_sink *sink = static_cast<warp_pja_sink *>(plan.pj->sink.get());
+  sink->shared.reset(new warp_pa_shared);
+  sink->failed = false;
+  plan.groups.clear();
+  plan.pos = 0;
+  plan.overflow = false;
+  if(!warp_pj_execute(*plan.pj, error)) {
+    return false;
+  }
+  if(sink->failed) {
+    *error = "out of memory";
+    return false;
+  }
+  warp_pa_collect(plan, *sink->shared);
+  sink->shared.reset();
+  return true;
+}
+
 static bool warp_pa_execute(warp_pa_plan &plan, std::string *error) {
+  if(plan.pj) {
+    return warp_pja_execute(plan, error);
+  }
   THD *thd = plan.thd;
   plan.groups.clear();
   plan.pos = 0;
@@ -1755,33 +1907,7 @@ static bool warp_pa_execute(warp_pa_plan &plan, std::string *error) {
     return false;
   }
 
-  /* the groups of the shards */
-  size_t total = 0;
-  for(size_t t = 0; t < warp_pa_shared::SHARDS; ++t) total += shared.table[t].size();
-  plan.groups.reserve(total);
-  if(plan.adjacent) {
-    /* the key of a group starts with the key of the GROUP BY columns, which
-       is not followed by anything that is not part of the key of the
-       columns: groups with the same prefix are next to each other in the
-       order of the keys */
-    std::vector<std::pair<uint32_t, uint32_t>> order;
-    order.reserve(total);
-    for(size_t t = 0; t < warp_pa_shared::SHARDS; ++t) {
-      for(size_t i = 0; i < shared.table[t].size(); ++i) order.push_back({(uint32_t)t, (uint32_t)i});
-    }
-    std::sort(order.begin(), order.end(), [&](const auto &a, const auto &b) {
-      return shared.table[a.first].key(a.second) < shared.table[b.first].key(b.second);
-    });
-    for(const auto &entry : order) {
-      plan.groups.push_back(std::move(shared.table[entry.first].groups[entry.second]));
-    }
-  } else {
-    for(size_t t = 0; t < warp_pa_shared::SHARDS; ++t) {
-      for(auto &group : shared.table[t].groups) {
-        plan.groups.push_back(std::move(group));
-      }
-    }
-  }
+  warp_pa_collect(plan, shared);
   return true;
 }
 
@@ -2025,6 +2151,9 @@ int ha_warp::pa_next(uchar *) {
 }
 
 /* Called from push_to_engine: changes the plan if the engine can aggregate. */
+static bool warp_pa_install(THD *thd, std::shared_ptr<warp_pa_plan> plan, AccessPath **slot, AccessPath **top_slot,
+                            AccessPath *stream);
+
 static bool warp_pa_replace(THD *thd, AccessPath *agg, const JOIN *join) {
   /* COUNT(DISTINCT) is aggregated over sorted rows that a STREAM path copies
      into a temporary table */
@@ -2051,6 +2180,13 @@ static bool warp_pa_replace(THD *thd, AccessPath *agg, const JOIN *join) {
   if(!plan) {
     return false;
   }
+  return warp_pa_install(thd, plan, slot, top_slot, stream);
+}
+
+/* The scan of the table of the plan replaces the tree below the aggregation:
+   the aggregates get the constants of the groups. */
+static bool warp_pa_install(THD *thd, std::shared_ptr<warp_pa_plan> plan, AccessPath **slot, AccessPath **top_slot,
+                            AccessPath *stream) {
   /* the fields that the engine sets must be in the read set */
   for(int slot_index : plan->key_cols) {
     bitmap_set_bit(plan->table->read_set, plan->cols[slot_index].field);
@@ -2108,6 +2244,280 @@ static bool warp_pa_replace(THD *thd, AccessPath *agg, const JOIN *join) {
   *(plan->adjacent && stream == nullptr ? top_slot : slot) = scan;
   plan->handler->par_agg = plan;
   return true;
+}
+
+/* ---------------------------------------------------------------------- */
+/* an aggregation of the rows of the join that the engine makes           */
+/* ---------------------------------------------------------------------- */
+
+static bool warp_pja_int_field(const Field *f) {
+  switch(f->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+      return true;
+    case MYSQL_TYPE_LONGLONG:
+      return !f->is_flag_set(UNSIGNED_FLAG);
+    default:
+      return false;
+  }
+}
+
+/* COUNT, SUM, MIN and MAX of integer columns of the tables of the join, grouped
+   by integer columns of its probe table.  agg_path is the aggregation, slot the
+   tree of the join: nested loops, one for every table that the join reads
+   (they return the rows that the engine chose), over the scan of the probe
+   table. */
+static std::shared_ptr<warp_pa_plan> warp_pja_make_plan(THD *thd, AccessPath *agg_path, AccessPath **slot,
+                                                        const JOIN *join, AccessPath *stream, bool sorted) {
+  std::shared_ptr<warp_pa_plan> none;
+  if(stream != nullptr) {
+    return (warp_pa_no(__LINE__), none);
+  }
+  /* the tree of the join that warp_pj_replace made */
+  AccessPath *node = *slot;
+  std::vector<TABLE *> followers;
+  while(node->type == AccessPath::NESTED_LOOP_JOIN) {
+    AccessPath *inner = node->nested_loop_join().inner;
+    if(inner->type != AccessPath::TABLE_SCAN) {
+      return (warp_pa_no(__LINE__), none);
+    }
+    followers.push_back(inner->table_scan().table);
+    node = node->nested_loop_join().outer;
+  }
+  if(node->type != AccessPath::TABLE_SCAN || followers.empty()) {
+    return (warp_pa_no(__LINE__), none);
+  }
+  TABLE *probe = node->table_scan().table;
+  ha_warp *handler = probe == nullptr ? nullptr : dynamic_cast<ha_warp *>(probe->file);
+  if(handler == nullptr || !handler->par_join || handler->par_agg || handler->star_agg) {
+    return (warp_pa_no(__LINE__), none);
+  }
+  std::shared_ptr<warp_pj_plan> pj = handler->par_join;
+  if(pj->probe != probe || pj->sink || (int)followers.size() != pj->nbuild) {
+    return (warp_pa_no(__LINE__), none);
+  }
+  for(int l = 1; l <= pj->nbuild; ++l) {
+    bool found = false;
+    for(TABLE *t : followers) found = found || t == pj->tables[l].table;
+    if(!found) return (warp_pa_no(__LINE__), none);
+  }
+  auto level_of = [&](const Field *field) -> int {
+    if(field->table == probe) return 0;
+    for(int l = 1; l <= pj->nbuild; ++l) {
+      if(pj->tables[l].table == field->table) return l;
+    }
+    return -1;
+  };
+
+  /* GROUP BY: integer columns of the probe table */
+  ORDER *group = nullptr;
+  if(agg_path->type == AccessPath::TEMPTABLE_AGGREGATE) {
+    group = agg_path->temptable_aggregate().table->group;
+  } else {
+    if(agg_path->aggregate().olap != UNSPECIFIED_OLAP_TYPE) {
+      return (warp_pa_no(__LINE__), none);
+    }
+    group = join->group_list.order;
+    if(group != nullptr && !sorted) {
+      return (warp_pa_no(__LINE__), none);
+    }
+  }
+  auto plan = std::make_shared<warp_pa_plan>();
+  plan->thd = thd;
+  plan->table = probe;
+  plan->handler = handler;
+  std::vector<Field *> group_fields;
+  for(; group != nullptr; group = group->next) {
+    Item *item = (*group->item)->real_item();
+    if(item->type() != Item::FIELD_ITEM) {
+      return (warp_pa_no(__LINE__), none);
+    }
+    Field *field = down_cast<Item_field *>(item)->field;
+    if(field == nullptr || field->table != probe || !warp_pja_int_field(field)) {
+      return (warp_pa_no(__LINE__), none);
+    }
+    const int col = warp_pa_add_col(plan.get(), field);
+    if(col < 0 || plan->cols[col].kind != PA_INT) {
+      return (warp_pa_no(__LINE__), none);
+    }
+    if(std::find(plan->key_cols.begin(), plan->key_cols.end(), col) == plan->key_cols.end()) {
+      plan->key_cols.push_back(col);
+      group_fields.push_back(field);
+    }
+  }
+  plan->group_cols = plan->key_cols.size();
+  if(plan->group_cols == 0) {
+    return (warp_pa_no(__LINE__), none);
+  }
+
+  /* the aggregates */
+  if(join->sum_funcs == nullptr || *join->sum_funcs == nullptr) {
+    return (warp_pa_no(__LINE__), none);
+  }
+  std::vector<std::pair<Field *, int>> arg_fields;   // the column of an aggregate, its table
+  for(Item_sum **it = join->sum_funcs; *it != nullptr; ++it) {
+    Item_sum *sum = *it;
+    warp_pa_agg agg;
+    agg.item = sum;
+    agg.replaced = true;
+    Field *arg_field = nullptr;
+    if(sum->has_with_distinct() || sum->argument_count() != 1) {
+      return (warp_pa_no(__LINE__), none);
+    }
+    Item *arg = sum->get_arg(0);
+    const Item_sum::Sumfunctype type = sum->sum_func();
+    if(type == Item_sum::COUNT_FUNC && (arg->type() == Item::INT_ITEM || arg->const_item())) {
+      agg.kind = warp_pa_agg::COUNT_ALL;
+    } else {
+      Item *real = arg->real_item();
+      if(real->type() != Item::FIELD_ITEM) {
+        return (warp_pa_no(__LINE__), none);
+      }
+      arg_field = down_cast<Item_field *>(real)->field;
+      if(arg_field == nullptr || level_of(arg_field) < 0 || !warp_pja_int_field(arg_field)) {
+        return (warp_pa_no(__LINE__), none);
+      }
+      switch(type) {
+        case Item_sum::COUNT_FUNC:
+          agg.kind = warp_pa_agg::COUNT_COL;
+          break;
+        case Item_sum::SUM_FUNC:
+          if(sum->result_type() != DECIMAL_RESULT) return (warp_pa_no(__LINE__), none);
+          agg.kind = warp_pa_agg::SUM;
+          agg.result_kind = PA_DEC;
+          agg.result_scale = 0;
+          break;
+        case Item_sum::MIN_FUNC:
+        case Item_sum::MAX_FUNC:
+          if(sum->result_type() != INT_RESULT) return (warp_pa_no(__LINE__), none);
+          agg.kind = type == Item_sum::MIN_FUNC ? warp_pa_agg::MIN : warp_pa_agg::MAX;
+          agg.result_kind = PA_INT;
+          break;
+        default:
+          return (warp_pa_no(__LINE__), none);
+      }
+    }
+    plan->aggs.push_back(agg);
+    arg_fields.push_back({arg_field, arg_field == nullptr ? 0 : level_of(arg_field)});
+  }
+
+  /* nothing else of the tables is read above the aggregation: the columns of
+     the select list and of HAVING that are not in an aggregate are columns of
+     the groups */
+  bool other_columns = false;
+  auto check = [&](Item *item) {
+    WalkItem(item, enum_walk::PREFIX, [&](Item *i) {
+      if(i->type() == Item::SUM_FUNC_ITEM) {
+        return true;   // its arguments are replaced
+      }
+      if(i->type() == Item::FIELD_ITEM) {
+        Field *f = down_cast<Item_field *>(i)->field;
+        if(f == nullptr || level_of(f) < 0) return false;   // a column of another table
+        if(std::find(group_fields.begin(), group_fields.end(), f) == group_fields.end()) other_columns = true;
+      }
+      return false;
+    });
+  };
+  if(join->fields != nullptr) {
+    for(Item *item : *join->fields) check(item);
+  }
+  if(join->having_cond != nullptr) check(join->having_cond);
+  if(other_columns || join->having_cond != nullptr) {
+    return (warp_pa_no(__LINE__), none);
+  }
+
+  /* the columns that the join reads for the aggregation */
+  auto sink = std::make_shared<warp_pja_sink>();
+  sink->pa = plan.get();
+  for(Field *field : group_fields) {
+    warp_pj_ref ref;
+    ref.level = 0;
+    ref.slot = warp_pj_add_root(*pj, field->field_index());
+    sink->group.push_back(ref);
+  }
+  for(size_t m = 0; m < plan->aggs.size(); ++m) {
+    warp_pja_agg a;
+    a.kind = plan->aggs[m].kind;
+    if(arg_fields[m].first != nullptr) {
+      const int level = arg_fields[m].second;
+      a.ref.level = level;
+      a.ref.slot = level == 0 ? warp_pj_add_root(*pj, arg_fields[m].first->field_index())
+                              : warp_pj_add_value(*pj, level, arg_fields[m].first->field_index());
+    }
+    sink->aggs.push_back(a);
+  }
+  /* MySQL does not read the rows of the other tables: only the columns of the
+     keys, of the aggregates and of the conditions that MySQL still evaluates
+     are read from them, and no image of the rows is kept */
+  for(int l = 1; l <= pj->nbuild; ++l) {
+    warp_pj_table &t = pj->tables[l];
+    std::set<uint> keep(t.value_fields.begin(), t.value_fields.end());
+    for(Item *filter : t.filters) {
+      WalkItem(filter, enum_walk::PREFIX, [&](Item *i) {
+        if(i->type() == Item::FIELD_ITEM && down_cast<Item_field *>(i)->field != nullptr) {
+          keep.insert(down_cast<Item_field *>(i)->field->field_index());
+        }
+        return false;
+      });
+    }
+    for(Field **field = t.table->field; *field; ++field) {
+      if(keep.count((*field)->field_index()) == 0) {
+        bitmap_clear_bit(t.table->read_set, (*field)->field_index());
+      }
+    }
+    t.ranges.clear();
+    t.image_len = 0;
+  }
+  plan->adjacent = sorted;
+  plan->pj = pj;
+  pj->sink = sink;
+  return plan;
+}
+
+static bool warp_pja_replace(THD *thd, AccessPath *agg, const JOIN *join) {
+  AccessPath **const top_slot = agg->type == AccessPath::AGGREGATE ? &agg->aggregate().child
+                                                                   : &agg->temptable_aggregate().subquery_path;
+  AccessPath **slot = top_slot;
+  bool sorted = false;
+  while((*slot)->type == AccessPath::SORT) {
+    sorted = true;
+    slot = &(*slot)->sort().child;
+  }
+  std::shared_ptr<warp_pa_plan> plan = warp_pja_make_plan(thd, agg, slot, join, nullptr, sorted);
+  if(!plan) {
+    return false;
+  }
+  /* the tables are read by the engine, not by the scans below the aggregation */
+  std::shared_ptr<warp_pj_plan> pj = plan->pj;
+  for(int l = 1; l <= pj->nbuild; ++l) {
+    pj->tables[l].handler->pj_follower.reset();
+    pj->tables[l].handler->pj_follower_pending = false;
+  }
+  pj->probe_handler->par_join.reset();
+  return warp_pa_install(thd, plan, slot, top_slot, nullptr);
+}
+
+/* The aggregations of the rows of the joins that the engine makes (called after
+   warp_try_parallel_join) */
+static void warp_try_parallel_join_aggregation(THD *thd, AccessPath *root, JOIN *join) {
+  if(!THDVAR(thd, parallel_aggregation) || !THDVAR(thd, parallel_hash_join) ||
+     (thd->lex->sql_command != SQLCOM_SELECT && thd->lex->sql_command != SQLCOM_CREATE_TABLE &&
+      thd->lex->sql_command != SQLCOM_INSERT_SELECT)) {
+    return;
+  }
+  WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
+                  [&](AccessPath *path, const JOIN *block_join) {
+                    if(path->type != AccessPath::AGGREGATE && path->type != AccessPath::TEMPTABLE_AGGREGATE) {
+                      return false;
+                    }
+                    if(warp_block_is_executed_again(block_join) || block_join->query_block->has_windows()) {
+                      return false;
+                    }
+                    warp_pja_replace(thd, path, block_join);
+                    return false;
+                  });
 }
 
 static void warp_try_parallel_aggregation(THD *thd, AccessPath *root, JOIN *join) {
