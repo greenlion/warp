@@ -1599,6 +1599,41 @@ static void warp_pa_merge_group(const warp_pa_plan &plan, warp_pa_group *dst, wa
   }
 }
 
+/* The groups of all the partitions.  A partition adds its groups when it is done
+   (and frees its own table), so that the memory is the groups that exist, not
+   the groups of every partition: a column with millions of values has that
+   many groups in every partition. */
+struct warp_pa_shared {
+  static constexpr size_t SHARDS = 64;
+  std::mutex mutex[SHARDS];
+  warp_pa_table table[SHARDS];
+};
+
+static void warp_pa_merge_into(const warp_pa_plan &plan, warp_pa_shared *shared, std::vector<warp_pa_worker> *local) {
+  for(auto &w : *local) {
+    /* the groups of one shard are added with the lock taken once */
+    std::vector<std::vector<uint32_t>> by_shard(warp_pa_shared::SHARDS);
+    for(size_t i = 0; i < w.groups.size(); ++i) {
+      by_shard[(w.groups.entries[i].hash >> 58) & (warp_pa_shared::SHARDS - 1)].push_back((uint32_t)i);
+    }
+    for(size_t s = 0; s < warp_pa_shared::SHARDS; ++s) {
+      if(by_shard[s].empty()) continue;
+      std::lock_guard<std::mutex> guard(shared->mutex[s]);
+      for(uint32_t i : by_shard[s]) {
+        bool added;
+        warp_pa_group *dst = shared->table[s].find_or_add(w.groups.key(i), w.groups.entries[i].hash, &added);
+        if(added) {
+          *dst = std::move(w.groups.groups[i]);
+        } else {
+          warp_pa_merge_group(plan, dst, w.groups.groups[i]);
+        }
+      }
+    }
+    w.groups = warp_pa_table();
+  }
+  local->clear();
+}
+
 static bool warp_pa_execute(warp_pa_plan &plan, std::string *error) {
   THD *thd = plan.thd;
   plan.groups.clear();
@@ -1633,7 +1668,7 @@ static bool warp_pa_execute(warp_pa_plan &plan, std::string *error) {
   }
   workers = std::min(workers, std::max<size_t>(work.size(), 1));
 
-  std::vector<std::vector<warp_pa_worker>> partials(workers);
+  warp_pa_shared shared;
   std::atomic<size_t> next(0);
   std::atomic<bool> failed(false);
   std::mutex error_mutex;
@@ -1650,7 +1685,8 @@ static bool warp_pa_execute(warp_pa_plan &plan, std::string *error) {
           break;
         }
         std::string message;
-        if(!warp_pa_partition(plan, work[k], snap, &partials[id], &message)) {
+        std::vector<warp_pa_worker> local;
+        if(!warp_pa_partition(plan, work[k], snap, &local, &message)) {
           std::lock_guard<std::mutex> guard(error_mutex);
           if(first_error.empty()) first_error = message;
           failed = true;
@@ -1660,6 +1696,7 @@ static bool warp_pa_execute(warp_pa_plan &plan, std::string *error) {
           failed = true;
           break;
         }
+        warp_pa_merge_into(plan, &shared, &local);
         warp_release_partition(work[k]->currentDataDir());
       }
     } catch(const std::exception &e) {
@@ -1693,37 +1730,31 @@ static bool warp_pa_execute(warp_pa_plan &plan, std::string *error) {
     return false;
   }
 
-  /* merge the groups of the workers */
-  warp_pa_table merged;
-  for(auto &list : partials) {
-    for(auto &w : list) {
-      for(size_t i = 0; i < w.groups.size(); ++i) {
-        bool added;
-        warp_pa_group *dst = merged.find_or_add(w.groups.key(i), w.groups.entries[i].hash, &added);
-        if(added) {
-          *dst = std::move(w.groups.groups[i]);
-        } else {
-          warp_pa_merge_group(plan, dst, w.groups.groups[i]);
-        }
-      }
-      w.groups = warp_pa_table();
-    }
-  }
-  plan.groups.reserve(merged.size());
+  /* the groups of the shards */
+  size_t total = 0;
+  for(size_t t = 0; t < warp_pa_shared::SHARDS; ++t) total += shared.table[t].size();
+  plan.groups.reserve(total);
   if(plan.adjacent) {
     /* the key of a group starts with the key of the GROUP BY columns, which
        is not followed by anything that is not part of the key of the
        columns: groups with the same prefix are next to each other in the
        order of the keys */
-    std::vector<uint32_t> order(merged.size());
-    for(size_t i = 0; i < order.size(); ++i) order[i] = (uint32_t)i;
-    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return merged.key(a) < merged.key(b); });
-    for(uint32_t i : order) {
-      plan.groups.push_back(std::move(merged.groups[i]));
+    std::vector<std::pair<uint32_t, uint32_t>> order;
+    order.reserve(total);
+    for(size_t t = 0; t < warp_pa_shared::SHARDS; ++t) {
+      for(size_t i = 0; i < shared.table[t].size(); ++i) order.push_back({(uint32_t)t, (uint32_t)i});
+    }
+    std::sort(order.begin(), order.end(), [&](const auto &a, const auto &b) {
+      return shared.table[a.first].key(a.second) < shared.table[b.first].key(b.second);
+    });
+    for(const auto &entry : order) {
+      plan.groups.push_back(std::move(shared.table[entry.first].groups[entry.second]));
     }
   } else {
-    for(auto &group : merged.groups) {
-      plan.groups.push_back(std::move(group));
+    for(size_t t = 0; t < warp_pa_shared::SHARDS; ++t) {
+      for(auto &group : shared.table[t].groups) {
+        plan.groups.push_back(std::move(group));
+      }
     }
   }
   return true;
