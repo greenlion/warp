@@ -935,6 +935,131 @@ static std::shared_ptr<warp_pa_plan> warp_pa_make_plan(THD *thd, AccessPath *agg
   return plan;
 }
 
+
+/* The plan for the scan below a materialization that removes duplicates (the
+   temporary table of a semijoin, of a DISTINCT): the rows of the scan that
+   have the columns `fields` are the distinct combinations of their values. */
+static std::shared_ptr<warp_pa_plan> warp_pa_make_distinct_plan(THD *thd, AccessPath *scan_path,
+                                                                const std::vector<Field *> &fields) {
+  std::shared_ptr<warp_pa_plan> none;
+  if(scan_path->type != AccessPath::TABLE_SCAN || fields.empty()) {
+    return (warp_pa_no(__LINE__), none);
+  }
+  TABLE *table = scan_path->table_scan().table;
+  ha_warp *handler = table == nullptr ? nullptr : dynamic_cast<ha_warp *>(table->file);
+  if(handler == nullptr || handler->is_partition_child || handler->locks_rows_on_read() ||
+     handler->star_agg || handler->par_join || handler->par_agg || handler->pj_following()) {
+    return (warp_pa_no(__LINE__), none);
+  }
+  {
+    warp_trx *trx = warp_get_trx(handler->ht, thd);
+    if(trx != nullptr && (trx->isolation_level == ISO_SERIALIZABLE || trx->lock_in_share_mode)) {
+      return (warp_pa_no(__LINE__), none);
+    }
+  }
+  if(warp_pa_rows_of(handler) < THDVAR(thd, parallel_join_min_rows)) {
+    return (warp_pa_no(__LINE__), none);
+  }
+  auto plan = std::make_shared<warp_pa_plan>();
+  plan->thd = thd;
+  plan->table = table;
+  plan->handler = handler;
+  for(Field *field : fields) {
+    if(field->table != table) {
+      return (warp_pa_no(__LINE__), none);
+    }
+    const int slot = warp_pa_add_col(plan.get(), field);
+    if(slot < 0) {
+      return none;
+    }
+    if(std::find(plan->key_cols.begin(), plan->key_cols.end(), slot) == plan->key_cols.end()) {
+      plan->key_cols.push_back(slot);
+    }
+  }
+  plan->group_cols = plan->key_cols.size();
+  /* MySQL reads the columns that are returned (and the ones of the conditions
+     that the engine evaluates) */
+  {
+    std::set<uint> allowed;
+    const std::string &w = handler->push_where_clause;
+    for(size_t i = 0; i + 1 < w.size(); ++i) {
+      if((w[i] == 'c' || w[i] == 'n') && (i == 0 || !isalnum((unsigned char)w[i - 1])) &&
+         isdigit((unsigned char)w[i + 1])) {
+        uint f = 0;
+        size_t j = i + 1;
+        while(j < w.size() && isdigit((unsigned char)w[j])) {
+          f = f * 10 + (w[j] - '0');
+          ++j;
+        }
+        allowed.insert(f);
+      }
+    }
+    for(int c : plan->key_cols) allowed.insert(plan->cols[c].field);
+    for(Field **field = table->field; *field; ++field) {
+      if(bitmap_is_set(table->read_set, (*field)->field_index()) && allowed.count((*field)->field_index()) == 0) {
+        return (warp_pa_no(__LINE__), none);
+      }
+    }
+  }
+  return plan;
+}
+
+/* The scan below a materialization with deduplication returns the distinct
+   rows (MySQL removes the duplicates that are left). */
+static bool warp_pa_replace_distinct(THD *thd, AccessPath *materialize) {
+  const MaterializePathParameters *param = materialize->materialize().param;
+  if(param == nullptr || param->rematerialize || !MaterializeIsDoingDeduplication(param->table) ||
+     param->m_operands.size() != 1 || param->cte != nullptr) {
+    return false;
+  }
+  const MaterializePathParameters::Operand &operand = param->m_operands[0];
+  if(operand.temp_table_param == nullptr || operand.temp_table_param->items_to_copy == nullptr ||
+     operand.subquery_path == nullptr) {
+    return warp_pa_no(__LINE__);
+  }
+  std::vector<Field *> fields;
+  for(const Func_ptr &entry : *operand.temp_table_param->items_to_copy) {
+    Item *source = entry.func()->real_item();
+    if(source->type() != Item::FIELD_ITEM || down_cast<Item_field *>(source)->field == nullptr) {
+      return warp_pa_no(__LINE__);
+    }
+    fields.push_back(down_cast<Item_field *>(source)->field);
+  }
+  AccessPath **slot = const_cast<AccessPath **>(&operand.subquery_path);
+  /* a condition that MySQL evaluates (b.k IS NOT NULL) stays above the scan if
+     it reads the returned columns only: a distinct row passes it if its
+     duplicates do */
+  while((*slot)->type == AccessPath::FILTER) {
+    bool only_key_columns = true;
+    WalkItem((*slot)->filter().condition, enum_walk::PREFIX, [&](Item *item) {
+      if(item->type() == Item::FIELD_ITEM) {
+        Field *field = down_cast<Item_field *>(item)->field;
+        if(std::find(fields.begin(), fields.end(), field) == fields.end()) only_key_columns = false;
+      } else if(item->has_subquery() || item->has_stored_program() || item->is_non_deterministic()) {
+        only_key_columns = false;
+      }
+      return false;
+    });
+    if(!only_key_columns) {
+      return warp_pa_no(__LINE__);
+    }
+    slot = &(*slot)->filter().child;
+  }
+  std::shared_ptr<warp_pa_plan> plan = warp_pa_make_distinct_plan(thd, *slot, fields);
+  if(!plan) {
+    return false;
+  }
+  for(int slot_index : plan->key_cols) {
+    bitmap_set_bit(plan->table->read_set, plan->cols[slot_index].field);
+  }
+  AccessPath *scan = NewTableScanAccessPath(thd, plan->table, false);
+  scan->set_num_output_rows((*slot)->num_output_rows());
+  scan->set_cost((*slot)->cost());
+  *slot = scan;
+  plan->handler->par_agg = plan;
+  return true;
+}
+
 /* ---------------------------------------------------------------------- */
 /* execution                                                              */
 /* ---------------------------------------------------------------------- */
@@ -1677,6 +1802,13 @@ int ha_warp::pa_run() {
   warp_pa_plan &plan = *par_agg;
   warp_index_build_scope budget_scope(ha_thd(), thread_budget);
   plan.where = push_where_clause == "1=1" ? "" : push_where_clause;
+  /* the keys of another table that limit the scan (see warp_try_semi_keys) */
+  if(semi_in) {
+    const std::string cond = semi_key_condition();
+    if(cond != "") {
+      plan.where = plan.where == "" ? cond : "(" + plan.where + ") AND (" + cond + ")";
+    }
+  }
   plan.where_fields.clear();
   for(size_t i = 0; i + 1 < plan.where.size(); ++i) {
     const std::string &w = plan.where;
@@ -1908,6 +2040,12 @@ static void warp_try_parallel_aggregation(THD *thd, AccessPath *root, JOIN *join
   }
   WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
                   [&](AccessPath *path, const JOIN *block_join) {
+                    if(path->type == AccessPath::MATERIALIZE) {
+                      if(!warp_block_is_executed_again(block_join)) {
+                        warp_pa_replace_distinct(thd, path);
+                      }
+                      return false;
+                    }
                     if(path->type != AccessPath::AGGREGATE && path->type != AccessPath::TEMPTABLE_AGGREGATE) {
                       return false;
                     }
