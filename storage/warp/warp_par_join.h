@@ -1483,6 +1483,7 @@ int ha_warp::pj_next(uchar *buf) {
         return HA_ERR_OUT_OF_MEM;
       }
       plan.out_cursor = plan.out_filtered->createCursor();
+      register_cursor(plan.out_cursor, plan.out_filtered);
       plan.out_pos = 0;
     }
     if(plan.out_pos >= result.rows()) {
