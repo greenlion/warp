@@ -105,7 +105,7 @@ COUNT(*)	SUM(a.id)
 2061	3105293
 DROP TABLE r_on, r_on2, r_off, r_i;
 # query 5
-# the scan was limited to the keys of the outer table: 0
+# the scan was limited to the keys of the outer table: 1
 SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
 (SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
 (SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;

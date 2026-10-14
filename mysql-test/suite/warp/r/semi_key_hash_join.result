@@ -100,7 +100,7 @@ different_rows
 0
 DROP TABLE r_on, r_off, r_i;
 # query 5
-# the scan was limited to the keys of the other table: 0
+# the scan was limited to the keys of the other table: 1
 SELECT * FROM r_i;
 COUNT(*)	SUM(o.id)
 38098	1904761921

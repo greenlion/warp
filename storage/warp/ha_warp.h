@@ -1217,9 +1217,16 @@ class ha_warp : public handler {
   struct warp_semi_in {
     TABLE *outer_table = nullptr;   // the table whose column is the key of the lookup
     uint outer_col = 0;             // its column
+    TABLE *inner_table = nullptr;   // the table that is limited to the keys
     uint inner_col = 0;             // the column of this table that is materialized
   };
+  /* the keys that the scan may be limited to: the one with the fewest keys is
+     the one that is used (semi_in, semi_pick_keys), see semi_pick */
+  std::vector<std::shared_ptr<warp_semi_in>> semi_candidates;
   std::shared_ptr<warp_semi_in> semi_in;
+  std::shared_ptr<std::vector<int64_t>> semi_pick_keys;
+  void semi_pick();
+  bool semi_keys_of(const std::shared_ptr<warp_semi_in> &candidate, std::vector<int64_t> *keys, uint64_t max_keys);
   /* more keys than a condition of the scan can list: each partition lists the
      keys that are in the range of its values (see where_for_partition) */
   std::shared_ptr<std::vector<int64_t>> semi_keys;
@@ -1468,7 +1475,7 @@ class ha_warp : public handler {
      written to their records). */
   std::shared_ptr<warp_pj_plan> par_join;
   int pj_run();
-  bool pj_collect_keys(uint field, std::vector<int64_t> *keys);
+  bool pj_collect_keys(TABLE *table, uint field, std::vector<int64_t> *keys);
   int pj_next(uchar *buf);
   void pj_close();
   /* A table that the engine joins to the probe table is still a table of the
@@ -1516,6 +1523,8 @@ class ha_warp : public handler {
     scan_where = "";
     outer_params.clear();
     semi_in.reset();
+    semi_candidates.clear();
+    semi_pick_keys.reset();
     par_join.reset();
     par_agg.reset();
     pj_follower.reset();
