@@ -423,6 +423,11 @@ static MYSQL_THDVAR_ULONG(index_cost_factor, PLUGIN_VAR_RQCMDARG,
                           "a hash join would be faster.",
                           nullptr, nullptr, 2, 1, 1000000, 0);
 
+static MYSQL_THDVAR_BOOL(parallel_aggregation, PLUGIN_VAR_NOCMDARG,
+                          "Aggregate the rows of one WARP table (SUM, AVG, COUNT, MIN, MAX, COUNT(DISTINCT) with a "
+                          "GROUP BY) inside the engine, in parallel by partition",
+                          nullptr, nullptr, true);
+
 static MYSQL_THDVAR_ULONG(parallel_min_rows, PLUGIN_VAR_RQCMDARG,
                           "Smallest number of rows of a piece of a partition that is processed by a thread of its own "
                           "(see warp_max_degree_of_parallelism).",
@@ -478,6 +483,7 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(adjust_table_stats_for_joins),
   MYSQL_SYSVAR(star_aggregation),
   MYSQL_SYSVAR(parallel_hash_join),
+  MYSQL_SYSVAR(parallel_aggregation),
   MYSQL_SYSVAR(scan_rows_per_cost),
   MYSQL_SYSVAR(index_cost_factor),
   MYSQL_SYSVAR(parallel_join_min_rows),
@@ -1038,6 +1044,7 @@ warp_trx* warp_get_trx(handlerton* hton, THD* thd);
 //scanning tables, inserts, updates, deletes, engine condition pushdown
 struct warp_star_agg;  /* warp_star_agg.h */
 struct warp_pj_plan;   /* warp_par_join.h */
+struct warp_pa_plan;   /* warp_par_agg.h */
 
 struct warp_table_lock_set;
 
@@ -1443,6 +1450,10 @@ class ha_warp : public handler {
   bool pj_follower_pending = false;
   int pj_follower_next(uchar *buf);
   bool pj_following() const;
+  /* aggregation of the rows of the table inside the engine, see warp_par_agg.h */
+  std::shared_ptr<warp_pa_plan> par_agg;
+  int pa_run();
+  int pa_next(uchar *buf);
   /* the engine join reads the table for its hash table (see rnd_init) */
   bool pj_plain_scan = false;
   /* the identity of the row that the handler returned last (position, rnd_pos) */
@@ -1474,6 +1485,7 @@ class ha_warp : public handler {
     scan_where = "";
     outer_params.clear();
     par_join.reset();
+    par_agg.reset();
     pj_follower.reset();
     pj_follower_pending = false;
     return 0;

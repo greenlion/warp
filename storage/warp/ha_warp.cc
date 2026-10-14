@@ -2332,6 +2332,7 @@ int ha_warp::extra(enum ha_extra_function xtra) {
 void ha_warp::cleanup_pushdown_info() {
   star_agg.reset();
   par_join.reset();
+  par_agg.reset();
   if(index_scan_open) {
     end_scan(true);
   }
@@ -2872,6 +2873,10 @@ int ha_warp::rnd_init(bool) {
     /* the query is aggregated by the engine, the rows are the groups */
     DBUG_RETURN(star_agg_run() ? HA_ERR_INTERNAL_ERROR : 0);
   }
+  if(par_agg) {
+    /* the rows of the table are aggregated by the engine, the rows are the groups */
+    DBUG_RETURN(pa_run());
+  }
   if(par_join) {
     /* the tables of the query are joined by the engine, the rows are the
        joined rows */
@@ -3303,6 +3308,9 @@ void ha_warp::wait_for_join_threads() {
    escape into the server, which would terminate it. */
 int ha_warp::rnd_next(uchar *buf) {
   DBUG_ENTER("ha_warp::rnd_next");
+  if(par_agg) {
+    DBUG_RETURN(pa_next(buf));
+  }
   if(par_join) {
     DBUG_RETURN(pj_next(buf));
   }
@@ -5072,6 +5080,7 @@ static void warp_push_table_conditions(THD *thd, TABLE *table,
   ha->outer_params.clear();
   ha->star_agg.reset();
   ha->par_join.reset();
+  ha->par_agg.reset();
   ha->pj_follower.reset();
   if (part_ha != nullptr) part_ha->set_pushed_condition("");
 
@@ -5204,6 +5213,7 @@ static bool warp_has_inner_nested_loop_table(AccessPath *root_path,
 
 #include "warp_star_agg.h"
 #include "warp_par_join.h"
+#include "warp_par_agg.h"
 
 /**
  * handlerton::push_to_engine implementation.  Walks the AccessPath tree and
@@ -5238,6 +5248,7 @@ int warp_push_to_engine(THD *thd, AccessPath *root_path, JOIN *join) {
   warp_inner_nested_loop_table = false;
   /* the star joins that the engine can evaluate and aggregate itself */
   warp_try_star_aggregation(thd, root_path, join);
+  warp_try_parallel_aggregation(thd, root_path, join);
   warp_try_parallel_join(thd, root_path, join);
   return 0;
 }
@@ -8533,11 +8544,20 @@ warp_global_data::~warp_global_data() {
   write_clean_shutdown();
 }
 
-std::string ha_warp::explain_extra() const { 
+std::string ha_warp::explain_extra() const {
+  std::string extra;
   if (pushed_cond != nullptr) {
-    return ", with pushed condition: " + ItemToString(pushed_cond);
+    extra = ", with pushed condition: " + ItemToString(pushed_cond);
   }
-  return "";
+  /* the engine does the work of the plan above this scan */
+  if (par_agg) {
+    extra += ", with parallel aggregation";
+  } else if (par_join) {
+    extra += ", with parallel hash join";
+  } else if (pj_follower) {
+    extra += ", joined by the parallel hash join";
+  }
+  return extra;
 }
 
 std::string warp_pd_key(const Table_ref *ref, const char *alias) {

@@ -45,9 +45,9 @@ EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d1.b, d2.c FROM f_w f JOIN d1_w d1 ON f.k
 EXPLAIN
 -> Nested loop inner join
     -> Nested loop inner join
-        -> Table scan on f
-        -> Table scan on d2
-    -> Table scan on d1
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d2, joined by the parallel hash join
+    -> Table scan on d1, joined by the parallel hash join
 
 # case 2: filters on dimensions, a dimension with a condition on both sides
 195:413706298965
@@ -55,9 +55,9 @@ EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f, d1_w d1, d2_w d2 WHERE f
 EXPLAIN
 -> Nested loop inner join
     -> Nested loop inner join
-        -> Table scan on f
-        -> Table scan on d2
-    -> Table scan on d1
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d2, joined by the parallel hash join
+    -> Table scan on d1, joined by the parallel hash join
 
 # case 3: snowflake: a dimension of a dimension
 1575:3337764591399
@@ -65,17 +65,17 @@ EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1
 EXPLAIN
 -> Nested loop inner join
     -> Nested loop inner join
-        -> Table scan on f
-        -> Table scan on d1
-    -> Table scan on d2
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d1, joined by the parallel hash join
+    -> Table scan on d2, joined by the parallel hash join
 
 # case 4: composite key
 900:1900154646063
 EXPLAIN FORMAT=TREE SELECT f.id, d3.z FROM f_w f JOIN d3_w d3 ON f.k1 = d3.x AND f.k2 = d3.y;
 EXPLAIN
 -> Nested loop inner join
-    -> Table scan on f
-    -> Table scan on d3
+    -> Table scan on f, with parallel hash join
+    -> Table scan on d3, joined by the parallel hash join
 
 # case 5: a join condition that closes a cycle
 555:1168842444991
@@ -83,9 +83,9 @@ EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1
 EXPLAIN
 -> Nested loop inner join
     -> Nested loop inner join
-        -> Table scan on f
-        -> Table scan on d2
-    -> Table scan on d1
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d2, joined by the parallel hash join
+    -> Table scan on d1, joined by the parallel hash join
 
 # case 6: columns of different integer types and an unsigned column
 1668:3621715716157
@@ -93,9 +93,9 @@ EXPLAIN FORMAT=TREE SELECT f.id, d2.c, d4.w FROM f_w f JOIN d2_w d2 ON f.k3 = d2
 EXPLAIN
 -> Nested loop inner join
     -> Nested loop inner join
-        -> Table scan on f
-        -> Table scan on d4
-    -> Table scan on d2
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d4, joined by the parallel hash join
+    -> Table scan on d2, joined by the parallel hash join
 
 # case 7: NULL keys do not join
 5344:11499688722869
@@ -103,9 +103,9 @@ EXPLAIN FORMAT=TREE SELECT f.id, d4.w FROM f_w f JOIN d4_w d4 ON f.t = d4.m JOIN
 EXPLAIN
 -> Nested loop inner join
     -> Nested loop inner join
-        -> Table scan on f
-        -> Table scan on d4
-    -> Table scan on d1
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d4, joined by the parallel hash join
+    -> Table scan on d1, joined by the parallel hash join
 
 # case 8: a condition of two tables that the engine does not evaluate
 1515:3266729829720
@@ -114,9 +114,9 @@ EXPLAIN
 -> Filter: (((f.v + d1.b) > 60) or (d2.c = 'C0'))
     -> Nested loop inner join
         -> Nested loop inner join
-            -> Table scan on f
-            -> Table scan on d2
-        -> Table scan on d1
+            -> Table scan on f, with parallel hash join
+            -> Table scan on d2, joined by the parallel hash join
+        -> Table scan on d1, joined by the parallel hash join
 
 # case 9: the same table twice
 871:1883142760909
@@ -132,8 +132,8 @@ EXPLAIN
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE d1.b > 1000;
 EXPLAIN
 -> Nested loop inner join
-    -> Table scan on f
-    -> Table scan on d1
+    -> Table scan on f, with parallel hash join
+    -> Table scan on d1, joined by the parallel hash join
 
 # case 11: a string column of a dimension and a COUNT
 18:30559796787
@@ -143,9 +143,9 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Nested loop inner join
             -> Nested loop inner join
-                -> Table scan on f
-                -> Table scan on d2
-            -> Table scan on d1
+                -> Table scan on f, with parallel hash join
+                -> Table scan on d2, joined by the parallel hash join
+            -> Table scan on d1, joined by the parallel hash join
 
 # case 12: an expression of the joined rows
 686:1489578616657
@@ -153,9 +153,9 @@ EXPLAIN FORMAT=TREE SELECT f.id, f.v * d1.b + d2.flag FROM f_w f JOIN d1_w d1 ON
 EXPLAIN
 -> Nested loop inner join
     -> Nested loop inner join
-        -> Table scan on f
-        -> Table scan on d2
-    -> Table scan on d1
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d2, joined by the parallel hash join
+    -> Table scan on d1, joined by the parallel hash join
 
 # case 13: an anti join over the joined rows: MySQL buffers the rows of all the tables (the join buffer is small, so it spills them to disk)
 42:94736792227
@@ -163,8 +163,8 @@ EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHE
 EXPLAIN
 -> Hash antijoin (g.k1 = f.k1), extra conditions: (g.v <> d1.b) and (g.id < f.id)
     -> Nested loop inner join
-        -> Table scan on f
-        -> Table scan on d1
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d1, joined by the parallel hash join
     -> Hash
         -> Table scan on g
 
@@ -182,9 +182,9 @@ EXPLAIN
         -> Hash
             -> Nested loop inner join
                 -> Nested loop inner join
-                    -> Table scan on g
-                    -> Table scan on f
-                -> Table scan on d2
+                    -> Table scan on g, with parallel hash join
+                    -> Table scan on f, joined by the parallel hash join
+                -> Table scan on d2, joined by the parallel hash join
 
 Warnings:
 Note	1276	Field or reference 'test.f.k2' of SELECT #2 was resolved in SELECT #1
@@ -197,25 +197,25 @@ EXPLAIN
     -> Stream results
         -> Nested loop inner join
             -> Nested loop inner join
-                -> Table scan on f
-                -> Table scan on d2
-            -> Table scan on d1
+                -> Table scan on f, with parallel hash join
+                -> Table scan on d2, joined by the parallel hash join
+            -> Table scan on d1, joined by the parallel hash join
 
 # case 16: a LEFT JOIN: rows without a match get NULLs
 499:1059878015669
 EXPLAIN FORMAT=TREE SELECT f.id, d2.c, d2.flag FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 500;
 EXPLAIN
 -> Nested loop left join
-    -> Table scan on f
-    -> Table scan on d2
+    -> Table scan on f, with parallel hash join
+    -> Table scan on d2, joined by the parallel hash join
 
 # case 17: a LEFT JOIN with a condition of the inner table in the ON clause
 499:1044670539468
 EXPLAIN FORMAT=TREE SELECT f.id, d2.c FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.flag = 1 WHERE f.id < 500;
 EXPLAIN
 -> Nested loop left join
-    -> Table scan on f
-    -> Table scan on d2
+    -> Table scan on f, with parallel hash join
+    -> Table scan on d2, joined by the parallel hash join
 
 # case 18: an inner join and a LEFT JOIN with a condition on a string column
 960:2053539217041
@@ -223,9 +223,9 @@ EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1
 EXPLAIN
 -> Nested loop inner join
     -> Nested loop left join
-        -> Table scan on f
-        -> Table scan on d2
-    -> Table scan on d1
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d2, joined by the parallel hash join
+    -> Table scan on d1, joined by the parallel hash join
 
 # case 19: a LEFT JOIN used as an anti join
 600:1288186545268
@@ -233,8 +233,8 @@ EXPLAIN FORMAT=TREE SELECT f.id FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHER
 EXPLAIN
 -> Filter: (d2.k is null)
     -> Nested loop left join
-        -> Table scan on f
-        -> Table scan on d2
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d2, joined by the parallel hash join
 
 # case 20: the small table is the outer table of the LEFT JOIN, a COUNT of the inner table
 45:109640937587
@@ -243,16 +243,16 @@ EXPLAIN
 -> Table scan on <temporary>
     -> Aggregate using temporary table
         -> Nested loop left join
-            -> Table scan on d1
-            -> Table scan on f
+            -> Table scan on d1, with parallel hash join
+            -> Table scan on f, joined by the parallel hash join
 
 # case 21: NULL keys of the outer table
 851:1832393546893
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f LEFT JOIN d1_w d1 ON f.n = d1.kk WHERE f.id < 400;
 EXPLAIN
 -> Nested loop left join
-    -> Table scan on f
-    -> Table scan on d1
+    -> Table scan on f, with parallel hash join
+    -> Table scan on d1, joined by the parallel hash join
 
 # case 22: a LEFT JOIN with a condition of the WHERE clause on the inner table
 1800:3864456740923
@@ -260,17 +260,17 @@ EXPLAIN FORMAT=TREE SELECT f.id, d2.c FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.
 EXPLAIN
 -> Filter: ((d2.flag = 0) or (d2.c is null))
     -> Nested loop left join
-        -> Table scan on f
-        -> Table scan on d2
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d2, joined by the parallel hash join
 
 # the join is done by the engine: the tables of the join are replaced by one scan
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 1;
 EXPLAIN
 -> Nested loop inner join
     -> Nested loop inner join
-        -> Table scan on f
-        -> Table scan on d2
-    -> Table scan on d1
+        -> Table scan on f, with parallel hash join
+        -> Table scan on d2, joined by the parallel hash join
+    -> Table scan on d1, joined by the parallel hash join
 
 SET SESSION warp_parallel_hash_join = 0;
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 1;

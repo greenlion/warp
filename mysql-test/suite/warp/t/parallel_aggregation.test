@@ -1,0 +1,244 @@
+
+--echo #
+--echo # The engine aggregates the rows of a WARP table itself
+--echo # (warp_parallel_aggregation): the groups of the rows that pass the
+--echo # conditions, SUM, AVG, MIN, MAX, COUNT and the DISTINCT aggregates of
+--echo # integers, decimals, floating point numbers and strings.  Every query is
+--echo # run against the WARP table (suffix w) and against an InnoDB copy (suffix
+--echo # i), and a checksum of the rows is compared.
+--echo #
+
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 10000;
+
+CREATE TABLE f_w (id INT, g1 TINYINT, g2 SMALLINT, g3 VARCHAR(8), g4 VARCHAR(8), u INT UNSIGNED, big BIGINT,
+                  d1 DECIMAL(10,2), d2 DECIMAL(18,4), fl FLOAT, db DOUBLE, s VARCHAR(10),
+                  n_i INT NULL, n_d DECIMAL(10,2) NULL, n_s VARCHAR(8) NULL, v INT)
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f_w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 4000)
+  SELECT x, x % 7 - 3, x % 50, CONCAT('b', x % 5), ELT(1 + x % 4, 'Aa', 'aA', 'Bb', 'bB'),
+         x * 3, x * 1000003 - 2000000, (x % 997) / 100 - 3, (x % 1013) / 7 - 20.5,
+         (x % 64) / 4, (x % 128) * 0.5 - 10, CONCAT('str', x % 13),
+         IF(x % 5 = 0, NULL, x % 9 - 2), IF(x % 6 = 0, NULL, (x % 40) / 8), IF(x % 4 = 0, NULL, CONCAT('n', x % 6)),
+         x % 100 - 30
+  FROM s;
+CREATE TABLE f_i LIKE f_w;
+ALTER TABLE f_i ENGINE=InnoDB;
+INSERT INTO f_i SELECT * FROM f_w;
+CREATE TABLE e_w (id INT, g INT, v INT, d DECIMAL(10,2)) ENGINE=WARP;
+CREATE TABLE e_i LIKE e_w;
+ALTER TABLE e_i ENGINE=InnoDB;
+
+--echo # case 1: groups of an integer, every kind of aggregate over integers and decimals
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5, c6, c7, c8))), 0)) FROM (SELECT g1 AS c0, SUM(v) AS c1, MIN(d1) AS c2, MAX(d2) AS c3, COUNT(*) AS c4, COUNT(n_i) AS c5, AVG(d1) AS c6, SUM(d1 * d2) AS c7, SUM(d1 * (1 - d2)) AS c8 FROM f_w GROUP BY g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5, c6, c7, c8))), 0)) FROM (SELECT g1 AS c0, SUM(v) AS c1, MIN(d1) AS c2, MAX(d2) AS c3, COUNT(*) AS c4, COUNT(n_i) AS c5, AVG(d1) AS c6, SUM(d1 * d2) AS c7, SUM(d1 * (1 - d2)) AS c8 FROM f_i GROUP BY g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 1
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, SUM(v), MIN(d1), MAX(d2), COUNT(*), COUNT(n_i), AVG(d1), SUM(d1 * d2), SUM(d1 * (1 - d2)) FROM f_w GROUP BY g1;
+--echo # case 2: groups of a string and an integer, COUNT(DISTINCT) of a nullable column
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4))), 0)) FROM (SELECT g3 AS c0, g1 AS c1, SUM(d1 * d2) AS c2, COUNT(DISTINCT n_i) AS c3, COUNT(DISTINCT n_i, v) AS c4 FROM f_w GROUP BY g3, g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4))), 0)) FROM (SELECT g3 AS c0, g1 AS c1, SUM(d1 * d2) AS c2, COUNT(DISTINCT n_i) AS c3, COUNT(DISTINCT n_i, v) AS c4 FROM f_i GROUP BY g3, g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 2
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g3, g1, SUM(d1 * d2), COUNT(DISTINCT n_i), COUNT(DISTINCT n_i, v) FROM f_w GROUP BY g3, g1;
+--echo # case 3: groups of a string of a case insensitive collation
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4))), 0)) FROM (SELECT LOWER(g4) AS c0, COUNT(*) AS c1, SUM(v) AS c2, MIN(g2) AS c3, MAX(big) AS c4 FROM f_w GROUP BY g4) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4))), 0)) FROM (SELECT LOWER(g4) AS c0, COUNT(*) AS c1, SUM(v) AS c2, MIN(g2) AS c3, MAX(big) AS c4 FROM f_i GROUP BY g4) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 3
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT LOWER(g4), COUNT(*), SUM(v), MIN(g2), MAX(big) FROM f_w GROUP BY g4;
+--echo # case 4: aggregates without GROUP BY
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5, c6, c7, c8))), 0)) FROM (SELECT SUM(d1) AS c0, AVG(d2) AS c1, MIN(s) AS c2, MAX(s) AS c3, COUNT(s) AS c4, COUNT(DISTINCT s) AS c5, SUM(big) AS c6, MIN(u) AS c7, MAX(u) AS c8 FROM f_w) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5, c6, c7, c8))), 0)) FROM (SELECT SUM(d1) AS c0, AVG(d2) AS c1, MIN(s) AS c2, MAX(s) AS c3, COUNT(s) AS c4, COUNT(DISTINCT s) AS c5, SUM(big) AS c6, MIN(u) AS c7, MAX(u) AS c8 FROM f_i) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 4
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT SUM(d1), AVG(d2), MIN(s), MAX(s), COUNT(s), COUNT(DISTINCT s), SUM(big), MIN(u), MAX(u) FROM f_w;
+--echo # case 5: floating point numbers
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5, c6))), 0)) FROM (SELECT g1 AS c0, ROUND(SUM(fl), 6) AS c1, ROUND(SUM(db), 6) AS c2, ROUND(AVG(db), 6) AS c3, MIN(fl) AS c4, MAX(db) AS c5, ROUND(SUM(fl * db), 6) AS c6 FROM f_w GROUP BY g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5, c6))), 0)) FROM (SELECT g1 AS c0, ROUND(SUM(fl), 6) AS c1, ROUND(SUM(db), 6) AS c2, ROUND(AVG(db), 6) AS c3, MIN(fl) AS c4, MAX(db) AS c5, ROUND(SUM(fl * db), 6) AS c6 FROM f_i GROUP BY g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 5
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, ROUND(SUM(fl), 6), ROUND(SUM(db), 6), ROUND(AVG(db), 6), MIN(fl), MAX(db), ROUND(SUM(fl * db), 6) FROM f_w GROUP BY g1;
+--echo # case 6: nullable columns
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5, c6, c7, c8))), 0)) FROM (SELECT g2 AS c0, COUNT(n_i) AS c1, SUM(n_i) AS c2, SUM(n_d) AS c3, MIN(n_s) AS c4, MAX(n_s) AS c5, COUNT(n_s) AS c6, AVG(n_i) AS c7, COUNT(*) AS c8 FROM f_w GROUP BY g2) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5, c6, c7, c8))), 0)) FROM (SELECT g2 AS c0, COUNT(n_i) AS c1, SUM(n_i) AS c2, SUM(n_d) AS c3, MIN(n_s) AS c4, MAX(n_s) AS c5, COUNT(n_s) AS c6, AVG(n_i) AS c7, COUNT(*) AS c8 FROM f_i GROUP BY g2) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 6
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g2, COUNT(n_i), SUM(n_i), SUM(n_d), MIN(n_s), MAX(n_s), COUNT(n_s), AVG(n_i), COUNT(*) FROM f_w GROUP BY g2;
+--echo # case 7: a group of NULLs
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT n_s AS c0, COUNT(*) AS c1, SUM(v) AS c2 FROM f_w GROUP BY n_s) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT n_s AS c0, COUNT(*) AS c1, SUM(v) AS c2 FROM f_i GROUP BY n_s) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 7
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT n_s, COUNT(*), SUM(v) FROM f_w GROUP BY n_s;
+--echo # case 8: DISTINCT aggregates
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5))), 0)) FROM (SELECT g1 AS c0, COUNT(DISTINCT s) AS c1, SUM(DISTINCT v) AS c2, AVG(DISTINCT d1) AS c3, COUNT(DISTINCT g3, g2) AS c4, COUNT(*) AS c5 FROM f_w GROUP BY g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5))), 0)) FROM (SELECT g1 AS c0, COUNT(DISTINCT s) AS c1, SUM(DISTINCT v) AS c2, AVG(DISTINCT d1) AS c3, COUNT(DISTINCT g3, g2) AS c4, COUNT(*) AS c5 FROM f_i GROUP BY g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 8
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, COUNT(DISTINCT s), SUM(DISTINCT v), AVG(DISTINCT d1), COUNT(DISTINCT g3, g2), COUNT(*) FROM f_w GROUP BY g1;
+--echo # case 9: HAVING
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT g2 AS c0, SUM(v) AS c1, COUNT(*) AS c2 FROM f_w GROUP BY g2 HAVING SUM(v) > 100 AND COUNT(*) > 70) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT g2 AS c0, SUM(v) AS c1, COUNT(*) AS c2 FROM f_i GROUP BY g2 HAVING SUM(v) > 100 AND COUNT(*) > 70) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 9
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g2, SUM(v), COUNT(*) FROM f_w GROUP BY g2 HAVING SUM(v) > 100 AND COUNT(*) > 70;
+--echo # case 10: HAVING with a decimal and a MIN
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT g2 AS c0, SUM(d1) AS c1, MIN(d2) AS c2 FROM f_w GROUP BY g2 HAVING SUM(d1) < 5.5 AND MIN(d2) > -19) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT g2 AS c0, SUM(d1) AS c1, MIN(d2) AS c2 FROM f_i GROUP BY g2 HAVING SUM(d1) < 5.5 AND MIN(d2) > -19) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 10
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g2, SUM(d1), MIN(d2) FROM f_w GROUP BY g2 HAVING SUM(d1) < 5.5 AND MIN(d2) > -19;
+--echo # case 11: many groups: a decimal column
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT d1 AS c0, COUNT(*) AS c1, SUM(v) AS c2, MAX(s) AS c3 FROM f_w GROUP BY d1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT d1 AS c0, COUNT(*) AS c1, SUM(v) AS c2, MAX(s) AS c3 FROM f_i GROUP BY d1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 11
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT d1, COUNT(*), SUM(v), MAX(s) FROM f_w GROUP BY d1;
+--echo # case 12: MIN and MAX of expressions
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4))), 0)) FROM (SELECT g1 AS c0, MIN(d1 * 2) AS c1, MAX(v - g1) AS c2, MIN(d1 + d2) AS c3, MAX(fl + 1) AS c4 FROM f_w GROUP BY g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4))), 0)) FROM (SELECT g1 AS c0, MIN(d1 * 2) AS c1, MAX(v - g1) AS c2, MIN(d1 + d2) AS c3, MAX(fl + 1) AS c4 FROM f_i GROUP BY g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 12
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, MIN(d1 * 2), MAX(v - g1), MIN(d1 + d2), MAX(fl + 1) FROM f_w GROUP BY g1;
+--echo # case 13: unsigned and big integers
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5))), 0)) FROM (SELECT g1 AS c0, SUM(u) AS c1, MAX(u) AS c2, MIN(big) AS c3, SUM(big) AS c4, SUM(u * 2) AS c5 FROM f_w GROUP BY g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4, c5))), 0)) FROM (SELECT g1 AS c0, SUM(u) AS c1, MAX(u) AS c2, MIN(big) AS c3, SUM(big) AS c4, SUM(u * 2) AS c5 FROM f_i GROUP BY g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 13
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, SUM(u), MAX(u), MIN(big), SUM(big), SUM(u * 2) FROM f_w GROUP BY g1;
+--echo # case 14: a condition that is pushed down
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT g1 AS c0, SUM(v) AS c1, COUNT(*) AS c2 FROM f_w WHERE id > 1000 AND g2 BETWEEN 5 AND 30 GROUP BY g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT g1 AS c0, SUM(v) AS c1, COUNT(*) AS c2 FROM f_i WHERE id > 1000 AND g2 BETWEEN 5 AND 30 GROUP BY g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 14
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, SUM(v), COUNT(*) FROM f_w WHERE id > 1000 AND g2 BETWEEN 5 AND 30 GROUP BY g1;
+--echo # case 15: no row passes with GROUP BY
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT g1 AS c0, SUM(v) AS c1, COUNT(*) AS c2 FROM f_w WHERE id < 0 GROUP BY g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT g1 AS c0, SUM(v) AS c1, COUNT(*) AS c2 FROM f_i WHERE id < 0 GROUP BY g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 15
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, SUM(v), COUNT(*) FROM f_w WHERE id < 0 GROUP BY g1;
+--echo # case 16: no row passes without GROUP BY
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4))), 0)) FROM (SELECT SUM(v) AS c0, COUNT(*) AS c1, MIN(s) AS c2, AVG(d1) AS c3, COUNT(DISTINCT g1) AS c4 FROM f_w WHERE id < 0) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3, c4))), 0)) FROM (SELECT SUM(v) AS c0, COUNT(*) AS c1, MIN(s) AS c2, AVG(d1) AS c3, COUNT(DISTINCT g1) AS c4 FROM f_i WHERE id < 0) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 16
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT SUM(v), COUNT(*), MIN(s), AVG(d1), COUNT(DISTINCT g1) FROM f_w WHERE id < 0;
+--echo # case 17: a table without rows
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT SUM(v) AS c0, COUNT(*) AS c1, MIN(d) AS c2, AVG(d) AS c3 FROM e_w) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT SUM(v) AS c0, COUNT(*) AS c1, MIN(d) AS c2, AVG(d) AS c3 FROM e_i) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 17
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT SUM(v), COUNT(*), MIN(d), AVG(d) FROM e_w;
+--echo # case 18: ORDER BY and LIMIT of the groups
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT g2 AS c0, SUM(d1) AS c1 FROM f_w GROUP BY g2 ORDER BY c1 DESC, g2 LIMIT 7) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT g2 AS c0, SUM(d1) AS c1 FROM f_i GROUP BY g2 ORDER BY c1 DESC, g2 LIMIT 7) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 18
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g2, SUM(d1) AS total FROM f_w GROUP BY g2 ORDER BY total DESC, g2 LIMIT 7;
+
+--echo # rows that a transaction can not see are not aggregated
+BEGIN;
+DELETE FROM f_w WHERE id % 2 = 0;
+DELETE FROM f_i WHERE id % 2 = 0;
+INSERT INTO f_w VALUES (9000, 1, 1, 'new', 'new', 1, 1, 1.5, 2.25, 1, 1, 'new', 1, 1.5, 'x', 7);
+INSERT INTO f_i VALUES (9000, 1, 1, 'new', 'new', 1, 1, 1.5, 2.25, 1, 1, 'new', 1, 1.5, 'x', 7);
+let $w = `SELECT CONCAT(COUNT(*), ':', SUM(v), ':', SUM(d1)) FROM (SELECT g1, SUM(v) v, SUM(d1) d1 FROM f_w GROUP BY g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', SUM(v), ':', SUM(d1)) FROM (SELECT g1, SUM(v) v, SUM(d1) d1 FROM f_i GROUP BY g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in the transaction
+}
+ROLLBACK;
+let $w = `SELECT CONCAT(COUNT(*), ':', SUM(v), ':', SUM(d1)) FROM (SELECT g1, SUM(v) v, SUM(d1) d1 FROM f_w GROUP BY g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', SUM(v), ':', SUM(d1)) FROM (SELECT g1, SUM(v) v, SUM(d1) d1 FROM f_i GROUP BY g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH after the rollback
+}
+
+--echo # the engine aggregates: the table is scanned once and the groups are the rows
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, SUM(d1), COUNT(*) FROM f_w GROUP BY g1;
+SET SESSION warp_parallel_aggregation = 0;
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT g1, SUM(d1), COUNT(*) FROM f_w GROUP BY g1;
+SET SESSION warp_parallel_aggregation = 1;
+
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
+DROP TABLE f_w, f_i, e_w, e_i;
