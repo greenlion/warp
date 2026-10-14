@@ -1,0 +1,53 @@
+--echo #
+--echo # A comparison of two columns of one table (a < b) is evaluated by FastBit,
+--echo # for numbers and DATE columns.  Every query is run against the WARP table
+--echo # and an InnoDB copy.
+--echo #
+
+CREATE TABLE t_w (id INT, i1 INT, i2 INT, u1 INT UNSIGNED, u2 INT UNSIGNED, t1 TINYINT, s1 SMALLINT, y1 YEAR,
+                  f1 FLOAT, f2 FLOAT, d1 DOUBLE, d2 DOUBLE, da1 DATE, da2 DATE, dt1 DATETIME(6), dt2 DATETIME(6),
+                  dc1 DECIMAL(10,2), dc2 DECIMAL(10,2), b1 BIGINT, b2 BIGINT, v1 VARCHAR(5), v2 VARCHAR(5),
+                  n1 INT NULL, n2 INT NULL, nd1 DATE NULL, nd2 DATE NULL) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+SET SESSION cte_max_recursion_depth = 10000;
+INSERT INTO t_w WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 4000)
+  SELECT x, x % 50, (x * 7) % 50, x % 40, (x * 3) % 40, x % 9, (x * 5) % 9 - 4, 2000 + x % 5,
+         (x % 30) / 4, ((x * 11) % 30) / 4, (x % 20) / 3, ((x * 13) % 20) / 3,
+         DATE_ADD('2020-01-01', INTERVAL x % 30 DAY), DATE_ADD('2020-01-01', INTERVAL (x * 7) % 30 DAY),
+         TIMESTAMP('2020-01-01 00:00:00.000100') + INTERVAL (x % 4) SECOND, TIMESTAMP('2020-01-01 00:00:00.000200') + INTERVAL ((x * 3) % 4) SECOND,
+         (x % 17) / 3, ((x * 5) % 17) / 3, x % 13, (x * 3) % 13, CONCAT('a', x % 4), CONCAT('a', (x * 3) % 4),
+         IF(x % 6 = 0, NULL, x % 12), IF(x % 5 = 0, NULL, (x * 5) % 12),
+         IF(x % 7 = 0, NULL, DATE_ADD('2020-02-01', INTERVAL x % 20 DAY)), IF(x % 4 = 0, NULL, DATE_ADD('2020-02-01', INTERVAL (x * 3) % 20 DAY))
+  FROM s;
+CREATE TABLE t_i LIKE t_w;
+ALTER TABLE t_i ENGINE=InnoDB;
+INSERT INTO t_i SELECT * FROM t_w;
+
+CREATE TABLE preds (i INT, p VARCHAR(100));
+INSERT INTO preds VALUES
+ (1,'i1 < i2'),(2,'i1 <= i2'),(3,'i1 > i2'),(4,'i1 >= i2'),(5,'i1 = i2'),(6,'i1 != i2'),(7,'i1 <> i2'),
+ (8,'u1 < u2'),(9,'u2 >= u1'),(10,'u1 < i1'),(11,'t1 > s1'),(12,'y1 < s1 + 2005'),(13,'y1 = y1'),
+ (14,'f1 < f2'),(15,'f1 >= f2'),(16,'d1 < d2'),(17,'d1 = d2'),(18,'f1 < d1'),(19,'i1 < d1'),
+ (20,'da1 < da2'),(21,'da1 <= da2'),(22,'da1 = da2'),(23,'da1 > da2'),(24,'da1 != da2'),
+ (25,'dt1 < dt2'),(26,'dt1 = dt2'),(27,'dc1 < dc2'),(28,'dc1 >= dc2'),(29,'b1 < b2'),(30,'b1 = b2'),
+ (31,'v1 < v2'),(32,'v1 = v2'),(33,'n1 < n2'),(34,'n1 = n2'),(35,'n1 >= n2'),(36,'n1 != n2'),
+ (37,'n1 <=> n2'),(38,'nd1 < nd2'),(39,'nd1 >= nd2'),(40,'da1 < nd2'),(41,'nd1 = nd1'),(42,'n1 < n1'),
+ (43,'i1 < i2 AND da1 < da2'),(44,'i1 < i2 OR da1 > da2'),(45,'NOT (i1 < i2)'),(46,'NOT (n1 < n2)'),
+ (47,'(n1 < n2) IS NULL'),(48,'i1 < i2 AND id < 100'),(49,'da1 < da2 AND n1 < n2 AND f1 <= f2');
+
+--let $i = 1
+while ($i <= 49)
+{
+  --let $p = `SELECT p FROM preds WHERE i = $i`
+  --disable_query_log
+  --let $rows = `SELECT COUNT(*) FROM t_w WHERE $p`
+  --let $same = `SELECT (SELECT CONCAT(COUNT(*), '/', COALESCE(SUM(id), 0)) FROM t_w WHERE $p) = (SELECT CONCAT(COUNT(*), '/', COALESCE(SUM(id), 0)) FROM t_i WHERE $p)`
+  --enable_query_log
+  --echo # $p: $rows rows, same as InnoDB: $same
+  --inc $i
+}
+
+--echo # the comparison of two columns is not left to MySQL
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE da1 < da2;
+EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE dt1 < dt2;
+
+DROP TABLE t_w, t_i, preds;

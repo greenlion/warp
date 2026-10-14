@@ -6060,6 +6060,48 @@ std::string ha_warp::semi_key_condition() {
   return cond;
 }
 
+/* A comparison of two columns of one table: FastBit evaluates it for numbers
+   (the math expression c1 < c2 is evaluated as doubles, which hold the values
+   of the types below exactly) and for DATE columns (stored as small integers
+   of the packed date).  DATETIME and TIMESTAMP values are too large for a
+   double, the other types are not numbers in FastBit. */
+static int warp_column_compare_kind(const Field *field) {
+  switch(field->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_YEAR:
+    case MYSQL_TYPE_FLOAT:
+    case MYSQL_TYPE_DOUBLE:
+      return 1;
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_NEWDATE:
+      return 2;
+    default:
+      return 0;
+  }
+}
+
+static bool warp_push_column_compare(const Field *f0, const Field *f1, const std::string &op,
+                                     std::string &condition) {
+  const int kind = warp_column_compare_kind(f0);
+  if(kind == 0 || kind != warp_column_compare_kind(f1)) {
+    return false;
+  }
+  if(op != " < " && op != " <= " && op != " > " && op != " >= " && op != " = " && op != " != ") {
+    return false;
+  }
+  const std::string i0 = std::to_string(f0->field_index());
+  const std::string i1 = std::to_string(f1->field_index());
+  std::string where;
+  /* a NULL marker is zero for the rows that have a value */
+  if(f0->is_nullable()) where += "n" + i0 + " = 0 AND ";
+  if(f1->is_nullable() && f1->field_index() != f0->field_index()) where += "n" + i1 + " = 0 AND ";
+  condition = "(" + where + "c" + i0 + op + "c" + i1 + ")";
+  return true;
+}
+
 int ha_warp::append_column_filter(const Item *cond,
                                    std::string &where_clause) {
   bool field_may_be_null = false;
@@ -6190,6 +6232,25 @@ int ha_warp::append_column_filter(const Item *cond,
        happen when a scan is initiated.
     */
     
+    /* two columns of this table (l_commitdate < l_receiptdate) */
+    if(tmp->arg_count == 2 && arg[0]->type() == Item::Type::FIELD_ITEM &&
+       arg[1]->type() == Item::Type::FIELD_ITEM && !is_between && !is_in) {
+      const Field *f0 = down_cast<Item_field *>(arg[0])->field;
+      const Field *f1 = down_cast<Item_field *>(arg[1])->field;
+      if(f0 != nullptr && f1 != nullptr && f0->table == table && f1->table == table) {
+        /* x <=> y is true for two NULLs */
+        if(tmp->functype() == Item_func::Functype::EQUAL_FUNC) {
+          return 0;
+        }
+        std::string condition;
+        if(warp_push_column_compare(f0, f1, op, condition)) {
+          where_clause += condition;
+          return 1;
+        }
+        return 0;
+      }
+    }
+
     if(tmp->arg_count == 2 && arg[0]->type() == Item::Type::FIELD_ITEM &&
         arg[0]->type() == arg[1]->type()
     ) {
