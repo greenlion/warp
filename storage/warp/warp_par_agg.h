@@ -167,6 +167,18 @@ struct warp_pa_plan {
   std::vector<uint> where_fields;
   std::atomic<bool> overflow{false};
 
+  /* The keys of another table (see warp_try_semi_keys): only the rows whose
+     column has one of them are grouped.  A bit per value from semi_min. */
+  int semi_slot = -1;                 // the column of the keys, in cols
+  bool semi_active = false;
+  int64_t semi_min = 0;
+  uint64_t semi_range = 0;
+  std::vector<uint64_t> semi_bits;
+  bool semi_has(int64_t key) const {
+    const uint64_t i = (uint64_t)(key - semi_min);
+    return i < semi_range && ((semi_bits[i >> 6] >> (i & 63)) & 1);
+  }
+
   /* the result */
   std::vector<warp_pa_group> groups;
   size_t pos = 0;
@@ -977,6 +989,13 @@ static std::shared_ptr<warp_pa_plan> warp_pa_make_distinct_plan(THD *thd, Access
     }
   }
   plan->group_cols = plan->key_cols.size();
+  if(handler->semi_in) {
+    for(size_t i = 0; i < plan->cols.size(); ++i) {
+      if(plan->cols[i].field == handler->semi_in->inner_col && plan->cols[i].kind == PA_INT) {
+        plan->semi_slot = (int)i;
+      }
+    }
+  }
   /* MySQL reads the columns that are returned (and the ones of the conditions
      that the engine evaluates) */
   {
@@ -1280,6 +1299,12 @@ static void warp_pa_slice(const warp_pa_plan &plan, const std::vector<warp_pa_lo
     const size_t row = hit_rows[i];
     if(!invisible.empty() && invisible[row]) {
       continue;
+    }
+    if(plan.semi_active) {
+      const warp_pa_loaded &kl = loaded[plan.semi_slot];
+      if((kl.has_nulls && kl.nulls.get(row) != 0) || !plan.semi_has(kl.ints.get(row))) {
+        continue;
+      }
     }
     /* the group */
     key.clear();
@@ -1834,10 +1859,32 @@ int ha_warp::pa_run() {
   warp_index_build_scope budget_scope(ha_thd(), thread_budget);
   plan.where = push_where_clause == "1=1" ? "" : push_where_clause;
   /* the keys of another table that limit the scan (see warp_try_semi_keys) */
+  plan.semi_active = false;
   if(semi_in) {
-    const std::string cond = semi_key_condition();
-    if(cond != "") {
-      plan.where = plan.where == "" ? cond : "(" + plan.where + ") AND (" + cond + ")";
+    if(plan.semi_slot >= 0) {
+      /* a bit for every key: a row is looked up in it without parsing a list */
+      std::vector<int64_t> keys;
+      if(semi_key_values(&keys, std::min<uint64_t>(table_row_count() / 2, 200000000ULL))) {
+        if(keys.empty()) {
+          plan.semi_range = 0;
+          plan.semi_bits.clear();
+          plan.semi_active = true;
+        } else if((uint64_t)(keys.back() - keys.front()) < (1ULL << 31)) {
+          plan.semi_min = keys.front();
+          plan.semi_range = (uint64_t)(keys.back() - keys.front()) + 1;
+          plan.semi_bits.assign((plan.semi_range + 63) / 64, 0);
+          for(int64_t key : keys) {
+            const uint64_t i = (uint64_t)(key - plan.semi_min);
+            plan.semi_bits[i >> 6] |= 1ULL << (i & 63);
+          }
+          plan.semi_active = true;
+        }
+      }
+    } else {
+      const std::string cond = semi_key_condition();
+      if(cond != "") {
+        plan.where = plan.where == "" ? cond : "(" + plan.where + ") AND (" + cond + ")";
+      }
     }
   }
   plan.where_fields.clear();

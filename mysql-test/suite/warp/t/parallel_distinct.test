@@ -15,6 +15,10 @@ INSERT INTO a_w WITH RECURSIVE x(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM x W
   SELECT i, i % 800, CONCAT('s', i % 300), (i % 90) / 4, IF(i % 7 = 0, NULL, i % 120), DATE_ADD('2021-01-01', INTERVAL i % 60 DAY) FROM x;
 INSERT INTO b_w WITH RECURSIVE x(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM x WHERE i < 40000)
   SELECT i % 1000, CONCAT('s', i % 400), (i % 100) / 4, IF(i % 5 = 0, NULL, i % 150), i % 11, DATE_ADD('2021-01-01', INTERVAL i % 80 DAY) FROM x;
+INSERT INTO a_w VALUES (5001, -7, 'neg', 1.00, 1, '2021-03-01'), (5002, -2000000000, 'low', 1.00, 1, '2021-03-01'),
+  (5003, 2000000000, 'high', 1.00, 1, '2021-03-01'), (5004, 0, 'zero', 1.00, 1, '2021-03-01');
+INSERT INTO b_w VALUES (-7, 'neg', 1.00, 1, 2, '2021-03-01'), (-7, 'neg', 1.00, 1, 2, '2021-03-02'), (0, 'zero', 1.00, 1, 2, '2021-03-01'),
+  (-2000000000, 'low', 1.00, 1, 3, '2021-03-01'), (2000000000, 'high', 1.00, 1, 3, '2021-03-01');
 CREATE TABLE a_i LIKE a_w;
 CREATE TABLE b_i LIKE b_w;
 ALTER TABLE a_i ENGINE=InnoDB;
@@ -24,32 +28,38 @@ INSERT INTO b_i SELECT * FROM b_w;
 
 CREATE TABLE queries (i INT, q TEXT);
 INSERT INTO queries VALUES
- (1, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_@ b WHERE b.v > 3)'),
- (2, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.s IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.s FROM b_@ b WHERE b.v < 5)'),
- (3, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.dd IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.dd FROM b_@ b WHERE b.v = 2)'),
- (4, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.n IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.n FROM b_@ b WHERE b.v > 6)'),
- (5, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE (a.k, a.s) IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k, b.s FROM b_@ b WHERE b.v = 1)'),
- (6, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.d >= ''2021-02-01'' AND EXISTS (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ 1 FROM b_@ b WHERE b.k = a.k AND b.d < b.d + INTERVAL 1 DAY AND b.v > 8)'),
- (7, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_@ b WHERE b.k < b.v * 100)'),
- (8, 'SELECT COUNT(*), SUM(a.id) FROM a_@ a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_@ b WHERE b.v = 99)'),
- (9, 'SELECT COUNT(*) FROM a_@ a JOIN (SELECT DISTINCT b.k, b.s FROM b_@ b WHERE b.v < 3) x ON x.k = a.k AND x.s = a.s');
+ (1, 'SELECT COUNT(*), SUM(a.id) FROM a_# a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_# b WHERE b.v > 3)'),
+ (2, 'SELECT COUNT(*), SUM(a.id) FROM a_# a WHERE a.s IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.s FROM b_# b WHERE b.v < 5)'),
+ (3, 'SELECT COUNT(*), SUM(a.id) FROM a_# a WHERE a.dd IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.dd FROM b_# b WHERE b.v = 2)'),
+ (4, 'SELECT COUNT(*), SUM(a.id) FROM a_# a WHERE a.n IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.n FROM b_# b WHERE b.v > 6)'),
+ (5, 'SELECT COUNT(*), SUM(a.id) FROM a_# a WHERE (a.k, a.s) IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k, b.s FROM b_# b WHERE b.v = 1)'),
+ (6, 'SELECT COUNT(*), SUM(a.id) FROM a_# a WHERE a.d >= ''2021-02-01'' AND EXISTS (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ 1 FROM b_# b WHERE b.k = a.k AND b.d < b.d + INTERVAL 1 DAY AND b.v > 8)'),
+ (7, 'SELECT COUNT(*), SUM(a.id) FROM a_# a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_# b WHERE b.k < b.v * 100)'),
+ (8, 'SELECT COUNT(*), SUM(a.id) FROM a_# a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_# b WHERE b.v = 99)'),
+ (10, 'SELECT COUNT(*), SUM(a.id) FROM a_# a WHERE a.id > 5000 AND a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_# b WHERE b.v = 2)'),
+ (11, 'SELECT COUNT(*), SUM(a.id) FROM a_# a WHERE a.id > 5000 AND a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_# b WHERE b.v >= 2)'),
+ (9, 'SELECT COUNT(*) FROM a_# a JOIN (SELECT DISTINCT b.k, b.s FROM b_# b WHERE b.v < 3) x ON x.k = a.k AND x.s = a.s');
 
 --let $i = 1
-while ($i <= 9)
+while ($i <= 11)
 {
-  --let $w = `SELECT REPLACE(q, '@', 'w') FROM queries WHERE i = $i`
-  --let $n = `SELECT REPLACE(q, '@', 'i') FROM queries WHERE i = $i`
+  --let $w = `SELECT REPLACE(q, '#', 'w') FROM queries WHERE i = $i`
+  --let $n = `SELECT REPLACE(q, '#', 'i') FROM queries WHERE i = $i`
   --echo # query $i
   --disable_query_log
   SET SESSION warp_parallel_aggregation = ON;
   SET SESSION warp_semi_key_pushdown = ON;
+  --let $before = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_semi_key_scans', Value, 1)
   eval CREATE TABLE r_on ENGINE=InnoDB AS $w;
+  --let $after = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_semi_key_scans', Value, 1)
+  --let $used = `SELECT $after > $before`
   SET SESSION warp_semi_key_pushdown = OFF;
   eval CREATE TABLE r_on2 ENGINE=InnoDB AS $w;
   SET SESSION warp_parallel_aggregation = OFF;
   eval CREATE TABLE r_off ENGINE=InnoDB AS $w;
   eval CREATE TABLE r_i ENGINE=InnoDB AS $n;
   --enable_query_log
+  --echo # the scan was limited to the keys of the outer table: $used
   SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
          (SELECT COUNT(*) FROM r_on2) = (SELECT COUNT(*) FROM r_i) AS same_rows_on2,
          (SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
