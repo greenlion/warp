@@ -1566,7 +1566,9 @@ int ha_warp::write_row_impl(uchar *buf) {
     current_trx->write_insert_log_rowid(current_rowid);
   } else
   */
-  if(writer->mRows() >= my_write_cache_size) {
+  /* a partition takes at most warp_partition_max_rows rows: FastBit does not
+     write the rows of a larger buffer that do not fit */
+  if(writer->mRows() >= std::min<uint64_t>(my_write_cache_size, my_partition_max_rows)) {
     // write the rows to disk and destroy the writer (a new one will be created)
     DBUG_RETURN(write_buffered_rows_to_disk());
   }
