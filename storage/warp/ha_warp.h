@@ -1216,6 +1216,10 @@ class ha_warp : public handler {
     uint inner_col = 0;             // the column of this table that is materialized
   };
   std::shared_ptr<warp_semi_in> semi_in;
+  /* more keys than a condition of the scan can list: each partition lists the
+     keys that are in the range of its values (see where_for_partition) */
+  std::shared_ptr<std::vector<int64_t>> semi_keys;
+  std::string where_for_partition(const std::string &dir);
   /* push_where_clause and the parameters for the scan that is started */
   std::string          scan_where         = "";
   void collect_outer_params(const Item *cond);
@@ -1460,6 +1464,7 @@ class ha_warp : public handler {
      written to their records). */
   std::shared_ptr<warp_pj_plan> par_join;
   int pj_run();
+  bool pj_collect_keys(uint field, std::vector<int64_t> *keys);
   int pj_next(uchar *buf);
   void pj_close();
   /* A table that the engine joins to the probe table is still a table of the

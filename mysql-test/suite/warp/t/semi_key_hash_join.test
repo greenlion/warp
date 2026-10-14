@@ -1,0 +1,76 @@
+--echo #
+--echo # The table that MySQL reads to build the hash table of the semijoin or the
+--echo # antijoin of EXISTS and NOT EXISTS is read for the keys of the rows that
+--echo # are probed (warp_semi_key_pushdown), also when the engine makes the join of
+--echo # the probed rows (warp_parallel_hash_join) and when there are more keys than
+--echo # a condition can list (the keys of a partition are the ones in its range).
+--echo # The result must be the one of InnoDB.
+--echo #
+
+SET @save_rows = @@global.warp_partition_max_rows;
+SET GLOBAL warp_partition_max_rows = 64000;
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 300000;
+
+CREATE TABLE t_w (id INT, k INT, s INT, d DATE) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE o_w (id INT, k INT, s INT, flag INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE p_w (id INT, flag INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t_w WITH RECURSIVE x(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM x WHERE i < 199999)
+  SELECT i, i DIV 2, i % 7, DATE_ADD('2022-01-01', INTERVAL i % 90 DAY) FROM x;
+INSERT INTO o_w WITH RECURSIVE x(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM x WHERE i < 99999)
+  SELECT i, i, i % 7, i % 5 FROM x;
+INSERT INTO o_w VALUES (100000, 5000000, 1, 0), (100001, 6000000, 2, 1);
+INSERT INTO t_w VALUES (200000, 5000000, 1, '2022-02-01'), (200001, 6000000, 3, '2022-02-01'), (200002, 6000000, 3, '2022-02-02');
+INSERT INTO p_w VALUES (0, 0), (1, 1), (2, 1), (3, 0), (4, 1), (5, 0), (6, 1);
+CREATE TABLE t_i LIKE t_w;
+CREATE TABLE o_i LIKE o_w;
+CREATE TABLE p_i LIKE p_w;
+ALTER TABLE t_i ENGINE=InnoDB;
+ALTER TABLE o_i ENGINE=InnoDB;
+ALTER TABLE p_i ENGINE=InnoDB;
+INSERT INTO t_i SELECT * FROM t_w;
+INSERT INTO o_i SELECT * FROM o_w;
+INSERT INTO p_i SELECT * FROM p_w;
+
+CREATE TABLE queries (i INT, q TEXT);
+INSERT INTO queries VALUES
+ (1, 'SELECT COUNT(*), SUM(o.id) FROM o_# o WHERE o.flag < 4 AND EXISTS (SELECT 1 FROM t_# t WHERE t.k = o.k AND t.s <> o.s)'),
+ (2, 'SELECT COUNT(*), SUM(o.id) FROM o_# o WHERE o.flag < 4 AND NOT EXISTS (SELECT 1 FROM t_# t WHERE t.k = o.k AND t.s <> o.s)'),
+ (3, 'SELECT COUNT(*), SUM(o.id) FROM o_# o WHERE o.flag = 0 AND EXISTS (SELECT 1 FROM t_# t WHERE t.k = o.k AND t.s <> o.s)'),
+ (4, 'SELECT COUNT(*), SUM(o.id) FROM o_# o WHERE o.flag = 0 AND NOT EXISTS (SELECT 1 FROM t_# t WHERE t.k = o.k AND t.s <> o.s)'),
+ (5, 'SELECT COUNT(*), SUM(o.id) FROM o_# o, p_# p WHERE o.s = p.id AND p.flag = 1 AND EXISTS (SELECT 1 FROM t_# t WHERE t.k = o.k AND t.s <> o.s) AND NOT EXISTS (SELECT 1 FROM t_# t2 WHERE t2.k = o.k AND t2.s <> o.s AND t2.d > ''2022-03-01'')'),
+ (6, 'SELECT COUNT(*), SUM(o.id) FROM o_# o, p_# p WHERE o.s = p.id AND p.flag = 0 AND o.flag > 2 AND EXISTS (SELECT 1 FROM t_# t WHERE t.k = o.k AND t.d > ''2022-02-15'')'),
+ (7, 'SELECT COUNT(*), SUM(o.id) FROM o_# o WHERE o.flag = 4 AND EXISTS (SELECT 1 FROM t_# t WHERE t.k = o.k AND t.k > 99990)'),
+ (8, 'SELECT COUNT(*), SUM(o.id) FROM o_# o WHERE o.id >= 99990 AND EXISTS (SELECT 1 FROM t_# t WHERE t.k = o.k AND t.s <> o.s)');
+
+--let $i = 1
+while ($i <= 8)
+{
+  --let $w = `SELECT REPLACE(q, '#', 'w') FROM queries WHERE i = $i`
+  --let $n = `SELECT REPLACE(q, '#', 'i') FROM queries WHERE i = $i`
+  --echo # query $i
+  --disable_query_log
+  SET SESSION warp_semi_key_pushdown = ON;
+  --let $before = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_semi_key_scans', Value, 1)
+  eval CREATE TABLE r_on ENGINE=InnoDB AS $w;
+  --let $after = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_semi_key_scans', Value, 1)
+  --let $used = `SELECT $after > $before`
+  SET SESSION warp_semi_key_pushdown = OFF;
+  eval CREATE TABLE r_off ENGINE=InnoDB AS $w;
+  eval CREATE TABLE r_i ENGINE=InnoDB AS $n;
+  --enable_query_log
+  --echo # the scan was limited to the keys of the other table: $used
+  SELECT * FROM r_i;
+  SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+         (SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+  SELECT COUNT(*) AS different_rows FROM
+    ((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+     UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+  DROP TABLE r_on, r_off, r_i;
+  --inc $i
+}
+
+SET SESSION warp_semi_key_pushdown = DEFAULT;
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
+SET GLOBAL warp_partition_max_rows = @save_rows;
+DROP TABLE queries, t_w, o_w, p_w, t_i, o_i, p_i;

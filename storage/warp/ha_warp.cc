@@ -2233,7 +2233,7 @@ bool ha_warp::start_prefetch(const std::string& datadir) {
     field_indexes.push_back((*field)->field_index());
   }
   const std::string columns = column_set;
-  const std::string where = scan_where;
+  const std::string where = where_for_partition(datadir);
   const std::string table_dir = share->data_dir_name;
   try {
     prefetched_partitions.emplace(datadir, std::async(std::launch::async,
@@ -3050,7 +3050,9 @@ int ha_warp::rnd_init(bool) {
     /* a scan that the join of the engine makes of a table (warp_par_join.h) is a
        plain scan: the join pushdown of the largest table of the statement
        (which it would be here) computes a join of its own */
-    if( (!is_partition_child && !pj_plain_scan && get_pushdown_info_count(current_thd) > 1 &&
+    /* a scan that is limited to the keys of another table (semi_in) is a plain
+       scan too: its keys are the join that the pushdown would make */
+    if( (!is_partition_child && !pj_plain_scan && !semi_in && get_pushdown_info_count(current_thd) > 1 &&
          pushdown_info->is_fact_table) || partition_filter_partition_name != "" ) {
       partitions = new ibis::partList;
     
@@ -3693,7 +3695,7 @@ fetch_again:
             
         // this will do some IO to read in projected columns that where not used for filters
         maintain_indexes(find_it->first.c_str());
-        filtered_table = base_table->select(column_set.c_str(), scan_where.c_str());
+        filtered_table = base_table->select(column_set.c_str(), where_for_partition(find_it->first).c_str());
         release_scanned_table();
       }
       prefetch_following_partitions();
@@ -3741,7 +3743,7 @@ fetch_again:
         assert(base_table != NULL);
       
         maintain_indexes((*part_it)->currentDataDir());
-        filtered_table = base_table->select(column_set.c_str(), scan_where.c_str());
+        filtered_table = base_table->select(column_set.c_str(), where_for_partition(part_dir).c_str());
         release_scanned_table();
       }
       prefetch_following_partitions();
@@ -5310,7 +5312,64 @@ static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
   if(warp_block_is_executed_again(join)) {
     return;
   }
+  auto integer = [](Field *f) {
+    switch(f->real_type()) {
+      case MYSQL_TYPE_TINY:
+      case MYSQL_TYPE_SHORT:
+      case MYSQL_TYPE_INT24:
+      case MYSQL_TYPE_LONG:
+        return true;
+      case MYSQL_TYPE_LONGLONG:
+        return !f->is_flag_set(UNSIGNED_FLAG);
+      default:
+        return false;
+    }
+  };
   WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK, [&](AccessPath *path, const JOIN *) {
+    if(path->type == AccessPath::HASH_JOIN && path->hash_join().join_predicate != nullptr) {
+      /* the table that is read to build the hash table is read for the keys of
+         the rows that are probed: the semijoin and the antijoin of EXISTS and
+         NOT EXISTS, an inner join */
+      const RelationalExpression *expr = path->hash_join().join_predicate->expr;
+      if(expr->type != RelationalExpression::INNER_JOIN && expr->type != RelationalExpression::SEMIJOIN &&
+         expr->type != RelationalExpression::ANTIJOIN) {
+        return false;
+      }
+      AccessPath *build = path->hash_join().inner;
+      while(build != nullptr && build->type == AccessPath::FILTER) {
+        build = build->filter().child;
+      }
+      if(build == nullptr || build->type != AccessPath::TABLE_SCAN) {
+        return false;
+      }
+      TABLE *build_table = build->table_scan().table;
+      ha_warp *build_handler = dynamic_cast<ha_warp *>(build_table->file);
+      if(build_handler == nullptr || build_handler->semi_in) {
+        return false;
+      }
+      for(Item_eq_base *eq : expr->equijoin_conditions) {
+        if(eq->argument_count() != 2 || eq->arguments()[0]->real_item()->type() != Item::FIELD_ITEM ||
+           eq->arguments()[1]->real_item()->type() != Item::FIELD_ITEM) {
+          continue;
+        }
+        Field *f0 = down_cast<Item_field *>(eq->arguments()[0]->real_item())->field;
+        Field *f1 = down_cast<Item_field *>(eq->arguments()[1]->real_item())->field;
+        Field *inner_field = f0->table == build_table ? f0 : f1;
+        Field *outer_field = f0->table == build_table ? f1 : f0;
+        if(inner_field->table != build_table || outer_field->table == build_table ||
+           dynamic_cast<ha_warp *>(outer_field->table->file) == nullptr || !integer(inner_field) ||
+           !integer(outer_field)) {
+          continue;
+        }
+        auto semi = std::make_shared<ha_warp::warp_semi_in>();
+        semi->outer_table = outer_field->table;
+        semi->outer_col = outer_field->field_index();
+        semi->inner_col = inner_field->field_index();
+        build_handler->semi_in = semi;
+        break;
+      }
+      return false;
+    }
     if(path->type != AccessPath::NESTED_LOOP_JOIN || path->nested_loop_join().join_type != JoinType::INNER) {
       return false;
     }
@@ -5365,19 +5424,6 @@ static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
       return false;
     }
     Field *inner_field = down_cast<Item_field *>(source)->field;
-    auto integer = [](Field *f) {
-      switch(f->real_type()) {
-        case MYSQL_TYPE_TINY:
-        case MYSQL_TYPE_SHORT:
-        case MYSQL_TYPE_INT24:
-        case MYSQL_TYPE_LONG:
-          return true;
-        case MYSQL_TYPE_LONGLONG:
-          return !f->is_flag_set(UNSIGNED_FLAG);
-        default:
-          return false;
-      }
-    };
     if(inner_field == nullptr || inner_field->table != inner_table || inner_table == outer->table ||
        !integer(inner_field) || !integer(outer)) {
       return false;
@@ -6025,12 +6071,66 @@ void ha_warp::make_scan_where() {
       scan_where = "(" + scan_where + ") AND (" + cond + ")";
     }
   }
+  semi_keys.reset();
   if(semi_in) {
-    const std::string cond = semi_key_condition();
-    if(cond != "") {
-      scan_where = (scan_where == "" || scan_where == "1=1") ? cond : "(" + scan_where + ") AND (" + cond + ")";
+    std::vector<int64_t> keys;
+    const uint64_t rows = table_row_count();
+    if(semi_key_values(&keys, rows / 2)) {
+      if(keys.size() <= std::min<uint64_t>(100000, rows / 4)) {
+        std::string cond = "c" + std::to_string(semi_in->inner_col) + " IN (";
+        if(keys.empty()) {
+          cond = "1=0";
+        } else {
+          for(size_t i = 0; i < keys.size(); ++i) {
+            if(i > 0) cond += ",";
+            cond += std::to_string(keys[i]);
+          }
+          cond += ")";
+        }
+        scan_where = (scan_where == "" || scan_where == "1=1") ? cond : "(" + scan_where + ") AND (" + cond + ")";
+      } else {
+        semi_keys = std::make_shared<std::vector<int64_t>>(std::move(keys));
+      }
     }
   }
+}
+
+/* The condition of the scan of a partition: with the keys of another table that
+   are in the range of the values of the column in the partition (a table that
+   is stored in the order of the column has few of them in each partition). */
+std::string ha_warp::where_for_partition(const std::string &dir) {
+  if(!semi_keys || semi_keys->empty() || partitions == nullptr) {
+    return scan_where;
+  }
+  const std::string name = "c" + std::to_string(semi_in->inner_col);
+  for(ibis::part *part : *partitions) {
+    if(part == nullptr || dir != part->currentDataDir()) {
+      continue;
+    }
+    ibis::column *col = part->getColumn(name.c_str());
+    if(col == nullptr) {
+      break;
+    }
+    const double lo = col->getActualMin();
+    const double hi = col->getActualMax();
+    auto first = std::lower_bound(semi_keys->begin(), semi_keys->end(), (int64_t)std::floor(lo));
+    auto last = std::upper_bound(semi_keys->begin(), semi_keys->end(), (int64_t)std::ceil(hi));
+    std::string cond;
+    if(first == last) {
+      cond = "1=0";
+    } else if((size_t)(last - first) > 200000) {
+      break;   // does not help
+    } else {
+      cond = name + " IN (";
+      for(auto it = first; it != last; ++it) {
+        if(it != first) cond += ",";
+        cond += std::to_string(*it);
+      }
+      cond += ")";
+    }
+    return (scan_where == "" || scan_where == "1=1") ? cond : "(" + scan_where + ") AND (" + cond + ")";
+  }
+  return scan_where;
 }
 
 /* The values of a column of the table whose pushed down condition is known:
@@ -6042,6 +6142,19 @@ bool ha_warp::semi_key_values(std::vector<int64_t> *keys_out, uint64_t max_keys)
   ha_warp *outer = dynamic_cast<ha_warp *>(semi_in->outer_table->file);
   if(outer == nullptr) {
     return false;
+  }
+  /* the other table is the probe table of a join that the engine makes: the
+     keys are the ones of the rows of the join (the join is made now) */
+  if(outer->par_join) {
+    std::vector<int64_t> joined;
+    if(outer->pj_collect_keys(semi_in->outer_col, &joined)) {
+      if(joined.size() > max_keys) {
+        return false;
+      }
+      ++warp_semi_key_scans;
+      *keys_out = std::move(joined);
+      return true;
+    }
   }
   std::vector<int64_t> keys;
   try {
