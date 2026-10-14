@@ -986,6 +986,233 @@ static int warp_pj_add_value(warp_pj_plan &plan, int level, uint field) {
 /* ---------------------------------------------------------------------- */
 
 /* the rows of a table that pass its conditions -> images, key columns and hash */
+/* A table that only gives the values of its columns to an aggregation (no images
+   of its rows are kept, no condition is left to MySQL) is read by the threads of
+   the statement, a partition each. */
+static bool warp_pj_build_parallel(warp_pj_table &t, const warp_star_snapshot &snap, THD *thd, std::string *error) {
+  ha_warp *handler = t.handler;
+  const size_t width = t.edge.width;
+  std::vector<int> own_slots;
+  for(uint f : t.own_key_fields) own_slots.push_back(t.slot_of(f));
+  t.arena.clear();
+  t.rowids.clear();
+  for(auto &v : t.vals) v.clear();
+  for(auto &v : t.nulls) v.clear();
+  t.nrows = 0;
+
+  /* the conditions that FastBit evaluates */
+  const std::string saved_where = handler->push_where_clause;
+  std::string where = saved_where;
+  if(!t.pushed_where.empty()) {
+    where = (saved_where.empty() || saved_where == "1=1") ? t.pushed_where
+                                                          : "(" + saved_where + ") AND (" + t.pushed_where + ")";
+  }
+  if(where == "1=1") where.clear();
+  std::vector<uint> where_fields;
+  for(size_t i = 0; i + 1 < where.size(); ++i) {
+    if(where[i] == 'c' && (i == 0 || !isalnum((unsigned char)where[i - 1])) && isdigit((unsigned char)where[i + 1])) {
+      uint f = 0;
+      size_t k = i + 1;
+      while(k < where.size() && isdigit((unsigned char)where[k])) {
+        f = f * 10 + (where[k] - '0');
+        ++k;
+      }
+      if(std::find(where_fields.begin(), where_fields.end(), f) == where_fields.end()) where_fields.push_back(f);
+    }
+  }
+
+  warp_table_read_lock lock(handler->get_warp_share()->data_dir_name);
+  ibis::partList parts;
+  ibis::util::gatherParts(parts, handler->get_warp_share()->data_dir_name, true);
+  std::vector<ibis::part *> work;
+  for(ibis::part *part : parts) {
+    if(part != nullptr && part->nRows() > 0 &&
+       std::string(part->currentDataDir()) != std::string(handler->get_warp_share()->data_dir_name)) {
+      work.push_back(part);
+    }
+  }
+  struct partial {
+    std::vector<std::vector<int64_t>> vals;
+    std::vector<std::vector<uint8_t>> nulls;
+    std::vector<int64_t> keys;
+    size_t rows = 0;
+  };
+  std::vector<partial> partials(work.size());
+  size_t workers = THDVAR(thd, max_degree_of_parallelism);
+  if(workers < 1) workers = 1;
+  if(!work.empty()) {
+    const uint64_t per_worker =
+        std::max<uint64_t>(work[0]->nRows(), 1) * 8 * (t.value_fields.size() * 2 + 3);
+    workers = std::min<uint64_t>(workers, std::max<uint64_t>(1, (ibis::fileManager::currentCacheSize() / 2) / per_worker));
+  }
+  workers = std::min(workers, std::max<size_t>(work.size(), 1));
+  std::atomic<size_t> next(0);
+  std::atomic<bool> failed(false);
+  std::mutex error_mutex;
+  std::string first_error;
+  std::shared_ptr<ibis::util::ThreadBudget> budget = ibis::util::ThreadBudget::current();
+  auto worker = [&]() {
+    ibis::util::ThreadBudgetScope scope(budget);
+    try {
+      for(;;) {
+        const size_t k = next.fetch_add(1);
+        if(k >= work.size() || failed.load()) break;
+        if(thd_killed(thd)) {
+          failed = true;
+          break;
+        }
+        ibis::part *part = work[k];
+        const size_t nrows = part->nRows();
+        const char *dir = part->currentDataDir();
+        {
+          std::vector<uint> stale;
+          for(uint f : where_fields) {
+            const std::string data = std::string(dir) + "/c" + std::to_string(f);
+            struct stat dst, ist;
+            if(stat((data + ".idx").c_str(), &ist) == 0 &&
+               (stat(data.c_str(), &dst) != 0 || dst.st_mtime > ist.st_mtime)) {
+              stale.push_back(f);
+            }
+          }
+          if(!stale.empty()) warp_maintain_partition_indexes(dir, stale);
+        }
+        ibis::bitvector everything;
+        std::unique_ptr<ibis::query> query;
+        const ibis::bitvector *hits = nullptr;
+        if(where.empty()) {
+          everything.set(1, nrows);
+          hits = &everything;
+        } else {
+          query.reset(new ibis::query((const char *)0, part, (const char *)0));
+          query->addConditions(where.c_str());
+          if(query->evaluate() < 0) {
+            std::lock_guard<std::mutex> guard(error_mutex);
+            if(first_error.empty()) first_error = std::string("could not evaluate the condition on ") + dir;
+            failed = true;
+            break;
+          }
+          hits = query->getHitVector();
+        }
+        partial &out = partials[k];
+        out.vals.resize(t.value_fields.size());
+        out.nulls.resize(t.value_fields.size());
+        if(hits != nullptr && hits->cnt() > 0) {
+          std::vector<uint8_t> invisible;
+          if(!warp_star_invisible(part, snap, &invisible)) {
+            std::lock_guard<std::mutex> guard(error_mutex);
+            if(first_error.empty()) first_error = std::string("could not read the transactions of ") + dir;
+            failed = true;
+            break;
+          }
+          std::vector<warp_star_col> cols(t.value_fields.size());
+          std::vector<warp_star_col> nulls(t.value_fields.size());
+          std::vector<bool> has_nulls(t.value_fields.size(), false);
+          bool ok = true;
+          for(size_t c = 0; c < t.value_fields.size() && ok; ++c) {
+            const std::string name = "c" + std::to_string(t.value_fields[c]);
+            ok = cols[c].load(part->getColumn(name.c_str()), nrows);
+            if(ok && t.table->field[t.value_fields[c]]->is_nullable()) {
+              const std::string nname = "n" + std::to_string(t.value_fields[c]);
+              ok = nulls[c].load(part->getColumn(nname.c_str()), nrows);
+              has_nulls[c] = true;
+            }
+          }
+          if(!ok) {
+            std::lock_guard<std::mutex> guard(error_mutex);
+            if(first_error.empty()) first_error = std::string("could not read the columns of ") + dir;
+            failed = true;
+            break;
+          }
+          const size_t expected = hits->cnt();
+          for(size_t c = 0; c < t.value_fields.size(); ++c) {
+            out.vals[c].reserve(expected);
+            out.nulls[c].reserve(expected);
+          }
+          std::vector<int64_t> row_vals(t.value_fields.size());
+          std::vector<uint8_t> row_nulls(t.value_fields.size());
+          auto take = [&](size_t row) {
+            if(!invisible.empty() && invisible[row]) return;
+            for(size_t c = 0; c < t.value_fields.size(); ++c) {
+              if(has_nulls[c] && nulls[c].get(row) != 0) {
+                row_nulls[c] = 1;
+                row_vals[c] = 0;
+              } else {
+                row_nulls[c] = 0;
+                row_vals[c] = cols[c].get(row);
+              }
+            }
+            for(int s : own_slots) {
+              if(row_nulls[s]) return;   // NULL does not join
+            }
+            for(size_t c = 0; c < row_vals.size(); ++c) {
+              out.vals[c].push_back(row_vals[c]);
+              out.nulls[c].push_back(row_nulls[c]);
+            }
+            for(int s : own_slots) out.keys.push_back(row_vals[s]);
+            ++out.rows;
+          };
+          for(ibis::bitvector::indexSet ix = hits->firstIndexSet(); ix.nIndices() > 0; ++ix) {
+            const ibis::bitvector::word_t *indices = ix.indices();
+            if(ix.isRange()) {
+              for(ibis::bitvector::word_t row = indices[0]; row < indices[1]; ++row) take(row);
+            } else {
+              for(ibis::bitvector::word_t j = 0; j < ix.nIndices(); ++j) take(indices[j]);
+            }
+          }
+        }
+        warp_release_partition(dir);
+      }
+    } catch(const std::exception &e) {
+      std::lock_guard<std::mutex> guard(error_mutex);
+      if(first_error.empty()) first_error = e.what();
+      failed = true;
+    } catch(...) {
+      std::lock_guard<std::mutex> guard(error_mutex);
+      if(first_error.empty()) first_error = "unknown exception";
+      failed = true;
+    }
+  };
+  std::vector<std::thread> threads;
+  for(size_t id = 1; id < workers; ++id) threads.emplace_back(worker);
+  worker();
+  for(auto &th : threads) th.join();
+  for(auto &part : parts) delete part;
+  if(thd_killed(thd)) {
+    *error = "interrupted";
+    return false;
+  }
+  if(!first_error.empty()) {
+    *error = first_error;
+    return false;
+  }
+  /* the partitions one after the other */
+  size_t total = 0;
+  for(const partial &p : partials) total += p.rows;
+  if(total >= 0xFFFFFFF0ULL) {
+    *error = "a table of the join has too many rows";
+    return false;
+  }
+  std::vector<int64_t> keys;
+  keys.reserve(total * own_slots.size());
+  for(size_t c = 0; c < t.vals.size(); ++c) {
+    t.vals[c].reserve(total);
+    t.nulls[c].reserve(total);
+  }
+  for(partial &p : partials) {
+    for(size_t c = 0; c < p.vals.size() && c < t.vals.size(); ++c) {
+      t.vals[c].insert(t.vals[c].end(), p.vals[c].begin(), p.vals[c].end());
+      t.nulls[c].insert(t.nulls[c].end(), p.nulls[c].begin(), p.nulls[c].end());
+      std::vector<int64_t>().swap(p.vals[c]);
+      std::vector<uint8_t>().swap(p.nulls[c]);
+    }
+    keys.insert(keys.end(), p.keys.begin(), p.keys.end());
+    std::vector<int64_t>().swap(p.keys);
+  }
+  t.nrows = total;
+  t.hash.build(keys, t.nrows, (int)width);
+  return true;
+}
+
 static bool warp_pj_build(warp_pj_table &t, std::string *error) {
   TABLE *table = t.table;
   ha_warp *handler = t.handler;
@@ -1414,7 +1641,10 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
       *error = "interrupted";
       return false;
     }
-    if(!warp_pj_build(plan.tables[l], error)) {
+    warp_pj_table &build_table = plan.tables[l];
+    const bool parallel = plan.sink && build_table.image_len == 0 && build_table.filters.empty() &&
+                          build_table.semi.empty();
+    if(!(parallel ? warp_pj_build_parallel(build_table, snap, thd, error) : warp_pj_build(build_table, error))) {
       return false;
     }
   }
