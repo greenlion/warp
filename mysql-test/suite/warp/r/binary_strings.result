@@ -115,28 +115,38 @@ EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`vb` = 0x0001)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vbn BETWEEN x'00' AND 'a';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`vbn` between 0x00 and 'a')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b IN (x'00', x'01', 'a');
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`b` in (0x00,0x01,'a'))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE bl = x'6161';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.bl = 0x6161)  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`bl` = 0x6161)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vb LIKE 'a%';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.vb like 'a%')  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`vb` like 'a%')
 #
 # Indexes on binary strings
 #

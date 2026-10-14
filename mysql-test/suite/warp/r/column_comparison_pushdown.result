@@ -1111,10 +1111,14 @@ EXPLAIN
 -> Aggregate: count(0)  (cost=718 rows=1)
     -> Table scan on t_w  (cost=410 rows=1334)
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`t_w` where (`test`.`t_w`.`da1` < `test`.`t_w`.`da2`)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE dt1 < dt2;
 EXPLAIN
 -> Aggregate: count(0)  (cost=718 rows=1)
     -> Filter: (t_w.dt1 < t_w.dt2)  (cost=410 rows=1334)
         -> Table scan on t_w  (cost=410 rows=4002)
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`t_w` where (`test`.`t_w`.`dt1` < `test`.`t_w`.`dt2`)
 DROP TABLE t_w, t_i, preds;

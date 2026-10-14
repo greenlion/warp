@@ -33,12 +33,16 @@ EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`id` = 5)
 PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE id BETWEEN ? AND ?';
 EXECUTE s USING @a, @b;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`id` between 5 and 100)
 SET @s = 'a';
 PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc = ?';
 EXECUTE s USING @s;
@@ -46,12 +50,16 @@ EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`vc` = 'a')
 PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc IN (?, ?)';
 EXECUTE s USING @s, @s;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`vc` in ('a','a'))
 SET @dc = 5.5;
 PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dc > ?';
 EXECUTE s USING @dc;
@@ -59,6 +67,8 @@ EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`dc` > 5.500)
 SET @n = NULL;
 PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE id = ?';
 # a NULL parameter is left to MySQL
@@ -68,5 +78,7 @@ EXPLAIN
     -> Filter: (w.id = NULL)  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`id` = NULL)
 DEALLOCATE PREPARE s;
 DROP TABLE w, i;

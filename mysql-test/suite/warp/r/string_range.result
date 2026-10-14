@@ -157,29 +157,39 @@ EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` in ('a','b ','c'))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE n IN ('a', 'b') AND p < 10;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`test`.`w`.`n` in ('a','b')) and (`test`.`w`.`p` < 10))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v NOT IN ('a', 'b');
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.v not in ('a','b'))  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` not in ('a','b'))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v IN ('a', NULL);
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.v in ('a',NULL))  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` in ('a',NULL))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v IN ('a', c);
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.v in ('a',w.c))  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` in ('a',`test`.`w`.`c`))
 #
 # Equality of strings is pushed down only when MySQL compares them as
 # utf8mb4_bin strings
@@ -191,20 +201,28 @@ EXPLAIN
     -> Filter: ((w.v collate utf8mb4_0900_ai_ci) = 'A')  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`test`.`w`.`v` collate utf8mb4_0900_ai_ci) = 'A')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE v = x'61';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.v = 0x61)  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`v` = 0x61)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE p = '5';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`p` = 5)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE c = 'b';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`c` = 'b')
 DROP TABLE w, i, pool;

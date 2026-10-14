@@ -251,6 +251,8 @@ EXPLAIN
                 -> Filter: (b.k is not null)  (cost=308 rows=1001)
                     -> Table scan on b, with parallel aggregation  (cost=308 rows=1001)
 
+Warnings:
+Note	1003	/* select#1 */ select /*+ SEMIJOIN(@`sq` MATERIALIZATION) */ count(0) AS `COUNT(*)` from `test`.`a_w` `a` semi join (`test`.`b_w` `b`) where ((`<subquery2>`.`k` = `a`.`k`) and (`b`.`v` > 3))
 SET SESSION warp_semi_key_pushdown = DEFAULT;
 SET SESSION warp_parallel_aggregation = DEFAULT;
 SET SESSION warp_parallel_join_min_rows = DEFAULT;

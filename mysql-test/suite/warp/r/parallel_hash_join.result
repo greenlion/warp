@@ -50,6 +50,8 @@ EXPLAIN
         -> Table scan on d2, joined by the parallel hash join
     -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d1`.`b` AS `b`,`d2`.`c` AS `c` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (`d2`.`flag` = 1) and (`f`.`k2` = `d2`.`k`))
 # case 2: filters on dimensions, a dimension with a condition on both sides
 195:413706298965
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f, d1_w d1, d2_w d2 WHERE f.k1 = d1.k AND f.k2 = d2.k AND d1.b > 2 AND d2.c = 'C1' AND f.v < 50;
@@ -60,6 +62,8 @@ EXPLAIN
         -> Table scan on d2, joined by the parallel hash join
     -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d2`.`c` AS `c` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d2`.`c` = 'C1') and (`d1`.`k` = `f`.`k1`) and (`f`.`k2` = `d2`.`k`) and (`d1`.`b` > 2) and (`f`.`v` < 50))
 # case 3: snowflake: a dimension of a dimension
 1575:3337764591399
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON d1.kk = d2.k WHERE d2.flag = 0;
@@ -70,6 +74,8 @@ EXPLAIN
         -> Table scan on d1, joined by the parallel hash join
     -> Table scan on d2, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d2`.`c` AS `c` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`f`.`k1` = `d1`.`k`) and (`d2`.`flag` = 0) and (`d1`.`kk` = `d2`.`k`))
 # case 4: a derived table with a key on a column of a joined table (IN with GROUP BY and HAVING)
 1170:2524356949313
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d1.b FROM f_w f, d1_w d1 WHERE f.k1 = d1.k AND d1.k IN (SELECT x FROM d3_w GROUP BY x HAVING COUNT(*) >= 2) AND f.v < 70;
@@ -85,6 +91,8 @@ EXPLAIN
                     -> Aggregate using temporary table
                         -> Table scan on d3_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d1`.`b` AS `b` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join (/* select#2 */ select `test`.`d3_w`.`x` AS `Name_exp_1` from `test`.`d3_w` group by `test`.`d3_w`.`x` having (count(0) >= 2)) `derived_1_2` where ((`d1`.`k` = `f`.`k1`) and (`derived_1_2`.`Name_exp_1` = `f`.`k1`) and (`f`.`v` < 70))
 # case 5: a derived table that matches nothing, and one with NULLs in its key
 0:0
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f, d1_w d1 WHERE f.k1 = d1.k AND d1.kk IN (SELECT kk FROM d1_w GROUP BY kk HAVING COUNT(*) > 1000);
@@ -100,6 +108,8 @@ EXPLAIN
                     -> Aggregate using temporary table
                         -> Table scan on d1_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join (/* select#2 */ select `test`.`d1_w`.`kk` AS `Name_exp_1` from `test`.`d1_w` group by `test`.`d1_w`.`kk` having (count(0) > 1000)) `derived_1_2` where ((`derived_1_2`.`Name_exp_1` = `d1`.`kk`) and (`d1`.`k` = `f`.`k1`))
 # case 6: composite key
 900:1900154646063
 EXPLAIN FORMAT=TREE SELECT f.id, d3.z FROM f_w f JOIN d3_w d3 ON f.k1 = d3.x AND f.k2 = d3.y;
@@ -108,6 +118,8 @@ EXPLAIN
     -> Table scan on f, with parallel hash join
     -> Table scan on d3, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d3`.`z` AS `z` from `test`.`f_w` `f` join `test`.`d3_w` `d3` where ((`d3`.`y` = `f`.`k2`) and (`d3`.`x` = `f`.`k1`))
 # case 7: a join condition that closes a cycle
 555:1168842444991
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k AND d1.kk = d2.k1;
@@ -118,6 +130,8 @@ EXPLAIN
         -> Table scan on d2, joined by the parallel hash join
     -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d2`.`c` AS `c` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (`d1`.`kk` = `d2`.`k1`) and (`f`.`k2` = `d2`.`k`))
 # case 8: columns of different integer types and an unsigned column
 1668:3621715716157
 EXPLAIN FORMAT=TREE SELECT f.id, d2.c, d4.w FROM f_w f JOIN d2_w d2 ON f.k3 = d2.k JOIN d4_w d4 ON f.u = d4.m;
@@ -128,6 +142,8 @@ EXPLAIN
         -> Table scan on d4, joined by the parallel hash join
     -> Table scan on d2, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d2`.`c` AS `c`,`d4`.`w` AS `w` from `test`.`f_w` `f` join `test`.`d2_w` `d2` join `test`.`d4_w` `d4` where ((`d2`.`k` = `f`.`k3`) and (`f`.`u` = `d4`.`m`))
 # case 9: NULL keys do not join
 5344:11499688722869
 EXPLAIN FORMAT=TREE SELECT f.id, d4.w FROM f_w f JOIN d4_w d4 ON f.t = d4.m JOIN d1_w d1 ON f.n = d1.kk;
@@ -138,6 +154,8 @@ EXPLAIN
         -> Table scan on d4, joined by the parallel hash join
     -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d4`.`w` AS `w` from `test`.`f_w` `f` join `test`.`d4_w` `d4` join `test`.`d1_w` `d1` where ((`d1`.`kk` = `f`.`n`) and (`f`.`t` = `d4`.`m`))
 # case 10: a condition of two tables that the engine does not evaluate
 1515:3266729829720
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.v + d1.b > 60 OR d2.c = 'C0';
@@ -149,6 +167,8 @@ EXPLAIN
             -> Table scan on d2, joined by the parallel hash join
         -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d2`.`c` AS `c` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (((`f`.`v` + `d1`.`b`) > 60) or (`d2`.`c` = 'C0')) and (`f`.`k2` = `d2`.`k`))
 # case 11: the same table twice
 871:1883142760909
 EXPLAIN FORMAT=TREE SELECT a.id, b.id FROM f_w a JOIN f_w b ON a.k1 = b.k1 AND a.id = b.id + 40 WHERE a.v < 30;
@@ -158,6 +178,8 @@ EXPLAIN
     -> Hash
         -> Table scan on a
 
+Warnings:
+Note	1003	/* select#1 */ select `a`.`id` AS `id`,`b`.`id` AS `id` from `test`.`f_w` `a` join `test`.`f_w` `b` where ((`b`.`k1` = `a`.`k1`) and (`a`.`v` < 30) and (`a`.`id` = (`b`.`id` + 40)))
 # case 12: no row matches
 0:0
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE d1.b > 1000;
@@ -166,6 +188,8 @@ EXPLAIN
     -> Table scan on f, with parallel hash join
     -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a` from `test`.`f_w` `f` join `test`.`d1_w` `d1` where ((`f`.`k1` = `d1`.`k`) and (`d1`.`b` > 1000))
 # case 13: a string column of a dimension and a COUNT
 18:30559796787
 EXPLAIN FORMAT=TREE SELECT d1.a, d2.c, COUNT(*), SUM(f.v) FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k GROUP BY d1.a, d2.c;
@@ -178,6 +202,8 @@ EXPLAIN
                 -> Table scan on d2, joined by the parallel hash join
             -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `d1`.`a` AS `a`,`d2`.`c` AS `c`,count(0) AS `COUNT(*)`,sum(`f`.`v`) AS `SUM(f.v)` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (`f`.`k2` = `d2`.`k`)) group by `d1`.`a`,`d2`.`c`
 # case 14: an expression of the joined rows
 686:1489578616657
 EXPLAIN FORMAT=TREE SELECT f.id, f.v * d1.b + d2.flag FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3');
@@ -188,6 +214,8 @@ EXPLAIN
         -> Table scan on d2, joined by the parallel hash join
     -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,((`f`.`v` * `d1`.`b`) + `d2`.`flag`) AS `f.v * d1.b + d2.flag` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (`f`.`s` in ('s1','s2','s3')) and (`f`.`k2` = `d2`.`k`))
 # case 15: an anti join over the joined rows: MySQL buffers the rows of all the tables (the join buffer is small, so it spills them to disk)
 42:94736792227
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_w g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id);
@@ -203,6 +231,7 @@ Warnings:
 Note	1276	Field or reference 'test.f.k1' of SELECT #2 was resolved in SELECT #1
 Note	1276	Field or reference 'test.d1.b' of SELECT #2 was resolved in SELECT #1
 Note	1276	Field or reference 'test.f.id' of SELECT #2 was resolved in SELECT #1
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a` from `test`.`f_w` `f` join `test`.`d1_w` `d1` anti join (`test`.`f_w` `g`) on(((`g`.`k1` = `f`.`k1`) and (`g`.`v` <> `d1`.`b`) and (`g`.`id` < `f`.`id`))) where (`d1`.`k` = `f`.`k1`)
 # case 16: a semi join over the joined rows
 150:321467921698
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_w g WHERE g.k2 = f.k2 AND g.v = d1.b + 40);
@@ -220,6 +249,7 @@ EXPLAIN
 Warnings:
 Note	1276	Field or reference 'test.f.k2' of SELECT #2 was resolved in SELECT #1
 Note	1276	Field or reference 'test.d1.b' of SELECT #2 was resolved in SELECT #1
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d2`.`c` AS `c` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` semi join (`test`.`f_w` `g`) where ((`d1`.`k` = `f`.`k1`) and (`g`.`k2` = `f`.`k2`) and ((`d1`.`b` + 40) = `g`.`v`) and (`f`.`k2` = `d2`.`k`))
 # case 17: a sort of the joined rows by columns of every table
 335:730320533564
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c, d1.b FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 400 ORDER BY d2.c DESC, d1.a, d1.b, f.id;
@@ -232,6 +262,8 @@ EXPLAIN
                 -> Table scan on d2, joined by the parallel hash join
             -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d2`.`c` AS `c`,`d1`.`b` AS `b` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (`f`.`id` < 400) and (`f`.`k2` = `d2`.`k`)) order by `d2`.`c` desc,`d1`.`a`,`d1`.`b`,`f`.`id`
 # case 18: a LEFT JOIN: rows without a match get NULLs
 499:1059878015669
 EXPLAIN FORMAT=TREE SELECT f.id, d2.c, d2.flag FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 500;
@@ -240,6 +272,8 @@ EXPLAIN
     -> Table scan on f, with parallel hash join
     -> Table scan on d2, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d2`.`c` AS `c`,`d2`.`flag` AS `flag` from `test`.`f_w` `f` left join `test`.`d2_w` `d2` on((`f`.`k2` = `d2`.`k`)) where (`f`.`id` < 500)
 # case 19: a LEFT JOIN with a condition of the inner table in the ON clause
 499:1044670539468
 EXPLAIN FORMAT=TREE SELECT f.id, d2.c FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.flag = 1 WHERE f.id < 500;
@@ -248,6 +282,8 @@ EXPLAIN
     -> Table scan on f, with parallel hash join
     -> Table scan on d2, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d2`.`c` AS `c` from `test`.`f_w` `f` left join `test`.`d2_w` `d2` on(((`d2`.`flag` = 1) and (`f`.`k2` = `d2`.`k`))) where (`f`.`id` < 500)
 # case 20: an inner join and a LEFT JOIN with a condition on a string column
 960:2053539217041
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.c = 'C1' WHERE f.v < 30;
@@ -258,6 +294,8 @@ EXPLAIN
         -> Table scan on d2, joined by the parallel hash join
     -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d2`.`c` AS `c` from `test`.`f_w` `f` join `test`.`d1_w` `d1` left join `test`.`d2_w` `d2` on(((`d2`.`c` = 'C1') and (`f`.`k2` = `d2`.`k`))) where ((`d1`.`k` = `f`.`k1`) and (`f`.`v` < 30))
 # case 21: a LEFT JOIN used as an anti join
 600:1288186545268
 EXPLAIN FORMAT=TREE SELECT f.id FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.k IS NULL;
@@ -267,6 +305,8 @@ EXPLAIN
         -> Table scan on f, with parallel hash join
         -> Table scan on d2, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id` from `test`.`f_w` `f` left join `test`.`d2_w` `d2` on((`f`.`k2` = `d2`.`k`)) where (`d2`.`k` is null)
 # case 22: the small table is the outer table of the LEFT JOIN, a COUNT of the inner table
 45:109640937587
 EXPLAIN FORMAT=TREE SELECT d1.k, COUNT(f.id), SUM(f.v) FROM d1_w d1 LEFT JOIN f_w f ON f.k1 = d1.k AND f.v > 50 GROUP BY d1.k;
@@ -277,6 +317,8 @@ EXPLAIN
             -> Table scan on d1, with parallel hash join
             -> Table scan on f, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `d1`.`k` AS `k`,count(`f`.`id`) AS `COUNT(f.id)`,sum(`f`.`v`) AS `SUM(f.v)` from `test`.`d1_w` `d1` left join `test`.`f_w` `f` on(((`f`.`k1` = `d1`.`k`) and (`f`.`v` > 50))) where true group by `d1`.`k`
 # case 23: NULL keys of the outer table
 851:1832393546893
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f LEFT JOIN d1_w d1 ON f.n = d1.kk WHERE f.id < 400;
@@ -285,6 +327,8 @@ EXPLAIN
     -> Table scan on f, with parallel hash join
     -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a` from `test`.`f_w` `f` left join `test`.`d1_w` `d1` on((`d1`.`kk` = `f`.`n`)) where (`f`.`id` < 400)
 # case 24: a LEFT JOIN with a condition of the WHERE clause on the inner table
 1800:3864456740923
 EXPLAIN FORMAT=TREE SELECT f.id, d2.c FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 0 OR d2.c IS NULL;
@@ -294,6 +338,8 @@ EXPLAIN
         -> Table scan on f, with parallel hash join
         -> Table scan on d2, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d2`.`c` AS `c` from `test`.`f_w` `f` left join `test`.`d2_w` `d2` on((`f`.`k2` = `d2`.`k`)) where ((`d2`.`flag` = 0) or (`d2`.`c` is null))
 # the join is done by the engine: the tables of the join are replaced by one scan
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 1;
 EXPLAIN
@@ -303,6 +349,8 @@ EXPLAIN
         -> Table scan on d2, joined by the parallel hash join
     -> Table scan on d1, joined by the parallel hash join
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d2`.`c` AS `c` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (`d2`.`flag` = 1) and (`f`.`k2` = `d2`.`k`))
 SET SESSION warp_parallel_hash_join = 0;
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 1;
 EXPLAIN
@@ -314,6 +362,8 @@ EXPLAIN
             -> Hash
                 -> Table scan on d2
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d2`.`c` AS `c` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (`d2`.`flag` = 1) and (`f`.`k2` = `d2`.`k`))
 SET SESSION warp_parallel_hash_join = 1;
 # rows that a transaction can not see are not joined
 BEGIN;

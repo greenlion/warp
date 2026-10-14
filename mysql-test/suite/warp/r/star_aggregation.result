@@ -38,6 +38,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,`test`.`d2`.`g2` AS `g2`,sum(0) AS `SUM(a)`,sum(0) AS `SUM(c - a)` from `test`.`f` join `test`.`d1` join `test`.`d2` where ((`test`.`f`.`k1` = `test`.`d1`.`k`) and (`test`.`d2`.`k` = `test`.`f`.`k2`) and (`test`.`d1`.`n1` < 3)) group by `test`.`d1`.`g1`,`test`.`d2`.`g2`
 one dimension, one group column: 6 rows
 no group by, conditions on both tables: 1 rows
 two dimensions, two groups, two sums, constants: 33 rows
@@ -83,6 +85,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,count(0) AS `COUNT(*)`,count(`test`.`f`.`b`) AS `COUNT(b)`,min(0) AS `MIN(c)`,max(0) AS `MAX(a - b)` from `test`.`f` join `test`.`d1` where (`test`.`d1`.`k` = `test`.`f`.`k1`) group by `test`.`d1`.`g1`
 # An average with groups stays with MySQL
 EXPLAIN FORMAT=TREE SELECT g1, AVG(a) FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1;
 EXPLAIN
@@ -93,6 +97,8 @@ EXPLAIN
             -> Hash
                 -> Table scan on f
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,avg(`test`.`f`.`a`) AS `AVG(a)` from `test`.`f` join `test`.`d1` where (`test`.`d1`.`k` = `test`.`f`.`k1`) group by `test`.`d1`.`g1`
 count min max, one dimension: 6 rows
 count min max, two dimensions with sums and conditions: 33 rows
 avg count min max, one dimension (the average is not taken over): 6 rows
@@ -122,6 +128,8 @@ EXPLAIN
         -> Stream results
             -> Table scan on f
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,count(distinct `test`.`f`.`a`) AS `COUNT(DISTINCT a)` from `test`.`f` join `test`.`d1` where (`test`.`d1`.`k` = `test`.`f`.`k1`) group by `test`.`d1`.`g1`
 distinct fact column: 6 rows
 distinct nullable fact column with sums: 36 rows
 distinct of an expression and of two columns: 6 rows
@@ -257,6 +265,8 @@ EXPLAIN
                 -> Index lookup on d1 using k_d1 (k = f.k1)
             -> Index lookup on d2 using k_d2 (k = f.k2)
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,`test`.`d2`.`g2` AS `g2`,sum(`test`.`f`.`a`) AS `SUM(a)` from `test`.`f` join `test`.`d1` FORCE INDEX (`k_d1`) join `test`.`d2` FORCE INDEX (`k_d2`) where ((`test`.`d1`.`k` = `test`.`f`.`k1`) and (`test`.`d2`.`k` = `test`.`f`.`k2`) and (`test`.`d1`.`n1` < 3)) group by `test`.`d1`.`g1`,`test`.`d2`.`g2`
 SET SESSION warp_star_aggregation = ON;
 # the engine does the join and the aggregation
 EXPLAIN FORMAT=TREE SELECT g1, g2, SUM(a)
@@ -267,6 +277,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,`test`.`d2`.`g2` AS `g2`,sum(0) AS `SUM(a)` from `test`.`f` join `test`.`d1` FORCE INDEX (`k_d1`) join `test`.`d2` FORCE INDEX (`k_d2`) where ((`test`.`d1`.`k` = `test`.`f`.`k1`) and (`test`.`d2`.`k` = `test`.`f`.`k2`) and (`test`.`d1`.`n1` < 3)) group by `test`.`d1`.`g1`,`test`.`d2`.`g2`
 keys: two dimensions, conditions on a dimension: 34 rows
 keys: no group by: 1 rows
 keys: a key that has several rows in the dimension: 8 rows

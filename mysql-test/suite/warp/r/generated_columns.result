@@ -64,11 +64,15 @@ EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`a` * 3) = 30)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w IGNORE INDEX (f1) WHERE g = 40 AND v > 10;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` IGNORE INDEX (`f1`) where ((`test`.`w`.`g` = 40) and (`test`.`w`.`v` > 10))
 #
 # Updates: of a base column (the generated columns change), and of a
 # column that no generated column depends on (the stored values of the

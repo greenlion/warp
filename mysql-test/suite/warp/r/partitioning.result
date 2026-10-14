@@ -1287,6 +1287,8 @@ EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`test`.`w`.`k` = 3) and (`test`.`w`.`d` >= DATE'2020-03-01') and (`test`.`w`.`d` < DATE'2020-09-01'))
 SELECT COUNT(*) FROM w WHERE d >= '2020-03-01' AND d < '2020-09-01' AND k = 3;
 COUNT(*)
 5

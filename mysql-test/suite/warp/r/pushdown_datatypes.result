@@ -68,150 +68,208 @@ EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`ti` > 1)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE uti BETWEEN 1 AND 5;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`uti` between 1 and 5)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE si IN (1, 5);
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`si` in (1,5))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE mi = 5;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`mi` = 5)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ui >= 5;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`ui` >= 5)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE bi < 5;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`bi` < 5)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ubi <> 5;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`ubi` <> 5)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE f > 0.5;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`f` > 0.5)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d <= 3.5;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`d` <= 3.5)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dc BETWEEN 1 AND 6.5;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`dc` between 1 and 6.5)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dcb > 5.25;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`dcb` > 5.2500000000)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE y = 2000;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`y` = 2000)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dt >= '2000-01-01';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`dt` >= DATE'2000-01-01')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE tm < '01:00:00';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`tm` < TIME'01:00:00.000')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE dtm BETWEEN '2000-01-01' AND '2001-01-01';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`dtm` between '2000-01-01' and '2001-01-01')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ts > '2000-01-01 00:00:00';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`ts` > TIMESTAMP'2000-01-01 00:00:00')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE c = 'a';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`c` = 'a')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc BETWEEN 'a' AND 'b';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`vc` between 'a' and 'b')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE vc IN ('a', 'B');
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`vc` in ('a','B'))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE en = 'x';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`en` = 'x')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE i IS NULL;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`i` is null)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE tx = 'a';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.tx = 'a')  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`tx` = 'a')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE st = 'a';
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.st = 'a')  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`st` = 'a')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b = 5;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`b` = 5)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE js = CAST('5' AS JSON);
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.js = <cache>(cast('5' as json)))  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`js` = <cache>(cast('5' as json)))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE tx IS NULL;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`tx` is null)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE en = 1;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (w.en = 1)  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`en` = 1)
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b > 1 AND i > 1;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`test`.`w`.`b` > 1) and (`test`.`w`.`i` > 1))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE bw > 100 AND b64 <> 5;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`test`.`w`.`bw` > 100) and (`test`.`w`.`b64` <> 5))
 #
 # GEOMETRY is not supported in a WARP table, nothing about it is pushed
 # down: the geometry values of other tables and the geometry functions
@@ -228,11 +286,15 @@ EXPLAIN
     -> Filter: (w.vc = <cache>(st_astext(st_geomfromtext('POINT(1 1)'))))  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`test`.`w`.`vc` = <cache>(st_astext(st_geomfromtext('POINT(1 1)'))))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE ST_X(ST_GeomFromText(CONCAT('POINT(', i, ' 1)'))) > 1;
 EXPLAIN
 -> Aggregate: count(0)  
     -> Filter: (st_x(st_geomfromtext(concat('POINT(',w.i,' 1)'))) > 1)  
         -> Table scan on w  
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (st_x(st_geomfromtext(concat('POINT(',`test`.`w`.`i`,' 1)'))) > 1)
 DROP TABLE geo;
 DROP TABLE w, i;

@@ -1058,6 +1058,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g1` AS `g1`,sum(0) AS `SUM(v)`,min(0) AS `MIN(d1)`,max(0) AS `MAX(d2)`,count(0) AS `COUNT(*)`,count(`test`.`f_w`.`n_i`) AS `COUNT(n_i)`,avg(0) AS `AVG(d1)`,sum(0) AS `SUM(d1 * d2)`,sum(0) AS `SUM(d1 * (1 - d2))` from `test`.`f_w` group by `test`.`f_w`.`g1`
 # case 2: groups of a string and an integer, COUNT(DISTINCT) of a nullable column
 35:84942360545
 EXPLAIN FORMAT=TREE SELECT g3, g1, SUM(d1 * d2), COUNT(DISTINCT n_i), COUNT(DISTINCT n_i, v) FROM f_w GROUP BY g3, g1;
@@ -1065,6 +1067,8 @@ EXPLAIN
 -> Group aggregate: sum(0), count(distinct f_w.n_i), count(distinct f_w.n_i,f_w.v)
     -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g3` AS `g3`,`test`.`f_w`.`g1` AS `g1`,sum(0) AS `SUM(d1 * d2)`,count(distinct `test`.`f_w`.`n_i`) AS `COUNT(DISTINCT n_i)`,count(distinct `test`.`f_w`.`n_i`,`test`.`f_w`.`v`) AS `COUNT(DISTINCT n_i, v)` from `test`.`f_w` group by `test`.`f_w`.`g3`,`test`.`f_w`.`g1`
 # case 3: groups of a string of a case insensitive collation
 4:12666527558
 EXPLAIN FORMAT=TREE SELECT LOWER(g4), COUNT(*), SUM(v), MIN(g2), MAX(big) FROM f_w GROUP BY g4;
@@ -1073,6 +1077,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select lower(`test`.`f_w`.`g4`) AS `LOWER(g4)`,count(0) AS `COUNT(*)`,sum(0) AS `SUM(v)`,min(0) AS `MIN(g2)`,max(0) AS `MAX(big)` from `test`.`f_w` group by `test`.`f_w`.`g4`
 # case 4: aggregates without GROUP BY
 1:472229715
 EXPLAIN FORMAT=TREE SELECT SUM(d1), AVG(d2), MIN(s), MAX(s), COUNT(s), COUNT(DISTINCT s), SUM(big), MIN(u), MAX(u) FROM f_w;
@@ -1080,6 +1086,8 @@ EXPLAIN
 -> Aggregate: sum(0), avg(0), min(''), max(''), count(f_w.s), count(distinct f_w.s), sum(0), min(0), max(0)
     -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select sum(0) AS `SUM(d1)`,avg(0) AS `AVG(d2)`,min('') AS `MIN(s)`,max('') AS `MAX(s)`,count(`test`.`f_w`.`s`) AS `COUNT(s)`,count(distinct `test`.`f_w`.`s`) AS `COUNT(DISTINCT s)`,sum(0) AS `SUM(big)`,min(0) AS `MIN(u)`,max(0) AS `MAX(u)` from `test`.`f_w`
 # case 5: floating point numbers
 7:14772051057
 EXPLAIN FORMAT=TREE SELECT g1, ROUND(SUM(fl), 6), ROUND(SUM(db), 6), ROUND(AVG(db), 6), MIN(fl), MAX(db), ROUND(SUM(fl * db), 6) FROM f_w GROUP BY g1;
@@ -1088,6 +1096,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g1` AS `g1`,round(sum(0),6) AS `ROUND(SUM(fl), 6)`,round(sum(0),6) AS `ROUND(SUM(db), 6)`,round(avg(0),6) AS `ROUND(AVG(db), 6)`,min(0) AS `MIN(fl)`,max(0) AS `MAX(db)`,round(sum(0),6) AS `ROUND(SUM(fl * db), 6)` from `test`.`f_w` group by `test`.`f_w`.`g1`
 # case 6: nullable columns
 50:109104996279
 EXPLAIN FORMAT=TREE SELECT g2, COUNT(n_i), SUM(n_i), SUM(n_d), MIN(n_s), MAX(n_s), COUNT(n_s), AVG(n_i), COUNT(*) FROM f_w GROUP BY g2;
@@ -1096,6 +1106,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g2` AS `g2`,count(`test`.`f_w`.`n_i`) AS `COUNT(n_i)`,sum(0) AS `SUM(n_i)`,sum(0) AS `SUM(n_d)`,min('') AS `MIN(n_s)`,max('') AS `MAX(n_s)`,count(`test`.`f_w`.`n_s`) AS `COUNT(n_s)`,avg(0) AS `AVG(n_i)`,count(0) AS `COUNT(*)` from `test`.`f_w` group by `test`.`f_w`.`g2`
 # case 7: a group of NULLs
 7:16616047406
 EXPLAIN FORMAT=TREE SELECT n_s, COUNT(*), SUM(v) FROM f_w GROUP BY n_s;
@@ -1104,6 +1116,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`n_s` AS `n_s`,count(0) AS `COUNT(*)`,sum(0) AS `SUM(v)` from `test`.`f_w` group by `test`.`f_w`.`n_s`
 # case 8: DISTINCT aggregates
 7:14823320239
 EXPLAIN FORMAT=TREE SELECT g1, COUNT(DISTINCT s), SUM(DISTINCT v), AVG(DISTINCT d1), COUNT(DISTINCT g3, g2), COUNT(*) FROM f_w GROUP BY g1;
@@ -1111,6 +1125,8 @@ EXPLAIN
 -> Group aggregate: count(distinct f_w.s), sum(distinct f_w.v), avg(distinct f_w.d1), count(distinct f_w.g3,f_w.g2), count(0)
     -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g1` AS `g1`,count(distinct `test`.`f_w`.`s`) AS `COUNT(DISTINCT s)`,sum(distinct `test`.`f_w`.`v`) AS `SUM(DISTINCT v)`,avg(distinct `test`.`f_w`.`d1`) AS `AVG(DISTINCT d1)`,count(distinct `test`.`f_w`.`g3`,`test`.`f_w`.`g2`) AS `COUNT(DISTINCT g3, g2)`,count(0) AS `COUNT(*)` from `test`.`f_w` group by `test`.`f_w`.`g1`
 # case 9: HAVING
 43:97007715710
 EXPLAIN FORMAT=TREE SELECT g2, SUM(v), COUNT(*) FROM f_w GROUP BY g2 HAVING SUM(v) > 100 AND COUNT(*) > 70;
@@ -1120,6 +1136,8 @@ EXPLAIN
         -> Aggregate using temporary table
             -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g2` AS `g2`,sum(0) AS `SUM(v)`,count(0) AS `COUNT(*)` from `test`.`f_w` group by `test`.`f_w`.`g2` having ((sum(0) > 100) and (count(0) > 70))
 # case 10: HAVING with a decimal and a MIN
 0:0
 EXPLAIN FORMAT=TREE SELECT g2, SUM(d1), MIN(d2) FROM f_w GROUP BY g2 HAVING SUM(d1) < 5.5 AND MIN(d2) > -19;
@@ -1129,6 +1147,8 @@ EXPLAIN
         -> Aggregate using temporary table
             -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g2` AS `g2`,sum(0) AS `SUM(d1)`,min(0) AS `MIN(d2)` from `test`.`f_w` group by `test`.`f_w`.`g2` having ((sum(0) < 5.5) and (min(0) > <cache>(-(19))))
 # case 11: many groups: a decimal column
 997:2117325629124
 EXPLAIN FORMAT=TREE SELECT d1, COUNT(*), SUM(v), MAX(s) FROM f_w GROUP BY d1;
@@ -1137,6 +1157,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`d1` AS `d1`,count(0) AS `COUNT(*)`,sum(0) AS `SUM(v)`,max('') AS `MAX(s)` from `test`.`f_w` group by `test`.`f_w`.`d1`
 # case 12: MIN and MAX of expressions
 7:10297085386
 EXPLAIN FORMAT=TREE SELECT g1, MIN(d1 * 2), MAX(v - g1), MIN(d1 + d2), MAX(fl + 1) FROM f_w GROUP BY g1;
@@ -1145,6 +1167,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g1` AS `g1`,min(0) AS `MIN(d1 * 2)`,max(0) AS `MAX(v - g1)`,min(0) AS `MIN(d1 + d2)`,max(0) AS `MAX(fl + 1)` from `test`.`f_w` group by `test`.`f_w`.`g1`
 # case 13: unsigned and big integers
 7:18775672478
 EXPLAIN FORMAT=TREE SELECT g1, SUM(u), MAX(u), MIN(big), SUM(big), SUM(u * 2) FROM f_w GROUP BY g1;
@@ -1153,6 +1177,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g1` AS `g1`,sum(0) AS `SUM(u)`,max(0) AS `MAX(u)`,min(0) AS `MIN(big)`,sum(0) AS `SUM(big)`,sum(0) AS `SUM(u * 2)` from `test`.`f_w` group by `test`.`f_w`.`g1`
 # case 14: a condition that is pushed down
 7:9692547790
 EXPLAIN FORMAT=TREE SELECT g1, SUM(v), COUNT(*) FROM f_w WHERE id > 1000 AND g2 BETWEEN 5 AND 30 GROUP BY g1;
@@ -1161,6 +1187,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g1` AS `g1`,sum(0) AS `SUM(v)`,count(0) AS `COUNT(*)` from `test`.`f_w` where ((`test`.`f_w`.`id` > 1000) and (`test`.`f_w`.`g2` between 5 and 30)) group by `test`.`f_w`.`g1`
 # case 15: no row passes with GROUP BY
 0:0
 EXPLAIN FORMAT=TREE SELECT g1, SUM(v), COUNT(*) FROM f_w WHERE id < 0 GROUP BY g1;
@@ -1169,6 +1197,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g1` AS `g1`,sum(0) AS `SUM(v)`,count(0) AS `COUNT(*)` from `test`.`f_w` where (`test`.`f_w`.`id` < 0) group by `test`.`f_w`.`g1`
 # case 16: no row passes without GROUP BY
 1:2121874132
 EXPLAIN FORMAT=TREE SELECT SUM(v), COUNT(*), MIN(s), AVG(d1), COUNT(DISTINCT g1) FROM f_w WHERE id < 0;
@@ -1176,6 +1206,8 @@ EXPLAIN
 -> Aggregate: sum(0), count(0), min(''), avg(0), count(distinct f_w.g1)
     -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select sum(0) AS `SUM(v)`,count(0) AS `COUNT(*)`,min('') AS `MIN(s)`,avg(0) AS `AVG(d1)`,count(distinct `test`.`f_w`.`g1`) AS `COUNT(DISTINCT g1)` from `test`.`f_w` where (`test`.`f_w`.`id` < 0)
 # case 17: a table without rows
 1:4108050209
 EXPLAIN FORMAT=TREE SELECT SUM(v), COUNT(*), MIN(d), AVG(d) FROM e_w;
@@ -1183,6 +1215,8 @@ EXPLAIN
 -> Aggregate: sum(0), count(0), min(0), avg(0)
     -> Table scan on e_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select sum(0) AS `SUM(v)`,count(0) AS `COUNT(*)`,min(0) AS `MIN(d)`,avg(0) AS `AVG(d)` from `test`.`e_w`
 # case 18: ORDER BY and LIMIT of the groups
 7:17162614928
 EXPLAIN FORMAT=TREE SELECT g2, SUM(d1) AS total FROM f_w GROUP BY g2 ORDER BY total DESC, g2 LIMIT 7;
@@ -1193,6 +1227,8 @@ EXPLAIN
             -> Aggregate using temporary table
                 -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g2` AS `g2`,sum(0) AS `total` from `test`.`f_w` group by `test`.`f_w`.`g2` order by `total` desc,`test`.`f_w`.`g2` limit 7
 # rows that a transaction can not see are not aggregated
 BEGIN;
 DELETE FROM f_w WHERE id % 2 = 0;
@@ -1211,6 +1247,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g1` AS `g1`,sum(0) AS `SUM(d1)`,count(0) AS `COUNT(*)` from `test`.`f_w` group by `test`.`f_w`.`g1`
 SET SESSION warp_parallel_aggregation = 0;
 EXPLAIN FORMAT=TREE SELECT g1, SUM(d1), COUNT(*) FROM f_w GROUP BY g1;
 EXPLAIN
@@ -1218,6 +1256,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`g1` AS `g1`,sum(`test`.`f_w`.`d1`) AS `SUM(d1)`,count(0) AS `COUNT(*)` from `test`.`f_w` group by `test`.`f_w`.`g1`
 SET SESSION warp_parallel_aggregation = 1;
 SET SESSION warp_parallel_join_min_rows = DEFAULT;
 DROP TABLE f_w, f_i, e_w, e_i;
