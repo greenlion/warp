@@ -847,6 +847,34 @@ int ha_warp::set_column_set() {
    record[0]: a row that is read into another buffer (record[1] for the row
    of a duplicate key that REPLACE replaces, for example) is read through
    fields that point to it. */
+/* The positions of the columns c<i> and n<i> in the table that the cursor reads
+   (the order of the columns of the select list): find_current_row reads the
+   values by position. */
+void ha_warp::register_cursor(ibis::table::cursor *cursor, ibis::table *rows) {
+  pos_cursor = nullptr;
+  pos_c.clear();
+  pos_n.clear();
+  if(cursor == nullptr || rows == nullptr) {
+    return;
+  }
+  const ibis::table::stringArray names = rows->columnNames();
+  pos_c.assign(table->s->fields, -1);
+  pos_n.assign(table->s->fields, -1);
+  for(size_t i = 0; i < names.size(); ++i) {
+    const char *name = names[i];
+    if((name[0] != 'c' && name[0] != 'n') || !isdigit((unsigned char)name[1])) {
+      continue;
+    }
+    char *end = nullptr;
+    const unsigned long idx = strtoul(name + 1, &end, 10);
+    if(*end != 0 || idx >= pos_c.size()) {
+      continue;
+    }
+    (name[0] == 'c' ? pos_c : pos_n)[idx] = (int)i;
+  }
+  pos_cursor = cursor;
+}
+
 int ha_warp::find_current_row(uchar *buf, ibis::table::cursor *cursor) {
   if(buf == table->record[0]) {
     return find_current_row_impl(buf, cursor);
@@ -857,6 +885,7 @@ int ha_warp::find_current_row(uchar *buf, ibis::table::cursor *cursor) {
   return rc;
 }
 
+#define WARP_GET(fn, var) (by_position ? cursor->fn((uint32_t)pos_c[idx], var) : cursor->fn(cname.c_str(), var))
 int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
   DBUG_ENTER("ha_warp::find_current_row");
   int rc = 0;
@@ -877,13 +906,22 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
        (bitmap_is_set(table->read_set, (*field)->field_index()) || current_thd->lex->sql_command == SQLCOM_UPDATE ||  current_thd->lex->sql_command == SQLCOM_UPDATE_MULTI  || current_thd->lex->sql_command == SQLCOM_DELETE || current_thd->lex->sql_command == SQLCOM_DELETE_MULTI )) {
       
       bool is_unsigned = (*field)->all_flags() & UNSIGNED_FLAG;
-      std::string cname = "c" + std::to_string((*field)->field_index());
-      std::string nname = "n" + std::to_string((*field)->field_index());
+      /* the position of the column in the table of the cursor (see
+         register_cursor), looking a column up by its name costs more than
+         the rest of the row */
+      const uint32_t idx = (*field)->field_index();
+      const bool by_position = cursor == pos_cursor && idx < pos_c.size() && pos_c[idx] >= 0;
+      std::string cname, nname;
+      if(!by_position) {
+        cname = "c" + std::to_string(idx);
+        nname = "n" + std::to_string(idx);
+      }
 
       if((*field)->is_nullable()) {
         unsigned char is_null = 0;
 
-        rc = cursor->getColumnAsUByte(nname.c_str(), is_null);
+        rc = (by_position && pos_n[idx] >= 0) ? cursor->getColumnAsUByte((uint32_t)pos_n[idx], is_null)
+                                              : cursor->getColumnAsUByte(((nname.empty() ? (nname = "n" + std::to_string(idx)) : nname)).c_str(), is_null);
 
         /* This column value is NULL */
         if(is_null != 0) {
@@ -898,11 +936,11 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
         case MYSQL_TYPE_YEAR: {
           if(is_unsigned) {
             unsigned int tmp = 0;
-            rc = cursor->getColumnAsUInt(cname.c_str(), tmp);
+            rc = WARP_GET(getColumnAsUInt, tmp);
             rc = (*field)->store(tmp, true);
           } else {
             int tmp = 0;
-            rc = cursor->getColumnAsInt(cname.c_str(), tmp);
+            rc = WARP_GET(getColumnAsInt, tmp);
             rc = (*field)->store(tmp, false);
           }
           break;
@@ -910,11 +948,11 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
         case MYSQL_TYPE_SHORT: {
           if(is_unsigned) {
             uint16_t tmp = 0;
-            rc = cursor->getColumnAsUShort(cname.c_str(), tmp);
+            rc = WARP_GET(getColumnAsUShort, tmp);
             rc = (*field)->store(tmp, true);
           } else {
             int16_t tmp = 0;
-            rc = cursor->getColumnAsShort(cname.c_str(), tmp);
+            rc = WARP_GET(getColumnAsShort, tmp);
             rc = (*field)->store(tmp, false);
           }
         } break;
@@ -922,11 +960,11 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
         case MYSQL_TYPE_LONG: {
           if(is_unsigned) {
             uint32_t tmp = 0;
-            rc = cursor->getColumnAsUInt(cname.c_str(), tmp);
+            rc = WARP_GET(getColumnAsUInt, tmp);
             rc = (*field)->store(tmp, true);
           } else {
             int32_t tmp = 0;
-            rc = cursor->getColumnAsInt(cname.c_str(), tmp);
+            rc = WARP_GET(getColumnAsInt, tmp);
             rc = (*field)->store(tmp, false);
           }
         } break;
@@ -934,11 +972,11 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
         case MYSQL_TYPE_LONGLONG: {
           uint64_t tmp = 0;
           if(is_unsigned) {
-            rc = cursor->getColumnAsULong(cname.c_str(), tmp);
+            rc = WARP_GET(getColumnAsULong, tmp);
             rc = (*field)->store(tmp, true);
           } else {
             int64_t tmp = 0;
-            rc = cursor->getColumnAsLong(cname.c_str(), tmp);
+            rc = WARP_GET(getColumnAsLong, tmp);
             rc = (*field)->store(tmp, false);
           }
         } break;
@@ -952,7 +990,7 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
         case MYSQL_TYPE_LONG_BLOB:
         case MYSQL_TYPE_JSON: {
           std::string tmp;
-          rc = cursor->getColumnAsString(cname.c_str(), tmp);
+          rc = WARP_GET(getColumnAsString, tmp);
           if(warp_is_binary_string(*field)) {
             std::string encoded;
             encoded.swap(tmp);
@@ -988,24 +1026,24 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
 
         case MYSQL_TYPE_FLOAT: {
           float_t tmp;
-          rc = cursor->getColumnAsFloat(cname.c_str(), tmp);
+          rc = WARP_GET(getColumnAsFloat, tmp);
           rc = (*field)->store(tmp);
         } break;
 
         case MYSQL_TYPE_DOUBLE: {
           double_t tmp;
-          rc = cursor->getColumnAsDouble(cname.c_str(), tmp);
+          rc = WARP_GET(getColumnAsDouble, tmp);
           rc = (*field)->store(tmp);
         } break;
 
         case MYSQL_TYPE_INT24: {
           uint32_t tmp;
           if(is_unsigned) {
-            rc = cursor->getColumnAsUInt(cname.c_str(), tmp);
+            rc = WARP_GET(getColumnAsUInt, tmp);
             rc = (*field)->store(tmp, true);
           } else {
             int32_t tmp;
-            rc = cursor->getColumnAsInt(cname.c_str(), tmp);
+            rc = WARP_GET(getColumnAsInt, tmp);
             rc = (*field)->store(tmp, false);
           }
         } break;
@@ -1020,7 +1058,7 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
         case MYSQL_TYPE_DATETIME2: {
           
           uint64_t tmp;
-          rc = cursor->getColumnAsULong(cname.c_str(), tmp);
+          rc = WARP_GET(getColumnAsULong, tmp);
           /* See encode_quote() for the on-disk temporal formats. Not
              every temporal Field implements store_packed() in 9.x, so
              unpack and store via store_time() instead. */
@@ -1041,7 +1079,7 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
         /* a BIT is stored as the unsigned integer that it holds */
         case MYSQL_TYPE_BIT: {
           uint64_t tmp = 0;
-          rc = cursor->getColumnAsULong(cname.c_str(), tmp);
+          rc = WARP_GET(getColumnAsULong, tmp);
           rc = (*field)->store(static_cast<longlong>(tmp), true);
         } break;
 
@@ -1053,7 +1091,7 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
         case MYSQL_TYPE_SET:
         case MYSQL_TYPE_GEOMETRY: {
           std::string tmp;
-          rc = cursor->getColumnAsString(cname.c_str(), tmp);
+          rc = WARP_GET(getColumnAsString, tmp);
           if((*field)->store(tmp.c_str(), tmp.length(), (*field)->charset(),
                               CHECK_FIELD_WARN)) {
             rc = HA_ERR_CRASHED_ON_USAGE;
@@ -1082,6 +1120,8 @@ err:
   
   DBUG_RETURN(rc);
 }
+
+#undef WARP_GET
 
 int ha_warp::reset_table() {
   DBUG_ENTER("ha_warp::reset_table");
@@ -2981,6 +3021,7 @@ int ha_warp::rnd_init(bool) {
     } else {
       if(filtered_table != NULL) {
         cursor = filtered_table->createCursor();
+    register_cursor(cursor, filtered_table);
         pushdown_info->cursor=cursor; 
       }
     }
@@ -3666,6 +3707,7 @@ fetch_again:
       }
       
       cursor = filtered_table->createCursor();
+    register_cursor(cursor, filtered_table);
 
     }
     
@@ -3709,7 +3751,8 @@ fetch_again:
         DBUG_RETURN(HA_ERR_OUT_OF_MEM);
       }
       
-      cursor = filtered_table->createCursor();  
+      cursor = filtered_table->createCursor();
+    register_cursor(cursor, filtered_table);
       rownum = 0;
     } 
   }
@@ -4104,6 +4147,7 @@ int ha_warp::rnd_pos(uchar *buf, uchar *pos) {
   }
   if(filtered_table != NULL && filtered_table->nRows() > 0) {
     cursor = filtered_table->createCursor();
+    register_cursor(cursor, filtered_table);
     /* position the cursor on the (only) matching row before reading it */
     if(cursor != NULL && cursor->fetch() == 0) {
       rc = find_current_row(buf, cursor);
@@ -4581,6 +4625,7 @@ bool ha_warp::build_unique_cache() {
     if(base != NULL && base->nRows() > 0) {
       ibis::table *rows = base->select(columns.c_str(), "1=1");
       ibis::table::cursor *cursor = rows != NULL ? rows->createCursor() : NULL;
+      register_cursor(cursor, rows);
       ok = cursor != NULL;
       decode_only = &key_columns;
       while(ok && cursor->fetch() == 0) {

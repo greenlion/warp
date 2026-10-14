@@ -1097,6 +1097,11 @@ class ha_warp : public handler {
   int set_column_set(); 
   //int set_column_set(uint32_t idxno);
   int find_current_row(uchar *buf, ibis::table::cursor* cursor);
+ public:
+  void register_cursor(ibis::table::cursor *cursor, ibis::table *rows);
+ private:
+  ibis::table::cursor *pos_cursor = nullptr;   // the cursor that pos_c and pos_n are the positions of
+  std::vector<int> pos_c, pos_n;               // by field index: position of c<i>, n<i> (-1: none)
   int find_current_row_impl(uchar *buf, ibis::table::cursor* cursor);
   int create_writer(TABLE *table_arg);
   void load_partition_rows();
