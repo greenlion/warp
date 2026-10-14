@@ -39,6 +39,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "sql/join_optimizer/access_path.h"
 #include "sql/join_optimizer/relational_expression.h"
@@ -174,6 +175,7 @@ struct warp_pj_table {
      that are about this table only are checked when its rows are read. */
   bool null_side = false;
   std::vector<Item *> filters;
+  std::vector<std::pair<uint, const std::unordered_set<int64_t> *>> semi;   // column, the values that have a match
   std::vector<uint> own_key_fields;   // columns of this table in the key of its edge
   std::vector<uint> value_fields;     // columns kept as integers
   std::vector<std::vector<int64_t>> vals;
@@ -203,6 +205,20 @@ struct warp_pj_result {
   size_t rows() const { return stride == 0 ? 0 : data.size() / stride; }
 };
 
+/* An inner join of the block with a derived table (a subquery that
+   MySQL materializes once) on a column of one of the tables: before the tables
+   are read, the engine materializes it and drops the rows of the table whose
+   column has no match, which MySQL would do for every row of the join result
+   (the join of MySQL stays, this only makes the engine's result smaller). */
+struct warp_pj_semi {
+  AccessPath *materialize = nullptr;
+  JOIN *join = nullptr;
+  Field *outer = nullptr;       // the column of the table of the join
+  Field *inner = nullptr;       // the column of the derived table
+  int level = 0;                // the table of the plan that the column belongs to
+  std::unordered_set<int64_t> keys;
+};
+
 struct warp_pj_plan {
   THD *thd = nullptr;
   TABLE *probe = nullptr;
@@ -215,6 +231,7 @@ struct warp_pj_plan {
   std::string probe_where;               // pushed down conditions of the probe table
   std::vector<uint> where_fields;
   int nbuild = 0;                        // tables[1..nbuild] are joined to the probe table
+  std::vector<warp_pj_semi> semis;
 
   /* the result */
   std::vector<warp_pj_result> results;
@@ -956,6 +973,13 @@ static bool warp_pj_build(warp_pj_table &t, std::string *error) {
         break;
       }
     }
+    for(const auto &sf : t.semi) {
+      Field *field = table->field[sf.first];
+      if(field->is_null() || sf.second->count(field->val_int()) == 0) {
+        joinable = false;
+        break;
+      }
+    }
     if(!joinable) {
       continue;
     }
@@ -1224,6 +1248,37 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
   return true;
 }
 
+/* the values of the column of the derived table (it is materialized once, MySQL
+   uses it as it is later) */
+static bool warp_pj_read_semi(THD *thd, warp_pj_semi &semi, std::string *error) {
+  semi.keys.clear();
+  TABLE *derived = semi.inner->table;
+  unique_ptr_destroy_only<RowIterator> iterator =
+      CreateIteratorFromAccessPath(thd, semi.materialize, semi.join, false);
+  if(!iterator || iterator->Init()) {
+    *error = "could not materialize a derived table of the join";
+    return false;
+  }
+  handler *file = derived->file;
+  file->ha_index_or_rnd_end();
+  if(file->ha_rnd_init(true) != 0) {
+    *error = "could not read a derived table of the join";
+    return false;
+  }
+  int rc;
+  while((rc = file->ha_rnd_next(derived->record[0])) == 0) {
+    if(!semi.inner->is_null()) {
+      semi.keys.insert(semi.inner->val_int());
+    }
+  }
+  file->ha_rnd_end();
+  if(rc != HA_ERR_END_OF_FILE) {
+    *error = "could not read a derived table of the join";
+    return false;
+  }
+  return true;
+}
+
 static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
   THD *thd = plan.thd;
   plan.serving = false;
@@ -1242,6 +1297,14 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
   snap.repeatable_read = (trx->isolation_level == ISO_REPEATABLE_READ ||
                           trx->isolation_level == ISO_SERIALIZABLE);
   snap.check_rowids = warp_state->has_history_locks() || warp_state->delete_bitmap->may_have_bits();
+
+  for(int l = 1; l <= plan.nbuild; ++l) plan.tables[l].semi.clear();
+  for(warp_pj_semi &semi : plan.semis) {
+    if(!warp_pj_read_semi(thd, semi, error)) {
+      return false;
+    }
+    plan.tables[semi.level].semi.push_back({semi.outer->field_index(), &semi.keys});
+  }
 
   /* the other tables first: what they hold decides which rows of the probe
      table are looked at */
@@ -1480,11 +1543,20 @@ int ha_warp::pj_follower_next(uchar *buf) {
 
 /* The access path `path` (a tree of joins) is replaced by a scan of the probe
    table, with a FILTER for the conditions that MySQL has to evaluate. */
-static bool warp_pj_replace(THD *thd, AccessPath *path) {
+static bool warp_pj_replace(THD *thd, AccessPath *path, JOIN *join, const std::vector<warp_pj_semi> &semis) {
   std::vector<Item *> residual;
   std::shared_ptr<warp_pj_plan> plan = warp_pj_make_plan(thd, path, &residual);
   if(!plan) {
     return false;
+  }
+  for(const warp_pj_semi &candidate : semis) {
+    for(int l = 1; l <= plan->nbuild; ++l) {
+      if(plan->tables[l].table == candidate.outer->table && !plan->tables[l].null_side) {
+        plan->semis.push_back(candidate);
+        plan->semis.back().level = l;
+        break;
+      }
+    }
   }
   AccessPath *scan = NewTableScanAccessPath(thd, plan->probe, false);
   scan->set_num_output_rows(path->num_output_rows());
@@ -1522,6 +1594,41 @@ static bool warp_pj_replace(THD *thd, AccessPath *path) {
   return true;
 }
 
+/* the inner side of a nested loop is a derived table that is read by an index
+   on one column, with a column of another table as the key */
+static void warp_pj_find_semi(AccessPath *inner, JOIN *join, std::vector<warp_pj_semi> *semis) {
+  if(inner->type != AccessPath::MATERIALIZE || inner->materialize().param == nullptr ||
+     inner->materialize().param->rematerialize) {
+    return;
+  }
+  AccessPath *table_path = inner->materialize().table_path;
+  if(table_path == nullptr || (table_path->type != AccessPath::REF && table_path->type != AccessPath::EQ_REF)) {
+    return;
+  }
+  const bool is_ref = table_path->type == AccessPath::REF;
+  TABLE *derived = is_ref ? table_path->ref().table : table_path->eq_ref().table;
+  Index_lookup *ref = is_ref ? table_path->ref().ref : table_path->eq_ref().ref;
+  if(derived == nullptr || ref == nullptr || ref->key_parts != 1) {
+    return;
+  }
+  Item *value = ref->items[0]->real_item();
+  if(value->type() != Item::FIELD_ITEM) {
+    return;
+  }
+  Field *outer = down_cast<Item_field *>(value)->field;
+  Field *key = derived->key_info[ref->key].key_part[0].field;
+  if(outer == nullptr || key == nullptr || outer->table == derived || !warp_pj_int_key(outer) ||
+     !warp_pj_int_key(key) || dynamic_cast<ha_warp *>(outer->table->file) == nullptr) {
+    return;
+  }
+  warp_pj_semi semi;
+  semi.materialize = inner;
+  semi.join = join;
+  semi.outer = outer;
+  semi.inner = key;
+  semis->push_back(semi);
+}
+
 /* Called from push_to_engine: the joins that the engine can evaluate are
    replaced. */
 static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
@@ -1536,11 +1643,16 @@ static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
     warp_pj_no(__LINE__);
     return;
   }
+  std::vector<warp_pj_semi> semis;
   WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
                   [&](AccessPath *path, const JOIN *) {
+                    if(path->type == AccessPath::NESTED_LOOP_JOIN &&
+                       path->nested_loop_join().join_type == JoinType::INNER) {
+                      warp_pj_find_semi(path->nested_loop_join().inner, join, &semis);
+                    }
                     if(path->type == AccessPath::HASH_JOIN ||
                        path->type == AccessPath::NESTED_LOOP_JOIN) {
-                      if(warp_pj_replace(thd, path)) {
+                      if(warp_pj_replace(thd, path, join, semis)) {
                         return true;  // everything below it is the engine's now
                       }
                     }
