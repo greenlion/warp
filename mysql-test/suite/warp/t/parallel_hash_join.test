@@ -10,6 +10,7 @@
 SET SESSION warp_parallel_join_min_rows = 0;
 SET SESSION cte_max_recursion_depth = 10000;
 SET SESSION join_buffer_size = 2048;
+SET SESSION optimizer_switch = 'subquery_to_derived=on';
 
 --let $engines = w,i
 CREATE TABLE f_w (id INT, k1 INT, k2 INT, k3 BIGINT, u INT UNSIGNED, t TINYINT, s VARCHAR(10), n INT NULL, v INT)
@@ -75,193 +76,213 @@ if ($w != $i)
 }
 --replace_regex /  *\(cost=[^)]*\)//
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON d1.kk = d2.k WHERE d2.flag = 0;
---echo # case 4: composite key
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d3.z AS c1 FROM f_w f JOIN d3_w d3 ON f.k1 = d3.x AND f.k2 = d3.y) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d3.z AS c1 FROM f_i f JOIN d3_i d3 ON f.k1 = d3.x AND f.k2 = d3.y) q`;
+--echo # case 4: a derived table with a key on a column of a joined table (IN with GROUP BY and HAVING)
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d1.b AS c2 FROM f_w f, d1_w d1 WHERE f.k1 = d1.k AND d1.k IN (SELECT x FROM d3_w GROUP BY x HAVING COUNT(*) >= 2) AND f.v < 70) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d1.b AS c2 FROM f_i f, d1_i d1 WHERE f.k1 = d1.k AND d1.k IN (SELECT x FROM d3_i GROUP BY x HAVING COUNT(*) >= 2) AND f.v < 70) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 4
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d3.z FROM f_w f JOIN d3_w d3 ON f.k1 = d3.x AND f.k2 = d3.y;
---echo # case 5: a join condition that closes a cycle
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k AND d1.kk = d2.k1) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k AND d1.kk = d2.k1) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d1.b FROM f_w f, d1_w d1 WHERE f.k1 = d1.k AND d1.k IN (SELECT x FROM d3_w GROUP BY x HAVING COUNT(*) >= 2) AND f.v < 70;
+--echo # case 5: a derived table that matches nothing, and one with NULLs in its key
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_w f, d1_w d1 WHERE f.k1 = d1.k AND d1.kk IN (SELECT kk FROM d1_w GROUP BY kk HAVING COUNT(*) > 1000)) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_i f, d1_i d1 WHERE f.k1 = d1.k AND d1.kk IN (SELECT kk FROM d1_i GROUP BY kk HAVING COUNT(*) > 1000)) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 5
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k AND d1.kk = d2.k1;
---echo # case 6: columns of different integer types and an unsigned column
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1, d4.w AS c2 FROM f_w f JOIN d2_w d2 ON f.k3 = d2.k JOIN d4_w d4 ON f.u = d4.m) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1, d4.w AS c2 FROM f_i f JOIN d2_i d2 ON f.k3 = d2.k JOIN d4_i d4 ON f.u = d4.m) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f, d1_w d1 WHERE f.k1 = d1.k AND d1.kk IN (SELECT kk FROM d1_w GROUP BY kk HAVING COUNT(*) > 1000);
+--echo # case 6: composite key
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d3.z AS c1 FROM f_w f JOIN d3_w d3 ON f.k1 = d3.x AND f.k2 = d3.y) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d3.z AS c1 FROM f_i f JOIN d3_i d3 ON f.k1 = d3.x AND f.k2 = d3.y) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 6
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d2.c, d4.w FROM f_w f JOIN d2_w d2 ON f.k3 = d2.k JOIN d4_w d4 ON f.u = d4.m;
---echo # case 7: NULL keys do not join
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d4.w AS c1 FROM f_w f JOIN d4_w d4 ON f.t = d4.m JOIN d1_w d1 ON f.n = d1.kk) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d4.w AS c1 FROM f_i f JOIN d4_i d4 ON f.t = d4.m JOIN d1_i d1 ON f.n = d1.kk) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d3.z FROM f_w f JOIN d3_w d3 ON f.k1 = d3.x AND f.k2 = d3.y;
+--echo # case 7: a join condition that closes a cycle
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k AND d1.kk = d2.k1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k AND d1.kk = d2.k1) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 7
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d4.w FROM f_w f JOIN d4_w d4 ON f.t = d4.m JOIN d1_w d1 ON f.n = d1.kk;
---echo # case 8: a condition of two tables that the engine does not evaluate
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.v + d1.b > 60 OR d2.c = 'C0') q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE f.v + d1.b > 60 OR d2.c = 'C0') q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k AND d1.kk = d2.k1;
+--echo # case 8: columns of different integer types and an unsigned column
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1, d4.w AS c2 FROM f_w f JOIN d2_w d2 ON f.k3 = d2.k JOIN d4_w d4 ON f.u = d4.m) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1, d4.w AS c2 FROM f_i f JOIN d2_i d2 ON f.k3 = d2.k JOIN d4_i d4 ON f.u = d4.m) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 8
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.v + d1.b > 60 OR d2.c = 'C0';
---echo # case 9: the same table twice
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT a.id AS c0, b.id AS c1 FROM f_w a JOIN f_w b ON a.k1 = b.k1 AND a.id = b.id + 40 WHERE a.v < 30) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT a.id AS c0, b.id AS c1 FROM f_i a JOIN f_i b ON a.k1 = b.k1 AND a.id = b.id + 40 WHERE a.v < 30) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d2.c, d4.w FROM f_w f JOIN d2_w d2 ON f.k3 = d2.k JOIN d4_w d4 ON f.u = d4.m;
+--echo # case 9: NULL keys do not join
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d4.w AS c1 FROM f_w f JOIN d4_w d4 ON f.t = d4.m JOIN d1_w d1 ON f.n = d1.kk) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d4.w AS c1 FROM f_i f JOIN d4_i d4 ON f.t = d4.m JOIN d1_i d1 ON f.n = d1.kk) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 9
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT a.id, b.id FROM f_w a JOIN f_w b ON a.k1 = b.k1 AND a.id = b.id + 40 WHERE a.v < 30;
---echo # case 10: no row matches
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE d1.b > 1000) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k WHERE d1.b > 1000) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d4.w FROM f_w f JOIN d4_w d4 ON f.t = d4.m JOIN d1_w d1 ON f.n = d1.kk;
+--echo # case 10: a condition of two tables that the engine does not evaluate
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.v + d1.b > 60 OR d2.c = 'C0') q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE f.v + d1.b > 60 OR d2.c = 'C0') q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 10
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE d1.b > 1000;
---echo # case 11: a string column of a dimension and a COUNT
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT d1.a AS c0, d2.c AS c1, COUNT(*) AS c2, SUM(f.v) AS c3 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k GROUP BY d1.a, d2.c) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT d1.a AS c0, d2.c AS c1, COUNT(*) AS c2, SUM(f.v) AS c3 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k GROUP BY d1.a, d2.c) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.v + d1.b > 60 OR d2.c = 'C0';
+--echo # case 11: the same table twice
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT a.id AS c0, b.id AS c1 FROM f_w a JOIN f_w b ON a.k1 = b.k1 AND a.id = b.id + 40 WHERE a.v < 30) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT a.id AS c0, b.id AS c1 FROM f_i a JOIN f_i b ON a.k1 = b.k1 AND a.id = b.id + 40 WHERE a.v < 30) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 11
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT d1.a, d2.c, COUNT(*), SUM(f.v) FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k GROUP BY d1.a, d2.c;
---echo # case 12: an expression of the joined rows
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, f.v * d1.b + d2.flag AS c1 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3')) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, f.v * d1.b + d2.flag AS c1 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3')) q`;
+EXPLAIN FORMAT=TREE SELECT a.id, b.id FROM f_w a JOIN f_w b ON a.k1 = b.k1 AND a.id = b.id + 40 WHERE a.v < 30;
+--echo # case 12: no row matches
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE d1.b > 1000) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k WHERE d1.b > 1000) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 12
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, f.v * d1.b + d2.flag FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3');
---echo # case 13: an anti join over the joined rows: MySQL buffers the rows of all the tables (the join buffer is small, so it spills them to disk)
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_w g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id)) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_i g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id)) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE d1.b > 1000;
+--echo # case 13: a string column of a dimension and a COUNT
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT d1.a AS c0, d2.c AS c1, COUNT(*) AS c2, SUM(f.v) AS c3 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k GROUP BY d1.a, d2.c) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT d1.a AS c0, d2.c AS c1, COUNT(*) AS c2, SUM(f.v) AS c3 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k GROUP BY d1.a, d2.c) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 13
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_w g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id);
---echo # case 14: a semi join over the joined rows
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_w g WHERE g.k2 = f.k2 AND g.v = d1.b + 40)) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_i g WHERE g.k2 = f.k2 AND g.v = d1.b + 40)) q`;
+EXPLAIN FORMAT=TREE SELECT d1.a, d2.c, COUNT(*), SUM(f.v) FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k GROUP BY d1.a, d2.c;
+--echo # case 14: an expression of the joined rows
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, f.v * d1.b + d2.flag AS c1 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3')) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, f.v * d1.b + d2.flag AS c1 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3')) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 14
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_w g WHERE g.k2 = f.k2 AND g.v = d1.b + 40);
---echo # case 15: a sort of the joined rows by columns of every table
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2, d1.b AS c3 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 400 ORDER BY d2.c DESC, d1.a, d1.b, f.id) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2, d1.b AS c3 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE f.id < 400 ORDER BY d2.c DESC, d1.a, d1.b, f.id) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, f.v * d1.b + d2.flag FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3');
+--echo # case 15: an anti join over the joined rows: MySQL buffers the rows of all the tables (the join buffer is small, so it spills them to disk)
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_w g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id)) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_i g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id)) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 15
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c, d1.b FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 400 ORDER BY d2.c DESC, d1.a, d1.b, f.id;
---echo # case 16: a LEFT JOIN: rows without a match get NULLs
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1, d2.flag AS c2 FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 500) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1, d2.flag AS c2 FROM f_i f LEFT JOIN d2_i d2 ON f.k2 = d2.k WHERE f.id < 500) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_w g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id);
+--echo # case 16: a semi join over the joined rows
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_w g WHERE g.k2 = f.k2 AND g.v = d1.b + 40)) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_i g WHERE g.k2 = f.k2 AND g.v = d1.b + 40)) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 16
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d2.c, d2.flag FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 500;
---echo # case 17: a LEFT JOIN with a condition of the inner table in the ON clause
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1 FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.flag = 1 WHERE f.id < 500) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1 FROM f_i f LEFT JOIN d2_i d2 ON f.k2 = d2.k AND d2.flag = 1 WHERE f.id < 500) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_w g WHERE g.k2 = f.k2 AND g.v = d1.b + 40);
+--echo # case 17: a sort of the joined rows by columns of every table
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2, d1.b AS c3 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 400 ORDER BY d2.c DESC, d1.a, d1.b, f.id) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2, d1.b AS c3 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k JOIN d2_i d2 ON f.k2 = d2.k WHERE f.id < 400 ORDER BY d2.c DESC, d1.a, d1.b, f.id) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 17
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d2.c FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.flag = 1 WHERE f.id < 500;
---echo # case 18: an inner join and a LEFT JOIN with a condition on a string column
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.c = 'C1' WHERE f.v < 30) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k LEFT JOIN d2_i d2 ON f.k2 = d2.k AND d2.c = 'C1' WHERE f.v < 30) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c, d1.b FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 400 ORDER BY d2.c DESC, d1.a, d1.b, f.id;
+--echo # case 18: a LEFT JOIN: rows without a match get NULLs
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1, d2.flag AS c2 FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 500) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1, d2.flag AS c2 FROM f_i f LEFT JOIN d2_i d2 ON f.k2 = d2.k WHERE f.id < 500) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 18
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.c = 'C1' WHERE f.v < 30;
---echo # case 19: a LEFT JOIN used as an anti join
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0))), 0)) FROM (SELECT f.id AS c0 FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.k IS NULL) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0))), 0)) FROM (SELECT f.id AS c0 FROM f_i f LEFT JOIN d2_i d2 ON f.k2 = d2.k WHERE d2.k IS NULL) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d2.c, d2.flag FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE f.id < 500;
+--echo # case 19: a LEFT JOIN with a condition of the inner table in the ON clause
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1 FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.flag = 1 WHERE f.id < 500) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1 FROM f_i f LEFT JOIN d2_i d2 ON f.k2 = d2.k AND d2.flag = 1 WHERE f.id < 500) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 19
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT f.id FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.k IS NULL;
---echo # case 20: the small table is the outer table of the LEFT JOIN, a COUNT of the inner table
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT d1.k AS c0, COUNT(f.id) AS c1, SUM(f.v) AS c2 FROM d1_w d1 LEFT JOIN f_w f ON f.k1 = d1.k AND f.v > 50 GROUP BY d1.k) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT d1.k AS c0, COUNT(f.id) AS c1, SUM(f.v) AS c2 FROM d1_i d1 LEFT JOIN f_i f ON f.k1 = d1.k AND f.v > 50 GROUP BY d1.k) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d2.c FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.flag = 1 WHERE f.id < 500;
+--echo # case 20: an inner join and a LEFT JOIN with a condition on a string column
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.c = 'C1' WHERE f.v < 30) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1, d2.c AS c2 FROM f_i f JOIN d1_i d1 ON f.k1 = d1.k LEFT JOIN d2_i d2 ON f.k2 = d2.k AND d2.c = 'C1' WHERE f.v < 30) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 20
 }
 --replace_regex /  *\(cost=[^)]*\)//
-EXPLAIN FORMAT=TREE SELECT d1.k, COUNT(f.id), SUM(f.v) FROM d1_w d1 LEFT JOIN f_w f ON f.k1 = d1.k AND f.v > 50 GROUP BY d1.k;
---echo # case 21: NULL keys of the outer table
-let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_w f LEFT JOIN d1_w d1 ON f.n = d1.kk WHERE f.id < 400) q`;
-let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_i f LEFT JOIN d1_i d1 ON f.n = d1.kk WHERE f.id < 400) q`;
+EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k LEFT JOIN d2_w d2 ON f.k2 = d2.k AND d2.c = 'C1' WHERE f.v < 30;
+--echo # case 21: a LEFT JOIN used as an anti join
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0))), 0)) FROM (SELECT f.id AS c0 FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.k IS NULL) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0))), 0)) FROM (SELECT f.id AS c0 FROM f_i f LEFT JOIN d2_i d2 ON f.k2 = d2.k WHERE d2.k IS NULL) q`;
 --echo $w
 if ($w != $i)
 {
   --echo MISMATCH in case 21
 }
 --replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT f.id FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.k IS NULL;
+--echo # case 22: the small table is the outer table of the LEFT JOIN, a COUNT of the inner table
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT d1.k AS c0, COUNT(f.id) AS c1, SUM(f.v) AS c2 FROM d1_w d1 LEFT JOIN f_w f ON f.k1 = d1.k AND f.v > 50 GROUP BY d1.k) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT d1.k AS c0, COUNT(f.id) AS c1, SUM(f.v) AS c2 FROM d1_i d1 LEFT JOIN f_i f ON f.k1 = d1.k AND f.v > 50 GROUP BY d1.k) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 22
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT d1.k, COUNT(f.id), SUM(f.v) FROM d1_w d1 LEFT JOIN f_w f ON f.k1 = d1.k AND f.v > 50 GROUP BY d1.k;
+--echo # case 23: NULL keys of the outer table
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_w f LEFT JOIN d1_w d1 ON f.n = d1.kk WHERE f.id < 400) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d1.a AS c1 FROM f_i f LEFT JOIN d1_i d1 ON f.n = d1.kk WHERE f.id < 400) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 23
+}
+--replace_regex /  *\(cost=[^)]*\)//
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f LEFT JOIN d1_w d1 ON f.n = d1.kk WHERE f.id < 400;
---echo # case 22: a LEFT JOIN with a condition of the WHERE clause on the inner table
+--echo # case 24: a LEFT JOIN with a condition of the WHERE clause on the inner table
 let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1 FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 0 OR d2.c IS NULL) q`;
 let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1))), 0)) FROM (SELECT f.id AS c0, d2.c AS c1 FROM f_i f LEFT JOIN d2_i d2 ON f.k2 = d2.k WHERE d2.flag = 0 OR d2.c IS NULL) q`;
 --echo $w
 if ($w != $i)
 {
-  --echo MISMATCH in case 22
+  --echo MISMATCH in case 24
 }
 --replace_regex /  *\(cost=[^)]*\)//
 EXPLAIN FORMAT=TREE SELECT f.id, d2.c FROM f_w f LEFT JOIN d2_w d2 ON f.k2 = d2.k WHERE d2.flag = 0 OR d2.c IS NULL;
