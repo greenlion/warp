@@ -171,21 +171,42 @@ UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FRO
 different_rows
 0
 DROP TABLE r_on, r_off, r_i;
+# rows that the transaction deleted, inserted and the other ones: the aggregation sees what the statement sees
+BEGIN;
+DELETE FROM d_w WHERE x % 3 = 0;
+DELETE FROM d_i WHERE x % 3 = 0;
+Warnings:
+Warning	6414	Combining the storage engines InnoDB and WARP is deprecated, but the statement or transaction updates both the InnoDB table test.d_i and the WARP table test.d_w.
+INSERT INTO d_w VALUES (1, 77, 5, 'new', 1), (2, 78, NULL, 'new', 2), (900, 5, 5, 'new', 3);
+INSERT INTO d_i VALUES (1, 77, 5, 'new', 1), (2, 78, NULL, 'new', 2), (900, 5, 5, 'new', 3);
+SELECT (SELECT SUM(g * 100000 + c * 100 + n) FROM (SELECT f.g, COUNT(*) AS c, COUNT(d.xn) AS n FROM f_w f LEFT JOIN d_w d ON f.k = d.k GROUP BY f.g) t)
+= (SELECT SUM(g * 100000 + c * 100 + n) FROM (SELECT f.g, COUNT(*) AS c, COUNT(d.xn) AS n FROM f_i f LEFT JOIN d_i d ON f.k = d.k GROUP BY f.g) t) AS same_in_transaction;
+same_in_transaction
+1
+SELECT (SELECT SUM(m) FROM (SELECT f.id, MAX(d.x) AS m FROM f_w f JOIN d_w d ON f.k = d.k GROUP BY f.id) t)
+= (SELECT SUM(m) FROM (SELECT f.id, MAX(d.x) AS m FROM f_i f JOIN d_i d ON f.k = d.k GROUP BY f.id) t) AS same_max_in_transaction;
+same_max_in_transaction
+1
+ROLLBACK;
+SELECT (SELECT SUM(g * 100000 + c * 100 + n) FROM (SELECT f.g, COUNT(*) AS c, COUNT(d.xn) AS n FROM f_w f LEFT JOIN d_w d ON f.k = d.k GROUP BY f.g) t)
+= (SELECT SUM(g * 100000 + c * 100 + n) FROM (SELECT f.g, COUNT(*) AS c, COUNT(d.xn) AS n FROM f_i f LEFT JOIN d_i d ON f.k = d.k GROUP BY f.g) t) AS same_after_rollback;
+same_after_rollback
+1
 SET SESSION warp_parallel_aggregation = ON;
 # the engine joins and aggregates
 EXPLAIN FORMAT=TREE SELECT f.g, COUNT(*), COUNT(d.x), SUM(d.x) FROM f_w f LEFT JOIN d_w d ON f.k = d.k AND d.s NOT LIKE '%special%requests%' GROUP BY f.g;
 EXPLAIN
 -> Table scan on <temporary>
     -> Aggregate using temporary table
-        -> Table scan on f, with parallel aggregation  (cost=225604 rows=2.26e+6)
+        -> Table scan on f, with parallel aggregation  (cost=147643 rows=1.48e+6)
 
 EXPLAIN FORMAT=TREE SELECT f.g, COUNT(DISTINCT d.x) FROM f_w f LEFT JOIN d_w d ON f.k = d.k GROUP BY f.g;
 EXPLAIN
 -> Group aggregate: count(distinct d_w.x)
     -> Sort: f.g
-        -> Stream results  (cost=225604 rows=2.26e+6)
-            -> Nested loop left join  (cost=225604 rows=2.26e+6)
-                -> Table scan on f, with parallel hash join  (cost=225604 rows=2.26e+6)
+        -> Stream results  (cost=147643 rows=1.48e+6)
+            -> Nested loop left join  (cost=147643 rows=1.48e+6)
+                -> Table scan on f, with parallel hash join  (cost=147643 rows=1.48e+6)
                 -> Table scan on d, joined by the parallel hash join  (cost=0 rows=1)
 
 SET SESSION warp_parallel_aggregation = DEFAULT;
