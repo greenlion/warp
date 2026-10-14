@@ -1,0 +1,60 @@
+--echo #
+--echo # Every branch of an OR has the same equality of two columns of two tables
+--echo # (DBT-3 Q19): it is a key of the join of the engine, the OR is evaluated for the
+--echo # rows of the join.  Every query is run against the WARP tables and InnoDB copies.
+--echo #
+
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE f_w (id INT, k INT, q INT, s VARCHAR(8), v INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d_w (k INT, a VARCHAR(8), b INT, c INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f_w WITH RECURSIVE x(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM x WHERE i < 30000)
+  SELECT i, 1 + i % 900, i % 50, CONCAT('s', i % 5), i % 100 FROM x;
+INSERT INTO d_w WITH RECURSIVE x(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM x WHERE i < 1200)
+  SELECT 1 + i % 1000, CONCAT('a', i % 4), i % 20, i % 7 FROM x;
+CREATE TABLE f_i LIKE f_w;
+CREATE TABLE d_i LIKE d_w;
+ALTER TABLE f_i ENGINE=InnoDB;
+ALTER TABLE d_i ENGINE=InnoDB;
+INSERT INTO f_i SELECT * FROM f_w;
+INSERT INTO d_i SELECT * FROM d_w;
+
+CREATE TABLE queries (i INT, q TEXT);
+INSERT INTO queries VALUES
+ (1, 'SELECT COUNT(*), SUM(f.v) FROM f_# f, d_# d WHERE (d.k = f.k AND d.a = ''a1'' AND f.q BETWEEN 1 AND 10) OR (d.k = f.k AND d.a = ''a2'' AND f.q BETWEEN 10 AND 20) OR (d.k = f.k AND d.a = ''a3'' AND f.q BETWEEN 20 AND 30)'),
+ (2, 'SELECT COUNT(*), SUM(f.v), SUM(d.b) FROM f_# f, d_# d WHERE (f.k = d.k AND d.b < 5) OR (f.k = d.k AND f.s = ''s1'') OR (d.k = f.k AND d.c = 3)'),
+ (3, 'SELECT COUNT(*) FROM f_# f, d_# d WHERE (f.k = d.k AND f.q = 1) OR (f.k = d.k + 1 AND f.q = 2)'),
+ (4, 'SELECT COUNT(*) FROM f_# f, d_# d WHERE (f.k = d.k AND f.q = 1) OR (f.q = 2)'),
+ (5, 'SELECT COUNT(*) FROM f_# f, d_# d WHERE (f.k = d.k AND f.q = 1 AND d.a = ''a0'') OR (f.k = d.k AND f.q = 2 AND d.a = ''a3'') OR (f.k = d.c AND d.a = ''a1'')'),
+ (6, 'SELECT f.id, d.b FROM f_# f, d_# d WHERE ((f.k = d.k AND f.q = 7) OR (f.k = d.k AND f.q = 9)) AND f.v < 3 ORDER BY f.id, d.b'),
+ (7, 'SELECT COUNT(*), SUM(f.id) FROM f_# f, d_# d WHERE (f.k = d.k AND d.a = ''zz'') OR (f.k = d.k AND d.a = ''yy'')'),
+ (8, 'SELECT COUNT(*) FROM f_# f LEFT JOIN d_# d ON (f.k = d.k AND d.a = ''a1'') OR (f.k = d.k AND d.a = ''a2'') WHERE f.q < 3');
+
+--let $i = 1
+while ($i <= 8)
+{
+  --let $w = `SELECT REPLACE(q, '#', 'w') FROM queries WHERE i = $i`
+  --let $n = `SELECT REPLACE(q, '#', 'i') FROM queries WHERE i = $i`
+  --echo # query $i
+  --disable_query_log
+  eval CREATE TABLE r_w ENGINE=InnoDB AS $w;
+  SET SESSION warp_parallel_hash_join = OFF;
+  eval CREATE TABLE r_off ENGINE=InnoDB AS $w;
+  SET SESSION warp_parallel_hash_join = ON;
+  eval CREATE TABLE r_i ENGINE=InnoDB AS $n;
+  --enable_query_log
+  SELECT (SELECT COUNT(*) FROM r_w) = (SELECT COUNT(*) FROM r_i) AS same_rows,
+         (SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+  SELECT COUNT(*) AS different_rows FROM
+    ((SELECT * FROM r_w EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_w)
+     UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+  DROP TABLE r_w, r_off, r_i;
+  --inc $i
+}
+
+--echo # the join has a key: the engine joins the tables
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(f.v) FROM f_w f, d_w d WHERE (d.k = f.k AND d.a = 'a1' AND f.q BETWEEN 1 AND 10) OR (d.k = f.k AND d.a = 'a2' AND f.q BETWEEN 10 AND 20);
+
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
+DROP TABLE queries, f_w, d_w, f_i, d_i;

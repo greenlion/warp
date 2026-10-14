@@ -32,8 +32,7 @@ Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where (`t
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE b > -5.25 AND c <> 10;
 EXPLAIN
 -> Aggregate: count(0)  (cost=2.23 rows=1)
-    -> Filter: ((w.b > <cache>(-(5.25))) and (w.c <> 10.0000000000))  (cost=1.33 rows=3.9)
-        -> Table scan on w  (cost=1.33 rows=13)
+    -> Table scan on w  (cost=1.33 rows=3.9)
 
 Warnings:
 Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`test`.`w`.`b` > <cache>(-(5.25))) and (`test`.`w`.`c` <> 10.0000000000))

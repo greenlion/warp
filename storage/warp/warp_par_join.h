@@ -202,7 +202,7 @@ struct warp_pj_table {
 struct warp_pj_result {
   std::string dir;
   size_t stride = 0;
-  std::vector<uint32_t> data;     // stride values per row: ordinal of the probe row, rows of the other tables
+  std::vector<uint32_t> data;     // stride values per row: the row of the probe table in the partition, rows of the other tables
   std::vector<std::vector<int64_t>> keys;   // the values of the exported columns (warp_pj_plan::exports) for every row
   size_t rows() const { return stride == 0 ? 0 : data.size() / stride; }
 };
@@ -286,6 +286,7 @@ struct warp_pj_plan {
   /* the scan that returns it */
   size_t out_part = 0;
   size_t out_pos = 0;
+  std::vector<uint32_t> out_rows;      // the rows of the probe partition that the result has, ascending
   ibis::table *out_base = nullptr;
   ibis::table *out_filtered = nullptr;
   ibis::table::cursor *out_cursor = nullptr;
@@ -388,8 +389,73 @@ static bool warp_pj_add_equality(Item_eq_base *condition, warp_pj_collector &col
    the block can be joined along it (see warp_pj_make_plan).  The other
    conditions are evaluated by MySQL for the result rows.  A condition joined
    by AND is taken apart. */
+/* an equality of two integer columns of two tables */
+static bool warp_pj_eq_pair(Item *item, Field **a, Field **b) {
+  if(item->type() != Item::FUNC_ITEM || down_cast<Item_func *>(item)->functype() != Item_func::EQ_FUNC) {
+    return false;
+  }
+  Item_func *eq = down_cast<Item_func *>(item);
+  Item *left = eq->arguments()[0]->real_item();
+  Item *right = eq->arguments()[1]->real_item();
+  if(left->type() != Item::FIELD_ITEM || right->type() != Item::FIELD_ITEM) {
+    return false;
+  }
+  Field *lf = down_cast<Item_field *>(left)->field;
+  Field *rf = down_cast<Item_field *>(right)->field;
+  if(lf == nullptr || rf == nullptr || lf->table == rf->table || !warp_pj_int_field(lf) || !warp_pj_int_field(rf)) {
+    return false;
+  }
+  *a = lf;
+  *b = rf;
+  return true;
+}
+
+static void warp_pj_flatten_and(Item *item, std::vector<Item *> *out) {
+  if(item->type() == Item::COND_ITEM && down_cast<Item_cond *>(item)->functype() == Item_func::COND_AND_FUNC) {
+    List_iterator_fast<Item> it(*down_cast<Item_cond *>(item)->argument_list());
+    for(Item *part = it++; part != nullptr; part = it++) warp_pj_flatten_and(part, out);
+  } else {
+    out->push_back(item);
+  }
+}
+
 static void warp_pj_add_filter(Item *item, warp_pj_collector &collector) {
   if(item == nullptr) {
+    return;
+  }
+  /* The condition of every branch of an OR has an equality of two columns:
+     the rows of the join have it, it is a key of the join (the OR is still
+     evaluated for the rows of the join). */
+  if(item->type() == Item::COND_ITEM && down_cast<Item_cond *>(item)->functype() == Item_func::COND_OR_FUNC) {
+    std::vector<std::vector<Item *>> branches;
+    List_iterator_fast<Item> it(*down_cast<Item_cond *>(item)->argument_list());
+    for(Item *branch = it++; branch != nullptr; branch = it++) {
+      branches.emplace_back();
+      warp_pj_flatten_and(branch, &branches.back());
+    }
+    if(branches.size() >= 2) {
+      for(Item *first : branches[0]) {
+        Field *a, *b;
+        if(!warp_pj_eq_pair(first, &a, &b)) continue;
+        bool in_all = true;
+        for(size_t k = 1; k < branches.size() && in_all; ++k) {
+          bool found = false;
+          for(Item *other : branches[k]) {
+            Field *x, *y;
+            if(warp_pj_eq_pair(other, &x, &y) && ((x == a && y == b) || (x == b && y == a))) found = true;
+          }
+          in_all = found;
+        }
+        if(in_all) {
+          warp_pj_pair_info pair;
+          pair.a = a;
+          pair.b = b;
+          pair.item = first;
+          collector.candidates.push_back(pair);
+        }
+      }
+    }
+    collector.residual.push_back(item);
     return;
   }
   if(item->type() == Item::COND_ITEM &&
@@ -1531,7 +1597,7 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
           continue;
         }
         prober.row = row;
-        prober.ordinal = (uint32_t)i;
+        prober.ordinal = (uint32_t)row;
         if(!prober.expand(1)) {
           too_large = true;
           return;
@@ -1587,7 +1653,7 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
       for(size_t r = 0; r < result->rows(); ++r) {
         const uint32_t *tuple = &result->data[r * result->stride];
         if(e.level == 0) {
-          const size_t row = hit_rows[tuple[0]];
+          const size_t row = tuple[0];
           const int null_slot = plan.root_null_slot[e.slot];
           if(null_slot >= 0 && nulls[null_slot].get(row) != 0) continue;
           out.push_back(cols[e.slot].get(row));
@@ -1877,6 +1943,72 @@ void ha_warp::pj_close() {
   }
 }
 
+/* The rows of a partition that the result of the join has, as a table in memory
+   with the columns of the select list: the columns are read for those rows
+   only, the conditions of the probe table are not evaluated again. */
+static ibis::table *warp_pj_rows_table(const std::string &dir, const std::string &columns,
+                                       const std::vector<uint32_t> &rows) {
+  ibis::partList parts;
+  ibis::util::gatherParts(parts, dir.c_str(), true);
+  ibis::table *result = nullptr;
+  if(parts.size() == 1 && parts[0] != nullptr) {
+    ibis::part *part = parts[0];
+    ibis::bitvector mask;
+    for(uint32_t row : rows) mask.setBit(row, 1);
+    mask.adjustSize(0, part->nRows());
+    ibis::table::bufferArray buffers;
+    ibis::table::typeArray types;
+    std::vector<std::string> names;
+    bool ok = true;
+    size_t start = 0;
+    while(ok && start <= columns.size()) {
+      size_t end = columns.find(',', start);
+      if(end == std::string::npos) end = columns.size();
+      const std::string name = columns.substr(start, end - start);
+      start = end + 1;
+      if(name.empty()) continue;
+      const ibis::column *col = part->getColumn(name.c_str());
+      void *values = nullptr;
+      if(col == nullptr) {
+        ok = false;
+        break;
+      }
+      switch(col->type()) {
+        case ibis::BYTE:   values = part->selectBytes(name.c_str(), mask); break;
+        case ibis::UBYTE:  values = part->selectUBytes(name.c_str(), mask); break;
+        case ibis::SHORT:  values = part->selectShorts(name.c_str(), mask); break;
+        case ibis::USHORT: values = part->selectUShorts(name.c_str(), mask); break;
+        case ibis::INT:    values = part->selectInts(name.c_str(), mask); break;
+        case ibis::UINT:   values = part->selectUInts(name.c_str(), mask); break;
+        case ibis::LONG:   values = part->selectLongs(name.c_str(), mask); break;
+        case ibis::ULONG:  values = part->selectULongs(name.c_str(), mask); break;
+        case ibis::FLOAT:  values = part->selectFloats(name.c_str(), mask); break;
+        case ibis::DOUBLE: values = part->selectDoubles(name.c_str(), mask); break;
+        case ibis::TEXT:   values = part->selectStrings(name.c_str(), mask); break;
+        default: break;
+      }
+      if(values == nullptr) {
+        ok = false;
+        break;
+      }
+      buffers.push_back(values);
+      types.push_back(col->type());
+      names.push_back(name);
+    }
+    if(ok) {
+      ibis::table::stringArray name_array;
+      for(const std::string &name : names) name_array.push_back(name.c_str());
+      result = new ibis::bord("pjrows", "", rows.size(), buffers, types, name_array);
+    } else {
+      for(size_t i = 0; i < buffers.size(); ++i) {
+        ibis::table::freeBuffer(buffers[i], types[i]);
+      }
+    }
+  }
+  for(ibis::part *part : parts) delete part;
+  return result;
+}
+
 int ha_warp::pj_next(uchar *buf) {
   warp_pj_plan &plan = *par_join;
   for(;;) {
@@ -1889,12 +2021,12 @@ int ha_warp::pj_next(uchar *buf) {
     }
     const warp_pj_result &result = plan.results[plan.out_part];
     if(plan.out_cursor == nullptr) {
-      plan.out_base = ibis::table::create(result.dir.c_str());
-      if(plan.out_base == nullptr) {
-        return HA_ERR_OUT_OF_MEM;
+      plan.out_rows.clear();
+      for(size_t r = 0; r < result.rows(); ++r) {
+        const uint32_t row = result.data[r * result.stride];
+        if(plan.out_rows.empty() || plan.out_rows.back() != row) plan.out_rows.push_back(row);
       }
-      std::string where = plan.probe_where.empty() ? "1=1" : plan.probe_where;
-      plan.out_filtered = plan.out_base->select(column_set.c_str(), where.c_str());
+      plan.out_filtered = warp_pj_rows_table(result.dir, column_set, plan.out_rows);
       if(plan.out_filtered == nullptr) {
         plan.close_output();
         return HA_ERR_OUT_OF_MEM;
@@ -1911,7 +2043,7 @@ int ha_warp::pj_next(uchar *buf) {
     }
     const uint32_t *tuple = &result.data[plan.out_pos * result.stride];
     ++plan.out_pos;
-    if(plan.out_cursor->fetch(tuple[0]) != 0) {
+    if(plan.out_cursor->fetch(std::lower_bound(plan.out_rows.begin(), plan.out_rows.end(), tuple[0]) - plan.out_rows.begin()) != 0) {
       return HA_ERR_INTERNAL_ERROR;
     }
     const int rc = find_current_row(buf, plan.out_cursor);
@@ -2103,8 +2235,14 @@ static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
                        path->nested_loop_join().join_type == JoinType::INNER) {
                       warp_pj_find_semi(path->nested_loop_join().inner, join, &semis);
                     }
-                    if(path->type == AccessPath::HASH_JOIN ||
-                       path->type == AccessPath::NESTED_LOOP_JOIN) {
+                    /* the conditions on top of a join are conditions of the join too */
+                    bool join_below = path->type == AccessPath::HASH_JOIN || path->type == AccessPath::NESTED_LOOP_JOIN;
+                    if(path->type == AccessPath::FILTER) {
+                      AccessPath *below = path->filter().child;
+                      while(below->type == AccessPath::FILTER) below = below->filter().child;
+                      join_below = below->type == AccessPath::HASH_JOIN || below->type == AccessPath::NESTED_LOOP_JOIN;
+                    }
+                    if(join_below) {
                       if(warp_pj_replace(thd, path, join, semis)) {
                         return true;  // everything below it is the engine's now
                       }

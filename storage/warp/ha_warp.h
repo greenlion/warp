@@ -92,6 +92,7 @@
 #include "include/fastbit/query.h"
 #include "include/fastbit/bundle.h"
 #include "include/fastbit/tafel.h"
+#include "include/fastbit/bord.h"
 #include "include/fastbit/array_t.h"
 #include "include/fastbit/mensa.h"
 #include "include/fastbit/resource.h"
