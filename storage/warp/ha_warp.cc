@@ -3102,6 +3102,11 @@ void exec_pushdown_join(
      incomplete.  It is recorded in join_error so that the scan fails
      instead of returning wrong results. */
   try {
+  if(column_query->evaluate() < 0) {
+    throw std::runtime_error(std::string("could not evaluate the pushed down condition on ") +
+                             (*part_it)->currentDataDir());
+  }
+  if(column_query->getNumHits() != 0) {
   /* match_count[i] is the number of filters that row i+1 of the rows of
      the query has satisfied so far.  Every row is looked up in the
      dimension keys of the first filter, later filters only look up the
@@ -3250,6 +3255,7 @@ void exec_pushdown_join(
       find_it->second = NULL;
     }
   }
+  }
   } catch(const std::exception &e) {
     sql_print_error("WARP: join worker failed: %s", e.what());
     *join_error = 1;
@@ -3374,8 +3380,19 @@ fetch_again:
     if( std::string((*part_it)->currentDataDir()) == std::string(share->data_dir_name) ) {
       ++part_it;
     }
+
+    /* Whether the join of the table is pushed down is known before the
+       partitions are looked at.  Without a pushed down join the condition is
+       evaluated when a partition is read (in the threads that read ahead),
+       evaluating it here for every partition one after the other would be
+       done twice and by one thread. */
+    bitmap_merge_join();
+    const bool no_pushed_join = fact_table_filters.size() == 0;
+    if(no_pushed_join && push_where_clause == "") {
+      push_where_clause = "1=1";
+    }
   
-    while( part_it != partitions->end() ) {        
+    while( !no_pushed_join && part_it != partitions->end() ) {        
       /* a statement that is killed schedules no more joins, the running
          ones are waited for below */
       if(thd_killed(ha_thd())) {
@@ -3410,13 +3427,9 @@ fetch_again:
       }
       
       column_query->addConditions(push_where_clause.c_str());
-      if( column_query->evaluate() < 0 ) {
-        sql_print_error("WARP: could not evaluate the pushed down condition on %s",
-                        (*part_it)->currentDataDir());
-        join_error = 1;
-        break;
-      }
-      if( column_query->getNumHits() != 0 ) {
+      /* the worker evaluates the condition (exec_pushdown_join), the
+         partitions are evaluated at the same time */
+      {
         // nothing happens if this function is called more than once during query evaluation
         // but it must be executed at least once when parallel hash join is being used
         bitmap_merge_join();
