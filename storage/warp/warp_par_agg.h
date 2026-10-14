@@ -41,6 +41,8 @@
 
 #include <cmath>
 #include <functional>
+#include <deque>
+#include <string_view>
 #include <unordered_map>
 
 #include "mysql/strings/m_ctype.h"
@@ -997,9 +999,62 @@ struct warp_pa_loaded {
   bool has_nulls = false;
 };
 
+
+/* The groups of a worker (or of the merge): the keys are in one buffer, the
+   groups in blocks, and the table is open addressing, so that a group costs no
+   allocation for its key and its place in the table. */
+struct warp_pa_table {
+  struct Entry {
+    uint64_t hash;
+    size_t offset;
+    uint32_t length;
+  };
+  std::string keys;                      // the bytes of the keys
+  std::vector<Entry> entries;            // by the index of the group
+  std::deque<warp_pa_group> groups;      // the groups do not move when more are added
+  std::vector<uint32_t> slots;           // index of the group + 1, 0 = free
+  size_t mask = 0;
+
+  size_t size() const { return entries.size(); }
+  std::string_view key(size_t i) const { return std::string_view(keys.data() + entries[i].offset, entries[i].length); }
+  static uint64_t hash_of(std::string_view k) { return std::_Hash_bytes(k.data(), k.size(), 0xc70f6907UL); }
+
+  void grow() {
+    const size_t n = slots.empty() ? 1024 : slots.size() * 2;
+    slots.assign(n, 0);
+    mask = n - 1;
+    for(size_t i = 0; i < entries.size(); ++i) {
+      size_t at = entries[i].hash & mask;
+      while(slots[at] != 0) at = (at + 1) & mask;
+      slots[at] = (uint32_t)(i + 1);
+    }
+  }
+  /* the group of the key; *added tells whether it is a new one (then it is empty) */
+  warp_pa_group *find_or_add(std::string_view k, uint64_t hash, bool *added) {
+    if(slots.empty() || (entries.size() + 1) * 2 > slots.size()) grow();
+    size_t at = hash & mask;
+    while(slots[at] != 0) {
+      const size_t i = slots[at] - 1;
+      if(entries[i].hash == hash && entries[i].length == k.size() &&
+         memcmp(keys.data() + entries[i].offset, k.data(), k.size()) == 0) {
+        *added = false;
+        return &groups[i];
+      }
+      at = (at + 1) & mask;
+    }
+    entries.push_back({hash, keys.size(), (uint32_t)k.size()});
+    keys.append(k.data(), k.size());
+    groups.emplace_back();
+    slots[at] = (uint32_t)entries.size();
+    *added = true;
+    return &groups.back();
+  }
+  warp_pa_group *find_or_add(std::string_view k, bool *added) { return find_or_add(k, hash_of(k), added); }
+};
+
 struct warp_pa_worker {
   warp_pa_plan *plan = nullptr;
-  std::unordered_map<std::string, warp_pa_group> groups;
+  warp_pa_table groups;
 };
 
 static inline void warp_pa_init_group(const warp_pa_plan &plan, warp_pa_group *g) {
@@ -1138,13 +1193,12 @@ static void warp_pa_slice(const warp_pa_plan &plan, const std::vector<warp_pa_lo
         }
       }
     }
-    auto found = worker->groups.find(key);
-    if(found == worker->groups.end()) {
-      found = worker->groups.emplace(key, warp_pa_group()).first;
-      warp_pa_init_group(plan, &found->second);
-      found->second.cells = cells;
+    bool added;
+    warp_pa_group &group = *worker->groups.find_or_add(key, &added);
+    if(added) {
+      warp_pa_init_group(plan, &group);
+      group.cells = cells;
     }
-    warp_pa_group &group = found->second;
     ++group.rows;
     /* the aggregates */
     for(size_t m = 0; m < plan.aggs.size(); ++m) {
@@ -1515,18 +1569,19 @@ static bool warp_pa_execute(warp_pa_plan &plan, std::string *error) {
   }
 
   /* merge the groups of the workers */
-  std::unordered_map<std::string, warp_pa_group> merged;
+  warp_pa_table merged;
   for(auto &list : partials) {
     for(auto &w : list) {
-      for(auto &entry : w.groups) {
-        auto found = merged.find(entry.first);
-        if(found == merged.end()) {
-          merged.emplace(entry.first, std::move(entry.second));
+      for(size_t i = 0; i < w.groups.size(); ++i) {
+        bool added;
+        warp_pa_group *dst = merged.find_or_add(w.groups.key(i), w.groups.entries[i].hash, &added);
+        if(added) {
+          *dst = std::move(w.groups.groups[i]);
         } else {
-          warp_pa_merge_group(plan, &found->second, entry.second);
+          warp_pa_merge_group(plan, dst, w.groups.groups[i]);
         }
       }
-      w.groups.clear();
+      w.groups = warp_pa_table();
     }
   }
   plan.groups.reserve(merged.size());
@@ -1535,18 +1590,15 @@ static bool warp_pa_execute(warp_pa_plan &plan, std::string *error) {
        is not followed by anything that is not part of the key of the
        columns: groups with the same prefix are next to each other in the
        order of the keys */
-    std::vector<std::pair<const std::string *, warp_pa_group *>> order;
-    order.reserve(merged.size());
-    for(auto &entry : merged) {
-      order.push_back({&entry.first, &entry.second});
-    }
-    std::sort(order.begin(), order.end(), [](const auto &a, const auto &b) { return *a.first < *b.first; });
-    for(auto &entry : order) {
-      plan.groups.push_back(std::move(*entry.second));
+    std::vector<uint32_t> order(merged.size());
+    for(size_t i = 0; i < order.size(); ++i) order[i] = (uint32_t)i;
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return merged.key(a) < merged.key(b); });
+    for(uint32_t i : order) {
+      plan.groups.push_back(std::move(merged.groups[i]));
     }
   } else {
-    for(auto &entry : merged) {
-      plan.groups.push_back(std::move(entry.second));
+    for(auto &group : merged.groups) {
+      plan.groups.push_back(std::move(group));
     }
   }
   return true;
