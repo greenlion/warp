@@ -6038,13 +6038,11 @@ void ha_warp::make_scan_where() {
    the statement are included, the keys are only used to leave rows out).  The
    condition that limits the scan of this table, or none if the keys are not
    known or are too many to help. */
-std::string ha_warp::semi_key_condition() {
+bool ha_warp::semi_key_values(std::vector<int64_t> *keys_out, uint64_t max_keys) {
   ha_warp *outer = dynamic_cast<ha_warp *>(semi_in->outer_table->file);
   if(outer == nullptr) {
-    return "";
+    return false;
   }
-  const uint64_t inner_rows = table_row_count();
-  const uint64_t max_keys = std::min<uint64_t>(500000, inner_rows / 4);
   std::vector<int64_t> keys;
   try {
     warp_table_read_lock data_lock(outer->share->data_dir_name);
@@ -6082,17 +6080,30 @@ std::string ha_warp::semi_key_condition() {
       delete part;
     }
     if(failed) {
-      return "";
+      return false;
     }
   } catch(...) {
-    return "";
+    return false;
   }
   std::sort(keys.begin(), keys.end());
   keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
   if(keys.size() > max_keys) {
-    return "";
+    return false;
   }
   ++warp_semi_key_scans;
+  *keys_out = std::move(keys);
+  return true;
+}
+
+/* The condition that limits the scan of this table to the keys of the other
+   table, as an IN list (the list is parsed for every partition: only a short
+   one helps), or none if the keys are not known or are too many. */
+std::string ha_warp::semi_key_condition() {
+  std::vector<int64_t> keys;
+  const uint64_t max_keys = std::min<uint64_t>(100000, table_row_count() / 4);
+  if(!semi_key_values(&keys, max_keys)) {
+    return "";
+  }
   std::string cond = "c" + std::to_string(semi_in->inner_col) + " IN (";
   if(keys.empty()) {
     return "1=0";

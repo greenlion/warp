@@ -1221,6 +1221,7 @@ class ha_warp : public handler {
   void collect_outer_params(const Item *cond);
   void make_scan_where();
   std::string semi_key_condition();
+  bool semi_key_values(std::vector<int64_t> *keys, uint64_t max_keys);
 
  private:
   int64_t pushdown_table_count = 0;
