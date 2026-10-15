@@ -1,0 +1,85 @@
+--echo #
+--echo # Aggregates over the join of the engine with decimal, string and date
+--echo # columns, expressions, CASE, LIKE, YEAR() and residual conditions are made
+--echo # by the engine.  Every query is run against the WARP tables with the
+--echo # aggregation on and off, and against InnoDB copies.
+--echo #
+
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE f_w (id INT, k INT, g INT, dt DATE, p DECIMAL(12,2), q DECIMAL(5,2) NULL, c CHAR(1), s VARCHAR(20) NULL, n INT NULL) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d_w (k INT, nm VARCHAR(30), t VARCHAR(10), r DECIMAL(6,3), j INT, yy DATE) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE e_w (j INT, z VARCHAR(10), w DECIMAL(8,2)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 6000)
+  SELECT i, 1 + i % 600, i % 7, DATE_ADD('1993-01-01', INTERVAL (i * 7) % 2000 DAY), (i * 37) % 10007 / 100 + 0.01,
+         IF(i % 5 = 0, NULL, (i % 11) / 100), CHAR(65 + i % 4), IF(i % 6 = 0, NULL, CONCAT('s', i % 13)), IF(i % 4 = 0, NULL, i % 9) FROM s;
+INSERT INTO d_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1500)
+  SELECT 1 + i % 500, CONCAT(IF(i % 6 = 0, 'special ', 'x '), IF(i % 4 = 0, 'requests', 'none'), i), CONCAT('t', i % 5),
+         (i % 997) / 7, 1 + i % 120, DATE_ADD('1992-01-01', INTERVAL i DAY) FROM s;
+INSERT INTO e_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 300)
+  SELECT 1 + i % 100, CONCAT('z', i % 7), i / 3 FROM s;
+CREATE TABLE f_i LIKE f_w;
+CREATE TABLE d_i LIKE d_w;
+CREATE TABLE e_i LIKE e_w;
+ALTER TABLE f_i ENGINE=InnoDB;
+ALTER TABLE d_i ENGINE=InnoDB;
+ALTER TABLE e_i ENGINE=InnoDB;
+INSERT INTO f_i SELECT * FROM f_w;
+INSERT INTO d_i SELECT * FROM d_w;
+INSERT INTO e_i SELECT * FROM e_w;
+
+CREATE TABLE queries (i INT, q TEXT);
+INSERT INTO queries VALUES
+ (1, 'SELECT d.t, SUM(f.p) a1, SUM(f.p * (1 - f.q)) a2, COUNT(*) a3, MIN(f.p) a4, MAX(f.p) a5 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+ (2, 'SELECT f.c, d.t, SUM(f.p * d.r) a1, SUM(f.p - d.r * 2 + 1) a2, AVG(f.p) a3 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY f.c, d.t'),
+ (3, 'SELECT YEAR(f.dt) AS y, d.t, SUM(f.p) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY YEAR(f.dt), d.t'),
+ (4, 'SELECT YEAR(f.dt) AS y, SUM(CASE WHEN d.t = ''t1'' THEN f.p ELSE 0 END) a1, SUM(CASE WHEN d.t = ''t1'' THEN 1 ELSE 0 END) a2, SUM(CASE WHEN f.c IN (''A'',''B'') THEN f.p * 2 ELSE 0 END) a3 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY YEAR(f.dt)'),
+ (5, 'SELECT SUM(CASE WHEN d.t LIKE ''t1%'' OR d.t LIKE ''t2'' THEN f.p ELSE 0 END) a1, SUM(CASE WHEN d.t NOT LIKE ''t1%'' THEN 1 ELSE 0 END) a2 FROM f_# f JOIN d_# d ON f.k = d.k'),
+ (6, 'SELECT d.nm, f.c, COUNT(*) FROM f_# f JOIN d_# d ON f.k = d.k WHERE d.nm LIKE ''special%requests%'' GROUP BY d.nm, f.c'),
+ (7, 'SELECT f.s, COUNT(*) a1, COUNT(f.s) a2, MIN(f.s) a3, MAX(d.nm) a4, SUM(f.n) a5 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY f.s'),
+ (8, 'SELECT f.g, SUM(f.p) a1 FROM f_# f JOIN d_# d ON f.k = d.k WHERE f.dt >= ''1994-01-01'' AND f.dt < ''1996-01-01'' AND d.r BETWEEN 10 AND 100 GROUP BY f.g'),
+ (9, 'SELECT f.g, SUM(f.p) a1 FROM f_# f JOIN d_# d ON f.k = d.k WHERE (d.t = ''t1'' AND f.p > 50) OR (d.t = ''t2'' AND f.p < 20) GROUP BY f.g'),
+ (10, 'SELECT f.g, SUM(f.p) a1, COUNT(d.r) a2, SUM(d.r) a3, MAX(d.nm) a4 FROM f_# f LEFT JOIN d_# d ON f.k = d.k AND d.t = ''t3'' GROUP BY f.g'),
+ (11, 'SELECT d.t, e.z, SUM(f.p * e.w) a1, COUNT(*) a2 FROM f_# f JOIN d_# d ON f.k = d.k JOIN e_# e ON d.j = e.j GROUP BY d.t, e.z'),
+ (12, 'SELECT f.id, SUM(f.p) a1, d.nm FROM f_# f JOIN d_# d ON f.k = d.k WHERE f.id < 300 GROUP BY f.id, d.nm'),
+ (13, 'SELECT f.q, COUNT(*) a1, SUM(f.q) a2, MIN(f.q) a3 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY f.q'),
+ (14, 'SELECT MAX(d.yy) a1, MIN(f.dt) a2, COUNT(DISTINCT d.t) a3 FROM f_# f JOIN d_# d ON f.k = d.k'),
+ (15, 'SELECT f.g, SUM(f.p) / SUM(d.r) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY f.g HAVING SUM(f.p) > 1000'),
+ (16, 'SELECT d.t, SUM(IF(f.n IS NULL, 1, 0)) a1, SUM(-f.p) a2, SUM(NOT (f.p > 40)) a3 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t ORDER BY d.t');
+
+--let $i = 1
+while ($i <= 16)
+{
+  --let $w = `SELECT REPLACE(q, '#', 'w') FROM queries WHERE i = $i`
+  --let $n = `SELECT REPLACE(q, '#', 'i') FROM queries WHERE i = $i`
+  --echo # query $i
+  --disable_query_log
+  SET SESSION warp_parallel_aggregation = ON;
+  eval CREATE TABLE r_on ENGINE=InnoDB AS $w;
+  SET SESSION warp_parallel_aggregation = OFF;
+  eval CREATE TABLE r_off ENGINE=InnoDB AS $w;
+  eval CREATE TABLE r_i ENGINE=InnoDB AS $n;
+  --enable_query_log
+  SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+         (SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+  SELECT COUNT(*) AS different_rows FROM
+    ((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+     UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+  DROP TABLE r_on, r_off, r_i;
+  --inc $i
+}
+
+--echo # the aggregation sees what the transaction sees
+BEGIN;
+DELETE FROM d_w WHERE j % 3 = 0;
+DELETE FROM d_i WHERE j % 3 = 0;
+INSERT INTO d_w VALUES (1, 'new', 't1', 1.5, 1, '2000-01-01'), (2, 'new', 't9', 2.5, 2, '2000-01-02');
+INSERT INTO d_i VALUES (1, 'new', 't1', 1.5, 1, '2000-01-01'), (2, 'new', 't9', 2.5, 2, '2000-01-02');
+SELECT (SELECT SUM(a) FROM (SELECT SUM(f.p * d.r) AS a FROM f_w f JOIN d_w d ON f.k = d.k GROUP BY d.t) t)
+     = (SELECT SUM(a) FROM (SELECT SUM(f.p * d.r) AS a FROM f_i f JOIN d_i d ON f.k = d.k GROUP BY d.t) t) AS same_in_transaction;
+ROLLBACK;
+SELECT (SELECT SUM(a) FROM (SELECT SUM(f.p * d.r) AS a FROM f_w f JOIN d_w d ON f.k = d.k GROUP BY d.t) t)
+     = (SELECT SUM(a) FROM (SELECT SUM(f.p * d.r) AS a FROM f_i f JOIN d_i d ON f.k = d.k GROUP BY d.t) t) AS same_after_rollback;
+
+DROP TABLE f_w, d_w, e_w, f_i, d_i, e_i, queries;

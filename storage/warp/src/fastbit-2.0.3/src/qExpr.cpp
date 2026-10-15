@@ -3351,6 +3351,36 @@ ibis::qDiscreteRange::qDiscreteRange(const char *col, const char *nums)
     }
 } // qDiscreteRange ctor
 
+/// Construct a discrete range from a string of numbers, used by FAST_IN.
+/// Unlike the constructor above, the numbers are not put through a std::set:
+/// they are kept in the order given and duplicates are not removed.  The
+/// evaluation of a discrete range expects the values in ascending order, so
+/// the caller must give them that way, each value once.
+ibis::qDiscreteRange::qDiscreteRange(const char *col, const char *nums,
+                                     bool /*as_is*/)
+    : ibis::qRange(ibis::qExpr::DRANGE) {
+    if (col == 0 || *col == 0) return;
+    name = col;
+    if (nums == 0 || *nums == 0) return;
+    size_t count = 1;
+    for (const char *p = nums; *p != 0; ++ p) {
+        if (*p == ',' || *p == ';') ++ count;
+    }
+    values.reserve(count);
+    const char *str = nums;
+    while (*str != 0) {
+        char *stmp;
+        double dtmp = strtod(str, &stmp);
+        if (stmp > str) {
+            values.push_back(dtmp);
+            str = stmp + strspn(stmp, "\n\v\t\r, ;");
+        }
+        else {
+            break;
+        }
+    }
+} // qDiscreteRange ctor, FAST_IN
+
 /// Construct a qDiscreteRange object from a vector of unsigned 32-bit
 /// integers.  Initially used to convert qAnyString to qDiscreteRange,
 /// but made visible to public upon user request.

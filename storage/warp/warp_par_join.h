@@ -165,7 +165,127 @@ struct warp_pj_edge {
   int slot[WARP_PJ_MAX_KEY] = {0, 0, 0, 0};   // in the parent (see warp_pj_ref)
 };
 
-/* a table that is joined to the probe table, directly or through others */
+/* The columns of the tables of a join that an aggregation of its rows reads
+   (see warp_par_gja.h), with their values: the values of a build table by the
+   number of its row, the ones of a partition of the probe table by the number of
+   the row among the rows that pass the conditions of the table. */
+enum { WARP_GJ_INT = 0, WARP_GJ_DEC = 1, WARP_GJ_REAL = 2, WARP_GJ_STR = 3 };
+
+struct warp_gj_colspec {
+  uint field = 0;
+  int kind = WARP_GJ_INT;     // INT: integers and temporal values (as they are stored), DEC: scaled by 10^scale
+  int scale = 0;
+  bool nullable = false;
+};
+
+struct warp_gj_arr {
+  std::vector<int64_t> i;
+  std::vector<double> d;
+  std::vector<std::string> s;
+  std::vector<uint8_t> nulls;   // empty: no NULLs
+};
+
+/* "-123.45" with the scale 2 is -12345; false if it does not fit 18 digits */
+static bool warp_gj_parse_decimal(const std::string &text, int scale, int64_t *out) {
+  size_t i = 0;
+  bool negative = false;
+  if(i < text.size() && (text[i] == '-' || text[i] == '+')) {
+    negative = text[i] == '-';
+    ++i;
+  }
+  __int128 value = 0;
+  int fraction = -1;
+  int digits = 0;
+  for(; i < text.size(); ++i) {
+    const char c = text[i];
+    if(c == '.') {
+      if(fraction >= 0) return false;
+      fraction = 0;
+      continue;
+    }
+    if(c < '0' || c > '9') return false;
+    if(fraction >= 0) {
+      if(fraction >= scale) continue;   // more digits than the scale are zeros
+      ++fraction;
+    }
+    value = value * 10 + (c - '0');
+    if(++digits > 24) return false;
+  }
+  for(int k = fraction < 0 ? 0 : fraction; k < scale; ++k) value *= 10;
+  if(value > (__int128)999999999999999999LL) return false;
+  *out = negative ? -(int64_t)value : (int64_t)value;
+  return true;
+}
+
+/* The values of a column for the rows of the mask (count of them), in the order of the rows */
+static bool warp_gj_load_column(ibis::part *part, const warp_gj_colspec &spec, const ibis::bitvector &mask,
+                                size_t count, warp_gj_arr *out) {
+  const std::string name = "c" + std::to_string(spec.field);
+  const ibis::column *col = part->getColumn(name.c_str());
+  if(col == nullptr) {
+    return false;
+  }
+  auto take = [&](auto *values) {
+    std::unique_ptr<std::remove_pointer_t<decltype(values)>> guard(values);
+    if(!guard || guard->size() != count) return false;
+    out->i.assign(guard->begin(), guard->end());
+    return true;
+  };
+  switch(spec.kind) {
+    case WARP_GJ_INT:
+      switch(col->type()) {
+        case ibis::BYTE:   if(!take(part->selectBytes(name.c_str(), mask))) return false; break;
+        case ibis::UBYTE:  if(!take(part->selectUBytes(name.c_str(), mask))) return false; break;
+        case ibis::SHORT:  if(!take(part->selectShorts(name.c_str(), mask))) return false; break;
+        case ibis::USHORT: if(!take(part->selectUShorts(name.c_str(), mask))) return false; break;
+        case ibis::INT:    if(!take(part->selectInts(name.c_str(), mask))) return false; break;
+        case ibis::UINT:   if(!take(part->selectUInts(name.c_str(), mask))) return false; break;
+        case ibis::LONG:   if(!take(part->selectLongs(name.c_str(), mask))) return false; break;
+        case ibis::ULONG:  if(!take(part->selectULongs(name.c_str(), mask))) return false; break;
+        default: return false;
+      }
+      break;
+    case WARP_GJ_DEC: {
+      std::unique_ptr<std::vector<std::string>> values(part->selectStrings(name.c_str(), mask));
+      if(!values || values->size() != count) return false;
+      out->i.resize(count);
+      for(size_t k = 0; k < count; ++k) {
+        if(!warp_gj_parse_decimal((*values)[k], spec.scale, &out->i[k])) return false;
+      }
+      break;
+    }
+    case WARP_GJ_REAL:
+      if(col->type() == ibis::FLOAT) {
+        std::unique_ptr<ibis::array_t<float>> values(part->selectFloats(name.c_str(), mask));
+        if(!values || values->size() != count) return false;
+        out->d.assign(values->begin(), values->end());
+      } else if(col->type() == ibis::DOUBLE) {
+        std::unique_ptr<ibis::array_t<double>> values(part->selectDoubles(name.c_str(), mask));
+        if(!values || values->size() != count) return false;
+        out->d.assign(values->begin(), values->end());
+      } else {
+        return false;
+      }
+      break;
+    case WARP_GJ_STR: {
+      std::unique_ptr<std::vector<std::string>> values(part->selectStrings(name.c_str(), mask));
+      if(!values || values->size() != count) return false;
+      out->s = std::move(*values);
+      break;
+    }
+    default:
+      return false;
+  }
+  if(spec.nullable) {
+    const std::string null_name = "n" + std::to_string(spec.field);
+    std::unique_ptr<ibis::array_t<unsigned char>> nulls(part->selectUBytes(null_name.c_str(), mask));
+    if(!nulls || nulls->size() != count) return false;
+    out->nulls.assign(nulls->begin(), nulls->end());
+  }
+  return true;
+}
+
+/* A table that is joined to the probe table, directly or through others */
 struct warp_pj_table {
   TABLE *table = nullptr;
   ha_warp *handler = nullptr;
@@ -183,6 +303,8 @@ struct warp_pj_table {
   std::vector<std::vector<uint8_t>> nulls;
   /* what MySQL reads: the null bytes and the columns of the read set */
   std::vector<std::pair<uint32_t, uint32_t>> ranges;
+  std::vector<warp_gj_colspec> gj_specs;   // the columns that the aggregation reads, in gj
+  std::vector<warp_gj_arr> gj;             // their values for the rows of the table
   uint32_t image_len = 0;
   std::vector<uchar> arena;           // image_len bytes per row
   std::vector<uint64_t> rowids;       // the row ids of the rows (position() of the handler)
@@ -259,7 +381,15 @@ struct warp_pj_plan {
   std::vector<uint> root_cols;           // columns of the probe table that are read from every partition
   std::vector<int> root_null_slot;       // position of the NULL markers in root_nulls, -1: not nullable
   std::vector<uint> root_nulls;
+  std::vector<warp_gj_colspec> gj_probe;  // the columns of the probe table that the aggregation reads
   std::string probe_where;               // pushed down conditions of the probe table
+  /* The keys of the small tables that are joined to the probe table: only the rows
+     of the probe table that have one of them can match (set when the join is made) */
+  struct warp_pj_key_limit {
+    uint field = 0;
+    std::vector<int64_t> keys;           // ascending
+  };
+  std::vector<warp_pj_key_limit> probe_limits;
   std::vector<uint> where_fields;
   int nbuild = 0;                        // tables[1..nbuild] are joined to the probe table
   std::vector<warp_pj_semi> semis;
@@ -1081,6 +1211,7 @@ static bool warp_pj_build_parallel(warp_pj_table &t, const warp_star_snapshot &s
   for(auto &v : t.vals) v.clear();
   for(auto &v : t.nulls) v.clear();
   t.nrows = 0;
+  t.gj.assign(t.gj_specs.size(), warp_gj_arr());
 
   /* the conditions that FastBit evaluates */
   const std::string saved_where = handler->push_where_clause;
@@ -1117,6 +1248,7 @@ static bool warp_pj_build_parallel(warp_pj_table &t, const warp_star_snapshot &s
     std::vector<std::vector<int64_t>> vals;
     std::vector<std::vector<uint8_t>> nulls;
     std::vector<int64_t> keys;
+    std::vector<warp_gj_arr> gj;
     size_t rows = 0;
   };
   std::vector<partial> partials(work.size());
@@ -1212,6 +1344,7 @@ static bool warp_pj_build_parallel(warp_pj_table &t, const warp_star_snapshot &s
           }
           std::vector<int64_t> row_vals(t.value_fields.size());
           std::vector<uint8_t> row_nulls(t.value_fields.size());
+          ibis::bitvector keep;
           auto take = [&](size_t row) {
             if(!invisible.empty() && invisible[row]) return;
             for(size_t c = 0; c < t.value_fields.size(); ++c) {
@@ -1231,6 +1364,7 @@ static bool warp_pj_build_parallel(warp_pj_table &t, const warp_star_snapshot &s
               out.nulls[c].push_back(row_nulls[c]);
             }
             for(int s : own_slots) out.keys.push_back(row_vals[s]);
+            if(!t.gj_specs.empty()) keep.setBit(row, 1);
             ++out.rows;
           };
           for(ibis::bitvector::indexSet ix = hits->firstIndexSet(); ix.nIndices() > 0; ++ix) {
@@ -1240,6 +1374,20 @@ static bool warp_pj_build_parallel(warp_pj_table &t, const warp_star_snapshot &s
             } else {
               for(ibis::bitvector::word_t j = 0; j < ix.nIndices(); ++j) take(indices[j]);
             }
+          }
+          /* the typed columns of the aggregation for the rows that were kept */
+          if(!t.gj_specs.empty()) {
+            keep.adjustSize(0, nrows);
+            out.gj.resize(t.gj_specs.size());
+            for(size_t c = 0; c < t.gj_specs.size(); ++c) {
+              if(!warp_gj_load_column(part, t.gj_specs[c], keep, out.rows, &out.gj[c])) {
+                std::lock_guard<std::mutex> guard(error_mutex);
+                if(first_error.empty()) first_error = std::string("could not read the columns of ") + dir;
+                failed = true;
+                break;
+              }
+            }
+            if(failed) break;
           }
         }
         warp_release_partition(dir);
@@ -1289,6 +1437,18 @@ static bool warp_pj_build_parallel(warp_pj_table &t, const warp_star_snapshot &s
     }
     keys.insert(keys.end(), p.keys.begin(), p.keys.end());
     std::vector<int64_t>().swap(p.keys);
+    for(size_t c = 0; c < p.gj.size() && c < t.gj.size(); ++c) {
+      warp_gj_arr &from = p.gj[c];
+      warp_gj_arr &to = t.gj[c];
+      to.i.insert(to.i.end(), from.i.begin(), from.i.end());
+      to.d.insert(to.d.end(), from.d.begin(), from.d.end());
+      to.s.insert(to.s.end(), std::make_move_iterator(from.s.begin()), std::make_move_iterator(from.s.end()));
+      to.nulls.insert(to.nulls.end(), from.nulls.begin(), from.nulls.end());
+      warp_gj_arr().i.swap(from.i);
+      std::vector<double>().swap(from.d);
+      std::vector<std::string>().swap(from.s);
+      std::vector<uint8_t>().swap(from.nulls);
+    }
   }
   t.nrows = total;
   t.hash.build(keys, t.nrows, (int)width);
@@ -1404,6 +1564,8 @@ struct warp_pj_prober {
   std::vector<uint32_t> *out = nullptr;
   warp_pj_sink *sink = nullptr;
   void *local = nullptr;
+  const void *extra = nullptr;      // the typed columns of the partition (std::vector<warp_gj_arr>)
+  size_t index = 0;                 // the number of the row among the rows that pass the conditions
 
   inline bool value(const warp_pj_ref &ref, int64_t *v) const {
     if(ref.level == 0) {
@@ -1485,7 +1647,9 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
   /* the indexes of the columns of the condition are brought up to date */
   {
     std::vector<uint> stale;
-    for(uint f : plan.where_fields) {
+    std::vector<uint> checked = plan.where_fields;
+    for(const auto &limit : plan.probe_limits) checked.push_back(limit.field);
+    for(uint f : checked) {
       const std::string data = std::string(dir) + "/c" + std::to_string(f);
       struct stat dst, ist;
       if(stat((data + ".idx").c_str(), &ist) == 0 &&
@@ -1498,15 +1662,36 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
     }
   }
 
+  /* the keys of the small tables that fall in the range of the values of the partition */
+  std::string where = (plan.probe_where.empty() || plan.probe_where == "1=1") ? std::string() : plan.probe_where;
+  for(const auto &limit : plan.probe_limits) {
+    const std::string name = "c" + std::to_string(limit.field);
+    ibis::column *col = part->getColumn(name.c_str());
+    if(col == nullptr) continue;
+    auto first = std::lower_bound(limit.keys.begin(), limit.keys.end(), (int64_t)std::floor(col->getActualMin()));
+    auto last = std::upper_bound(limit.keys.begin(), limit.keys.end(), (int64_t)std::ceil(col->getActualMax()));
+    if(first == last) {
+      return true;   // no row of the partition has a key of the other table
+    }
+    if((size_t)(last - first) > 10000) continue;
+    /* the keys are ascending and unique: FAST_IN uses the list as it is */
+    std::string cond = name + " FAST_IN (";
+    for(auto it = first; it != last; ++it) {
+      if(it != first) cond += ",";
+      cond += std::to_string(*it);
+    }
+    cond += ")";
+    where = where.empty() ? cond : "(" + where + ") AND (" + cond + ")";
+  }
   ibis::bitvector everything;
   std::unique_ptr<ibis::query> query;
   const ibis::bitvector *hits = nullptr;
-  if(plan.probe_where.empty() || plan.probe_where == "1=1") {
+  if(where.empty()) {
     everything.set(1, nrows);
     hits = &everything;
   } else {
     query.reset(new ibis::query((const char *)0, part, (const char *)0));
-    query->addConditions(plan.probe_where.c_str());
+    query->addConditions(where.c_str());
     if(query->evaluate() < 0) {
       *error = std::string("could not evaluate the condition on ") + dir;
       plan.out_of_cache = true;
@@ -1563,6 +1748,19 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
   result->dir = dir;
   result->stride = 1 + (size_t)plan.nbuild;
 
+  /* the typed columns of the aggregation, for the rows that pass the conditions (by the number among them) */
+  std::vector<warp_gj_arr> gj_arrays;
+  if(!plan.gj_probe.empty()) {
+    gj_arrays.resize(plan.gj_probe.size());
+    for(size_t c = 0; c < plan.gj_probe.size(); ++c) {
+      if(!warp_gj_load_column(part, plan.gj_probe[c], *hits, hit_rows.size(), &gj_arrays[c])) {
+        *error = std::string("could not read the columns of ") + dir;
+        plan.out_of_cache = true;
+        return false;
+      }
+    }
+  }
+
   /* the rows are probed in slices, at the same time if the thread budget of
      the statement has threads to spare */
   const size_t min_slice = std::max<size_t>(THDVAR(plan.thd, parallel_min_rows), 1);
@@ -1591,12 +1789,14 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
       } scope{plan.sink.get(), plan.sink ? plan.sink->begin() : nullptr};
       prober.sink = scope.sink;
       prober.local = scope.local;
+      prober.extra = &gj_arrays;
       for(size_t i = lo; i < hi; ++i) {
         const size_t row = hit_rows[i];
         if(!invisible.empty() && invisible[row]) {
           continue;
         }
         prober.row = row;
+        prober.index = i;
         prober.ordinal = (uint32_t)row;
         if(!prober.expand(1)) {
           too_large = true;
@@ -1741,11 +1941,91 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
     warp_pj_table &build_table = plan.tables[l];
     const bool parallel = plan.sink && build_table.image_len == 0 && build_table.filters.empty() &&
                           build_table.semi.empty();
-    if(!(parallel ? warp_pj_build_parallel(build_table, snap, thd, error) : warp_pj_build(build_table, error))) {
+    /* the keys that the rows of the table must have (the ones of a derived table that
+       the engine materialized, the ones of the rows of the table that this one is
+       joined to) go into the condition of the scan: FastBit leaves the other rows
+       out, they are not read */
+    const std::string saved_where = build_table.pushed_where;
+    auto limit_scan = [&](uint field, const std::vector<int64_t> &keys) {
+      if(keys.empty() || keys.size() > 10000) return;
+      /* the keys are ascending and unique: FAST_IN uses the list as it is */
+      std::string cond = "c" + std::to_string(field) + " FAST_IN (";
+      for(size_t i = 0; i < keys.size(); ++i) {
+        if(i > 0) cond += ",";
+        cond += std::to_string(keys[i]);
+      }
+      cond += ")";
+      build_table.pushed_where = build_table.pushed_where.empty() ? cond : "(" + build_table.pushed_where + ") AND (" + cond + ")";
+    };
+    for(const auto &sf : build_table.semi) {
+      std::vector<int64_t> keys(sf.second->begin(), sf.second->end());
+      std::sort(keys.begin(), keys.end());
+      limit_scan(sf.first, keys);
+    }
+    if(!build_table.null_side && build_table.edge.parent >= 1 && build_table.edge.parent < l && build_table.edge.width == 1 &&
+       build_table.own_key_fields.size() == 1) {
+      const warp_pj_table &parent = plan.tables[build_table.edge.parent];
+      const int slot = build_table.edge.slot[0];
+      if(slot >= 0 && (size_t)slot < parent.vals.size() && parent.nrows <= 10000 &&
+         parent.vals[slot].size() == parent.nrows) {
+        std::vector<int64_t> keys;
+        for(size_t r = 0; r < parent.nrows; ++r) {
+          if(!parent.nulls[slot][r]) keys.push_back(parent.vals[slot][r]);
+        }
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        if(keys.empty()) {
+          build_table.pushed_where = "1=0";   // no row can match
+        } else {
+          limit_scan(build_table.own_key_fields[0], keys);
+        }
+      }
+    }
+    const bool built = parallel ? warp_pj_build_parallel(build_table, snap, thd, error) : warp_pj_build(build_table, error);
+    build_table.pushed_where = saved_where;
+    if(!built) {
       return false;
     }
   }
 
+  /* a table that is joined to the probe table by one column and has few rows (it
+     was limited by its own conditions or by a derived table): the probe table is
+     read for the rows that have one of its keys */
+  plan.probe_limits.clear();
+  for(int l = 1; l <= plan.nbuild; ++l) {
+    const warp_pj_table &t = plan.tables[l];
+    if(t.null_side || t.edge.parent != 0 || t.edge.width != 1 || t.edge.slot[0] < 0 ||
+       (size_t)t.edge.slot[0] >= plan.root_cols.size()) {
+      continue;
+    }
+    std::vector<int64_t> keys;
+    bool small = true;
+    if(t.hash.dense_range != 0) {
+      for(uint64_t i = 0; i < t.hash.dense_range && small; ++i) {
+        if(t.hash.dense[i] != 0) {
+          keys.push_back(t.hash.dense_min + (int64_t)i);
+          small = keys.size() <= 200000;
+        }
+      }
+    } else if(t.hash.sparse.size() <= 200000) {
+      for(const auto &entry : t.hash.sparse) keys.push_back(entry.first);
+    } else {
+      small = false;
+    }
+    if(!small) continue;
+    std::sort(keys.begin(), keys.end());
+    warp_pj_plan::warp_pj_key_limit limit;
+    limit.field = plan.root_cols[t.edge.slot[0]];
+    limit.keys = std::move(keys);
+    plan.probe_limits.push_back(std::move(limit));
+  }
+
+  if(getenv("WARP_PA_TRACE") != nullptr) {
+    for(const auto &limit : plan.probe_limits) {
+      sql_print_warning("WARP: the probe table is limited to %zu keys of column %u", limit.keys.size(), limit.field);
+    }
+    sql_print_warning("WARP: the join tables are built, %zu limits", plan.probe_limits.size());
+  }
   /* no row is written while the columns are read */
   warp_table_read_lock probe_lock(plan.probe_handler->get_warp_share()->data_dir_name);
 

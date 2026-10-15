@@ -342,6 +342,9 @@ public:
     /// Construct an empty dicrete range expression.
     qDiscreteRange() : qRange(DRANGE) {};
     qDiscreteRange(const char *col, const char *nums);
+    /// FAST_IN: the numbers are used as they are (not sorted, duplicates are
+    /// not removed).  The caller gives them in ascending order, each once.
+    qDiscreteRange(const char *col, const char *nums, bool as_is);
     qDiscreteRange(const char *col, const std::vector<uint32_t>& val);
     qDiscreteRange(const char *col, const std::vector<double>& val);
     qDiscreteRange(const char *col, ibis::array_t<uint32_t>& val);

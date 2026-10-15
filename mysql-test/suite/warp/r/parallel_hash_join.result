@@ -196,11 +196,7 @@ EXPLAIN FORMAT=TREE SELECT d1.a, d2.c, COUNT(*), SUM(f.v) FROM f_w f JOIN d1_w d
 EXPLAIN
 -> Table scan on <temporary>
     -> Aggregate using temporary table
-        -> Nested loop inner join
-            -> Nested loop inner join
-                -> Table scan on f, with parallel hash join
-                -> Table scan on d2, joined by the parallel hash join
-            -> Table scan on d1, joined by the parallel hash join
+        -> Table scan on f, with parallel aggregation
 
 Warnings:
 Note	1003	/* select#1 */ select `d1`.`a` AS `a`,`d2`.`c` AS `c`,count(0) AS `COUNT(*)`,sum(`f`.`v`) AS `SUM(f.v)` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (`f`.`k2` = `d2`.`k`)) group by `d1`.`a`,`d2`.`c`
