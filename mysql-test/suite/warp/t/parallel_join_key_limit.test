@@ -9,6 +9,7 @@
 SET SESSION warp_parallel_join_min_rows = 0;
 SET SESSION cte_max_recursion_depth = 100000;
 SET GLOBAL warp_partition_max_rows = 1000;
+SET SESSION optimizer_switch = 'subquery_to_derived=on';
 
 CREATE TABLE l_w (ok INT, v INT, q DECIMAL(6,2)) ENGINE=WARP;
 CREATE TABLE o_w (ok INT, ck INT, p DECIMAL(8,2)) ENGINE=WARP;
@@ -38,10 +39,14 @@ INSERT INTO queries VALUES
  (5, 'SELECT o.ok, l.v, l.q FROM o_# o, l_# l WHERE o.ok IN (SELECT ok FROM l_# GROUP BY ok HAVING SUM(q) > 149.9) AND o.ok = l.ok'),
  (6, 'SELECT c.nm, COUNT(*) n, SUM(l.q) s FROM l_# l JOIN o_# o ON o.ok = l.ok AND o.p < 5 JOIN c_# c ON c.ck = o.ck GROUP BY c.nm'),
  (7, 'SELECT c.nm, COUNT(l.ok) n FROM o_# o LEFT JOIN l_# l ON o.ok = l.ok AND l.v = 3 JOIN c_# c ON c.ck = o.ck WHERE o.p < 20 GROUP BY c.nm'),
- (8, 'SELECT o.ok, l.v FROM o_# o, l_# l WHERE o.ok = -100 AND o.ok = l.ok');
+ (8, 'SELECT o.ok, l.v FROM o_# o, l_# l WHERE o.ok = -100 AND o.ok = l.ok'),
+ (9, 'SELECT o.ok, o.ck, l.v, l.q FROM o_# o, l_# l WHERE o.ck = 3 AND o.ok = l.ok AND l.q = (SELECT MIN(l2.q) FROM l_# l2, c_# c WHERE l2.ok = o.ok AND c.ck = l2.v)'),
+ (10, 'SELECT o.ok, l.v, l.q FROM o_# o, l_# l WHERE o.ck < 0 AND o.ok = l.ok AND l.q = (SELECT MAX(l2.q) FROM l_# l2 JOIN c_# c ON c.ck = l2.v JOIN o_# o2 ON o2.ok = l2.ok WHERE l2.ok = o.ok AND o2.p > 10)'),
+ (11, 'SELECT o.ok, l.v, l.q FROM o_# o, l_# l WHERE o.ck = 5 AND o.ok = l.ok AND l.q > (SELECT AVG(l2.q) FROM l_# l2 LEFT JOIN c_# c ON c.ck = l2.v + 1000 WHERE l2.ok = o.ok)'),
+ (12, 'SELECT o.ok, l.v, l.q FROM o_# o, l_# l WHERE o.ck = 7 AND o.ok = l.ok AND l.q >= (SELECT MIN(l2.q) FROM l_# l2, c_# c WHERE l2.ok = o.ok AND c.ck = l2.v AND c.nm LIKE ''c1%'')');
 
 --let $i = 1
-while ($i <= 8)
+while ($i <= 12)
 {
   --let $w = `SELECT REPLACE(q, '#', 'w') FROM queries WHERE i = $i`
   --let $n = `SELECT REPLACE(q, '#', 'i') FROM queries WHERE i = $i`

@@ -1962,6 +1962,12 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
       std::sort(keys.begin(), keys.end());
       limit_scan(sf.first, keys);
     }
+    for(const auto &candidate : build_table.handler->semi_candidates) {
+      std::vector<int64_t> keys;
+      if(build_table.handler->semi_keys_of(candidate, &keys, 10000)) {
+        limit_scan(candidate->inner_col, keys);
+      }
+    }
     if(!build_table.null_side && build_table.edge.parent >= 1 && build_table.edge.parent < l && build_table.edge.width == 1 &&
        build_table.own_key_fields.size() == 1) {
       const warp_pj_table &parent = plan.tables[build_table.edge.parent];
@@ -1992,6 +1998,18 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
      was limited by its own conditions or by a derived table): the probe table is
      read for the rows that have one of its keys */
   plan.probe_limits.clear();
+  /* the keys that the block above found after the join of the engine replaced the scans (a
+     derived table that the join is the source of): the candidates that were found before
+     are for the hash joins that the engine's join replaced, and are dropped */
+  for(const auto &candidate : plan.probe_handler->semi_candidates) {
+    std::vector<int64_t> keys;
+    if(plan.probe_handler->semi_keys_of(candidate, &keys, 5000000)) {
+      warp_pj_plan::warp_pj_key_limit limit;
+      limit.field = candidate->inner_col;
+      limit.keys = std::move(keys);
+      plan.probe_limits.push_back(std::move(limit));
+    }
+  }
   for(int l = 1; l <= plan.nbuild; ++l) {
     const warp_pj_table &t = plan.tables[l];
     if(t.null_side || t.edge.parent != 0 || t.edge.width != 1 || t.edge.slot[0] < 0 ||
