@@ -15,6 +15,7 @@ call mtr.add_suppression("WARP: join worker failed");
 call mtr.add_suppression("WARP: could not read the selected rows");
 call mtr.add_suppression("WARP: scan of .* failed");
 call mtr.add_suppression("WARP: the parallel hash join of .* failed");
+call mtr.add_suppression("WARP: parallel aggregation of .* failed");
 
 SELECT @@warp_cache_size;
 SET SESSION cte_max_recursion_depth = 1000000;

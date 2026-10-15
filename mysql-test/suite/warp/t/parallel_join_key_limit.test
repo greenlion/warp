@@ -1,0 +1,61 @@
+--echo #
+--echo # The tables of the join of the engine that have few rows (a table that is
+--echo # joined to a derived table with a selective HAVING, or the rows of the table
+--echo # that another one is joined to) limit the scans of the tables that are joined
+--echo # to them: the scans read the rows that have those keys only.  Every query is
+--echo # run against the WARP tables and InnoDB copies.
+--echo #
+
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 100000;
+SET GLOBAL warp_partition_max_rows = 1000;
+
+CREATE TABLE l_w (ok INT, v INT, q DECIMAL(6,2)) ENGINE=WARP;
+CREATE TABLE o_w (ok INT, ck INT, p DECIMAL(8,2)) ENGINE=WARP;
+CREATE TABLE c_w (ck INT, nm VARCHAR(10)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO l_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 9000)
+  SELECT i DIV 3 - 100, i % 17, (i % 50) + 0.5 FROM s;
+INSERT INTO o_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 3200)
+  SELECT i - 101, i % 400 - 50, ROUND(i / 7, 2) FROM s;
+INSERT INTO c_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 450)
+  SELECT i - 51, CONCAT('c', i) FROM s;
+CREATE TABLE l_i LIKE l_w;
+CREATE TABLE o_i LIKE o_w;
+CREATE TABLE c_i LIKE c_w;
+ALTER TABLE l_i ENGINE=InnoDB;
+ALTER TABLE o_i ENGINE=InnoDB;
+ALTER TABLE c_i ENGINE=InnoDB;
+INSERT INTO l_i SELECT * FROM l_w;
+INSERT INTO o_i SELECT * FROM o_w;
+INSERT INTO c_i SELECT * FROM c_w;
+
+CREATE TABLE queries (i INT, q TEXT);
+INSERT INTO queries VALUES
+ (1, 'SELECT c.nm, o.ok, o.p, SUM(l.q) s FROM c_# c, o_# o, l_# l WHERE o.ok IN (SELECT ok FROM l_# GROUP BY ok HAVING SUM(q) > 140) AND c.ck = o.ck AND o.ok = l.ok GROUP BY c.nm, o.ok, o.p'),
+ (2, 'SELECT o.ok, SUM(l.q) s FROM o_# o, l_# l WHERE o.ok IN (SELECT ok FROM l_# GROUP BY ok HAVING SUM(q) > 148) AND o.ok = l.ok GROUP BY o.ok'),
+ (3, 'SELECT o.ok, COUNT(*) n FROM o_# o, l_# l WHERE o.ok IN (SELECT ok FROM l_# GROUP BY ok HAVING SUM(q) > 100000) AND o.ok = l.ok GROUP BY o.ok'),
+ (4, 'SELECT o.ok, COUNT(*) n FROM o_# o, l_# l WHERE o.ok IN (SELECT ok FROM l_# GROUP BY ok HAVING SUM(q) > 0) AND o.ok = l.ok AND l.v < 3 GROUP BY o.ok'),
+ (5, 'SELECT o.ok, l.v, l.q FROM o_# o, l_# l WHERE o.ok IN (SELECT ok FROM l_# GROUP BY ok HAVING SUM(q) > 149.9) AND o.ok = l.ok'),
+ (6, 'SELECT c.nm, COUNT(*) n, SUM(l.q) s FROM l_# l JOIN o_# o ON o.ok = l.ok AND o.p < 5 JOIN c_# c ON c.ck = o.ck GROUP BY c.nm'),
+ (7, 'SELECT c.nm, COUNT(l.ok) n FROM o_# o LEFT JOIN l_# l ON o.ok = l.ok AND l.v = 3 JOIN c_# c ON c.ck = o.ck WHERE o.p < 20 GROUP BY c.nm'),
+ (8, 'SELECT o.ok, l.v FROM o_# o, l_# l WHERE o.ok = -100 AND o.ok = l.ok');
+
+--let $i = 1
+while ($i <= 8)
+{
+  --let $w = `SELECT REPLACE(q, '#', 'w') FROM queries WHERE i = $i`
+  --let $n = `SELECT REPLACE(q, '#', 'i') FROM queries WHERE i = $i`
+  --echo # query $i
+  --disable_query_log
+  eval CREATE TABLE r_w ENGINE=InnoDB AS $w;
+  eval CREATE TABLE r_i ENGINE=InnoDB AS $n;
+  --enable_query_log
+  SELECT (SELECT COUNT(*) FROM r_w) = (SELECT COUNT(*) FROM r_i) AS same_rows, (SELECT COUNT(*) FROM r_i) > 0 AS has_rows;
+  SELECT COUNT(*) AS different_rows FROM
+    ((SELECT * FROM r_w EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_w)) d;
+  DROP TABLE r_w, r_i;
+  --inc $i
+}
+
+SET GLOBAL warp_partition_max_rows = DEFAULT;
+DROP TABLE l_w, o_w, c_w, l_i, o_i, c_i, queries;

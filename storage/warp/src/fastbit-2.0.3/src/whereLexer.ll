@@ -183,6 +183,13 @@ NAME	[_a-zA-Z]((->)?[0-9A-Za-z_:.]+)*(\[[^\]]+\])?
     return token::STRLIT;
 }
 
+[fF][aA][sS][tT]_[iI][nN]{WS}*\({WS}*{NUMBER}({SEP}+{NUMBER})*{WS}*\) {
+    /* FAST_IN (n1, n2, ...): the numbers are used as they are, they must be in ascending order and unique */
+    const char *open = strchr(yytext, '(');
+    yylval->stringVal = new std::string(open + 1, yytext + yyleng - open - 2);
+    return token::FASTINSEQ;
+}
+
 \({WS}*{NUMBER}{SEP}+{NUMBER}({SEP}+{NUMBER})+{WS}*\) { /* a number series */
 #if defined(DEBUG) && DEBUG + 0 > 1
     LOGGER(ibis::gVerbose >= 0)

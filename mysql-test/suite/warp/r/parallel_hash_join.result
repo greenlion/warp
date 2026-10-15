@@ -172,11 +172,7 @@ EXPLAIN FORMAT=TREE SELECT d1.a, d2.c, COUNT(*), SUM(f.v) FROM f_w f JOIN d1_w d
 EXPLAIN
 -> Table scan on <temporary>
     -> Aggregate using temporary table
-        -> Nested loop inner join
-            -> Nested loop inner join
-                -> Table scan on f, with parallel hash join
-                -> Table scan on d2, joined by the parallel hash join
-            -> Table scan on d1, joined by the parallel hash join
+        -> Table scan on f, with parallel aggregation
 
 # case 14: an expression of the joined rows
 686:1489578616657

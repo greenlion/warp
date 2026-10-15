@@ -5290,6 +5290,8 @@ static bool warp_has_inner_nested_loop_table(AccessPath *root_path,
 #include "warp_star_agg.h"
 #include "warp_par_join.h"
 #include "warp_par_agg.h"
+#include "sql/item_timefunc.h"
+#include "warp_par_gja.h"
 
 /**
  * handlerton::push_to_engine implementation.  Walks the AccessPath tree and
@@ -6206,7 +6208,7 @@ void ha_warp::make_scan_where() {
     const std::vector<int64_t> &keys = *semi_pick_keys;
     const uint64_t rows = table_row_count();
     if(keys.size() <= std::min<uint64_t>(100000, rows / 4)) {
-      std::string cond = "c" + std::to_string(semi_in->inner_col) + " IN (";
+      std::string cond = "c" + std::to_string(semi_in->inner_col) + " FAST_IN (";   // the keys are ascending and unique
       if(keys.empty()) {
         cond = "1=0";
       } else {
@@ -6249,7 +6251,7 @@ std::string ha_warp::where_for_partition(const std::string &dir) {
     } else if((size_t)(last - first) > 200000) {
       break;   // does not help
     } else {
-      cond = name + " IN (";
+      cond = name + " FAST_IN (";   // the keys are ascending and unique
       for(auto it = first; it != last; ++it) {
         if(it != first) cond += ",";
         cond += std::to_string(*it);

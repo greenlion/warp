@@ -118,11 +118,8 @@ DROP TABLE r_w, r_off, r_i;
 # the join has a key: the engine joins the tables
 EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(f.v) FROM f_w f, d_w d WHERE (d.k = f.k AND d.a = 'a1' AND f.q BETWEEN 1 AND 10) OR (d.k = f.k AND d.a = 'a2' AND f.q BETWEEN 10 AND 20);
 EXPLAIN
--> Aggregate: count(0), sum(f.v)  (cost=29073 rows=1)
-    -> Filter: (((d.a = 'a1') and (f.k = d.k) and (f.q between 1 and 10)) or ((d.a = 'a2') and (f.k = d.k) and (f.q between 10 and 20)))  (cost=27676 rows=6066)
-        -> Nested loop inner join  (cost=27676 rows=6066)
-            -> Table scan on f, with parallel hash join  (cost=27676 rows=6066)
-            -> Table scan on d, joined by the parallel hash join  (cost=0 rows=1)
+-> Aggregate: count(0), sum(0)  (cost=29073 rows=1)
+    -> Table scan on f, with parallel aggregation  (cost=27676 rows=6066)
 
 SET SESSION warp_parallel_join_min_rows = DEFAULT;
 DROP TABLE queries, f_w, d_w, f_i, d_i;

@@ -291,9 +291,10 @@ namespace ibis {
     UINTSEQ = 296,                 // "unsigned integer sequence"
     NOUNSTR = 297,                 // "name string"
     NUMSEQ = 298,                  // "number sequence"
-    STRSEQ = 299,                  // "string sequence"
-    STRLIT = 300,                  // "string literal"
-    CONSTAINSOP = 301              // CONSTAINSOP
+    FASTINSEQ = 299,               // "FAST_IN sequence"
+    STRSEQ = 300,                  // "string sequence"
+    STRLIT = 301,                  // "string literal"
+    CONSTAINSOP = 302              // CONSTAINSOP
       };
       /// Backward compatibility alias (Bison 3.6).
       typedef token_kind_type yytokentype;
@@ -310,7 +311,7 @@ namespace ibis {
     {
       enum symbol_kind_type
       {
-        YYNTOKENS = 51, ///< Number of tokens.
+        YYNTOKENS = 52, ///< Number of tokens.
         S_YYEMPTY = -2,
         S_YYEOF = 0,                             // "end of input"
         S_YYerror = 1,                           // error
@@ -356,20 +357,21 @@ namespace ibis {
         S_UINTSEQ = 41,                          // "unsigned integer sequence"
         S_NOUNSTR = 42,                          // "name string"
         S_NUMSEQ = 43,                           // "number sequence"
-        S_STRSEQ = 44,                           // "string sequence"
-        S_STRLIT = 45,                           // "string literal"
-        S_CONSTAINSOP = 46,                      // CONSTAINSOP
-        S_47_ = 47,                              // '('
-        S_48_ = 48,                              // ')'
-        S_49_ = 49,                              // ','
-        S_50_ = 50,                              // ';'
-        S_YYACCEPT = 51,                         // $accept
-        S_qexpr = 52,                            // qexpr
-        S_simpleRange = 53,                      // simpleRange
-        S_compRange2 = 54,                       // compRange2
-        S_compRange3 = 55,                       // compRange3
-        S_mathExpr = 56,                         // mathExpr
-        S_START = 57                             // START
+        S_FASTINSEQ = 44,                        // "FAST_IN sequence"
+        S_STRSEQ = 45,                           // "string sequence"
+        S_STRLIT = 46,                           // "string literal"
+        S_CONSTAINSOP = 47,                      // CONSTAINSOP
+        S_48_ = 48,                              // '('
+        S_49_ = 49,                              // ')'
+        S_50_ = 50,                              // ','
+        S_51_ = 51,                              // ';'
+        S_YYACCEPT = 52,                         // $accept
+        S_qexpr = 53,                            // qexpr
+        S_simpleRange = 54,                      // simpleRange
+        S_compRange2 = 55,                       // compRange2
+        S_compRange3 = 56,                       // compRange3
+        S_mathExpr = 57,                         // mathExpr
+        S_START = 58                             // START
       };
     };
 
@@ -881,9 +883,9 @@ namespace ibis {
     /// Constants.
     enum
     {
-      yylast_ = 627,     ///< Last index in yytable_.
+      yylast_ = 664,     ///< Last index in yytable_.
       yynnts_ = 7,  ///< Number of nonterminal symbols.
-      yyfinal_ = 84 ///< Termination state number.
+      yyfinal_ = 85 ///< Termination state number.
     };
 
 
@@ -895,7 +897,7 @@ namespace ibis {
 
 #line 25 "whereParser.yy"
 } // ibis
-#line 899 "whereParser.hh"
+#line 901 "whereParser.hh"
 
 
 

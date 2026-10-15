@@ -84,6 +84,7 @@
 %token <stringVal>  UINTSEQ	"unsigned integer sequence"
 %token <stringVal>  NOUNSTR	"name string"
 %token <stringVal>  NUMSEQ	"number sequence"
+%token <stringVal>  FASTINSEQ	"FAST_IN sequence"
 %token <stringVal>  STRSEQ	"string sequence"
 %token <stringVal>  STRLIT	"string literal"
 
@@ -102,7 +103,7 @@
 %type <whereNode> qexpr simpleRange compRange2 compRange3 mathExpr
 
 
-%destructor { delete $$; } INTSEQ UINTSEQ NOUNSTR NUMSEQ STRSEQ STRLIT
+%destructor { delete $$; } INTSEQ UINTSEQ NOUNSTR NUMSEQ FASTINSEQ STRSEQ STRLIT
 %destructor { delete $$; } qexpr simpleRange compRange2 compRange3 mathExpr
 
 %{
@@ -270,6 +271,17 @@ EXISTSOP NOUNSTR {
 #endif
     $$ = new ibis::qExists($3->c_str());
     delete $3;
+}
+| NOUNSTR FASTINSEQ {
+    $$ = new ibis::qDiscreteRange($1->c_str(), $2->c_str(), true);
+    delete $2;
+    delete $1;
+}
+| NOUNSTR NOTOP FASTINSEQ {
+    $$ = new ibis::qExpr(ibis::qExpr::LOGICAL_NOT);
+    $$->setLeft(new ibis::qDiscreteRange($1->c_str(), $3->c_str(), true));
+    delete $3;
+    delete $1;
 }
 | NOUNSTR INOP NUMSEQ {
 #if defined(DEBUG) && DEBUG + 0 > 1
