@@ -5395,6 +5395,43 @@ static bool warp_derived_source(const MaterializePathParameters::Operand &operan
   while(scan != nullptr && scan->type == AccessPath::FILTER) {
     scan = scan->filter().child;
   }
+  if(field != nullptr && scan != nullptr && operand.subquery_path != nullptr &&
+     operand.subquery_path->type == AccessPath::TEMPTABLE_AGGREGATE && scan->type != AccessPath::TABLE_SCAN) {
+    /* the groups are made of the rows of a join: if the joins are inner joins, the rows of
+       the table of the column that have other values do not change the groups of the
+       values that are looked up */
+    bool inner_only = true;
+    bool found = false;
+    WalkAccessPaths(scan, nullptr, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK, [&](AccessPath *p, const JOIN *) {
+      switch(p->type) {
+        case AccessPath::NESTED_LOOP_JOIN:
+          inner_only = inner_only && p->nested_loop_join().join_type == JoinType::INNER;
+          return false;
+        case AccessPath::HASH_JOIN: {
+          const RelationalExpression *expr = p->hash_join().join_predicate == nullptr ? nullptr : p->hash_join().join_predicate->expr;
+          inner_only = inner_only && expr != nullptr && expr->type == RelationalExpression::INNER_JOIN;
+          return false;
+        }
+        case AccessPath::FILTER:
+          return false;
+        default: {
+          TABLE *table = GetBasicTable(p);
+          if(table == nullptr) {
+            inner_only = false;
+          } else if(table == field->table) {
+            found = true;
+          }
+          return true;
+        }
+      }
+    });
+    if(!inner_only || !found) {
+      return false;
+    }
+    *source_handler = dynamic_cast<ha_warp *>(field->table->file);
+    *source_field = field;
+    return *source_handler != nullptr;
+  }
   if(scan == nullptr || scan->type != AccessPath::TABLE_SCAN || field == nullptr ||
      field->table != scan->table_scan().table) {
     return false;
