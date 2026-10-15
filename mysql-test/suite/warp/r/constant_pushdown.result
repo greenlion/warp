@@ -65,9 +65,13 @@ EXPLAIN
 -> Aggregate: count(0)  (cost=44.6 rows=1)
     -> Table scan on t_w  (cost=41.2 rows=14.9)
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`t_w` where ((`test`.`t_w`.`d` between <cache>((0.06 - 0.01)) and <cache>((0.06 + 0.01))) and (`test`.`t_w`.`i` < <cache>((12 * 2))))
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE i IN (5, -5);
 EXPLAIN
 -> Aggregate: count(0)  (cost=59.7 rows=1)
     -> Table scan on t_w  (cost=41.2 rows=80.4)
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`t_w` where (`test`.`t_w`.`i` in (5,<cache>(-(5))))
 DROP TABLE t_w, t_i, preds;

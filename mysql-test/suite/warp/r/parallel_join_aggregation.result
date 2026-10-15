@@ -200,6 +200,8 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f, with parallel aggregation  (cost=147643 rows=1.48e+6)
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`g` AS `g`,count(0) AS `COUNT(*)`,count(`d`.`x`) AS `COUNT(d.x)`,sum(0) AS `SUM(d.x)` from `test`.`f_w` `f` left join `test`.`d_w` `d` on(((`d`.`k` = `f`.`k`) and (not((`d`.`s` like '%special%requests%'))))) where true group by `f`.`g`
 EXPLAIN FORMAT=TREE SELECT f.g, COUNT(DISTINCT d.x) FROM f_w f LEFT JOIN d_w d ON f.k = d.k GROUP BY f.g;
 EXPLAIN
 -> Group aggregate: count(distinct d_w.x)
@@ -209,6 +211,8 @@ EXPLAIN
                 -> Table scan on f, with parallel hash join  (cost=147643 rows=1.48e+6)
                 -> Table scan on d, joined by the parallel hash join  (cost=0 rows=1)
 
+Warnings:
+Note	1003	/* select#1 */ select `f`.`g` AS `g`,count(distinct `test`.`d_w`.`x`) AS `COUNT(DISTINCT d.x)` from `test`.`f_w` `f` left join `test`.`d_w` `d` on((`d`.`k` = `f`.`k`)) where true group by `f`.`g`
 SET SESSION warp_parallel_aggregation = DEFAULT;
 SET SESSION warp_parallel_join_min_rows = DEFAULT;
 DROP TABLE queries, f_w, d_w, e_w, f_i, d_i, e_i;

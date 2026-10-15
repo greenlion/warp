@@ -199,7 +199,7 @@ EXPLAIN
         -> Table scan on f, with parallel aggregation
 
 Warnings:
-Note	1003	/* select#1 */ select `d1`.`a` AS `a`,`d2`.`c` AS `c`,count(0) AS `COUNT(*)`,sum(`f`.`v`) AS `SUM(f.v)` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (`f`.`k2` = `d2`.`k`)) group by `d1`.`a`,`d2`.`c`
+Note	1003	/* select#1 */ select `d1`.`a` AS `a`,`d2`.`c` AS `c`,count(0) AS `COUNT(*)`,sum(0) AS `SUM(f.v)` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join `test`.`d2_w` `d2` where ((`d1`.`k` = `f`.`k1`) and (`f`.`k2` = `d2`.`k`)) group by `d1`.`a`,`d2`.`c`
 # case 14: an expression of the joined rows
 686:1489578616657
 EXPLAIN FORMAT=TREE SELECT f.id, f.v * d1.b + d2.flag FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE f.s IN ('s1', 's2', 's3');
@@ -312,7 +312,7 @@ EXPLAIN
         -> Table scan on d1, with parallel aggregation
 
 Warnings:
-Note	1003	/* select#1 */ select `d1`.`k` AS `k`,count(`f`.`id`) AS `COUNT(f.id)`,sum(`f`.`v`) AS `SUM(f.v)` from `test`.`d1_w` `d1` left join `test`.`f_w` `f` on(((`f`.`k1` = `d1`.`k`) and (`f`.`v` > 50))) where true group by `d1`.`k`
+Note	1003	/* select#1 */ select `d1`.`k` AS `k`,count(`f`.`id`) AS `COUNT(f.id)`,sum(0) AS `SUM(f.v)` from `test`.`d1_w` `d1` left join `test`.`f_w` `f` on(((`f`.`k1` = `d1`.`k`) and (`f`.`v` > 50))) where true group by `d1`.`k`
 # case 23: NULL keys of the outer table
 851:1832393546893
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f LEFT JOIN d1_w d1 ON f.n = d1.kk WHERE f.id < 400;

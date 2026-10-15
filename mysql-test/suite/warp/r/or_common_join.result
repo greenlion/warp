@@ -121,5 +121,7 @@ EXPLAIN
 -> Aggregate: count(0), sum(0)  (cost=29073 rows=1)
     -> Table scan on f, with parallel aggregation  (cost=27676 rows=6066)
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(0) AS `SUM(f.v)` from `test`.`f_w` `f` join `test`.`d_w` `d` where (((`d`.`a` = 'a1') and (`f`.`k` = `d`.`k`) and (`f`.`q` between 1 and 10)) or ((`d`.`a` = 'a2') and (`f`.`k` = `d`.`k`) and (`f`.`q` between 10 and 20)))
 SET SESSION warp_parallel_join_min_rows = DEFAULT;
 DROP TABLE queries, f_w, d_w, f_i, d_i;

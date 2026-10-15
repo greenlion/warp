@@ -76,11 +76,15 @@ EXPLAIN
 -> Aggregate: count(0)  (cost=3.2 rows=1)
     -> Table scan on t_w  (cost=2.56 rows=2.78)
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`t_w` where (`test`.`t_w`.`v` like '%special%requests%')
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE n NOT LIKE '%special%requests%';
 EXPLAIN
 -> Aggregate: count(0)  (cost=7.68 rows=1)
     -> Table scan on t_w  (cost=2.56 rows=22.2)
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`t_w` where (not((`test`.`t_w`.`n` like '%special%requests%')))
 # a column in another collation is left to MySQL
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE ci LIKE 'a%';
 EXPLAIN
@@ -88,6 +92,8 @@ EXPLAIN
     -> Filter: (t_w.ci like 'a%')  (cost=2.56 rows=2.78)
         -> Table scan on t_w  (cost=2.56 rows=25)
 
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`t_w` where (`test`.`t_w`.`ci` like 'a%')
 # prepared
 PREPARE s FROM 'SELECT COUNT(*) FROM t_w WHERE v NOT LIKE ?';
 SET @p = '%a%';
