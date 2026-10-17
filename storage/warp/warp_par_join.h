@@ -42,6 +42,8 @@
 #include <unordered_set>
 
 #include "sql/join_optimizer/access_path.h"
+#include "sql/filesort.h"
+#include "sql/join_optimizer/walk_access_paths.h"
 #include "sql/join_optimizer/relational_expression.h"
 
 static inline bool warp_pj_no(int line) {
@@ -2579,6 +2581,48 @@ static void warp_pj_find_semi(AccessPath *inner, JOIN *join, std::vector<warp_pj
 
 /* Called from push_to_engine: the joins that the engine can evaluate are
    replaced. */
+/* A nested loop whose outer side is sorted (the order of a GROUP BY that is
+   aggregated as the rows come, by columns of the outer table) is
+   NLJ(SORT(x), y): the rows of the nested loop are in the order of x.  The
+   engine can join x and y if the sort is done after the join instead,
+   SORT(join of x and y), which returns the rows in the same order (the keys
+   of the sort are columns of the tables of x).  The sort is made again for
+   all the tables of the join (it keeps the columns of all of them).  Before,
+   every row of x looked up y with an index (TPC-H Q16: an index lookup of
+   partsupp for each of 3 million parts). */
+static bool warp_pj_replace_below_sort(THD *thd, AccessPath *path, JOIN *join,
+                                       const std::vector<warp_pj_semi> &semis) {
+  if(path->type != AccessPath::NESTED_LOOP_JOIN || path->nested_loop_join().join_type != JoinType::INNER) {
+    return false;
+  }
+  AccessPath *sort = path->nested_loop_join().outer;
+  if(sort == nullptr || sort->type != AccessPath::SORT || sort->sort().filesort == nullptr ||
+     sort->sort().order == nullptr || sort->sort().remove_duplicates || sort->sort().unwrap_rollup) {
+    return false;
+  }
+  Mem_root_array<TABLE *> tables(thd->mem_root);
+  WalkTablesUnderAccessPath(path, [&](TABLE *t) {
+    tables.push_back(t);
+    return false;
+  }, /*include_pruned_tables=*/false);
+  AccessPath *nested = new (thd->mem_root) AccessPath(*path);
+  nested->nested_loop_join().outer = sort->sort().child;
+  if(!warp_pj_replace(thd, nested, join, semis)) {
+    return false;
+  }
+  Filesort *filesort = new (thd->mem_root)
+      Filesort(thd, std::move(tables), sort->sort().filesort->keep_buffers, sort->sort().order,
+               sort->sort().limit, /*remove_duplicates=*/false, sort->sort().force_sort_rowids,
+               /*unwrap_rollup=*/false);
+  AccessPath *top = NewSortAccessPath(thd, nested, filesort, sort->sort().order,
+                                      /*count_examined_rows=*/false);
+  top->sort().limit = sort->sort().limit;
+  top->set_num_output_rows(path->num_output_rows());
+  top->set_cost(path->cost());
+  *path = *top;
+  return true;
+}
+
 static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
   if(!THDVAR(thd, parallel_hash_join) ||
      (thd->lex->sql_command != SQLCOM_SELECT && thd->lex->sql_command != SQLCOM_CREATE_TABLE &&
@@ -2608,6 +2652,9 @@ static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
                     if(join_below) {
                       if(warp_pj_replace(thd, path, join, semis)) {
                         return true;  // everything below it is the engine's now
+                      }
+                      if(warp_pj_replace_below_sort(thd, path, join, semis)) {
+                        return true;
                       }
                     }
                     return false;

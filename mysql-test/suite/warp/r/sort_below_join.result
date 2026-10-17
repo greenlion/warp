@@ -1,0 +1,103 @@
+#
+# A nested loop whose outer table is sorted for a GROUP BY that is
+# aggregated as the rows come (NLJ(SORT(p), ps)) is joined by the engine
+# and sorted after the join, in the same order (TPC-H Q16).
+#
+SET SESSION cte_max_recursion_depth = 300000;
+CREATE TABLE p (pk INT, brand VARCHAR(10), sz INT, KEY (pk))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE ps (pk INT, sk INT, cost INT, KEY (pk, sk), KEY (sk))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE s (sk INT, cmt VARCHAR(20), KEY (sk))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO p WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 20000)
+SELECT x, CONCAT('B', x % 13), x % 9 FROM seq;
+INSERT INTO ps WITH RECURSIVE seq(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM seq WHERE x < 159999)
+SELECT 1 + x DIV 8, 1 + (x * 7) % 1000, x % 50 FROM seq;
+INSERT INTO s WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000)
+SELECT x, IF(x % 17 = 0, 'complaint', 'fine') FROM seq;
+EXPLAIN FORMAT=TREE SELECT brand, sz, COUNT(DISTINCT ps.sk) AS cnt, COUNT(*) AS n
+FROM ps, p
+WHERE p.pk = ps.pk AND brand <> 'B3' AND sz IN (1, 4, 7, 8)
+AND ps.sk NOT IN (SELECT sk FROM s WHERE cmt = 'complaint')
+GROUP BY brand, sz
+ORDER BY cnt DESC, brand, sz;
+EXPLAIN
+-> Sort: cnt DESC, p.brand, p.sz
+    -> Stream results  
+        -> Group aggregate: count(distinct ps.sk), count(0)  
+            -> Sort: p.brand, p.sz  
+                -> Filter: <in_optimizer>(ps.sk,ps.sk in (select #2) is false)  
+                    -> Nested loop inner join  
+                        -> Table scan on ps, with parallel hash join  
+                        -> Table scan on p, joined by the parallel hash join  
+                    -> Select #2 (subquery in condition; run only once)
+                        -> Filter: ((ps.sk = `<materialized_subquery>`.sk))  
+                            -> Limit: 1 row(s)  
+                                -> Index lookup on <materialized_subquery> using <auto_distinct_key> (sk = ps.sk)
+                                    -> Materialize with deduplication  
+                                        -> Table scan on s  
+
+SELECT COUNT(*) AS different_rows FROM
+(SELECT * FROM r_on UNION ALL SELECT * FROM r_off) u
+GROUP BY brand, sz, cnt, n HAVING COUNT(*) <> 2;
+different_rows
+SELECT COUNT(*), SUM(cnt), SUM(n) FROM r_on;
+COUNT(*)	SUM(cnt)	SUM(n)
+48	45216	61838
+SELECT brand, sz, COUNT(DISTINCT ps.sk) AS cnt, COUNT(*) AS n
+FROM ps, p
+WHERE p.pk = ps.pk AND brand <> 'B3' AND sz IN (1, 4, 7, 8)
+AND ps.sk NOT IN (SELECT sk FROM s WHERE cmt = 'complaint')
+GROUP BY brand, sz
+ORDER BY cnt DESC, brand, sz;
+brand	sz	cnt	n
+B0	1	942	1285
+B0	4	942	1292
+B0	7	942	1290
+B0	8	942	1292
+B1	1	942	1286
+B1	4	942	1288
+B1	7	942	1293
+B1	8	942	1291
+B10	1	942	1293
+B10	4	942	1286
+B10	7	942	1286
+B10	8	942	1284
+B11	1	942	1291
+B11	4	942	1291
+B11	7	942	1276
+B11	8	942	1288
+B12	1	942	1287
+B12	4	942	1292
+B12	7	942	1287
+B12	8	942	1285
+B2	1	942	1288
+B2	4	942	1284
+B2	7	942	1293
+B2	8	942	1286
+B4	1	942	1292
+B4	4	942	1288
+B4	7	942	1285
+B4	8	942	1286
+B5	1	942	1289
+B5	4	942	1293
+B5	7	942	1285
+B5	8	942	1290
+B6	1	942	1285
+B6	4	942	1292
+B6	7	942	1287
+B6	8	942	1292
+B7	1	942	1285
+B7	4	942	1290
+B7	7	942	1293
+B7	8	942	1293
+B8	1	942	1287
+B8	4	942	1279
+B8	7	942	1292
+B8	8	942	1288
+B9	1	942	1292
+B9	4	942	1284
+B9	7	942	1291
+B9	8	942	1286
+DROP TABLE r_on, r_off, p, ps, s;

@@ -1,0 +1,41 @@
+--echo #
+--echo # A nested loop whose outer table is sorted for a GROUP BY that is
+--echo # aggregated as the rows come (NLJ(SORT(p), ps)) is joined by the engine
+--echo # and sorted after the join, in the same order (TPC-H Q16).
+--echo #
+
+SET SESSION cte_max_recursion_depth = 300000;
+CREATE TABLE p (pk INT, brand VARCHAR(10), sz INT, KEY (pk))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE ps (pk INT, sk INT, cost INT, KEY (pk, sk), KEY (sk))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE s (sk INT, cmt VARCHAR(20), KEY (sk))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO p WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 20000)
+  SELECT x, CONCAT('B', x % 13), x % 9 FROM seq;
+INSERT INTO ps WITH RECURSIVE seq(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM seq WHERE x < 159999)
+  SELECT 1 + x DIV 8, 1 + (x * 7) % 1000, x % 50 FROM seq;
+INSERT INTO s WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000)
+  SELECT x, IF(x % 17 = 0, 'complaint', 'fine') FROM seq;
+
+let $q = SELECT brand, sz, COUNT(DISTINCT ps.sk) AS cnt, COUNT(*) AS n
+FROM ps, p
+WHERE p.pk = ps.pk AND brand <> 'B3' AND sz IN (1, 4, 7, 8)
+  AND ps.sk NOT IN (SELECT sk FROM s WHERE cmt = 'complaint')
+GROUP BY brand, sz
+ORDER BY cnt DESC, brand, sz;
+
+--replace_regex /\(cost=[^)]*\)//
+eval EXPLAIN FORMAT=TREE $q;
+--disable_query_log
+eval CREATE TABLE r_on ENGINE=InnoDB AS $q;
+SET SESSION warp_parallel_hash_join = OFF;
+eval CREATE TABLE r_off ENGINE=InnoDB AS $q;
+SET SESSION warp_parallel_hash_join = DEFAULT;
+--enable_query_log
+SELECT COUNT(*) AS different_rows FROM
+  (SELECT * FROM r_on UNION ALL SELECT * FROM r_off) u
+  GROUP BY brand, sz, cnt, n HAVING COUNT(*) <> 2;
+SELECT COUNT(*), SUM(cnt), SUM(n) FROM r_on;
+eval $q;
+DROP TABLE r_on, r_off, p, ps, s;
