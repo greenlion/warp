@@ -1250,6 +1250,7 @@ void ha_warp::update_row_count() {
      scans that follow read the old copy with the new number of rows. */
   warp_table_read_lock data_lock(share->data_dir_name);
   stats.records = warp_table_estimate(share->data_dir_name, "");
+  unadjusted_records = stats.records;
   DBUG_VOID_RETURN;
 }
 
@@ -1592,7 +1593,7 @@ int ha_warp::write_row_impl(uchar *buf) {
     or an allocation failure will happen.
   */
   writer->appendRow(buffer.c_ptr(), ",");
-  stats.records++;
+  stats.records = ++unadjusted_records;
   if(has_unique_keys()) {
     remember_unique_keys(buf);
     buffered_rowids.insert(current_rowid);
@@ -1722,7 +1723,8 @@ int ha_warp::delete_row(const uchar *buf) {
   current_trx->write_delete_log_rowid(current_rowid);
   
   ha_statistic_increment(&System_status_var::ha_delete_count);
-  stats.records--;
+  if(unadjusted_records > 0) --unadjusted_records;
+  stats.records = unadjusted_records;
   DBUG_RETURN(0);
 }
 
@@ -1998,7 +2000,11 @@ int ha_warp::info(uint flag) {
 
   // if this is the fact table set the records to the smallest possible value,
   // the number of rows of the smallest table of the statement plus 2
-  // (otherwise const evaluation will be used)
+  // (otherwise const evaluation will be used).  The handler stays open in
+  // the table cache between statements: the number of rows is set every
+  // time, a count that was lowered for one statement (as the fact table, or
+  // with warp_adjust_table_stats_for_joins = ON) is not kept for the next.
+  stats.records = unadjusted_records;
   if(is_fact_table && !is_partition_child &&
      THDVAR(table->in_use, adjust_table_stats_for_joins)) {
     stats.records = least_row_count+2;

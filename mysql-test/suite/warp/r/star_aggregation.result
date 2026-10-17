@@ -88,10 +88,10 @@ EXPLAIN FORMAT=TREE SELECT g1, AVG(a) FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1;
 EXPLAIN
 -> Table scan on <temporary>
     -> Aggregate using temporary table
-        -> Inner hash join (d1.k = f.k1)
-            -> Table scan on d1
+        -> Inner hash join (f.k1 = d1.k)
+            -> Table scan on f
             -> Hash
-                -> Table scan on f
+                -> Table scan on d1
 
 count min max, one dimension: 6 rows
 count min max, two dimensions with sums and conditions: 33 rows

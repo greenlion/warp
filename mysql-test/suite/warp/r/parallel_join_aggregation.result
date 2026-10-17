@@ -198,15 +198,15 @@ EXPLAIN FORMAT=TREE SELECT f.g, COUNT(*), COUNT(d.x), SUM(d.x) FROM f_w f LEFT J
 EXPLAIN
 -> Table scan on <temporary>
     -> Aggregate using temporary table
-        -> Table scan on f, with parallel aggregation  (cost=147643 rows=1.48e+6)
+        -> Table scan on f, with parallel aggregation  (cost=147342 rows=1.47e+6)
 
 EXPLAIN FORMAT=TREE SELECT f.g, COUNT(DISTINCT d.x) FROM f_w f LEFT JOIN d_w d ON f.k = d.k GROUP BY f.g;
 EXPLAIN
 -> Group aggregate: count(distinct d_w.x)
     -> Sort: f.g
-        -> Stream results  (cost=147643 rows=1.48e+6)
-            -> Nested loop left join  (cost=147643 rows=1.48e+6)
-                -> Table scan on f, with parallel hash join  (cost=147643 rows=1.48e+6)
+        -> Stream results  (cost=147342 rows=1.47e+6)
+            -> Nested loop left join  (cost=147342 rows=1.47e+6)
+                -> Table scan on f, with parallel hash join  (cost=147342 rows=1.47e+6)
                 -> Table scan on d, joined by the parallel hash join  (cost=0 rows=1)
 
 SET SESSION warp_parallel_aggregation = DEFAULT;

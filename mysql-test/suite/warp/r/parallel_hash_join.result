@@ -89,16 +89,17 @@ EXPLAIN
 0:0
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f, d1_w d1 WHERE f.k1 = d1.k AND d1.kk IN (SELECT kk FROM d1_w GROUP BY kk HAVING COUNT(*) > 1000);
 EXPLAIN
--> Nested loop inner join
-    -> Nested loop inner join
-        -> Table scan on f, with parallel hash join
-        -> Table scan on d1, joined by the parallel hash join
-    -> Covering index lookup on derived_1_2 using <auto_key0> (Name_exp_1 = d1.kk)
-        -> Materialize
-            -> Filter: (count(0) > 1000)
-                -> Table scan on <temporary>
-                    -> Aggregate using temporary table
-                        -> Table scan on d1_w, with parallel aggregation
+-> Inner hash join (f.k1 = d1.k)
+    -> Table scan on f
+    -> Hash
+        -> Nested loop inner join
+            -> Table scan on d1
+            -> Covering index lookup on derived_1_2 using <auto_key0> (Name_exp_1 = d1.kk)
+                -> Materialize
+                    -> Filter: (count(0) > 1000)
+                        -> Table scan on <temporary>
+                            -> Aggregate using temporary table
+                                -> Table scan on d1_w, with parallel aggregation
 
 # case 6: composite key
 900:1900154646063
@@ -188,7 +189,7 @@ EXPLAIN
 42:94736792227
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_w g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id);
 EXPLAIN
--> Hash antijoin (g.k1 = f.k1), extra conditions: (g.v <> d1.b) and (g.id < f.id)
+-> Hash antijoin (g.k1 = d1.k), extra conditions: (g.v <> d1.b) and (g.id < f.id)
     -> Nested loop inner join
         -> Table scan on f, with parallel hash join
         -> Table scan on d1, joined by the parallel hash join
@@ -203,7 +204,7 @@ Note	1276	Field or reference 'test.f.id' of SELECT #2 was resolved in SELECT #1
 150:321467921698
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_w g WHERE g.k2 = f.k2 AND g.v = d1.b + 40);
 EXPLAIN
--> Remove duplicate (f, d2, d1) rows using temporary table (weedout)
+-> Remove duplicate (d2, f, d1) rows using temporary table (weedout)
     -> Inner hash join (d1.k = f.k1), ((d1.b + 40) = g.v)
         -> Table scan on d1
         -> Hash
