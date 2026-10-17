@@ -228,9 +228,9 @@ SET SESSION warp_semi_key_pushdown = OFF;
 # the engine makes the rows of the temporary table distinct
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM a_w a WHERE a.k IN (SELECT /*+ QB_NAME(sq) SEMIJOIN(@sq MATERIALIZATION) */ b.k FROM b_w b WHERE b.v > 3);
 EXPLAIN
--> Aggregate: count(0)  (cost=995722 rows=1)
-    -> Nested loop inner join  (cost=301780 rows=3.01e+6)
-        -> Table scan on a  (cost=308 rows=3006)
+-> Aggregate: count(0)  (cost=995060 rows=1)
+    -> Nested loop inner join  (cost=301579 rows=3.01e+6)
+        -> Table scan on a  (cost=308 rows=3004)
         -> Single-row index lookup on <subquery2> using <auto_distinct_key> (k = a.k)  (cost=539..539 rows=1)
             -> Materialize with deduplication  (cost=539..539 rows=1002)
                 -> Filter: (b.k is not null)  (cost=308 rows=1002)

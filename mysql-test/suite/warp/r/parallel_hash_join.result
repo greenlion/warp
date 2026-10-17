@@ -97,16 +97,17 @@ Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a`,`d1`.`b` AS `b`
 0:0
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f, d1_w d1 WHERE f.k1 = d1.k AND d1.kk IN (SELECT kk FROM d1_w GROUP BY kk HAVING COUNT(*) > 1000);
 EXPLAIN
--> Nested loop inner join
-    -> Nested loop inner join
-        -> Table scan on f, with parallel hash join
-        -> Table scan on d1, joined by the parallel hash join
-    -> Covering index lookup on derived_1_2 using <auto_key0> (Name_exp_1 = d1.kk)
-        -> Materialize
-            -> Filter: (count(0) > 1000)
-                -> Table scan on <temporary>
-                    -> Aggregate using temporary table
-                        -> Table scan on d1_w, with parallel aggregation
+-> Inner hash join (f.k1 = d1.k)
+    -> Table scan on f
+    -> Hash
+        -> Nested loop inner join
+            -> Table scan on d1
+            -> Covering index lookup on derived_1_2 using <auto_key0> (Name_exp_1 = d1.kk)
+                -> Materialize
+                    -> Filter: (count(0) > 1000)
+                        -> Table scan on <temporary>
+                            -> Aggregate using temporary table
+                                -> Table scan on d1_w, with parallel aggregation
 
 Warnings:
 Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join (/* select#2 */ select `test`.`d1_w`.`kk` AS `Name_exp_1` from `test`.`d1_w` group by `test`.`d1_w`.`kk` having (count(0) > 1000)) `derived_1_2` where ((`derived_1_2`.`Name_exp_1` = `d1`.`kk`) and (`d1`.`k` = `f`.`k1`))
@@ -216,7 +217,7 @@ Note	1003	/* select#1 */ select `f`.`id` AS `id`,((`f`.`v` * `d1`.`b`) + `d2`.`f
 42:94736792227
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k WHERE NOT EXISTS (SELECT 1 FROM f_w g WHERE g.k1 = f.k1 AND g.v <> d1.b AND g.id < f.id);
 EXPLAIN
--> Hash antijoin (g.k1 = f.k1), extra conditions: (g.v <> d1.b) and (g.id < f.id)
+-> Hash antijoin (g.k1 = d1.k), extra conditions: (g.v <> d1.b) and (g.id < f.id)
     -> Nested loop inner join
         -> Table scan on f, with parallel hash join
         -> Table scan on d1, joined by the parallel hash join
@@ -232,7 +233,7 @@ Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a` from `test`.`f_
 150:321467921698
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_w g WHERE g.k2 = f.k2 AND g.v = d1.b + 40);
 EXPLAIN
--> Remove duplicate (f, d2, d1) rows using temporary table (weedout)
+-> Remove duplicate (d2, f, d1) rows using temporary table (weedout)
     -> Inner hash join (d1.k = f.k1), ((d1.b + 40) = g.v)
         -> Table scan on d1
         -> Hash

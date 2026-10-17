@@ -118,8 +118,8 @@ DROP TABLE r_w, r_off, r_i;
 # the join has a key: the engine joins the tables
 EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(f.v) FROM f_w f, d_w d WHERE (d.k = f.k AND d.a = 'a1' AND f.q BETWEEN 1 AND 10) OR (d.k = f.k AND d.a = 'a2' AND f.q BETWEEN 10 AND 20);
 EXPLAIN
--> Aggregate: count(0), sum(0)  (cost=29073 rows=1)
-    -> Table scan on f, with parallel aggregation  (cost=27676 rows=6066)
+-> Aggregate: count(0), sum(0)  (cost=29025 rows=1)
+    -> Table scan on f, with parallel aggregation  (cost=27630 rows=6056)
 
 Warnings:
 Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(0) AS `SUM(f.v)` from `test`.`f_w` `f` join `test`.`d_w` `d` where (((`d`.`a` = 'a1') and (`f`.`k` = `d`.`k`) and (`f`.`q` between 1 and 10)) or ((`d`.`a` = 'a2') and (`f`.`k` = `d`.`k`) and (`f`.`q` between 10 and 20)))

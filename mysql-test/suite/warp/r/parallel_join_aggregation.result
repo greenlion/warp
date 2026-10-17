@@ -198,7 +198,7 @@ EXPLAIN FORMAT=TREE SELECT f.g, COUNT(*), COUNT(d.x), SUM(d.x) FROM f_w f LEFT J
 EXPLAIN
 -> Table scan on <temporary>
     -> Aggregate using temporary table
-        -> Table scan on f, with parallel aggregation  (cost=147643 rows=1.48e+6)
+        -> Table scan on f, with parallel aggregation  (cost=147342 rows=1.47e+6)
 
 Warnings:
 Note	1003	/* select#1 */ select `f`.`g` AS `g`,count(0) AS `COUNT(*)`,count(`d`.`x`) AS `COUNT(d.x)`,sum(0) AS `SUM(d.x)` from `test`.`f_w` `f` left join `test`.`d_w` `d` on(((`d`.`k` = `f`.`k`) and (not((`d`.`s` like '%special%requests%'))))) where true group by `f`.`g`
@@ -206,9 +206,9 @@ EXPLAIN FORMAT=TREE SELECT f.g, COUNT(DISTINCT d.x) FROM f_w f LEFT JOIN d_w d O
 EXPLAIN
 -> Group aggregate: count(distinct d_w.x)
     -> Sort: f.g
-        -> Stream results  (cost=147643 rows=1.48e+6)
-            -> Nested loop left join  (cost=147643 rows=1.48e+6)
-                -> Table scan on f, with parallel hash join  (cost=147643 rows=1.48e+6)
+        -> Stream results  (cost=147342 rows=1.47e+6)
+            -> Nested loop left join  (cost=147342 rows=1.47e+6)
+                -> Table scan on f, with parallel hash join  (cost=147342 rows=1.47e+6)
                 -> Table scan on d, joined by the parallel hash join  (cost=0 rows=1)
 
 Warnings:

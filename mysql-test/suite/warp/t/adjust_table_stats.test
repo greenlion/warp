@@ -1,0 +1,32 @@
+--echo #
+--echo # warp_adjust_table_stats_for_joins: the largest table of a join is given
+--echo # the number of rows of the smallest one plus 2.  The handler stays open
+--echo # between statements: the next statement that does not adjust the number
+--echo # of rows (OFF, or the table is not the largest one) sees the real one.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE f (a INT, b INT) ENGINE=WARP;
+CREATE TABLE d (a INT, c INT) ENGINE=WARP;
+CREATE TABLE g (a INT) ENGINE=WARP;
+INSERT INTO f WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000)
+  SELECT x, x FROM seq;
+INSERT INTO d VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 10);
+INSERT INTO g WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 5000)
+  SELECT x FROM seq;
+
+SET SESSION warp_adjust_table_stats_for_joins = ON;
+--replace_column 1 # 2 # 4 # 5 # 6 # 7 # 8 # 9 # 11 # 12 #
+EXPLAIN SELECT COUNT(*) FROM f JOIN d ON f.a = d.a;
+SET SESSION warp_adjust_table_stats_for_joins = OFF;
+--echo # the real number of rows of f, without FLUSH TABLES
+--replace_column 1 # 2 # 4 # 5 # 6 # 7 # 8 # 9 # 11 # 12 #
+EXPLAIN SELECT COUNT(*) FROM f JOIN d ON f.a = d.a;
+SET SESSION warp_adjust_table_stats_for_joins = ON;
+--replace_column 1 # 2 # 4 # 5 # 6 # 7 # 8 # 9 # 11 # 12 #
+EXPLAIN SELECT COUNT(*) FROM f JOIN d ON f.a = d.a;
+--echo # f is not the largest table of this join: its real number of rows
+--replace_column 1 # 2 # 4 # 5 # 6 # 7 # 8 # 9 # 11 # 12 #
+EXPLAIN SELECT COUNT(*) FROM f JOIN g ON f.a = g.a;
+SET SESSION warp_adjust_table_stats_for_joins = DEFAULT;
+DROP TABLE f, d, g;

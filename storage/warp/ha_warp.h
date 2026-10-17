@@ -1296,6 +1296,9 @@ class ha_warp : public handler {
 
   /* this is always the rowid of the current row */
   uint64_t current_rowid = 0;  
+  /* the number of rows of the table, before warp_adjust_table_stats_for_joins
+     lowers stats.records for a statement (see info) */
+  ha_rows unadjusted_records = 0;
 
   /* a SELECT lists of the columns that have been fetched for the current query */
   std::string column_set = "";
