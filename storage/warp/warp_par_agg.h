@@ -884,7 +884,16 @@ static std::shared_ptr<warp_pa_plan> warp_pa_make_plan(THD *thd, AccessPath *agg
   /* HAVING: the groups that do not pass are not returned (MySQL checks the
      condition again).  Only if every group of MySQL is one group of the
      engine, and a query without GROUP BY always has a row. */
-  if(join->having_cond != nullptr && plan->group_cols > 0 && plan->key_cols.size() == plan->group_cols) {
+  /* With a temporary table for the groups, MySQL moved HAVING to a condition
+     of the temporary table before the engine sees the plan (and kept it in
+     having_for_explain): it is the same HAVING (TPC-H Q18 returned all of its
+     75 million groups to MySQL, of which 3 thousand pass).  MySQL moves it
+     only without DISTINCT and ROLLUP. */
+  Item *having = join->having_cond;
+  if(having == nullptr && !join->select_distinct && join->rollup_state == JOIN::RollupState::NONE) {
+    having = join->having_for_explain;
+  }
+  if(having != nullptr && plan->group_cols > 0 && plan->key_cols.size() == plan->group_cols) {
     std::vector<Item *> conjuncts;
     std::function<void(Item *)> split = [&](Item *item) {
       if(item->type() == Item::COND_ITEM &&
@@ -895,7 +904,7 @@ static std::shared_ptr<warp_pa_plan> warp_pa_make_plan(THD *thd, AccessPath *agg
         conjuncts.push_back(item);
       }
     };
-    split(join->having_cond);
+    split(having);
     for(Item *conjunct : conjuncts) {
       if(conjunct->type() != Item::FUNC_ITEM) continue;
       Item_func *func = down_cast<Item_func *>(conjunct);
