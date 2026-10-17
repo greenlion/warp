@@ -42,6 +42,8 @@
 #include <thread>
 #include <condition_variable>
 #include <future>
+#include <deque>
+#include <functional>
 #include <map>
 #include <forward_list>
 #include <unordered_map>
@@ -1062,6 +1064,69 @@ static inline handler::Table_flags warp_table_flags() {
           HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN | HA_DUPLICATE_POS);
 }
 
+/* The threads that read partitions ahead of a scan (ha_warp::start_prefetch).
+   A thread for every partition that is read ahead cost more than the read
+   of a small partition: a scan that an index lookup makes for every row of a
+   join (the dependent subquery of TPC-H Q2) started thousands of threads a
+   second.  The threads of the pool are started once and wait for work; a
+   task that no thread has started yet when the scan needs it is run by the
+   scan itself (see warp_prefetch_slot), so a busy pool never makes a scan
+   wait. */
+class warp_prefetch_pool {
+ public:
+  static warp_prefetch_pool &instance() {
+    static warp_prefetch_pool pool;
+    return pool;
+  }
+  void submit(std::function<void()> task) {
+    {
+      std::lock_guard<std::mutex> guard(mtx);
+      if(stopping) return;     // the slot is claimed and run by the scan
+      if(workers.empty()) start();
+      queue.push_back(std::move(task));
+    }
+    cv.notify_one();
+  }
+  /* called when the plugin is unloaded: the code of the threads goes away */
+  void stop() {
+    std::vector<std::thread> joined;
+    {
+      std::lock_guard<std::mutex> guard(mtx);
+      stopping = true;
+      joined.swap(workers);
+    }
+    cv.notify_all();
+    for(auto &t : joined) t.join();
+  }
+
+ private:
+  void start() {
+    unsigned n = std::thread::hardware_concurrency();
+    n = std::max(4u, std::min(n == 0 ? 8u : n, 64u));
+    for(unsigned i = 0; i < n; ++i) {
+      workers.emplace_back([this]() { run(); });
+    }
+  }
+  void run() {
+    for(;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [this]() { return stopping || !queue.empty(); });
+        if(queue.empty()) return;   // stopping, nothing left to run
+        task = std::move(queue.front());
+        queue.pop_front();
+      }
+      task();
+    }
+  }
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::deque<std::function<void()>> queue;
+  std::vector<std::thread> workers;
+  bool stopping = false;
+};
+
 class ha_warp : public handler {
   /* MySQL lock - Fastbit has its own internal mutex implementation.  This is used to protect the share.*/
   THR_LOCK_DATA lock; 
@@ -1100,9 +1165,25 @@ class ha_warp : public handler {
   int find_current_row(uchar *buf, ibis::table::cursor* cursor);
  public:
   void register_cursor(ibis::table::cursor *cursor, ibis::table *rows);
+  void read_row_ids(ibis::table::cursor *cursor, uint64_t &rowid, uint64_t &trx_id);
  private:
   ibis::table::cursor *pos_cursor = nullptr;   // the cursor that pos_c and pos_n are the positions of
   std::vector<int> pos_c, pos_n;               // by field index: position of c<i>, n<i> (-1: none)
+  int pos_r = -1, pos_t = -1;                  // positions of the row id r and the transaction id t
+  /* An index lookup of one integer value of the first column of the key:
+     the partitions whose values of the column do not contain it are not
+     opened (see warp_partition_may_contain) */
+  int prune_field = -1;
+  double prune_value = 0;
+  /* The partitions that the index lookups of the statement opened, by
+     directory, with the signature they had: the next lookup of the statement
+     uses them again instead of reading their metadata again (a dependent
+     subquery looks up the same partitions for every outer row).  They are
+     freed when the statement ends. */
+  std::unordered_map<std::string, std::pair<std::string, ibis::part *>> lookup_parts;
+  std::unordered_set<ibis::part *> lookup_owned;
+  bool lookup_scan = false;   // the scan is an index lookup of pruned partitions: nothing is read ahead
+  void clear_lookup_parts();
   int find_current_row_impl(uchar *buf, ibis::table::cursor* cursor);
   int create_writer(TABLE *table_arg);
   void load_partition_rows();
@@ -1140,7 +1221,16 @@ class ha_warp : public handler {
     ibis::table* base_table = NULL;
     ibis::table* filtered_table = NULL;
   };
-  std::map<std::string, std::future<prefetched_partition>> prefetched_partitions;
+  /* A partition that is read ahead: the task is run once, by a thread of
+     the pool or by the scan when it needs the partition first (whichever
+     claims it). */
+  struct prefetch_slot {
+    std::shared_ptr<std::atomic<bool>> claimed;
+    std::shared_ptr<std::packaged_task<prefetched_partition()>> task;
+    std::future<prefetched_partition> result;
+    std::shared_ptr<ibis::util::ThreadBudget> budget;
+  };
+  std::map<std::string, prefetch_slot> prefetched_partitions;
   std::shared_ptr<ibis::util::ThreadBudget> thread_budget;
   bool start_prefetch(const std::string& datadir);
   void prefetch_following_partitions();
@@ -1533,6 +1623,7 @@ class ha_warp : public handler {
     par_agg.reset();
     pj_follower.reset();
     pj_follower_pending = false;
+    clear_lookup_parts();
     return 0;
   }
   int delete_all_rows(void);
