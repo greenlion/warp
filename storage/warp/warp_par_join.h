@@ -2623,6 +2623,137 @@ static bool warp_pj_replace_below_sort(THD *thd, AccessPath *path, JOIN *join,
   return true;
 }
 
+/* The child that a join or a filter returns the rows of first */
+static AccessPath **warp_pj_outer_slot(AccessPath *path) {
+  switch(path->type) {
+    case AccessPath::NESTED_LOOP_JOIN:
+      return path->nested_loop_join().join_type == JoinType::INNER ? &path->nested_loop_join().outer : nullptr;
+    case AccessPath::HASH_JOIN:
+      return path->hash_join().join_predicate != nullptr &&
+                     path->hash_join().join_predicate->expr->type == RelationalExpression::INNER_JOIN
+                 ? &path->hash_join().outer
+                 : nullptr;
+    case AccessPath::FILTER:
+      return &path->filter().child;
+    default:
+      return nullptr;
+  }
+}
+
+/* A scalar subquery that MySQL made a derived table (subquery_to_derived)
+   is joined by a LEFT JOIN without a condition: the derived table is an
+   aggregate without GROUP BY, it has one row.  Such a join is
+   (a LEFT JOIN d ON TRUE) JOIN b JOIN c, which is the same as
+   (a JOIN b JOIN c) LEFT JOIN d ON TRUE when no condition of the other
+   joins uses d.  The engine joins a, b and c, and the derived table is
+   joined to the rows of their join.  Before, the derived table stopped
+   the engine's join, and the other tables were joined by index lookups
+   (TPC-H Q11: a lookup of partsupp for each supplier of a nation, over all
+   the partitions of partsupp, 142 seconds at SF50). */
+static bool warp_pj_replace_around_one_row(THD *thd, AccessPath *path, JOIN *join,
+                                           const std::vector<warp_pj_semi> &semis) {
+  /* the LEFT JOIN on the side of the rows that come first */
+  AccessPath *left = nullptr;
+  for(AccessPath *at = path; at != nullptr;) {
+    if(at != path && at->type == AccessPath::HASH_JOIN && at->hash_join().join_predicate != nullptr &&
+       at->hash_join().join_predicate->expr->type == RelationalExpression::LEFT_JOIN) {
+      left = at;
+      break;
+    }
+    AccessPath **slot = warp_pj_outer_slot(at);
+    at = slot == nullptr ? nullptr : *slot;
+  }
+  if(left == nullptr || left->hash_join().rewrite_semi_to_inner) {
+    return false;
+  }
+  const RelationalExpression *expr = left->hash_join().join_predicate->expr;
+  if(!expr->equijoin_conditions.empty() || !expr->join_conditions.empty()) {
+    return false;
+  }
+  AccessPath *inner = left->hash_join().inner;
+  if(inner->type != AccessPath::MATERIALIZE || inner->materialize().table_path == nullptr ||
+     inner->materialize().table_path->type != AccessPath::TABLE_SCAN) {
+    return false;
+  }
+  TABLE *derived = inner->materialize().table_path->table_scan().table;
+  if(derived == nullptr || derived->pos_in_table_list == nullptr || !derived->pos_in_table_list->is_derived()) {
+    return false;
+  }
+  /* exactly one row: an aggregate without GROUP BY */
+  Query_expression *unit = derived->pos_in_table_list->derived_query_expression();
+  if(unit == nullptr || !unit->is_simple()) {
+    return false;
+  }
+  Query_block *block = unit->first_query_block();
+  if(block == nullptr || block->group_list.elements != 0 || !block->is_implicitly_grouped() ||
+     block->having_cond() != nullptr || block->has_limit()) {
+    return false;
+  }
+  /* nothing below the join to the derived table uses it, but the derived
+     table itself */
+  const table_map dmap = derived->pos_in_table_list->map();
+  bool uses_derived = false;
+  auto uses = [&](Item *item) {
+    if(item != nullptr && (item->used_tables() & dmap)) uses_derived = true;
+  };
+  WalkAccessPaths(path, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK, [&](AccessPath *p, const JOIN *) {
+    if(p == inner) return true;   // the derived table itself
+    switch(p->type) {
+      case AccessPath::FILTER:
+        uses(p->filter().condition);
+        break;
+      case AccessPath::REF:
+        for(uint k = 0; k < p->ref().ref->key_parts; ++k) uses(p->ref().ref->items[k]);
+        break;
+      case AccessPath::EQ_REF:
+        for(uint k = 0; k < p->eq_ref().ref->key_parts; ++k) uses(p->eq_ref().ref->items[k]);
+        break;
+      case AccessPath::NESTED_LOOP_JOIN:
+        if(p->nested_loop_join().join_predicate != nullptr) {
+          for(Item *c : p->nested_loop_join().join_predicate->expr->join_conditions) uses(c);
+          for(Item *c : p->nested_loop_join().join_predicate->expr->equijoin_conditions) uses(c);
+        }
+        break;
+      case AccessPath::HASH_JOIN:
+        if(p != left && p->hash_join().join_predicate != nullptr) {
+          for(Item *c : p->hash_join().join_predicate->expr->join_conditions) uses(c);
+          for(Item *c : p->hash_join().join_predicate->expr->equijoin_conditions) uses(c);
+        }
+        break;
+      default:
+        break;
+    }
+    return false;
+  });
+  if(uses_derived) {
+    return false;
+  }
+  /* the path without the LEFT JOIN (a copy of the nodes above it) */
+  AccessPath *copy = new (thd->mem_root) AccessPath(*path);
+  AccessPath *at = copy;
+  for(;;) {
+    AccessPath **slot = warp_pj_outer_slot(at);
+    if(slot == nullptr) {
+      return false;
+    }
+    if(*slot == left) {
+      *slot = left->hash_join().outer;
+      break;
+    }
+    *slot = new (thd->mem_root) AccessPath(**slot);
+    at = *slot;
+  }
+  if(!warp_pj_replace(thd, copy, join, semis)) {
+    return false;
+  }
+  AccessPath *top = new (thd->mem_root) AccessPath(*left);
+  top->hash_join().outer = copy;
+  top->set_num_output_rows(path->num_output_rows());
+  top->set_cost(path->cost());
+  *path = *top;
+  return true;
+}
+
 static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
   if(!THDVAR(thd, parallel_hash_join) ||
      (thd->lex->sql_command != SQLCOM_SELECT && thd->lex->sql_command != SQLCOM_CREATE_TABLE &&
@@ -2654,6 +2785,9 @@ static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
                         return true;  // everything below it is the engine's now
                       }
                       if(warp_pj_replace_below_sort(thd, path, join, semis)) {
+                        return true;
+                      }
+                      if(warp_pj_replace_around_one_row(thd, path, join, semis)) {
                         return true;
                       }
                     }
