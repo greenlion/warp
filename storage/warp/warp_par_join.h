@@ -694,24 +694,30 @@ static bool warp_pj_collect(AccessPath *path, warp_pj_collector &collector) {
     case AccessPath::EQ_REF: {
       TABLE *table = path->type == AccessPath::REF ? path->ref().table : path->eq_ref().table;
       Index_lookup *ref = path->type == AccessPath::REF ? path->ref().ref : path->eq_ref().ref;
-      if(table == nullptr || ref == nullptr || ref->key_parts != 1 ||
-         dynamic_cast<ha_warp *>(table->file) == nullptr) {
+      /* every part of the key is a column of a table before it: a lookup by
+         several columns (the key of partsupp) joins by all of them */
+      if(table == nullptr || ref == nullptr || ref->key_parts < 1 ||
+         ref->key_parts > (uint)WARP_PJ_MAX_KEY || dynamic_cast<ha_warp *>(table->file) == nullptr) {
         return warp_pj_no(__LINE__);
       }
-      Item *value = ref->items[0]->real_item();
-      if(value->type() != Item::FIELD_ITEM) {
-        return warp_pj_no(__LINE__);
-      }
-      Field *outer_field = down_cast<Item_field *>(value)->field;
-      Field *key_field = table->key_info[ref->key].key_part[0].field;
-      if(outer_field == nullptr || key_field == nullptr || outer_field->table == table) {
-        return warp_pj_no(__LINE__);
+      std::vector<warp_pj_pair_info> parts;
+      for(uint k = 0; k < ref->key_parts; ++k) {
+        Item *value = ref->items[k]->real_item();
+        if(value->type() != Item::FIELD_ITEM) {
+          return warp_pj_no(__LINE__);
+        }
+        Field *outer_field = down_cast<Item_field *>(value)->field;
+        Field *key_field = table->key_info[ref->key].key_part[k].field;
+        if(outer_field == nullptr || key_field == nullptr || outer_field->table == table) {
+          return warp_pj_no(__LINE__);
+        }
+        warp_pj_pair_info pair;
+        pair.a = outer_field;
+        pair.b = key_field;
+        parts.push_back(pair);
       }
       collector.tables.push_back(table);
-      warp_pj_pair_info pair;
-      pair.a = outer_field;
-      pair.b = key_field;
-      collector.pairs.push_back(pair);
+      collector.pairs.insert(collector.pairs.end(), parts.begin(), parts.end());
       return true;
     }
     case AccessPath::FILTER:
@@ -952,32 +958,80 @@ static std::shared_ptr<warp_pj_plan> warp_pj_make_plan(THD *thd, AccessPath *pat
     }
   }
 
+  /* The tree of the joins: every table is joined to one table that is
+     before it by the columns of one edge, the other equalities are checked
+     when their second table is reached (extras).  The edge of a table is the
+     one that matches the fewest of its rows per row of the other table (its
+     rows over the number of distinct values of its columns of the edge): the
+     first edge that reaches a table may be on a column that has few values,
+     whose hash chains are long, while another edge is on a key of the table.
+     A table is added when its edge to the tables of the tree is the best of
+     all, the ties go to the shallowest parent and the smallest table. */
   std::vector<int> depth(n, -1), parent(n, -1), order;
   std::vector<int> parent_edge(n, -1);
+  std::map<std::pair<int, uint>, double> ndv_of;   // (table, column): distinct values, -1 unknown
+  auto ndv = [&](int t, Field *field) -> double {
+    const auto key = std::make_pair(t, (uint)field->field_index());
+    auto it = ndv_of.find(key);
+    if(it != ndv_of.end()) return it->second;
+    double d = -1.0;
+    try {
+      ha_warp *ha = dynamic_cast<ha_warp *>(tables[t]->file);
+      warp_table_read_lock lock(ha->get_warp_share()->data_dir_name);
+      uint64_t total = 0;
+      d = warp_column_ndv(ha->get_warp_share()->data_dir_name, field->field_index(), &total);
+    } catch(...) {
+      d = -1.0;
+    }
+    ndv_of[key] = d;
+    return d;
+  };
+  /* the rows of table t that match one row of the other table of edge e */
+  auto fanout = [&](int t, const join_edge &e) -> double {
+    const double table_rows = std::max<double>((double)rows[t], 1.0);
+    double distinct = 1.0;
+    for(const auto &column : e.columns) {
+      Field *own = e.a == t ? column.first : column.second;
+      const double d = ndv(t, own);
+      if(d < 1.0) {
+        return std::sqrt(table_rows);   // no estimate
+      }
+      distinct = std::min(distinct * d, table_rows);
+    }
+    return std::max(table_rows / distinct, 1.0);
+  };
   depth[probe_index] = 0;
   order.push_back((int)probe_index);
-  for(size_t at = 0; at < order.size(); ++at) {
-    const int current = order[at];
-    std::vector<int> found;
-    /* the tables of the inner side of a LEFT JOIN have no tables below them */
-    if(collector.null_side.count(tables[current])) {
-      continue;
-    }
+  while(order.size() < n) {
+    int best = -1, best_edge = -1, best_parent = -1;
+    double best_cost = 0;
     for(size_t e = 0; e < edges.size(); ++e) {
-      const int other = edges[e].a == current ? edges[e].b : (edges[e].b == current ? edges[e].a : -1);
-      /* the inner table of a LEFT JOIN is reached from the other side only */
-      if(other >= 0 && edges[e].null_index >= 0 && edges[e].null_index == current) {
-        continue;
-      }
-      if(other >= 0 && depth[other] < 0) {
-        depth[other] = depth[current] + 1;
-        parent[other] = current;
-        parent_edge[other] = (int)e;
-        found.push_back(other);
+      for(int side = 0; side < 2; ++side) {
+        const int current = side == 0 ? edges[e].a : edges[e].b;
+        const int other = side == 0 ? edges[e].b : edges[e].a;
+        if(depth[current] < 0 || depth[other] >= 0) continue;
+        /* the tables of the inner side of a LEFT JOIN have no tables below
+           them, and are reached from the other side only */
+        if(collector.null_side.count(tables[current])) continue;
+        if(edges[e].null_index >= 0 && edges[e].null_index == current) continue;
+        const double cost = fanout(other, edges[e]);
+        const bool better =
+          best < 0 || cost < best_cost ||
+          (cost == best_cost && (depth[current] < depth[best_parent] ||
+                                 (depth[current] == depth[best_parent] && rows[other] < rows[best])));
+        if(better) {
+          best = other;
+          best_edge = (int)e;
+          best_parent = current;
+          best_cost = cost;
+        }
       }
     }
-    std::sort(found.begin(), found.end(), [&](int x, int y) { return rows[x] < rows[y]; });
-    for(int f : found) order.push_back(f);
+    if(best < 0) break;
+    depth[best] = depth[best_parent] + 1;
+    parent[best] = best_parent;
+    parent_edge[best] = best_edge;
+    order.push_back(best);
   }
   if(order.size() != n) {
     return (warp_pj_no(__LINE__), none);  // a table that is not joined by a column: a cross product
@@ -985,7 +1039,7 @@ static std::shared_ptr<warp_pj_plan> warp_pj_make_plan(THD *thd, AccessPath *pat
   /* the small tables first among the ones of the same depth, the parents
      are always before their children */
   std::stable_sort(order.begin() + 1, order.end(), [&](int x, int y) {
-    return depth[x] < depth[y];
+    return depth[x] != depth[y] ? depth[x] < depth[y] : rows[x] < rows[y];
   });
 
   /* build memory: the keys and images of the other tables */
@@ -1773,6 +1827,7 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
   std::vector<std::vector<uint32_t>> slice_out(nslices);
   std::vector<std::exception_ptr> slice_error(nslices);
   std::atomic<bool> too_large(false);
+  std::atomic<bool> killed(false);
   auto run_slice = [&](size_t k) {
     try {
       const size_t lo = hit_rows.size() * k / nslices;
@@ -1791,6 +1846,12 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
       prober.local = scope.local;
       prober.extra = &gj_arrays;
       for(size_t i = lo; i < hi; ++i) {
+        /* a row can expand to many rows of the join: KILL is checked while
+           the slice is probed, not only between partitions */
+        if(((i - lo) & 0xFFFF) == 0xFFFF && (thd_killed(plan.thd) || killed.load(std::memory_order_relaxed))) {
+          killed = true;
+          return;
+        }
         const size_t row = hit_rows[i];
         if(!invisible.empty() && invisible[row]) {
           continue;
@@ -1832,6 +1893,10 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
     if(slice_error[k]) {
       std::rethrow_exception(slice_error[k]);
     }
+  }
+  if(killed) {
+    *error = "interrupted";
+    return false;
   }
   if(too_large) {
     *error = "the result of the join is too large";
