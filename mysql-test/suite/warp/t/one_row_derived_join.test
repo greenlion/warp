@@ -1,0 +1,62 @@
+--echo #
+--echo # A scalar subquery that MySQL makes a derived table (subquery_to_derived)
+--echo # is joined by a LEFT JOIN without a condition to a table of one row.  The
+--echo # engine joins the other tables and the derived table is joined to their
+--echo # rows (TPC-H Q11), unless a condition below uses the derived table.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 300000;
+SET @old_switch = @@optimizer_switch;
+SET SESSION optimizer_switch = 'subquery_to_derived=on';
+SET SESSION warp_adjust_table_stats_for_joins = OFF;
+SET SESSION warp_parallel_join_min_rows = 1000;
+CREATE TABLE ps (pk INT, sk INT, cost INT, qty INT, KEY (pk), KEY (sk))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE s (sk INT, nk INT, KEY (sk), KEY (nk))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE n (nk INT, name VARCHAR(10), KEY (nk))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO ps WITH RECURSIVE seq(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM seq WHERE x < 49999)
+  SELECT 1 + x DIV 4, 1 + (x * 13) % 2000, 1 + x % 97, 1 + x % 31 FROM seq;
+INSERT INTO s WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 2000)
+  SELECT x, x % 25 FROM seq;
+INSERT INTO n WITH RECURSIVE seq(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM seq WHERE x < 24)
+  SELECT x, CONCAT('N', x) FROM seq;
+
+--echo # the subquery of HAVING: the engine joins ps, s and n
+let $q1 = SELECT pk, SUM(cost * qty) AS v FROM ps, s, n
+WHERE ps.sk = s.sk AND s.nk = n.nk AND n.name = 'N7'
+GROUP BY pk HAVING SUM(cost * qty) > (
+  SELECT SUM(cost * qty) * 0.0004 FROM ps, s, n WHERE ps.sk = s.sk AND s.nk = n.nk AND n.name = 'N7');
+--replace_regex /\(cost=[^)]*\)//
+eval EXPLAIN FORMAT=TREE $q1;
+
+--echo # the subquery of WHERE: its value is a condition of the join
+let $q2 = SELECT COUNT(*), SUM(cost) FROM ps, s
+WHERE ps.sk = s.sk AND s.nk = 3 AND ps.cost > (SELECT AVG(cost) FROM ps WHERE qty = 5);
+
+--echo # a derived table with GROUP BY has more than one row
+let $q3 = SELECT COUNT(*) FROM ps, s, (SELECT nk, COUNT(*) c FROM s GROUP BY nk) d
+WHERE ps.sk = s.sk AND s.nk = d.nk AND d.c > 0;
+
+--disable_query_log
+eval CREATE TABLE r1_on ENGINE=InnoDB AS $q1;
+eval CREATE TABLE r2_on ENGINE=InnoDB AS $q2;
+eval CREATE TABLE r3_on ENGINE=InnoDB AS $q3;
+SET SESSION warp_parallel_hash_join = OFF;
+eval CREATE TABLE r1_off ENGINE=InnoDB AS $q1;
+eval CREATE TABLE r2_off ENGINE=InnoDB AS $q2;
+eval CREATE TABLE r3_off ENGINE=InnoDB AS $q3;
+SET SESSION warp_parallel_hash_join = DEFAULT;
+--enable_query_log
+SELECT COUNT(*) AS different_rows FROM
+  (SELECT * FROM r1_on UNION ALL SELECT * FROM r1_off) u GROUP BY pk, v HAVING COUNT(*) <> 2;
+SELECT COUNT(*), SUM(v) FROM r1_on;
+SELECT * FROM r2_on;
+SELECT * FROM r2_off;
+SELECT * FROM r3_on;
+SELECT * FROM r3_off;
+DROP TABLE r1_on, r1_off, r2_on, r2_off, r3_on, r3_off, ps, s, n;
+SET SESSION optimizer_switch = @old_switch;
+SET SESSION warp_adjust_table_stats_for_joins = DEFAULT;
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
