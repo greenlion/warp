@@ -1,0 +1,44 @@
+--echo #
+--echo # An index lookup of one integer value only opens the partitions whose
+--echo # values of the column contain it (their smallest and largest values are
+--echo # kept for every version of a partition), and the lookups of a statement
+--echo # use the partitions that they opened again.
+--echo #
+
+SET SESSION cte_max_recursion_depth = 300000;
+CREATE TABLE t (id INT, k INT, v VARCHAR(10), KEY (id), KEY (k)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+--echo # partitions of 64000 rows: id 1..64000, 64001..128000, ...
+INSERT INTO t WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 200000)
+  SELECT x, x % 7, CONCAT('v', x) FROM seq;
+SELECT * FROM t FORCE INDEX (id) WHERE id = 1;
+SELECT * FROM t FORCE INDEX (id) WHERE id = 100000;
+SELECT * FROM t FORCE INDEX (id) WHERE id = 200000;
+--echo # values that no partition has
+SELECT * FROM t FORCE INDEX (id) WHERE id = 0;
+SELECT * FROM t FORCE INDEX (id) WHERE id = 999999;
+SELECT * FROM t FORCE INDEX (id) WHERE id = -5;
+SELECT * FROM t FORCE INDEX (id) WHERE id IN (0, 3, 999999, 128001, 199999, -1) ORDER BY id;
+--echo # a value that every partition has
+SELECT COUNT(*) FROM t FORCE INDEX (k) WHERE k = 3;
+SELECT COUNT(*) FROM t;
+
+--echo # new rows: the partition changed, its range is found again
+INSERT INTO t VALUES (999999, 1, 'new'), (-5, 2, 'neg');
+SELECT * FROM t FORCE INDEX (id) WHERE id = 999999;
+SELECT * FROM t FORCE INDEX (id) WHERE id = -5;
+DELETE FROM t WHERE id = 100000;
+SELECT * FROM t FORCE INDEX (id) WHERE id = 100000;
+
+--echo # a lookup for every row of another table (a dependent subquery)
+CREATE TABLE o (id INT) ENGINE=WARP;
+INSERT INTO o VALUES (1), (64000), (64001), (100000), (128000), (128001), (200000), (200001), (999999), (-5);
+SELECT o.id, (SELECT v FROM t FORCE INDEX (id) WHERE t.id = o.id) AS v FROM o ORDER BY o.id;
+SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM t FORCE INDEX (id) WHERE t.id = o.id AND t.k >= 0) ORDER BY o.id;
+--echo # in a transaction, with rows that it wrote
+BEGIN;
+INSERT INTO t VALUES (777777, 0, 'trx');
+SELECT o.id, (SELECT v FROM t FORCE INDEX (id) WHERE t.id = o.id + 577776) AS v FROM o WHERE o.id IN (200001, 1) ORDER BY o.id;
+SELECT * FROM t FORCE INDEX (id) WHERE id = 777777;
+ROLLBACK;
+SELECT * FROM t FORCE INDEX (id) WHERE id = 777777;
+DROP TABLE t, o;

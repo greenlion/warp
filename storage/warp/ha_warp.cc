@@ -478,6 +478,7 @@ static int warp_init_func(void *p) {
 static int warp_done_func(void *) {
   sql_print_information("WARP storage engine shutdown started");
   warp_purge_stop();
+  warp_prefetch_pool::instance().stop();
   /* the commits of warp_sync_commit = OFF are made durable */
   warp_state->stop_syncer();
   warp_open_tables.reset();
@@ -854,6 +855,7 @@ void ha_warp::register_cursor(ibis::table::cursor *cursor, ibis::table *rows) {
   pos_cursor = nullptr;
   pos_c.clear();
   pos_n.clear();
+  pos_r = pos_t = -1;
   if(cursor == nullptr || rows == nullptr) {
     return;
   }
@@ -862,6 +864,10 @@ void ha_warp::register_cursor(ibis::table::cursor *cursor, ibis::table *rows) {
   pos_n.assign(table->s->fields, -1);
   for(size_t i = 0; i < names.size(); ++i) {
     const char *name = names[i];
+    if((name[0] == 'r' || name[0] == 't') && name[1] == 0) {
+      (name[0] == 'r' ? pos_r : pos_t) = (int)i;
+      continue;
+    }
     if((name[0] != 'c' && name[0] != 'n') || !isdigit((unsigned char)name[1])) {
       continue;
     }
@@ -873,6 +879,21 @@ void ha_warp::register_cursor(ibis::table::cursor *cursor, ibis::table *rows) {
     (name[0] == 'c' ? pos_c : pos_n)[idx] = (int)i;
   }
   pos_cursor = cursor;
+}
+
+/* the row id and the transaction id of the row of the cursor, by position
+   when the cursor is registered */
+void ha_warp::read_row_ids(ibis::table::cursor *cursor, uint64_t &rowid, uint64_t &trx_id) {
+  if(cursor == pos_cursor && pos_r >= 0) {
+    cursor->getColumnAsULong((uint32_t)pos_r, rowid);
+  } else {
+    cursor->getColumnAsULong("r", rowid);
+  }
+  if(cursor == pos_cursor && pos_t >= 0) {
+    cursor->getColumnAsULong((uint32_t)pos_t, trx_id);
+  } else {
+    cursor->getColumnAsULong("t", trx_id);
+  }
 }
 
 int ha_warp::find_current_row(uchar *buf, ibis::table::cursor *cursor) {
@@ -1293,12 +1314,29 @@ int ha_warp::open(const char *name, int, uint, const dd::Table *) {
   Close a database file. We remove ourselves from the shared strucutre.
   If it is empty we destroy it.
 */
+/* Frees the partitions that the index lookups of the statement kept.  A
+   partition that the open scan uses is freed by the scan (end_scan). */
+void ha_warp::clear_lookup_parts() {
+  for(auto &entry : lookup_parts) {
+    ibis::part *p = entry.second.second;
+    const bool in_scan = partitions != NULL &&
+                         std::find(partitions->begin(), partitions->end(), p) != partitions->end();
+    lookup_owned.erase(p);
+    if(!in_scan) {
+      delete p;
+    }
+  }
+  lookup_parts.clear();
+  lookup_owned.clear();
+}
+
 int ha_warp::close(void) {
   DBUG_ENTER("ha_warp::close");
   release_scan_lease();
   if(index_scan_open) {
     end_scan(true);
   }
+  clear_lookup_parts();
   discard_prefetched();
   if(writer) {
     writer->clearData();
@@ -2242,7 +2280,10 @@ bool ha_warp::start_prefetch(const std::string& datadir) {
   const std::string where = where_for_partition(datadir);
   const std::string table_dir = share->data_dir_name;
   try {
-    prefetched_partitions.emplace(datadir, std::async(std::launch::async,
+    prefetch_slot slot;
+    slot.claimed = std::make_shared<std::atomic<bool>>(false);
+    slot.budget = budget;
+    slot.task = std::make_shared<std::packaged_task<prefetched_partition()>>(
       [budget, datadir, field_indexes, columns, where, table_dir]() {
         ibis::util::ThreadBudgetScope budget_scope(budget);
         prefetched_partition result;
@@ -2262,8 +2303,20 @@ bool ha_warp::start_prefetch(const std::string& datadir) {
         }
         budget->release(1);
         return result;
-      }));
+      });
+    slot.result = slot.task->get_future();
+    std::shared_ptr<std::atomic<bool>> claimed = slot.claimed;
+    std::shared_ptr<std::packaged_task<prefetched_partition()>> task = slot.task;
+    prefetched_partitions.emplace(datadir, std::move(slot));
+    warp_prefetch_pool::instance().submit([claimed, task]() {
+      if(!claimed->exchange(true)) (*task)();
+    });
   } catch(...) {
+    auto it = prefetched_partitions.find(datadir);
+    if(it != prefetched_partitions.end()) {
+      /* not submitted: the scan runs it when it needs the partition */
+      return true;
+    }
     budget->release(1);
     return false;
   }
@@ -2273,7 +2326,9 @@ bool ha_warp::start_prefetch(const std::string& datadir) {
 /* Keeps the next few partitions that will be returned being prepared. */
 void ha_warp::prefetch_following_partitions() {
   static const size_t depth = 3;
-  if(partitions == NULL || ibis::util::ThreadBudget::current() == nullptr) {
+  /* an index lookup selects a few rows of the partitions that can have its
+     value: reading ahead would open them a second time in another thread */
+  if(partitions == NULL || lookup_scan || ibis::util::ThreadBudget::current() == nullptr) {
     return;
   }
   auto it = part_it;
@@ -2314,7 +2369,12 @@ bool ha_warp::take_prefetched(const std::string& datadir, ibis::table** base,
   if(find_it == prefetched_partitions.end()) {
     return false;
   }
-  prefetched_partition result = find_it->second.get();
+  prefetch_slot &slot = find_it->second;
+  /* a task that no thread of the pool has started is run here */
+  if(!slot.claimed->exchange(true)) {
+    (*slot.task)();
+  }
+  prefetched_partition result = slot.result.get();
   prefetched_partitions.erase(find_it);
   *base = result.base_table;
   *filtered = result.filtered_table;
@@ -2355,7 +2415,13 @@ void ha_warp::release_scanned_table() {
 
 void ha_warp::discard_prefetched() {
   for(auto &entry : prefetched_partitions) {
-    prefetched_partition result = entry.second.get();
+    prefetch_slot &slot = entry.second;
+    if(!slot.claimed->exchange(true)) {
+      /* never started: nothing was read, the thread it reserved is free */
+      slot.budget->release(1);
+      continue;
+    }
+    prefetched_partition result = slot.result.get();
     delete result.filtered_table;
     delete result.base_table;
   }
@@ -2929,6 +2995,70 @@ warp_partition_signature_strings(const std::string &datadir) {
   return out;
 }
 
+/* The smallest and the largest value of an integer column of every
+   partition, computed once for each version of the partition (its signature,
+   see warp_partition_signature_string): an index lookup of a value opens only
+   the partitions whose range contains it.  Without it a lookup that a join
+   makes for every row of another table reads the metadata of every partition
+   of the table (the partsupp lookups of the dependent subquery of TPC-H Q2:
+   48 partitions for each one). */
+struct warp_partition_range_cache {
+  struct entry {
+    std::string signature;
+    std::unordered_map<uint, std::pair<double, double>> ranges;   // field: min, max
+  };
+  std::mutex mtx;
+  std::unordered_map<std::string, entry> parts;
+};
+static warp_partition_range_cache warp_part_ranges;
+
+/* false only if no row of the partition can have value in the column */
+static bool warp_partition_may_contain(const std::string &dir, const std::string &signature,
+                                       uint field, double value) {
+  if(signature.empty()) {
+    return true;
+  }
+  {
+    std::lock_guard<std::mutex> guard(warp_part_ranges.mtx);
+    auto it = warp_part_ranges.parts.find(dir);
+    if(it != warp_part_ranges.parts.end() && it->second.signature == signature) {
+      auto range = it->second.ranges.find(field);
+      if(range != it->second.ranges.end()) {
+        return value >= range->second.first && value <= range->second.second;
+      }
+    }
+  }
+  double lo = 0, hi = 0;
+  try {
+    ibis::part part(dir.c_str(), static_cast<const char *>(0));
+    if(part.nRows() == 0) {
+      return false;
+    }
+    const std::string name = "c" + std::to_string(field);
+    ibis::column *col = part.getColumn(name.c_str());
+    if(col == nullptr || !col->isInteger()) {
+      return true;
+    }
+    lo = col->getActualMin();
+    hi = col->getActualMax();
+    if(!(lo <= hi)) {
+      return true;   // not known
+    }
+  } catch(...) {
+    return true;
+  }
+  {
+    std::lock_guard<std::mutex> guard(warp_part_ranges.mtx);
+    auto &e = warp_part_ranges.parts[dir];
+    if(e.signature != signature) {
+      e.signature = signature;
+      e.ranges.clear();
+    }
+    e.ranges[field] = std::make_pair(lo, hi);
+  }
+  return value >= lo && value <= hi;
+}
+
 int ha_warp::rnd_init(bool) {
   DBUG_ENTER("ha_warp::rnd_init");
   if(star_agg) {
@@ -3081,7 +3211,53 @@ int ha_warp::rnd_init(bool) {
       /* taken before the partitions are read: a partition that still has
          this signature when it is scanned has not changed since */
       scan_part_sigs = warp_partition_signature_strings(share->data_dir_name);
-      ibis::util::gatherParts(*partitions, share->data_dir_name, true);
+      if(index_scan_mode && prune_field >= 0 && !is_partition_child) {
+        /* an index lookup of one value: the partitions that can have it */
+        std::vector<std::string> dirs;
+        DIR *dirp = opendir(share->data_dir_name);
+        if(dirp != nullptr) {
+          struct dirent *ent;
+          while((ent = readdir(dirp)) != nullptr) {
+            if(ent->d_name[0] == '.' || ent->d_type == DT_REG) continue;
+            dirs.push_back(std::string(share->data_dir_name) + "/" + ent->d_name);
+          }
+          closedir(dirp);
+        }
+        std::sort(dirs.begin(), dirs.end());
+        lookup_scan = true;
+        for(const std::string &dir : dirs) {
+          auto sig = scan_part_sigs.find(dir);
+          const std::string signature = sig == scan_part_sigs.end() ? std::string() : sig->second;
+          if(!warp_partition_may_contain(dir, signature, (uint)prune_field, prune_value)) {
+            continue;
+          }
+          /* the partition that an earlier lookup of the statement opened */
+          auto cached = lookup_parts.find(dir);
+          if(cached != lookup_parts.end() && !signature.empty() && cached->second.first == signature &&
+             std::find(partitions->begin(), partitions->end(), cached->second.second) == partitions->end()) {
+            partitions->push_back(cached->second.second);
+            continue;
+          }
+          const size_t before = partitions->size();
+          ibis::util::gatherParts(*partitions, dir.c_str(), true);
+          if(!signature.empty() && partitions->size() == before + 1) {
+            ibis::part *opened = (*partitions)[before];
+            if(cached != lookup_parts.end()) {
+              ibis::part *old = cached->second.second;
+              if(std::find(partitions->begin(), partitions->end(), old) == partitions->end()) {
+                lookup_owned.erase(old);
+                delete old;
+              } else {
+                lookup_owned.erase(old);   // the scan frees it (end_scan)
+              }
+            }
+            lookup_parts[dir] = std::make_pair(signature, opened);
+            lookup_owned.insert(opened);
+          }
+        }
+      } else {
+        ibis::util::gatherParts(*partitions, share->data_dir_name, true);
+      }
       part_it = partitions->begin();
     }
   }
@@ -3726,6 +3902,10 @@ fetch_again:
     // table scan (possibly with filters) without any joins
     if(cursor == NULL) {
       use_thread_budget();
+      /* an index lookup whose value no partition can have has no partitions */
+      if(part_it == partitions->end()) {
+        DBUG_RETURN(HA_ERR_END_OF_FILE);
+      }
       if( std::string((*part_it)->currentDataDir()) == std::string(share->data_dir_name) ) {
       
         ++part_it;
@@ -3857,8 +4037,7 @@ fetch_again:
   
   ++fetch_count;
   
-  cursor->getColumnAsULong("r", current_rowid);
-  cursor->getColumnAsULong("t", row_trx_id);
+  read_row_ids(cursor, current_rowid, row_trx_id);
   
   /* This sets is_trx_visible handler variable!
      If we already checked this trx_id in the last iteration
@@ -4074,11 +4253,15 @@ int ha_warp::end_scan(bool finish) {
        contains all the partitions), and the next query would read and
        decompress everything again. */
     for(auto it=partitions->begin();it!=partitions->end();++it) {
-      delete *it;
+      /* the partitions that the lookups of the statement keep (lookup_parts) */
+      if(lookup_owned.count(*it) == 0) {
+        delete *it;
+      }
       *it=NULL;
     } 
     delete partitions;
   }
+  lookup_scan = false;
   
   int write_rc = 0;
   if(finish) {
@@ -4416,12 +4599,25 @@ bool ha_warp::make_key_condition(const key_range *start_key,
   const KEY *key = &table->key_info[active_index];
   std::vector<warp_key_value> values;
   condition = "";
+  prune_field = -1;
 
   if(start_key != NULL && start_key->flag == HA_READ_KEY_EXACT &&
      (end_key == NULL ? true : eq_range)) {
     /* the rows with this key (or this prefix of the key) */
     if(!warp_decode_key(table, active_index, start_key, values)) {
       return false;
+    }
+    /* the value of an integer first column limits the partitions that are read */
+    Field *first = key->key_part[0].field;
+    const enum_field_types type = first->real_type();
+    if(!values.empty() && !values[0].is_null &&
+       (type == MYSQL_TYPE_TINY || type == MYSQL_TYPE_SHORT || type == MYSQL_TYPE_INT24 ||
+        type == MYSQL_TYPE_LONG || type == MYSQL_TYPE_LONGLONG)) {
+      const double v = strtod(values[0].text.c_str(), nullptr);
+      if(std::fabs(v) < 9007199254740992.0) {   // exact in a double
+        prune_field = (int)first->field_index();
+        prune_value = v;
+      }
     }
     for(size_t i = 0; i < values.size(); ++i) {
       if(i > 0) condition += " AND ";
@@ -4640,8 +4836,7 @@ bool ha_warp::build_unique_cache() {
       decode_only = &key_columns;
       while(ok && cursor->fetch() == 0) {
         uint64_t r = 0, t = 0;
-        cursor->getColumnAsULong("r", r);
-        cursor->getColumnAsULong("t", t);
+        read_row_ids(cursor, r, t);
         /* the committed deletes are not keys of any row */
         if(warp_state->delete_bitmap->is_set(r)) continue;
         if(find_current_row(scratch.data(), cursor) != 0) {
