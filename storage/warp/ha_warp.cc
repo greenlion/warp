@@ -9261,8 +9261,32 @@ static void warp_repair_partition(const std::string &part_dir,
                     (unsigned long long)rows,
                     (unsigned long long)(meta.rows == UINT64_MAX ? 0 : meta.rows));
   if(rows == 0) {
-    std::error_code ec;
-    std::filesystem::remove_all(part_dir, ec);
+    /* Column files exist but not one durable row can be read from any
+       of them.  Do not delete the partition: whatever is in the files
+       may still be recoverable by hand, so move it out of the table
+       directory instead of destroying it silently.  The destination
+       is a sibling directory named <table>.data.lost: warp_list_tables
+       only looks at directories whose name ends in ".data", and a
+       partition outside its table directory does not exist for the
+       engine. */
+    const size_t slash = part_dir.rfind('/');
+    const std::string part_name = part_dir.substr(slash + 1);
+    const std::string table_dir = part_dir.substr(0, slash);
+    const std::string lost_dir = table_dir + ".lost";
+    std::error_code ec, ec2;
+    std::filesystem::create_directories(lost_dir, ec);
+    std::filesystem::rename(part_dir, lost_dir + "/" + part_name, ec2);
+    if(!ec2) {
+      sql_print_error("WARP: recovery moved the partition %s, whose files "
+                      "have no durable rows, to %s",
+                      part_dir.c_str(), lost_dir.c_str());
+    } else {
+      sql_print_error("WARP: recovery could not move the partition %s to "
+                      "%s (%s) and deleted it",
+                      part_dir.c_str(), lost_dir.c_str(),
+                      ec2.message().c_str());
+      std::filesystem::remove_all(part_dir, ec);
+    }
     return;
   }
   /* the columns are cut to the rows */
