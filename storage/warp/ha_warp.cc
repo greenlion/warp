@@ -9025,6 +9025,12 @@ retry_lock:
 sleep:
   //lock_mtx.unlock();
   //fixme - make this configurable
+  /* a waiter whose client went away (KILL, or a dropped connection)
+     would otherwise retry until lock_wait_timeout, and a KILL QUERY is
+     not honored while the statement sleeps here */
+  if(current_thd != NULL && thd_killed(current_thd)) {
+    return ER_LOCK_ABORTED;
+  }
   if(spin_count++ > 0) {
     
     int err = nanosleep(&sleep_time, &remaining_time);
