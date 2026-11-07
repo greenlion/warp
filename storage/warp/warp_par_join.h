@@ -345,6 +345,25 @@ struct warp_pj_semi {
   std::unordered_set<int64_t> keys;
 };
 
+/* The materialized subquery tables of the semis of the query that is being
+   planned (warp_pj_find_semi and warp_pj_find_semi_hash): the columns of
+   those tables do not join tables of the plan, the rows of the table that
+   an equality compares to one of them are limited to its keys instead. */
+static thread_local std::vector<AccessPath *> warp_pj_semi_materializes;
+static thread_local std::vector<TABLE *> warp_pj_semi_tables;
+
+/* Does the condition read a column of a materialized subquery table of a
+   semi?  Those columns do not join tables of the plan: the equality that
+   compares them is the semi, not a join of the plan. */
+static bool warp_pj_touches_semi_table(Item *condition) {
+  for(TABLE *t : warp_pj_semi_tables) {
+    if((condition->used_tables() & t->pos_in_table_list->map()) != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /* The scans of the statement that are limited to the keys of a table (see
    warp_try_semi_keys): the join of the engine exports the values of those
    columns when it is made. */
@@ -762,9 +781,11 @@ static bool warp_pj_collect(AccessPath *path, warp_pj_collector &collector) {
       if(join.join_predicate != nullptr && join.join_predicate->expr != nullptr) {
         const RelationalExpression *expr = join.join_predicate->expr;
         for(Item *condition : expr->join_conditions) {
+          if(warp_pj_touches_semi_table(condition)) continue;
           warp_pj_add_filter(condition, collector);
         }
         for(Item_eq_base *condition : expr->equijoin_conditions) {
+          if(warp_pj_touches_semi_table(condition)) continue;
           if(!warp_pj_add_equality(condition, collector, nullptr)) {
             return false;
           }
@@ -803,9 +824,11 @@ static bool warp_pj_collect(AccessPath *path, warp_pj_collector &collector) {
         return true;
       }
       for(Item *condition : predicate->expr->join_conditions) {
+        if(warp_pj_touches_semi_table(condition)) continue;
         warp_pj_add_filter(condition, collector);
       }
       for(Item_eq_base *condition : predicate->expr->equijoin_conditions) {
+        if(warp_pj_touches_semi_table(condition)) continue;
         if(!warp_pj_add_equality(condition, collector, nullptr)) {
           return false;
         }
@@ -813,6 +836,16 @@ static bool warp_pj_collect(AccessPath *path, warp_pj_collector &collector) {
       return warp_pj_collect(path->hash_join().outer, collector) &&
              warp_pj_collect(path->hash_join().inner, collector);
     }
+    case AccessPath::MATERIALIZE:
+      /* the materialized subquery table of a semi: it is not a table of
+         the join, the rows of the table that its equality compares to
+         one of its columns are limited to its keys instead */
+      for(AccessPath *m : warp_pj_semi_materializes) {
+        if(m == path) {
+          return true;
+        }
+      }
+      return warp_pj_no(__LINE__);
     default:
       return warp_pj_no(__LINE__);
   }
@@ -2579,6 +2612,64 @@ static void warp_pj_find_semi(AccessPath *inner, JOIN *join, std::vector<warp_pj
   semis->push_back(semi);
 }
 
+/* The inner side of a hash join is a materialized subquery table (an IN
+   that MySQL made a semijoin of) that the join reads with a scan: the
+   equality of the join gives the column of the table of the plan and the
+   column of the subquery table, as the key of an index lookup does in
+   warp_pj_find_semi.  The engine reads the keys of the subquery table
+   into a set and limits the rows of the table of the plan to them. */
+static void warp_pj_find_semi_hash(AccessPath *inner, JOIN *join,
+                                   const RelationalExpression *expr,
+                                   std::vector<warp_pj_semi> *semis) {
+  if(inner == nullptr || inner->type != AccessPath::MATERIALIZE ||
+     inner->materialize().param == nullptr ||
+     inner->materialize().param->rematerialize) {
+    return;
+  }
+  AccessPath *table_path = inner->materialize().table_path;
+  if(table_path == nullptr || table_path->type != AccessPath::TABLE_SCAN) {
+    return;
+  }
+  TABLE *derived = table_path->table_scan().table;
+  if(derived == nullptr || expr == nullptr) {
+    return;
+  }
+  for(Item_eq_base *condition : expr->equijoin_conditions) {
+    if(condition->argument_count() != 2) {
+      continue;
+    }
+    Item *a = condition->arguments()[0]->real_item();
+    Item *b = condition->arguments()[1]->real_item();
+    if(a == nullptr || b == nullptr || a->type() != Item::FIELD_ITEM ||
+       b->type() != Item::FIELD_ITEM) {
+      continue;
+    }
+    Field *fa = down_cast<Item_field *>(a)->field;
+    Field *fb = down_cast<Item_field *>(b)->field;
+    if(fa == nullptr || fb == nullptr) {
+      continue;
+    }
+    Field *inner_f = fa->table == derived ? fa :
+                     (fb->table == derived ? fb : nullptr);
+    if(inner_f == nullptr) {
+      continue;  // not an equality with a column of the subquery table
+    }
+    Field *outer_f = inner_f == fa ? fb : fa;
+    if(outer_f->table == derived || !warp_pj_int_key(outer_f) ||
+       !warp_pj_int_key(inner_f) ||
+       dynamic_cast<ha_warp *>(outer_f->table->file) == nullptr) {
+      continue;
+    }
+    warp_pj_semi semi;
+    semi.materialize = inner;
+    semi.join = join;
+    semi.outer = outer_f;
+    semi.inner = inner_f;
+    semis->push_back(semi);
+    return;
+  }
+}
+
 /* Called from push_to_engine: the joins that the engine can evaluate are
    replaced. */
 /* A nested loop whose outer side is sorted (the order of a GROUP BY that is
@@ -2767,6 +2858,34 @@ static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
     return;
   }
   std::vector<warp_pj_semi> semis;
+  /* find the semis before the joins are replaced: a join that contains
+     the materialized subquery table of a semi is visited before the
+     join whose equality compares its keys, and warp_pj_collect skips
+     the tables of the semis of this list */
+  warp_pj_semi_materializes.clear();
+  warp_pj_semi_tables.clear();
+  WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
+                  [&](AccessPath *path, const JOIN *) {
+                    const JoinPredicate *predicate = nullptr;
+                    AccessPath *inner = nullptr;
+                    if(path->type == AccessPath::HASH_JOIN) {
+                      predicate = path->hash_join().join_predicate;
+                      inner = path->hash_join().inner;
+                    } else if(path->type == AccessPath::NESTED_LOOP_JOIN &&
+                              path->nested_loop_join().join_type == JoinType::INNER) {
+                      predicate = path->nested_loop_join().join_predicate;
+                      inner = path->nested_loop_join().inner;
+                    }
+                    if(predicate != nullptr && predicate->expr != nullptr &&
+                       predicate->expr->type == RelationalExpression::INNER_JOIN) {
+                      warp_pj_find_semi_hash(inner, join, predicate->expr, &semis);
+                    }
+                    return false;
+                  });
+  for(const warp_pj_semi &semi : semis) {
+    warp_pj_semi_materializes.push_back(semi.materialize);
+    warp_pj_semi_tables.push_back(semi.inner->table);
+  }
   WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
                   [&](AccessPath *path, const JOIN *) {
                     if(path->type == AccessPath::NESTED_LOOP_JOIN &&

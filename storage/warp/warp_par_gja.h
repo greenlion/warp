@@ -895,6 +895,16 @@ static std::shared_ptr<warp_pa_plan> warp_gja_make_plan(THD *thd, AccessPath *ag
     for(TABLE *t : followers) found = found || t == pj->tables[l].table;
     if(!found || !pj->tables[l].filters.empty() || !pj->tables[l].semi.empty()) return (warp_pa_no(__LINE__), none);
   }
+  /* the tables of the join are limited by the keys of a materialized
+     subquery table (a semi): the rows that the join emits for them are
+     the rows of the probe table with a chosen row of every other table,
+     the aggregation does not know which row of a table of a semi was
+     chosen, so it reads the columns of the tables of a semi as the
+     columns of the probe table (the join of the semi replaced their
+     equality) */
+  if(!pj->semis.empty()) {
+    return (warp_pa_no(__LINE__), none);
+  }
   /* the sets of columns of the other joins of the engine are not used by this one */
   if(!pj->gj_probe.empty()) {
     return (warp_pa_no(__LINE__), none);
