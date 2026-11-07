@@ -4744,23 +4744,30 @@ bool ha_warp::unique_key_image(uint key_nr, const uchar *record,
    strings, 'a' and 'a ' in a PAD SPACE collation for example, have the same
    hash) */
 uint64_t ha_warp::unique_key_lock(uint key_nr, const uchar *record) const {
-  uint64_t nr1 = 1, nr2 = 4;
-  my_charset_bin.coll->hash_sort(&my_charset_bin,
-                                 pointer_cast<const uchar *>(share->data_dir_name),
-                                 strlen(share->data_dir_name), &nr1, &nr2);
-  ulong h1 = static_cast<ulong>(nr1) ^ (key_nr + 1) * 0x9E3779B97F4A7C15ULL;
-  ulong h2 = static_cast<ulong>(nr2);
-  const KEY *key = &table->key_info[key_nr];
-  const ptrdiff_t diff = record - table->record[0];
-  for(uint p = 0; p < key->user_defined_key_parts; ++p) {
-    Field *f = key->key_part[p].field;
-    f->move_field_offset(diff);
-    f->hash(&h1, &h2);
-    f->move_field_offset(-diff);
+  /* Hash the collation-correct key image with FNV-1a 64.  The previous
+     implementation chained the legacy my_hash_sort functions
+     (charset bin over the data directory, then Field::hash over the raw
+     key bytes) and collapsed distinct integer keys: it produced 3341
+     colliding lock ids for the 1.92 million PRIMARY KEY values of a
+     TPC-DS customer_demographics load, so concurrent LOADs of disjoint
+     keys waited on each other's row locks and timed out (1205).  The
+     image is the same byte string the duplicate cache uses, so equal
+     keys still hash equal ('a' and 'a ' in a PAD SPACE collation).
+     NULL keys are skipped by the caller. */
+  std::string image;
+  if(!unique_key_image(key_nr, record, &image)) {
+    return 0;
   }
-  const uint64_t h = static_cast<uint64_t>(h1) * 0xC2B2AE3D27D4EB4FULL ^
-                     static_cast<uint64_t>(h2);
-  return (1ULL << 63) | (h & ((1ULL << 63) - 1));
+  uint64_t h = 1469598103934665603ULL;
+  const auto mix = [&h](const char *p, size_t n) {
+    for(size_t i = 0; i < n; ++i) {
+      h = (h ^ static_cast<unsigned char>(p[i])) * 1099511628211ULL;
+    }
+  };
+  mix(share->data_dir_name, strlen(share->data_dir_name));
+  mix(reinterpret_cast<const char *>(&key_nr), sizeof(key_nr));
+  mix(image.data(), image.size());
+  return (1ULL << 63) | h;
 }
 
 static int warp_key_lock_error(int lock_taken) {
@@ -8082,6 +8089,19 @@ void warp_trx::rollback(bool all) {
   }
 
   commit_mtx.unlock();
+
+  /* the row and key locks of a rolled back transaction are released
+     here: they are held in the global map until the transaction
+     ends, and nothing else would remove them (free_locks used to be
+     called only by commit, so a failed transaction leaked every lock
+     it took and blocked later loads of the same key values).
+     Called after commit_mtx is released: create_lock takes
+     is_transaction_open (commit_mtx) while holding lock_mtx, so
+     taking lock_mtx under commit_mtx would be a lock-order
+     inversion. */
+  if(all != ROLLBACK_STATEMENT) {
+    warp_state->free_locks(this);
+  }
 }
 
 
@@ -8394,6 +8414,11 @@ int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
     if(current_trx->autocommit) {
       //warp_state->mark_transaction_closed(trx->trx_id);
       current_trx->dirty = false;
+      /* an autocommit statement is the whole transaction: if it failed
+         the transaction is over and its locks must be released (they
+         would otherwise leak, as free_locks is called by commit and
+         transaction rollback only) */
+      warp_state->free_locks(current_trx);
     } else {
       return 0;
     }
@@ -8794,6 +8819,23 @@ bool warp_global_data::is_transaction_open(uint64_t trx_id) {
   return retval;
 }
 
+/* DEBUG: rate-limited logging of lock conflicts, to diagnose the
+   parallel-load stalls (see free_locks/create_lock investigations). */
+static void warp_lock_log_conflict(const char *where, uint64_t rowid, uint64_t my_trx,
+                                   const warp_lock &tl, uint64_t map_size) {
+  static std::atomic<int> logged{0};
+  if(logged.fetch_add(1) >= 40) {
+    return;
+  }
+  sql_print_warning("WARP LOCKWAIT[%s] rowid=%llu my_trx=%llu held_by=%llu "
+                   "waiting_on=%llu lock_type=%d map_size=%llu",
+                   where, (unsigned long long)rowid,
+                   (unsigned long long)my_trx,
+                   (unsigned long long)tl.holder,
+                   (unsigned long long)tl.waiting_on, tl.lock_type,
+                   (unsigned long long)map_size);
+}
+
 int warp_global_data::create_lock(uint64_t rowid, warp_trx* trx, int lock_type) {
   uint spin_count = 0;
   struct timespec sleep_time;
@@ -8848,6 +8890,8 @@ retry_lock:
       // from the same trx before all the locks are 
       // released as the transaction closes
       if(test_lock.lock_type == LOCK_DEADLOCK) {
+        warp_lock_log_conflict("deadlock-marker", rowid, trx->trx_id, test_lock,
+                               row_locks.size());
         lock_mtx.unlock();
         goto sleep;
       }
@@ -8856,6 +8900,8 @@ retry_lock:
       if(test_lock.holder != trx->trx_id) {
         
         if(test_lock.lock_type != LOCK_HISTORY && (test_lock.lock_type != LOCK_SH && lock_type != LOCK_SH)) {
+          warp_lock_log_conflict("holder-conflict", rowid, trx->trx_id, test_lock,
+                                 row_locks.size());
           lock_mtx.unlock();
           goto sleep;
         }
@@ -8864,6 +8910,8 @@ retry_lock:
         if(test_lock.waiting_on != 0) {
           // does the waiting transaction still exist?
           if(is_transaction_open(test_lock.waiting_on)) {
+            warp_lock_log_conflict("self-waiting", rowid, trx->trx_id, test_lock,
+                                   row_locks.size());
             lock_mtx.unlock();
             goto sleep;
           }
@@ -8916,6 +8964,8 @@ retry_lock:
         // will error out if lock_wait_timeout is exhausted
         new_lock.waiting_on = test_lock.waiting_on;
         row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+        warp_lock_log_conflict("sh-waiting", rowid, trx->trx_id, test_lock,
+                               row_locks.size());
         lock_mtx.unlock();
         goto sleep;
       }
@@ -8925,12 +8975,16 @@ retry_lock:
       // lock, then a DEADLOCK is detected!
       // this transaction will be rolled back
       if((lock_type == LOCK_EX || lock_type == WRITE_INTENTION) && test_lock.waiting_on == new_lock.holder) {
+        warp_lock_log_conflict("deadlock-detected", rowid, trx->trx_id, test_lock,
+                               row_locks.size());
         new_lock.lock_type = LOCK_DEADLOCK;
         row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
         lock_mtx.unlock();
         return LOCK_DEADLOCK;
       } else {
         // have to wait to upgrade the lock
+        warp_lock_log_conflict("upgrade-wait", rowid, trx->trx_id, test_lock,
+                               row_locks.size());
         lock_mtx.unlock();
         goto sleep;
       }
@@ -9376,14 +9430,17 @@ int warp_global_data::downgrade_to_history_lock(uint64_t rowid, warp_trx* trx) {
 
 int warp_global_data::free_locks(warp_trx* trx) {
   lock_mtx.lock();
-  restart:
-  for(auto it = row_locks.begin(); it != row_locks.end();++it) {
+  /* erase() returns the iterator following the erased element, so all
+     the locks of the transaction are released in a single pass over the
+     map.  Deleting and continuing (rather than restarting from begin())
+     keeps the total cost linear in the size of the map: a restart after
+     every erase made a commit that holds K locks in a map of N locks
+     cost O(K*N) lock scans while holding the engine-wide mutex. */
+  for(auto it = row_locks.begin(); it != row_locks.end();) {
     if(it->second.holder == trx->trx_id) {
-      row_locks.erase(it);
-      // deleting the lock invalidates the iterator...
-      // so restart at the beginning.   There is probably
-      // a better way to do this...
-      goto restart;
+      it = row_locks.erase(it);
+    } else {
+      ++it;
     }
   }
   lock_mtx.unlock();
