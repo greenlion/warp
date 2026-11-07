@@ -422,6 +422,30 @@ static std::string warp_collate_prefix(const CHARSET_INFO *cs) {
   return "collate_" + std::to_string(cs->number) + " ";
 }
 
+/* Applies warp_cache_size to the running FastBit cache when the value
+   changes after the plugin is initialized: SET GLOBAL, and the values of
+   mysqld-auto.cnf, which are read after the plugins are initialized.
+   Without this the cache kept the value the variable had at
+   initialization: the 512 MB FastBit default, unless warp_cache_size
+   came from the command line or my.cnf (see warp_init_func). */
+static void warp_cache_size_update(MYSQL_THD thd, SYS_VAR *var,
+                                   void *var_ptr, const void *save) {
+  (void)thd;
+  (void)var;
+  *(unsigned long long *)var_ptr = *(const unsigned long long *)save;
+  if(warp_state == NULL) {
+    return;
+  }
+  if(ibis::fileManager::adjustCacheSize(*(unsigned long long *)var_ptr) != 0) {
+    /* FastBit refuses a size that is not larger than the memory it is
+       already using, and keeps its current size */
+    sql_print_warning("WARP: warp_cache_size = %llu is too small and was ignored, "
+                      "the FastBit cache size is %llu bytes",
+                      *(unsigned long long *)var_ptr,
+                      (unsigned long long)ibis::fileManager::currentCacheSize());
+  }
+}
+
 static int warp_init_func(void *p) {
   DBUG_ENTER("warp_init_func");
   sql_print_information("WARP storage engine initialization started");
