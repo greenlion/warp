@@ -412,6 +412,10 @@ static bool WriteRowToChunk(
 
 bool HashJoinIterator::WriteBuildTableToChunkFiles() {
   for (;;) {  // Termination condition within loop.
+    if (thd()->killed) {  // Aborted by user.
+      thd()->send_kill_message();
+      return true;
+    }
     int res = m_build_input->Read();
     if (res == 1) {
       assert(thd()->is_error() ||
@@ -530,6 +534,10 @@ bool HashJoinIterator::BuildHashTable() {
 
   PFSBatchMode batch_mode(m_build_input.get());
   for (;;) {  // Termination condition within loop.
+    if (thd()->killed) {  // Aborted by user.
+      thd()->send_kill_message();
+      return true;
+    }
     int res = m_build_input->Read();
     if (res == 1) {
       assert(thd()->is_error() ||
