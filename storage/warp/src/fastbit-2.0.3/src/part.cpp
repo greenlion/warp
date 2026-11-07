@@ -1752,20 +1752,25 @@ void ibis::part::writeMetaData(const uint32_t nrows, const columnList &plist,
         delete [] filename;
         return;
     }
-    FILE *fptr = fopen(filename, "w");
-    if (fptr == 0) {
-        LOGGER(ibis::gVerbose >= 0)
-            << "Warning -- part::writeMetaData could not open file \""
-            << filename << "\" for writing ... "
-            << (errno ? strerror(errno) : "no free stdio stream");
-        delete [] filename;
-        return;
-    }
-
     bool isActive = (activeDir != 0 ? (std::strcmp(activeDir, dir) == 0)
                      : false);
     bool isBackup = (backupDir != 0 ? (std::strcmp(backupDir, dir) == 0)
                      : false);
+    // Write to a temporary file and rename it over -part.txt: a crash
+    // in the middle of the old in-place write left a torn or empty
+    // metadata file, and the recovery of the storage engine then saw
+    // "metadata had 0 rows" and destroyed committed data.
+    std::string tmpname(filename);
+    tmpname += ".tmp";
+    FILE *fptr = fopen(tmpname.c_str(), "w");
+    if (fptr == 0) {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- part::writeMetaData could not open file \""
+            << tmpname << "\" for writing ... "
+            << (errno ? strerror(errno) : "no free stdio stream");
+        delete [] filename;
+        return;
+    }
     char stamp[28];
     ibis::util::getLocalTime(stamp);
     fprintf(fptr, "# metadata file written by ibis::part::writeMetaData\n"
@@ -1836,11 +1841,24 @@ void ibis::part::writeMetaData(const uint32_t nrows, const columnList &plist,
     for (columnList::const_iterator it = plist.begin();
          it != plist.end(); ++ it)
         (*it).second->write(fptr);
-    fclose(fptr);
-    LOGGER(ibis::gVerbose > 4)
-        << "part[" << name() << "]::writeMetaData -- wrote metadata for "
-        << nrows << " rows and " << plist.size() << " columns to \""
-        << filename << "\"";
+    if (fflush(fptr) != 0 || fsync(fileno(fptr)) != 0) {
+        fclose(fptr);
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- part::writeMetaData could not flush \""
+            << tmpname << "\" ... " << strerror(errno);
+    }
+    else if (fclose(fptr) == 0 && std::rename(tmpname.c_str(), filename) == 0) {
+        LOGGER(ibis::gVerbose > 4)
+            << "part[" << name() << "]::writeMetaData -- wrote metadata for "
+            << nrows << " rows and " << plist.size() << " columns to \""
+            << filename << "\"";
+    }
+    else {
+        LOGGER(ibis::gVerbose >= 0)
+            << "Warning -- part::writeMetaData could not replace \""
+            << filename << "\" with \"" << tmpname << "\" ... "
+            << strerror(errno);
+    }
     delete [] filename;
 } // ibis::part::writeMetaData
 
