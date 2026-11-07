@@ -605,6 +605,17 @@ ibis::part::part(const char* adir, const char* bdir, bool ro) :
 ibis::part::~part() {
     LOGGER(ibis::gVerbose > 3 && m_name != 0)
         << "clearing data partition " << name();
+    // Remove the cleaner before clearing any data: the file manager
+    // invokes the cleaners while holding its mutex, and removeCleaner
+    // takes the same mutex, so an in-flight cleaner has always
+    // finished when removeCleaner returns.  Once this part is out of
+    // the cleaner list no cache pressure can call unloadIndexes()
+    // here again, and the columns can be deleted in peace.  The old
+    // order (removeCleaner after the columns were deleted) let a
+    // concurrent invokeCleaners walk the columns map of this part
+    // while it was being torn down: use after free, SIGSEGV.
+    ibis::fileManager::instance().removeCleaner(myCleaner);
+    delete myCleaner;
     {   // make sure all read accesses have finished
         writeLock lock(this, "~part");
 
@@ -623,11 +634,9 @@ ibis::part::~part() {
         tmp.clear();
     }
 
-    ibis::fileManager::instance().removeCleaner(myCleaner);
     ibis::resource::clear(metaList);
     // clear the rid list and the rest
     delete rids;
-    delete myCleaner;
     if (backupDir != 0 && *backupDir != 0)
         ibis::fileManager::instance().flushDir(backupDir);
     //ibis::fileManager::instance().flushDir(activeDir);
