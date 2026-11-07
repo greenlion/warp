@@ -343,6 +343,7 @@ struct warp_pj_semi {
   Field *inner = nullptr;       // the column of the derived table
   int level = 0;                // the table of the plan that the column belongs to
   std::unordered_set<int64_t> keys;
+  std::vector<TABLE *> sources;  // the tables that the subquery reads
 };
 
 /* The materialized subquery tables of the semis of the query that is being
@@ -2030,6 +2031,26 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
     }
     plan.tables[semi.level].semi.push_back({semi.outer->field_index(), &semi.keys});
   }
+  /* a table of the join that the subquery of a semi reads too: MySQL
+     pushed the conditions of the subquery into the handler of the table
+     (it starts a new scan of the table for the subquery, and it clears
+     what it pushed when the next scan starts), and the scan of the join
+     that the engine drives would read them: its rows are the rows of the
+     join, not the rows of the subquery.  Clear what the subquery pushed
+     (the conditions of the table of the join are the filters of its rows,
+     the engine evaluates them itself). */
+  for(const warp_pj_semi &semi : plan.semis) {
+    for(TABLE *source : semi.sources) {
+      if(source->s == plan.probe->s) {
+        plan.probe_handler->push_where_clause = "";
+      }
+      for(int l = 1; l <= plan.nbuild; ++l) {
+        if(plan.tables[l].table->s == source->s) {
+          plan.tables[l].handler->push_where_clause = "";
+        }
+      }
+    }
+  }
 
   /* the other tables first: what they hold decides which rows of the probe
      table are looked at */
@@ -2665,6 +2686,26 @@ static void warp_pj_find_semi_hash(AccessPath *inner, JOIN *join,
     semi.join = join;
     semi.outer = outer_f;
     semi.inner = inner_f;
+    /* the tables of the subquery: a semijoin of an IN shares the table
+       instance of a table of the join (the subquery is part of the query
+       block, MySQL does not open another instance of a table that it reads
+       twice), and the conditions that MySQL pushes into the handler of the
+       table for the subquery must not limit the scan of the join */
+    WalkAccessPaths(inner, join, WalkAccessPathPolicy::ENTIRE_TREE,
+                    [&](AccessPath *p, const JOIN *) {
+                      TABLE *source = nullptr;
+                      if(p->type == AccessPath::TABLE_SCAN) {
+                        source = p->table_scan().table;
+                      } else if(p->type == AccessPath::REF) {
+                        source = p->ref().table;
+                      } else if(p->type == AccessPath::EQ_REF) {
+                        source = p->eq_ref().table;
+                      }
+                      if(source != nullptr) {
+                        semi.sources.push_back(source);
+                      }
+                      return false;
+                    });
     semis->push_back(semi);
     return;
   }
