@@ -2918,6 +2918,11 @@ bool MaterializeIterator<Profiler>::MaterializeOperand(const Operand &operand,
     // For EXCEPT and INTERSECT we test LIMIT in ScanTableIterator
     assert(is_union_or_table || m_limit_rows == HA_POS_ERROR);
 
+    if (thd()->killed) {  // Aborted by user.
+      thd()->send_kill_message();
+      return true;
+    }
+
     if (*stored_rows >= m_limit_rows) break;
 
     int error = read_next_row(operand);
