@@ -143,13 +143,22 @@ static MYSQL_SYSVAR_ULONGLONG(
   0
 );
 
+/* warp_init_func applies warp_cache_size to the running FastBit cache
+   only when the plugin is initialized; a value that arrives later (SET
+   GLOBAL, or mysqld-auto.cnf, which is read after the plugins are
+   initialized) needs this update function, or the cache keeps the size
+   the variable had at initialization (the 512 MB default, unless the
+   value came from the command line or my.cnf). */
+static void warp_cache_size_update(MYSQL_THD thd, SYS_VAR *var,
+                                   void *var_ptr, const void *save);
+
 static MYSQL_SYSVAR_ULONGLONG(
   cache_size,
   my_cache_size,
   PLUGIN_VAR_RQCMDARG,
-  "Fastbit file cache size",
+  "Fastbit file cache size.  An entire partition must fit in the cache.",
   NULL,
-  NULL,
+  warp_cache_size_update,
   1024ULL * 1024 * 512,
   0ULL,
   1ULL<<63,
