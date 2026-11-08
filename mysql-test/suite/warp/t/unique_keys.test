@@ -5,6 +5,8 @@
 --echo # not insert it at the same time.  NULL is not equal to NULL.
 --echo #
 
+call mtr.add_suppression("MY-015655");
+call mtr.add_suppression("WARP LOCKWAIT");
 CREATE TABLE t (id INT NOT NULL, u VARCHAR(10), v INT, PRIMARY KEY (id), UNIQUE KEY (u))
   ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 SHOW CREATE TABLE t;
