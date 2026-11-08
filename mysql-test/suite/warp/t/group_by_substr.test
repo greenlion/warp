@@ -1,0 +1,66 @@
+--echo #
+--echo # The aggregation of the rows of a join of the engine groups by SUBSTR() of
+--echo # a string column (TPC-DS query 23 groups by a part of the description of
+--echo # an item), and HAVING leaves the groups that do not pass out before they
+--echo # are returned to MySQL (the query of the description of an item keeps the
+--echo # rows of an item and a date with more than four sales: without it, 1.5
+--echo # million groups went to MySQL).
+--echo # Every query is run with the aggregation of the engine on and off, and
+--echo # against InnoDB copies.  The multi byte characters are counted, not their
+--echo # bytes.
+--echo #
+call mtr.add_suppression("MY-015655");
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 200000;
+
+CREATE TABLE f_w (id INT, k INT, s VARCHAR(40) NULL, n INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d_w (id INT, t VARCHAR(10)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 5999)
+  SELECT i, 1 + i % 200, IF(i % 13 = 0, NULL, CONCAT('ab', REPEAT('é', i % 3), 'yz', i % 11)), i % 5 FROM s;
+INSERT INTO f_w VALUES (10000, 0, '', 1), (10001, 0, NULL, 1), (10002, 1, 'éééé', 1), (10003, 1, 'é', 1);
+INSERT INTO d_w VALUES (0, 'x'), (1, 'y'), (2, 'x');
+CREATE TABLE f_i LIKE f_w;
+CREATE TABLE d_i LIKE d_w;
+ALTER TABLE f_i ENGINE=InnoDB;
+ALTER TABLE d_i ENGINE=InnoDB;
+INSERT INTO f_i SELECT * FROM f_w;
+INSERT INTO d_i SELECT * FROM d_w;
+
+CREATE TABLE queries (i INT, q TEXT);
+INSERT INTO queries VALUES
+ (1, 'SELECT SUBSTR(s, 1, 3) g, COUNT(*) c FROM f_# GROUP BY SUBSTR(s, 1, 3) HAVING COUNT(*) > 40 ORDER BY g'),
+ (2, 'SELECT SUBSTR(s, 1, 4) g, t, SUM(n) a, COUNT(*) c FROM f_# f, d_# d WHERE f.k = d.id GROUP BY SUBSTR(s, 1, 4), t HAVING COUNT(*) > 20 ORDER BY g, t'),
+ (3, 'SELECT SUBSTR(s, 3) g, COUNT(*) c FROM f_# GROUP BY SUBSTR(s, 3) HAVING COUNT(*) > 30 ORDER BY g'),
+ (4, 'SELECT SUBSTR(s, 2, 2) g, MIN(n) a, MAX(n) b, COUNT(n) c FROM f_# GROUP BY SUBSTR(s, 2, 2) HAVING COUNT(*) > 10 ORDER BY g'),
+ (5, 'SELECT SUBSTR(s, 100, 2) g, COUNT(*) c FROM f_# GROUP BY SUBSTR(s, 100, 2)'),
+ (6, 'SELECT k, SUBSTR(s, 1, 2) g, COUNT(*) c FROM f_# WHERE n < 3 GROUP BY k, SUBSTR(s, 1, 2) HAVING COUNT(*) > 20 ORDER BY k, g'),
+ (7, 'SELECT SUBSTR(s, 1, 3) g, SUM(n) a FROM f_# GROUP BY SUBSTR(s, 1, 3) HAVING SUM(n) > 12000 ORDER BY g');
+
+--let $i = 1
+while ($i <= 7)
+{
+  --let $w = `SELECT REPLACE(q, '#', 'w') FROM queries WHERE i = $i`
+  --let $n = `SELECT REPLACE(q, '#', 'i') FROM queries WHERE i = $i`
+  --echo # query $i
+  --disable_query_log
+  SET SESSION warp_parallel_aggregation = ON;
+  eval CREATE TABLE r_on ENGINE=InnoDB AS $w;
+  SET SESSION warp_parallel_aggregation = OFF;
+  eval CREATE TABLE r_off ENGINE=InnoDB AS $w;
+  SET SESSION warp_parallel_aggregation = ON;
+  eval CREATE TABLE r_i ENGINE=InnoDB AS $n;
+  --enable_query_log
+  SELECT * FROM r_i;
+  SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+         (SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+  SELECT COUNT(*) AS different_rows FROM
+    ((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+     UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+  DROP TABLE r_on, r_off, r_i;
+  --inc $i
+}
+
+SET SESSION warp_parallel_aggregation = DEFAULT;
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
+DROP TABLE queries, f_w, d_w, f_i, d_i;
+--echo # end

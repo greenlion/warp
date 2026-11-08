@@ -653,6 +653,102 @@ static uint64_t warp_pa_rows_of(ha_warp *handler) {
   }
 }
 
+/* HAVING: the groups that do not pass are not returned (MySQL checks the
+   condition again).  Only if every group of MySQL is one group of the engine,
+   and a query without GROUP BY always has a row. */
+/* With a temporary table for the groups, MySQL moved HAVING to a condition of
+   the temporary table before the engine sees the plan (and kept it in
+   having_for_explain): it is the same HAVING (TPC-H Q18 returned all of its
+   75 million groups to MySQL, of which 3 thousand pass).  MySQL moves it only
+   without DISTINCT and ROLLUP. */
+static Item *warp_pa_having_item(const JOIN *join) {
+  Item *having = join->having_cond;
+  if(having == nullptr && !join->select_distinct && join->rollup_state == JOIN::RollupState::NONE) {
+    having = join->having_for_explain;
+  }
+  return having;
+}
+
+/* The conditions of HAVING that compare an aggregate of the plan with a constant
+   are checked before the groups are returned. */
+static void warp_pa_add_having(warp_pa_plan *plan, Item *having) {
+  std::vector<Item *> conjuncts;
+  std::function<void(Item *)> split = [&](Item *item) {
+    if(item->type() == Item::COND_ITEM &&
+       down_cast<Item_cond *>(item)->functype() == Item_func::COND_AND_FUNC) {
+      List_iterator_fast<Item> list(*down_cast<Item_cond *>(item)->argument_list());
+      for(Item *part = list++; part != nullptr; part = list++) split(part);
+    } else {
+      conjuncts.push_back(item);
+    }
+  };
+  split(having);
+  for(Item *conjunct : conjuncts) {
+    if(conjunct->type() != Item::FUNC_ITEM) continue;
+    Item_func *func = down_cast<Item_func *>(conjunct);
+    Item_func::Functype op = func->functype();
+    if(func->argument_count() != 2 ||
+       (op != Item_func::GT_FUNC && op != Item_func::GE_FUNC && op != Item_func::LT_FUNC &&
+        op != Item_func::LE_FUNC && op != Item_func::EQ_FUNC && op != Item_func::NE_FUNC)) {
+      continue;
+    }
+    Item *left = func->arguments()[0]->real_item();
+    Item *right = func->arguments()[1]->real_item();
+    Item *constant = right;
+    Item *aggregate = left;
+    if(left->const_item() && !right->const_item()) {
+      std::swap(left, right);
+      aggregate = left;
+      constant = right;
+      if(op == Item_func::GT_FUNC) op = Item_func::LT_FUNC;
+      else if(op == Item_func::GE_FUNC) op = Item_func::LE_FUNC;
+      else if(op == Item_func::LT_FUNC) op = Item_func::GT_FUNC;
+      else if(op == Item_func::LE_FUNC) op = Item_func::GE_FUNC;
+    }
+    size_t index = plan->aggs.size();
+    for(size_t m = 0; m < plan->aggs.size(); ++m) {
+      if(plan->aggs[m].item == aggregate && plan->aggs[m].replaced) index = m;
+    }
+    if(index == plan->aggs.size() || !constant->const_item() ||
+       (constant->type() != Item::INT_ITEM && constant->type() != Item::DECIMAL_ITEM &&
+        constant->type() != Item::REAL_ITEM)) {
+      continue;
+    }
+    const warp_pa_agg &agg = plan->aggs[index];
+    if(agg.kind == warp_pa_agg::AVG) continue;
+    warp_pa_having h;
+    h.agg = index;
+    h.op = op;
+    if(agg.kind == warp_pa_agg::COUNT_ALL || agg.kind == warp_pa_agg::COUNT_COL || agg.result_kind == PA_INT) {
+      if(constant->type() != Item::INT_ITEM) continue;
+      h.ivalue = constant->val_int();
+      h.iscale = 0;
+    } else if(agg.result_kind == PA_DEC) {
+      if(constant->type() == Item::REAL_ITEM) continue;
+      my_decimal buffer;
+      my_decimal *dec = constant->val_decimal(&buffer);
+      if(dec == nullptr || constant->decimals > 18) continue;
+      String digits;
+      my_decimal2string(E_DEC_FATAL_ERROR, dec, 0, constant->decimals, &digits);
+      warp_i128 v = 0;
+      bool negative = false;
+      for(size_t i = 0; i < digits.length(); ++i) {
+        const char ch = digits.ptr()[i];
+        if(ch == '-') negative = true;
+        else if(ch >= '0' && ch <= '9') v = v * 10 + (ch - '0');
+      }
+      h.ivalue = negative ? -v : v;
+      h.iscale = constant->decimals;
+    } else if(agg.result_kind == PA_REAL) {
+      h.dvalue = constant->val_real();
+    } else {
+      continue;
+    }
+    plan->having.push_back(h);
+  }
+}
+
+
 /* The plan for the aggregation agg_path of a query block, or none.  scan is the
    scan of the table below it. */
 static std::shared_ptr<warp_pa_plan> warp_pa_make_plan(THD *thd, AccessPath *agg_path, AccessPath **slot,
@@ -881,93 +977,9 @@ static std::shared_ptr<warp_pa_plan> warp_pa_make_plan(THD *thd, AccessPath *agg
     }
   }
   plan->adjacent = sorted;
-  /* HAVING: the groups that do not pass are not returned (MySQL checks the
-     condition again).  Only if every group of MySQL is one group of the
-     engine, and a query without GROUP BY always has a row. */
-  /* With a temporary table for the groups, MySQL moved HAVING to a condition
-     of the temporary table before the engine sees the plan (and kept it in
-     having_for_explain): it is the same HAVING (TPC-H Q18 returned all of its
-     75 million groups to MySQL, of which 3 thousand pass).  MySQL moves it
-     only without DISTINCT and ROLLUP. */
-  Item *having = join->having_cond;
-  if(having == nullptr && !join->select_distinct && join->rollup_state == JOIN::RollupState::NONE) {
-    having = join->having_for_explain;
-  }
+  Item *having = warp_pa_having_item(join);
   if(having != nullptr && plan->group_cols > 0 && plan->key_cols.size() == plan->group_cols) {
-    std::vector<Item *> conjuncts;
-    std::function<void(Item *)> split = [&](Item *item) {
-      if(item->type() == Item::COND_ITEM &&
-         down_cast<Item_cond *>(item)->functype() == Item_func::COND_AND_FUNC) {
-        List_iterator_fast<Item> list(*down_cast<Item_cond *>(item)->argument_list());
-        for(Item *part = list++; part != nullptr; part = list++) split(part);
-      } else {
-        conjuncts.push_back(item);
-      }
-    };
-    split(having);
-    for(Item *conjunct : conjuncts) {
-      if(conjunct->type() != Item::FUNC_ITEM) continue;
-      Item_func *func = down_cast<Item_func *>(conjunct);
-      Item_func::Functype op = func->functype();
-      if(func->argument_count() != 2 ||
-         (op != Item_func::GT_FUNC && op != Item_func::GE_FUNC && op != Item_func::LT_FUNC &&
-          op != Item_func::LE_FUNC && op != Item_func::EQ_FUNC && op != Item_func::NE_FUNC)) {
-        continue;
-      }
-      Item *left = func->arguments()[0]->real_item();
-      Item *right = func->arguments()[1]->real_item();
-      Item *constant = right;
-      Item *aggregate = left;
-      if(left->const_item() && !right->const_item()) {
-        std::swap(left, right);
-        aggregate = left;
-        constant = right;
-        if(op == Item_func::GT_FUNC) op = Item_func::LT_FUNC;
-        else if(op == Item_func::GE_FUNC) op = Item_func::LE_FUNC;
-        else if(op == Item_func::LT_FUNC) op = Item_func::GT_FUNC;
-        else if(op == Item_func::LE_FUNC) op = Item_func::GE_FUNC;
-      }
-      size_t index = plan->aggs.size();
-      for(size_t m = 0; m < plan->aggs.size(); ++m) {
-        if(plan->aggs[m].item == aggregate && plan->aggs[m].replaced) index = m;
-      }
-      if(index == plan->aggs.size() || !constant->const_item() ||
-         (constant->type() != Item::INT_ITEM && constant->type() != Item::DECIMAL_ITEM &&
-          constant->type() != Item::REAL_ITEM)) {
-        continue;
-      }
-      const warp_pa_agg &agg = plan->aggs[index];
-      if(agg.kind == warp_pa_agg::AVG) continue;
-      warp_pa_having h;
-      h.agg = index;
-      h.op = op;
-      if(agg.kind == warp_pa_agg::COUNT_ALL || agg.kind == warp_pa_agg::COUNT_COL || agg.result_kind == PA_INT) {
-        if(constant->type() != Item::INT_ITEM) continue;
-        h.ivalue = constant->val_int();
-        h.iscale = 0;
-      } else if(agg.result_kind == PA_DEC) {
-        if(constant->type() == Item::REAL_ITEM) continue;
-        my_decimal buffer;
-        my_decimal *dec = constant->val_decimal(&buffer);
-        if(dec == nullptr || constant->decimals > 18) continue;
-        String digits;
-        my_decimal2string(E_DEC_FATAL_ERROR, dec, 0, constant->decimals, &digits);
-        warp_i128 v = 0;
-        bool negative = false;
-        for(size_t i = 0; i < digits.length(); ++i) {
-          const char ch = digits.ptr()[i];
-          if(ch == '-') negative = true;
-          else if(ch >= '0' && ch <= '9') v = v * 10 + (ch - '0');
-        }
-        h.ivalue = negative ? -v : v;
-        h.iscale = constant->decimals;
-      } else if(agg.result_kind == PA_REAL) {
-        h.dvalue = constant->val_real();
-      } else {
-        continue;
-      }
-      plan->having.push_back(h);
-    }
+    warp_pa_add_having(plan.get(), having);
   }
   return plan;
 }

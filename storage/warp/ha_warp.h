@@ -127,6 +127,12 @@ static const char *ha_warp_exts[] = {
   NullS
 };
 
+/* The rows of the materialized subquery of a semi are read before the join is
+   made (warp_par_join.h).  The subquery can read a table of the join: the scans
+   of the tables of the plan are the scans of the table then, not the scans of
+   the join (a scan of the join would read the subquery again, without end). */
+extern thread_local bool warp_pj_suspended;
+
 /* engine variables */
 static unsigned long long my_partition_max_rows, my_cache_size, my_write_cache_size;//, my_lock_wait_timeout;
 

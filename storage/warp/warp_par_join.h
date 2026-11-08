@@ -412,6 +412,15 @@ struct warp_pj_plan {
     std::vector<int64_t> keys;           // ascending
   };
   std::vector<warp_pj_key_limit> probe_limits;
+  /* The rows of the probe table that a semi demands: the keys of the
+     materialized subquery of the semi (level 0, read when the join is made).
+     A row is looked up in them while it is read, whatever their number: the
+     condition that limits the partition is only an optimization. */
+  struct warp_pj_probe_semi {
+    int slot = -1;        // position of the column in root_cols
+    size_t semi = 0;      // position in semis (level 0)
+  };
+  std::vector<warp_pj_probe_semi> probe_semis;
   std::vector<uint> where_fields;
   int nbuild = 0;                        // tables[1..nbuild] are joined to the probe table
   std::vector<warp_pj_semi> semis;
@@ -1774,6 +1783,7 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
     where = where.empty() ? cond : "(" + where + ") AND (" + cond + ")";
   }
   ibis::bitvector everything;
+  ibis::bitvector filtered;
   std::unique_ptr<ibis::query> query;
   const ibis::bitvector *hits = nullptr;
   if(where.empty()) {
@@ -1833,6 +1843,36 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
         hit_rows.push_back(indices[j]);
       }
     }
+  }
+
+  /* the rows that have a key of a subquery of a semi of the probe table: the
+     condition that limited the partition is not enough (a partition of many
+     keys was read with only the conditions of the table) */
+  if(!plan.probe_semis.empty()) {
+    for(const warp_pj_plan::warp_pj_probe_semi &probe_semi : plan.probe_semis) {
+      const warp_pj_semi &semi = plan.semis[probe_semi.semi];
+      const warp_star_col &column = cols[probe_semi.slot];
+      const int null_slot = plan.root_null_slot[probe_semi.slot];
+      std::vector<uint32_t> keep;
+      keep.reserve(hit_rows.size());
+      for(uint32_t row : hit_rows) {
+        if(null_slot >= 0 && nulls[null_slot].get(row) != 0) continue;
+        if(semi.keys.count(column.get(row)) == 0) continue;
+        keep.push_back(row);
+      }
+      hit_rows.swap(keep);
+      if(hit_rows.empty()) {
+        break;
+      }
+    }
+    if(hit_rows.empty()) {
+      return true;   // no row of the partition is a row of the join
+    }
+    filtered.set(0, nrows);
+    for(uint32_t row : hit_rows) {
+      filtered.setBit(row, 1);
+    }
+    hits = &filtered;   // the columns of the aggregation are read for these rows
   }
 
   result->dir = dir;
@@ -1975,6 +2015,14 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
 static bool warp_pj_read_semi(THD *thd, warp_pj_semi &semi, std::string *error) {
   semi.keys.clear();
   TABLE *derived = semi.inner->table;
+  /* the subquery can read a table of the join: while its rows are read, the
+     tables are read by the scans of the table, not by the scan of the join
+     (the scan of the join reads the subquery again) */
+  struct suspended_scope {
+    bool saved = warp_pj_suspended;
+    suspended_scope() { warp_pj_suspended = true; }
+    ~suspended_scope() { warp_pj_suspended = saved; }
+  } suspended;
   unique_ptr_destroy_only<RowIterator> iterator =
       CreateIteratorFromAccessPath(thd, semi.materialize, semi.join, false);
   if(!iterator || iterator->Init()) {
@@ -2001,8 +2049,33 @@ static bool warp_pj_read_semi(THD *thd, warp_pj_semi &semi, std::string *error) 
   return true;
 }
 
+/* The plan that the thread makes the rows of the join with: the subquery of a
+   semi can read a table of the join, and a scan that the subquery makes of the
+   table must not make the join again. */
+static thread_local warp_pj_plan *warp_pj_executing = nullptr;
+
 static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
   THD *thd = plan.thd;
+  if(warp_pj_executing == &plan) {
+    *error = "the rows of the join are read while the subquery of a semi is read";
+    return false;
+  }
+  struct executing_scope {
+    warp_pj_plan *saved;
+    bool suspended = warp_pj_suspended;
+    executing_scope(warp_pj_plan *plan) : saved(warp_pj_executing) {
+      warp_pj_executing = plan;
+      /* the tables of the plan are read by the scans of the tables while the
+         rows of the join are made: the subqueries of the semis and the tables
+         that the join builds are read by the engine itself, and a scan that
+         would make the join again would never end */
+      warp_pj_suspended = true;
+    }
+    ~executing_scope() {
+      warp_pj_executing = saved;
+      warp_pj_suspended = suspended;
+    }
+  } executing(&plan);
   for(warp_pj_export &e : plan.exports) {
     e.ready = false;
     e.keys.clear();
@@ -2025,12 +2098,6 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
   snap.check_rowids = warp_state->has_history_locks() || warp_state->delete_bitmap->may_have_bits();
 
   for(int l = 1; l <= plan.nbuild; ++l) plan.tables[l].semi.clear();
-  for(warp_pj_semi &semi : plan.semis) {
-    if(!warp_pj_read_semi(thd, semi, error)) {
-      return false;
-    }
-    plan.tables[semi.level].semi.push_back({semi.outer->field_index(), &semi.keys});
-  }
   /* a table of the join that the subquery of a semi reads too: MySQL
      pushed the conditions of the subquery into the handler of the table
      (it starts a new scan of the table for the subquery, and it clears
@@ -2050,6 +2117,17 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
         }
       }
     }
+  }
+  for(warp_pj_semi &semi : plan.semis) {
+    if(!warp_pj_read_semi(thd, semi, error)) {
+      return false;
+    }
+    if(semi.level == 0) {
+      ++warp_join_semi_keys;
+      continue;   // the rows of the probe table are looked up in the keys
+    }
+    ++warp_join_semi_keys;
+    plan.tables[semi.level].semi.push_back({semi.outer->field_index(), &semi.keys});
   }
 
   /* the other tables first: what they hold decides which rows of the probe
@@ -2119,6 +2197,16 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
      was limited by its own conditions or by a derived table): the probe table is
      read for the rows that have one of its keys */
   plan.probe_limits.clear();
+  /* the rows of the probe table that a semi demands limit the scan (the rows
+     are looked up in the keys when they are read, this only leaves rows out) */
+  for(const warp_pj_semi &semi : plan.semis) {
+    if(semi.level != 0) continue;
+    warp_pj_plan::warp_pj_key_limit limit;
+    limit.field = semi.outer->field_index();
+    limit.keys.assign(semi.keys.begin(), semi.keys.end());
+    std::sort(limit.keys.begin(), limit.keys.end());
+    plan.probe_limits.push_back(std::move(limit));
+  }
   /* the keys that the block above found after the join of the engine replaced the scans (a
      derived table that the join is the source of): the candidates that were found before
      are for the hash joins that the engine's join replaced, and are dropped */
@@ -2554,11 +2642,39 @@ static bool warp_pj_replace(THD *thd, AccessPath *path, JOIN *join, const std::v
     }
   }
   for(const warp_pj_semi &candidate : semis) {
-    for(int l = 1; l <= plan->nbuild; ++l) {
+    if(candidate.outer->table == plan->probe) {
+      /* the keys limit the rows of the probe table itself: the subquery table
+         is read before the probe table is read, and a row that does not have
+         one of its keys is not a row of the join */
+      plan->semis.push_back(candidate);
+      plan->semis.back().level = 0;
+      warp_pj_plan::warp_pj_probe_semi probe_semi;
+      probe_semi.slot = warp_pj_add_root(*plan, candidate.outer->field_index());
+      probe_semi.semi = plan->semis.size() - 1;
+      plan->probe_semis.push_back(probe_semi);
+      continue;
+    }
+    bool placed = false;
+    for(int l = 1; l <= plan->nbuild && !placed; ++l) {
       if(plan->tables[l].table == candidate.outer->table && !plan->tables[l].null_side) {
         plan->semis.push_back(candidate);
         plan->semis.back().level = l;
-        break;
+        placed = true;
+      }
+    }
+    if(!placed) {
+      /* the rows of the table of the semi are not limited by this join, and
+         the condition of the semi was not collected: the join would have rows
+         that the semi removes.  The join is made by MySQL if the materialized
+         subquery of the semi is read by it. */
+      bool inside = false;
+      WalkAccessPaths(path, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
+                      [&](AccessPath *p, const JOIN *) {
+                        inside = inside || p == candidate.materialize;
+                        return inside;
+                      });
+      if(inside) {
+        return false;
       }
     }
   }
@@ -2598,8 +2714,9 @@ static bool warp_pj_replace(THD *thd, AccessPath *path, JOIN *join, const std::v
   return true;
 }
 
-/* the inner side of a nested loop is a derived table that is read by an index
-   on one column, with a column of another table as the key */
+/* the inner side of a nested loop is a derived table that is read by a unique
+   index on one column, with a column of another table as the key (the
+   materialized subquery of a semi: every key has one row) */
 static void warp_pj_find_semi(AccessPath *inner, JOIN *join, std::vector<warp_pj_semi> *semis) {
   if(inner->type != AccessPath::MATERIALIZE || inner->materialize().param == nullptr ||
      inner->materialize().param->rematerialize) {
@@ -2613,6 +2730,16 @@ static void warp_pj_find_semi(AccessPath *inner, JOIN *join, std::vector<warp_pj
   TABLE *derived = is_ref ? table_path->ref().table : table_path->eq_ref().table;
   Index_lookup *ref = is_ref ? table_path->ref().ref : table_path->eq_ref().ref;
   if(derived == nullptr || ref == nullptr || ref->key_parts != 1) {
+    return;
+  }
+  /* The keys of the materialized subquery limit the rows of the table that
+     they are compared with: every row of the table with one of the keys is a
+     row of the join, and a row without one is not.  That is the subquery of a
+     semi only if the index that the subquery is read by has one row for a key
+     (the deduplicated table of an IN): a derived table that the equality joins
+     can have more than one row for a key (a table of MIN() values), and its
+     rows are the rows of the join. */
+  if(is_ref && (derived->key_info[ref->key].flags & HA_NOSAME) == 0) {
     return;
   }
   Item *value = ref->items[0]->real_item();
@@ -2916,6 +3043,8 @@ static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
                               path->nested_loop_join().join_type == JoinType::INNER) {
                       predicate = path->nested_loop_join().join_predicate;
                       inner = path->nested_loop_join().inner;
+                      /* the derived table of a semi that is read by a key */
+                      warp_pj_find_semi(inner, join, &semis);
                     }
                     if(predicate != nullptr && predicate->expr != nullptr &&
                        predicate->expr->type == RelationalExpression::INNER_JOIN) {
@@ -2929,10 +3058,6 @@ static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
   }
   WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
                   [&](AccessPath *path, const JOIN *) {
-                    if(path->type == AccessPath::NESTED_LOOP_JOIN &&
-                       path->nested_loop_join().join_type == JoinType::INNER) {
-                      warp_pj_find_semi(path->nested_loop_join().inner, join, &semis);
-                    }
                     /* the conditions on top of a join are conditions of the join too */
                     bool join_below = path->type == AccessPath::HASH_JOIN || path->type == AccessPath::NESTED_LOOP_JOIN;
                     if(path->type == AccessPath::FILTER) {
