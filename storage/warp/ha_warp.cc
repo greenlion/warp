@@ -5565,6 +5565,14 @@ static void warp_add_semi_candidate(ha_warp *inner_handler, Field *inner_field, 
      !integer(inner_field) || !integer(outer_field)) {
     return;
   }
+  /* the other table must be a table that has its rows when the scan starts
+     (ha_warp::semi_pick reads them): a temporary table that MySQL
+     materializes from a query (a CTE that the outer block joins, TPC-DS
+     query 2) does not have them yet when the scan of the inner table
+     starts, and the keys that it has are not the keys of its rows */
+  if(outer_field->table->s->tmp_table != NO_TMP_TABLE) {
+    return;
+  }
   for(const auto &known : inner_handler->semi_candidates) {
     if(known->outer_table == outer_field->table && known->outer_col == outer_field->field_index() &&
        known->inner_col == inner_field->field_index()) {
@@ -6880,16 +6888,21 @@ int ha_warp::append_column_filter(const Item *cond,
     //notice that there are AND conditions that compare constants in diffrent tables.
     for(size_t arg_num = 0; arg_num < tmp->arg_count-1; ++arg_num) {
       // if a field item refers to another field, then this is a join, and it is handled below in JOIN PUSHDOWN
-      if( ( arg[arg_num]->type() == Item::Type::FIELD_ITEM && arg[arg_num+1]->type() != Item::Type::FIELD_ITEM ) )  {
-        
+      if( ( arg[arg_num]->type() == Item::Type::FIELD_ITEM && arg[arg_num+1]->type() != Item::Type::FIELD_ITEM ) ) {
+
         if(arg[arg_num]->used_tables() == 0) continue;
-        
-        /* the alias of the table of the column (the name of the column, as
-           it is printed, is not always qualified: the hidden column of a
-           functional index is printed as its expression) */
+
+        /* the column must belong to the table of this scan: the same table
+           can be read more than once in one statement (a self join, the
+           blocks of a CTE that the outer block joins), and the alias of the
+           table is the same in every one of its instances, so the table is
+           not identified by its alias: a condition of another instance is
+           not a condition of this scan.  Two instances of the same table
+           with different constants of the same column (d_year = 2000 and
+           d_year = 2001, TPC-DS query 2) made a contradiction that no row
+           satisfied. */
         const Field *col = down_cast<Item_field *>(arg[arg_num])->field;
-        if(col == nullptr || col->table == nullptr ||
-           strcmp(table->alias, col->table->alias) != 0) {
+        if(col == nullptr || col->table == nullptr || col->table != table) {
           return 0;
         }
       }

@@ -1,0 +1,41 @@
+--echo #
+--echo # The same table can be read more than once in one statement with the
+--echo # same alias (the blocks of a CTE that the outer block joins).  A
+--echo # condition of another instance of the table is not a condition of a
+--echo # scan of it: the constants of the two instances made a contradiction
+--echo # that no row satisfied, and the rows were silently missing (TPC-DS
+--echo # query 2 returned no rows, queries 59 and 83 lost rows).
+--echo # The keys of a temporary table that MySQL materializes from a query
+--echo # (the CTE) are not the keys of its rows when a scan that they would
+--echo # limit starts.
+--echo #
+call mtr.add_suppression("MY-015655");
+
+CREATE TABLE t1 (i INT NOT NULL, j INT, v DECIMAL(10,2))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t1 VALUES (1, 1, 10.0), (1, 2, 11.0), (2, 1, 20.0),
+                      (2, 2, 21.0), (3, 1, 30.0), (4, 2, 41.0);
+
+--echo # the two blocks read t1 with different constants of the same column
+WITH cte AS (SELECT i AS k, v FROM t1 WHERE i > 0)
+SELECT COUNT(*) FROM
+ (SELECT cte.k k1 FROM cte, t1 WHERE t1.i = cte.k AND t1.j = 1) y,
+ (SELECT cte.k k2 FROM cte, t1 WHERE t1.i = cte.k AND t1.j = 2) z
+WHERE k1 = k2;
+
+--echo # the columns that the blocks compare are different columns
+WITH cte AS (SELECT i AS k, v FROM t1 WHERE i > 0)
+SELECT COUNT(*) FROM
+ (SELECT cte.k k1 FROM cte, t1 WHERE t1.i = cte.k AND t1.v = 30.0) y,
+ (SELECT cte.k k2 FROM cte, t1 WHERE t1.i = cte.k AND t1.v = 41.0) z
+WHERE k1 = k2;
+
+--echo # the rows themselves
+WITH cte AS (SELECT i AS k, v FROM t1 WHERE i > 0)
+SELECT k1, k2 FROM
+ (SELECT cte.k k1, t1.v v1 FROM cte, t1 WHERE t1.i = cte.k AND t1.j = 1) y,
+ (SELECT cte.k k2, t1.v v2 FROM cte, t1 WHERE t1.i = cte.k AND t1.j = 2) z
+WHERE k1 = k2 ORDER BY k1, k2;
+
+DROP TABLE t1;
+--echo # end
