@@ -1420,8 +1420,17 @@ class ha_warp : public handler {
      on the table (they name its alias) never find. */
   bool is_partition_child = false;
   std::string pd_alias_suffix;
+  /* the key of the pushdown information of this handler, written by
+     pd_alias() (it is the key that the information was stored under).
+     cleanup_pushdown_info() reads it instead of making a new key: the
+     table reference that the key is made from belongs to the statement
+     that stored the information, and it is gone when the statement is
+     over.  LOCK TABLES keeps a table open past the statements that read
+     it, and the reference of its handler can be a dangling pointer then. */
+  mutable std::string pd_key;
   std::string pd_alias() const {
-    return warp_pd_key(table->pos_in_table_list, table->alias) + pd_alias_suffix;
+    pd_key = warp_pd_key(table->pos_in_table_list, table->alias) + pd_alias_suffix;
+    return pd_key;
   }
   friend class ha_warp_part;
 

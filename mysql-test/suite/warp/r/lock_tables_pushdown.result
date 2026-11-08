@@ -1,0 +1,60 @@
+#
+# LOCK TABLES keeps a table open past the statements that read it: the
+# statements are over before the table is unlocked, and the pushdown
+# information of the table is cleaned up when the lock is released.
+# Its key was made from the table reference of the statement that
+# stored the information, and that reference is gone then: it must
+# not be read (a connection that failed while it held the locks of a
+# WARP table, like mysqldump, crashed the server when it was dropped).
+#
+call mtr.add_suppression("MY-015655");
+CREATE TABLE t1 (id INT NOT NULL, cat VARCHAR(10), val DECIMAL(10,2))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE t2 (id INT NOT NULL, cat VARCHAR(10), val DECIMAL(10,2))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t1 VALUES (1,'a',1.25), (2,'b',2.50), (3,'a',4.00),
+(4,'b',0.75), (5,'a',NULL);
+INSERT INTO t2 VALUES (1,'a',10.00), (2,'b',20.00);
+# a pushdown query stores pushdown information under the alias key
+SELECT cat, COUNT(*), SUM(val) FROM t1 GROUP BY cat ORDER BY cat;
+cat	COUNT(*)	SUM(val)
+a	3	5.25
+b	2	3.25
+SELECT COUNT(*) FROM t1 JOIN t2 ON t1.id = t2.id;
+COUNT(*)
+2
+# lock, read, error, unlock: the cleanup runs when the lock is released
+LOCK TABLES t1 READ, t2 READ;
+SELECT cat, COUNT(*), SUM(val) FROM t1 GROUP BY cat ORDER BY cat;
+cat	COUNT(*)	SUM(val)
+a	3	5.25
+b	2	3.25
+SELECT * FROM t1, t2, t1 AS x;
+ERROR HY000: Table 'x' was not locked with LOCK TABLES
+UNLOCK TABLES;
+SELECT cat, COUNT(*), SUM(val) FROM t1 GROUP BY cat ORDER BY cat;
+cat	COUNT(*)	SUM(val)
+a	3	5.25
+b	2	3.25
+# a connection that disconnects while it holds the locks
+LOCK TABLES t1 READ, t2 READ;
+SELECT cat, COUNT(*), SUM(val) FROM t1 GROUP BY cat ORDER BY cat;
+cat	COUNT(*)	SUM(val)
+a	3	5.25
+b	2	3.25
+SELECT * FROM t1, t2, t1 AS x;
+ERROR HY000: Table 'x' was not locked with LOCK TABLES
+# the locks are released when the connection is dropped
+SELECT COUNT(*) FROM t1 JOIN t2 ON t1.id = t2.id;
+COUNT(*)
+2
+# a failed statement inside the locks of another connection
+LOCK TABLES t1 WRITE;
+SELECT * FROM t2;
+ERROR HY000: Table 't2' was not locked with LOCK TABLES
+# the write lock is released when the connection is dropped
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+5
+DROP TABLE t1, t2;
+# end
