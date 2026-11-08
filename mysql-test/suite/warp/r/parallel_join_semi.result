@@ -1,0 +1,144 @@
+#
+# The keys of a materialized subquery that a join reads by a key limit the
+# rows of the probe table of the join that the engine makes
+# (warp_parallel_hash_join): the subquery is materialized before the probe
+# table is read, and every row of the probe table is looked up in its keys,
+# also when there are more keys than the condition of a scan can list.  A
+# row that the subquery leaves out is not a row of the join (TPC-DS query
+# 23 read the 4.3 million rows of its fact tables one by one for the keys
+# of two small subqueries).
+# Every query is run with the join of the engine on and off, and against
+# InnoDB copies.
+#
+call mtr.add_suppression("MY-015655");
+SET @save_rows = @@global.warp_partition_max_rows;
+SET GLOBAL warp_partition_max_rows = 64000;
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 400000;
+CREATE TABLE f_w (id INT, k INT NULL, cid INT NULL, v INT, flag INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d_w (id INT, flag INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE k_w (k INT, w INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE c_w (cid INT, w INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 199999)
+SELECT i, IF(i % 1000 = 0, NULL, i % 20000), IF(i % 500 = 0, NULL, i % 3000), i % 97, i % 3 FROM s;
+INSERT INTO d_w VALUES (0, 1), (1, 0), (2, 1);
+INSERT INTO k_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 19999)
+SELECT i, i % 3 FROM s;
+INSERT INTO c_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 2999)
+SELECT i, i % 2 FROM s;
+CREATE TABLE f_i LIKE f_w;
+CREATE TABLE d_i LIKE d_w;
+CREATE TABLE k_i LIKE k_w;
+CREATE TABLE c_i LIKE c_w;
+ALTER TABLE f_i ENGINE=InnoDB;
+ALTER TABLE d_i ENGINE=InnoDB;
+ALTER TABLE k_i ENGINE=InnoDB;
+ALTER TABLE c_i ENGINE=InnoDB;
+INSERT INTO f_i SELECT * FROM f_w;
+INSERT INTO d_i SELECT * FROM d_w;
+INSERT INTO k_i SELECT * FROM k_w;
+INSERT INTO c_i SELECT * FROM c_w;
+CREATE TABLE queries (i INT, q TEXT);
+INSERT INTO queries VALUES
+(1, 'SELECT COUNT(*) cnt, SUM(f.v) s FROM f_# f, d_# d WHERE f.flag = d.id AND d.flag = 1 AND f.k IN (SELECT k FROM (SELECT k FROM k_# WHERE w = 1 UNION SELECT k FROM k_# WHERE w = 2) u)'),
+(2, 'SELECT COUNT(*) cnt, SUM(f.v) s FROM f_# f, d_# d WHERE f.flag = d.id AND d.flag = 1 AND f.k IN (SELECT k FROM (SELECT k FROM k_# WHERE w = 7 UNION SELECT k FROM k_# WHERE w = 8) u)'),
+(3, 'SELECT COUNT(*) cnt, SUM(f.v) s FROM f_# f, d_# d WHERE f.flag = d.id AND d.flag = 1 AND f.k IN (SELECT k FROM (SELECT k FROM k_# UNION SELECT k FROM k_#) u)'),
+(4, 'SELECT COUNT(*) cnt, SUM(f.v) s FROM f_# f, d_# d WHERE f.flag = d.id AND d.flag = 1 AND f.k IN (SELECT k FROM (SELECT k FROM k_# WHERE k % 2 = 1 UNION SELECT k FROM k_# WHERE k % 2 = 1) u)'),
+(5, 'SELECT COUNT(*) cnt, SUM(f.v) s FROM f_# f, d_# d WHERE f.flag = d.id AND d.flag = 1 AND f.k IN (SELECT k FROM (SELECT k FROM k_# WHERE w = 1 UNION SELECT k FROM k_# WHERE w = 2) u) AND f.cid IN (SELECT cid FROM (SELECT cid FROM c_# WHERE w = 0 UNION SELECT cid FROM c_# WHERE w = 0) u2)'),
+(6, 'SELECT COUNT(*) cnt, SUM(f.v) s FROM f_# f, d_# d WHERE f.flag = d.id AND d.flag = 1 AND f.k IN (SELECT k FROM (SELECT k FROM k_# WHERE w = 1 UNION SELECT k FROM k_# WHERE w = 2) u) AND d.id IN (SELECT cid FROM (SELECT cid FROM c_# WHERE w = 0 UNION SELECT cid FROM c_# WHERE w = 0) u3)');
+# query 1
+# the keys of the subquery limited the rows of the join of the engine: 1
+SELECT * FROM r_i;
+cnt	s
+86580	4155649
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 2
+# the keys of the subquery limited the rows of the join of the engine: 1
+SELECT * FROM r_i;
+cnt	s
+0	NULL
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 3
+# the keys of the subquery limited the rows of the join of the engine: 1
+SELECT * FROM r_i;
+cnt	s
+133200	6393234
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 4
+# the keys of the subquery limited the rows of the join of the engine: 1
+SELECT * FROM r_i;
+cnt	s
+66666	3199744
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 5
+# the keys of the subquery limited the rows of the join of the engine: 1
+SELECT * FROM r_i;
+cnt	s
+43160	2071290
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 6
+# the keys of the subquery limited the rows of the join of the engine: 1
+SELECT * FROM r_i;
+cnt	s
+46620	2237669
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+SET SESSION warp_parallel_hash_join = DEFAULT;
+SET SESSION warp_semi_key_pushdown = DEFAULT;
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
+SET GLOBAL warp_partition_max_rows = @save_rows;
+DROP TABLE queries, f_w, d_w, k_w, c_w, f_i, d_i, k_i, c_i;
+# end

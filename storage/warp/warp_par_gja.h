@@ -41,7 +41,7 @@ struct warp_gj_val {
 };
 
 enum { GJN_COL, GJN_CONST, GJN_ADD, GJN_SUB, GJN_MUL, GJN_NEG, GJN_CMP, GJN_AND, GJN_OR, GJN_NOT, GJN_CASE,
-       GJN_LIKE, GJN_YEAR };
+       GJN_LIKE, GJN_YEAR, GJN_SUBSTR };
 enum { GJC_EQ, GJC_NE, GJC_LT, GJC_LE, GJC_GT, GJC_GE };
 
 struct warp_gj_node {
@@ -51,6 +51,8 @@ struct warp_gj_node {
   int level = 0;                  // GJN_COL: the table (0: the probe table) and the column among its columns
   int ci = 0;
   bool temporal = false;          // GJN_COL: an integer that is a date or a time
+  int pos = 1;                    // GJN_SUBSTR: the first character (1 is the first)
+  int slen = -1;                  // GJN_SUBSTR: the number of characters, -1: to the end
   warp_gj_val c;                  // GJN_CONST
   std::string cstr;               // GJN_CONST of a string
   int cmp = GJC_EQ;               // GJN_CMP
@@ -286,6 +288,36 @@ static void warp_gj_eval(const warp_gj_ctx &c, const warp_gj_nodes &nodes, int i
       MYSQL_TIME t;
       TIME_from_longlong_datetime_packed(&t, (longlong)a.i);
       out->i = t.year;
+      return;
+    }
+    case GJN_SUBSTR: {
+      /* SUBSTR(s, pos, len) of the non null string s: the value is a part of
+         the string of the column, the characters are counted (a multi byte
+         character set has more bytes than characters) */
+      warp_gj_val a;
+      warp_gj_eval(c, nodes, n.kids[0], &a);
+      out->kind = WARP_GJ_STR;
+      out->scale = 0;
+      out->null = a.null;
+      out->s = "";
+      out->n = 0;
+      if(a.null) return;
+      size_t from;
+      if(n.pos <= 1) {
+        from = 0;
+      } else {
+        from = n.cs->cset->charpos(n.cs, a.s, a.s + a.n, (size_t)(n.pos - 1));
+      }
+      if(from > a.n) {
+        from = a.n;   // fewer characters than the position: nothing is left
+      }
+      size_t length = a.n - from;
+      if(n.slen >= 0) {
+        const size_t end = n.cs->cset->charpos(n.cs, a.s + from, a.s + a.n, (size_t)n.slen);
+        length = std::min(length, end);
+      }
+      out->s = a.s + from;
+      out->n = length;
       return;
     }
     default:
@@ -667,6 +699,35 @@ struct warp_gj_compiler {
       default:
         break;
     }
+    /* SUBSTR(s, pos, len) of a string: the group by of a part of a description
+       (TPC-DS query 23) */
+    if(Item_func_substr *substr = dynamic_cast<Item_func_substr *>(func)) {
+      if(substr->arg_count < 2 || substr->arg_count > 3) return -1;
+      const int kid = compile(func->arguments()[0]);
+      if(kid < 0 || nodes[kid].kind != WARP_GJ_STR || nodes[kid].cs == nullptr) return -1;
+      const CHARSET_INFO *cs = func->collation.collation;
+      if(cs == nullptr || !my_charset_same(cs, nodes[kid].cs)) return -1;
+      Item *position = func->arguments()[1]->real_item();
+      Item *amount = substr->arg_count == 3 ? func->arguments()[2]->real_item() : nullptr;
+      if(position->type() != Item::INT_ITEM || (amount != nullptr && amount->type() != Item::INT_ITEM)) {
+        return -1;
+      }
+      const longlong pos = position->val_int();
+      if(position->null_value || pos < 1) return -1;
+      longlong len = -1;
+      if(amount != nullptr) {
+        len = amount->val_int();
+        if(amount->null_value || len < 0) return -1;
+      }
+      warp_gj_node n;
+      n.op = GJN_SUBSTR;
+      n.kind = WARP_GJ_STR;
+      n.kids = {kid};
+      n.cs = nodes[kid].cs;
+      n.pos = (int)std::min<longlong>(pos, INT_MAX);
+      n.slen = len < 0 ? -1 : (int)std::min<longlong>(len, INT_MAX);
+      return add(n);
+    }
     /* + - * and unary - */
     Item_func_plus *plus = dynamic_cast<Item_func_plus *>(func);
     Item_func_minus *minus = dynamic_cast<Item_func_minus *>(func);
@@ -1044,6 +1105,14 @@ static std::shared_ptr<warp_pa_plan> warp_gja_make_plan(THD *thd, AccessPath *ag
     plan->aggs.push_back(agg);
   }
 
+  /* HAVING: the groups that do not pass are not returned (MySQL checks the
+     condition again, if it kept it).  The groups of the engine are the groups
+     of MySQL: every column of the GROUP BY is a key of the groups. */
+  Item *having = warp_pa_having_item(join);
+  if(having != nullptr && plan->group_cols > 0) {
+    warp_pa_add_having(plan.get(), having);
+  }
+
   /* the columns that MySQL reads above the aggregation: in the group by and in the select list
      (outside the aggregates), they have the values of the first row of the group */
   std::vector<Field *> out_fields;
@@ -1069,7 +1138,7 @@ static std::shared_ptr<warp_pa_plan> warp_gja_make_plan(THD *thd, AccessPath *ag
   for(Item *item : group_items) collect(item);
   /* the select list of the block, not the one that points to the temporary table */
   for(Item *item : join->query_block->fields) collect(item);
-  if(bad || join->having_cond != nullptr) {
+  if(bad) {
     undo();
     return (warp_pa_no(__LINE__), none);
   }

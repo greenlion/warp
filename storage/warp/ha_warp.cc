@@ -253,6 +253,8 @@ static int show_warp_active_transactions(MYSQL_THD, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
+thread_local bool warp_pj_suspended = false;
+
 /* Warp_semi_key_scans: the scans that were limited to the keys of another
    table (see ha_warp::semi_key_condition) */
 static std::atomic<unsigned long long> warp_semi_key_scans{0};
@@ -260,6 +262,16 @@ static int show_warp_semi_key_scans(MYSQL_THD, SHOW_VAR *var, char *buff) {
   var->type = SHOW_LONGLONG;
   var->value = buff;
   *reinterpret_cast<longlong *>(buff) = (longlong)warp_semi_key_scans.load();
+  return 0;
+}
+
+/* Warp_join_semi_keys: the semis of the joins that the engine makes whose keys
+   were read and applied (see warp_pj_find_semi) */
+static std::atomic<unsigned long long> warp_join_semi_keys{0};
+static int show_warp_join_semi_keys(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) = (longlong)warp_join_semi_keys.load();
   return 0;
 }
 
@@ -274,6 +286,7 @@ static SHOW_VAR warp_status_variables[] = {
     {"Warp_history_locks", (char *)&show_warp_history_locks, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_active_transactions", (char *)&show_warp_active_transactions, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_semi_key_scans", (char *)&show_warp_semi_key_scans, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Warp_join_semi_keys", (char *)&show_warp_join_semi_keys, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}};
 
 mysql_declare_plugin(warp){
@@ -3093,20 +3106,20 @@ static bool warp_partition_may_contain(const std::string &dir, const std::string
 
 int ha_warp::rnd_init(bool) {
   DBUG_ENTER("ha_warp::rnd_init");
-  if(star_agg) {
+  if(star_agg && !warp_pj_suspended) {
     /* the query is aggregated by the engine, the rows are the groups */
     DBUG_RETURN(star_agg_run() ? HA_ERR_INTERNAL_ERROR : 0);
   }
-  if(par_agg) {
+  if(par_agg && !warp_pj_suspended) {
     /* the rows of the table are aggregated by the engine, the rows are the groups */
     DBUG_RETURN(pa_run());
   }
-  if(par_join) {
+  if(par_join && !warp_pj_suspended) {
     /* the tables of the query are joined by the engine, the rows are the
        joined rows */
     DBUG_RETURN(pj_run());
   }
-  if(pj_following()) {
+  if(pj_following() && !warp_pj_suspended) {
     /* a table of the join of the engine: one row for every probe row */
     pj_follower_pending = true;
     DBUG_RETURN(0);
@@ -3587,16 +3600,16 @@ void ha_warp::wait_for_join_threads() {
    escape into the server, which would terminate it. */
 int ha_warp::rnd_next(uchar *buf) {
   DBUG_ENTER("ha_warp::rnd_next");
-  if(par_agg) {
+  if(par_agg && !warp_pj_suspended) {
     DBUG_RETURN(pa_next(buf));
   }
-  if(par_join) {
+  if(par_join && !warp_pj_suspended) {
     DBUG_RETURN(pj_next(buf));
   }
-  if(pj_following()) {
+  if(pj_following() && !warp_pj_suspended) {
     DBUG_RETURN(pj_follower_next(buf));
   }
-  if(star_agg) {
+  if(star_agg && !warp_pj_suspended) {
     DBUG_RETURN(star_agg_next(buf));
   }
   const char* what = NULL;
@@ -6556,6 +6569,12 @@ std::string ha_warp::where_for_partition(const std::string &dir) {
 bool ha_warp::semi_keys_of(const std::shared_ptr<warp_semi_in> &candidate, std::vector<int64_t> *keys_out, uint64_t max_keys) {
   ha_warp *outer = dynamic_cast<ha_warp *>(candidate->outer_table->file);
   if(outer == nullptr) {
+    return false;
+  }
+  /* the rows of the join of the engine are being read (the subquery of a semi
+     of that join is read): the rows of the table are not limited to the keys
+     of a join that is not made (the subquery reads the rows of the table) */
+  if(warp_pj_suspended) {
     return false;
   }
   /* the other table is the probe table of a join that the engine makes: the
