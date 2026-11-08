@@ -6,6 +6,7 @@
 # the index files built in parallel must be identical to the ones
 # built one after another.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 1000000;
 # The partitions of this test are small: index them all
 SET @min_rows = @@global.warp_index_min_rows;

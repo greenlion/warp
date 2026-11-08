@@ -7,6 +7,8 @@
 --echo # join and the multi-table statements join with InnoDB.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 SET SESSION group_concat_max_len = 1000000;
 

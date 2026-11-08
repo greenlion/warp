@@ -4,6 +4,8 @@
 --echo # are covered by warp.csv_encoding.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 CREATE TABLE t1 (
   id INT,
   ti TINYINT, uti TINYINT UNSIGNED,

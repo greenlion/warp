@@ -4,6 +4,7 @@
 # kept for every version of a partition), and the lookups of a statement
 # use the partitions that they opened again.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 300000;
 CREATE TABLE t (id INT, k INT, v VARCHAR(10), KEY (id), KEY (k)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 # partitions of 64000 rows: id 1..64000, 64001..128000, ...

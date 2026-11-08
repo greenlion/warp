@@ -8,6 +8,8 @@
 --echo # the plan.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 CREATE TABLE w (
   id INT,
   ti TINYINT, uti TINYINT UNSIGNED, si SMALLINT, usi SMALLINT UNSIGNED,

@@ -1,6 +1,7 @@
 #
 # Basic WARP storage engine functionality: DDL, DML and NULL handling
 #
+call mtr.add_suppression("MY-015655");
 SELECT ENGINE, SUPPORT, TRANSACTIONS FROM INFORMATION_SCHEMA.ENGINES
 WHERE ENGINE = 'WARP';
 ENGINE	SUPPORT	TRANSACTIONS

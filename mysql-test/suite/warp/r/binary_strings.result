@@ -8,6 +8,7 @@
 # spaces at the end count).  Every value and every condition is checked
 # against an identical InnoDB table.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE TABLE pool (k INT, s VARBINARY(20)) ENGINE=InnoDB;
 INSERT INTO pool VALUES

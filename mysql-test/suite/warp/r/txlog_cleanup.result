@@ -7,6 +7,7 @@
 # Regression test: only transactions that changed data removed their log,
 # and the removal of the old logs at startup never found a file.
 #
+call mtr.add_suppression("MY-015655");
 CREATE TABLE w (id INT, v INT) ENGINE=WARP;
 INSERT INTO w VALUES (1, 1), (2, 2), (3, 3);
 # No transaction log is left by read only statements

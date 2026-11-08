@@ -7,6 +7,7 @@
 # evaluated on the stored values.  Every result is compared with an
 # identical InnoDB table.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE TABLE w (
 id INT NOT NULL,

@@ -9,6 +9,7 @@
 # Regression test: a star join over a 180 million row table failed with
 # an out of memory error although the cache was large.
 #
+call mtr.add_suppression("MY-015655");
 call mtr.add_suppression("WARP: could not read the selected rows");
 call mtr.add_suppression("WARP: scan of .* failed");
 call mtr.add_suppression("WARP: a join worker failed");

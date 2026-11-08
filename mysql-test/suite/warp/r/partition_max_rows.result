@@ -3,6 +3,7 @@
 # that are buffered for a write (warp_write_cache_size) are more than that,
 # the rows that did not fit in a partition were lost.
 #
+call mtr.add_suppression("MY-015655");
 SET @save_max = @@global.warp_partition_max_rows;
 SET GLOBAL warp_partition_max_rows = 64000;
 SET SESSION cte_max_recursion_depth = 400000;

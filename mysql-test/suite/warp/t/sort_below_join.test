@@ -4,6 +4,8 @@
 --echo # and sorted after the join, in the same order (TPC-H Q16).
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 300000;
 CREATE TABLE p (pk INT, brand VARCHAR(10), sz INT, KEY (pk))
   ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

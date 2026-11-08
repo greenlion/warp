@@ -4,6 +4,8 @@
 --echo # key, the results must be the same as InnoDB's.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 CREATE TABLE w (id INT NOT NULL, a INT, b BIGINT UNSIGNED, s VARCHAR(20), c CHAR(5),
   KEY a_idx (a), KEY ab_idx (a, b), KEY s_idx (s), KEY c_idx (c), KEY b_idx (b))
   ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

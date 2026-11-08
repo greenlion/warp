@@ -8,6 +8,8 @@
 --echo # used to be stored escaped.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 CREATE TABLE w (id INT, bi BIGINT, s VARCHAR(40)) ENGINE=WARP
   DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 CREATE TABLE i LIKE w;

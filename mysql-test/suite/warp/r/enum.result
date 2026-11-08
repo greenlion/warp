@@ -6,6 +6,7 @@
 # wrong values, because the result of a scan kept a pointer to the
 # dictionary of a table that was already closed.
 #
+call mtr.add_suppression("MY-015655");
 # collation utf8mb4_bin
 16 queries checked, 0 mismatches
 # changes

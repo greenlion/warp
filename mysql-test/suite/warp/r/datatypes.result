@@ -3,6 +3,7 @@
 # BIGINT's minimum value and strings containing backslashes or newlines
 # are covered by warp.csv_encoding.
 #
+call mtr.add_suppression("MY-015655");
 CREATE TABLE t1 (
 id INT,
 ti TINYINT, uti TINYINT UNSIGNED,

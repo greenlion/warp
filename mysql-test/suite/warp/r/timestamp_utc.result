@@ -2,6 +2,7 @@
 # TIMESTAMP values are stored in UTC, as MySQL stores them: the rows
 # that are written in one time zone are the same ones in another one.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION time_zone = '+05:00';
 SET SESSION explicit_defaults_for_timestamp = 1;
 CREATE TABLE w (id INT NOT NULL, ts TIMESTAMP NULL, ts3 TIMESTAMP(3) NULL, dt DATETIME, KEY ts_idx (ts), KEY ts3_idx (ts3)) ENGINE=WARP;

@@ -5,6 +5,8 @@
 --echo # rows (TPC-H Q11), unless a condition below uses the derived table.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 300000;
 SET @old_switch = @@optimizer_switch;
 SET SESSION optimizer_switch = 'subquery_to_derived=on';

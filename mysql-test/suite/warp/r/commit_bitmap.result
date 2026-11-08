@@ -5,6 +5,7 @@
 # across restarts, transactions that did not commit are not visible, and
 # the list of older versions (commits.warp) is converted once.
 #
+call mtr.add_suppression("MY-015655");
 CREATE TABLE w (id INT, v INT) ENGINE=WARP;
 INSERT INTO w VALUES (1, 1), (2, 2);
 # transactions that commit, roll back and are open

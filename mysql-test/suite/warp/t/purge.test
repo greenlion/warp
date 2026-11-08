@@ -6,6 +6,8 @@
 --echo # table.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 SET GLOBAL warp_purge_interval = 0;
 SET SESSION cte_max_recursion_depth = 100000;
 

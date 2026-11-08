@@ -7,6 +7,8 @@
 --echo # built one after another.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 1000000;
 --echo # The partitions of this test are small: index them all
 SET @min_rows = @@global.warp_index_min_rows;

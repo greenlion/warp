@@ -3,7 +3,9 @@
 # another kind of lock on it keeps the stronger one (it used to crash the
 # server), the locks of other transactions still conflict.
 #
+call mtr.add_suppression("MY-015655");
 call mtr.add_suppression("lock wait timeout");
+call mtr.add_suppression("WARP LOCKWAIT");
 CREATE TABLE t1 (id INT NOT NULL, v INT) ENGINE=WARP;
 INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
 # FOR UPDATE, then LOCK IN SHARE MODE on the same rows

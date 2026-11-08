@@ -4,6 +4,8 @@
 --echo # and an InnoDB copy.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 CREATE TABLE t_w (id INT, i1 INT, i2 INT, u1 INT UNSIGNED, u2 INT UNSIGNED, t1 TINYINT, s1 SMALLINT, y1 YEAR,
                   f1 FLOAT, f2 FLOAT, d1 DOUBLE, d2 DOUBLE, da1 DATE, da2 DATE, dt1 DATETIME(6), dt2 DATETIME(6),
                   dc1 DECIMAL(10,2), dc2 DECIMAL(10,2), b1 BIGINT, b2 BIGINT, v1 VARCHAR(5), v2 VARCHAR(5),

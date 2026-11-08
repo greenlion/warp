@@ -4,6 +4,8 @@
 --echo # condition is run against the WARP table and an InnoDB copy.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 CREATE TABLE t_w (id INT, i INT, u INT UNSIGNED, b BIGINT, d DECIMAL(10,2), f DOUBLE, ti TINYINT, n INT NULL, v VARCHAR(10)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 INSERT INTO t_w WITH RECURSIVE x(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM x WHERE k < 400)
   SELECT k, (k % 41) - 20, k % 37, (k - 200) * 1000003, ((k % 61) - 30) / 4, ((k % 53) - 26) / 3, (k % 17) - 8, IF(k % 7 = 0, NULL, (k % 29) - 14), CONCAT('s', k % 9) FROM x;

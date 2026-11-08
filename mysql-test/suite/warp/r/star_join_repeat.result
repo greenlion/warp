@@ -9,6 +9,7 @@
 # filter, which was freed again when the statement ended.  The server
 # aborted, usually on the second execution.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 1000000;
 SET SESSION group_concat_max_len = 10000000;
 CREATE TABLE sf (id INT, k1 INT, k2 INT, v INT) ENGINE=WARP;

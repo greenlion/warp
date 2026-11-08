@@ -2,6 +2,7 @@
 # Star queries that the engine joins and aggregates itself
 # (warp_star_aggregation): the results must be the ones of InnoDB.
 #
+call mtr.add_suppression("MY-015655");
 call mtr.add_suppression("WARP: aggregation of");
 SET SESSION cte_max_recursion_depth = 1000000;
 # the joins that the engine does not aggregate are left to MySQL here (see parallel_hash_join)
@@ -86,7 +87,7 @@ EXPLAIN
         -> Table scan on f
 
 Warnings:
-Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,count(0) AS `COUNT(*)`,count(`test`.`f`.`b`) AS `COUNT(b)`,min(0) AS `MIN(c)`,max(0) AS `MAX(a - b)` from `test`.`f` join `test`.`d1` where (`test`.`d1`.`k` = `test`.`f`.`k1`) group by `test`.`d1`.`g1`
+Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,count(0) AS `COUNT(*)`,count(`test`.`f`.`b`) AS `COUNT(b)`,min(0) AS `MIN(c)`,max(0) AS `MAX(a - b)` from `test`.`f` join `test`.`d1` where (`test`.`f`.`k1` = `test`.`d1`.`k`) group by `test`.`d1`.`g1`
 # An average with groups stays with MySQL
 EXPLAIN FORMAT=TREE SELECT g1, AVG(a) FROM f JOIN d1 ON f.k1 = d1.k GROUP BY g1;
 EXPLAIN
@@ -98,7 +99,7 @@ EXPLAIN
                 -> Table scan on d1
 
 Warnings:
-Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,avg(`test`.`f`.`a`) AS `AVG(a)` from `test`.`f` join `test`.`d1` where (`test`.`d1`.`k` = `test`.`f`.`k1`) group by `test`.`d1`.`g1`
+Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,avg(`test`.`f`.`a`) AS `AVG(a)` from `test`.`f` join `test`.`d1` where (`test`.`f`.`k1` = `test`.`d1`.`k`) group by `test`.`d1`.`g1`
 count min max, one dimension: 6 rows
 count min max, two dimensions with sums and conditions: 33 rows
 avg count min max, one dimension (the average is not taken over): 6 rows
@@ -129,7 +130,7 @@ EXPLAIN
             -> Table scan on f
 
 Warnings:
-Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,count(distinct `test`.`f`.`a`) AS `COUNT(DISTINCT a)` from `test`.`f` join `test`.`d1` where (`test`.`d1`.`k` = `test`.`f`.`k1`) group by `test`.`d1`.`g1`
+Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,count(distinct `test`.`f`.`a`) AS `COUNT(DISTINCT a)` from `test`.`f` join `test`.`d1` where (`test`.`f`.`k1` = `test`.`d1`.`k`) group by `test`.`d1`.`g1`
 distinct fact column: 6 rows
 distinct nullable fact column with sums: 36 rows
 distinct of an expression and of two columns: 6 rows

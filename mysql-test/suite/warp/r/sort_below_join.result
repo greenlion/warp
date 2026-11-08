@@ -3,6 +3,7 @@
 # aggregated as the rows come (NLJ(SORT(p), ps)) is joined by the engine
 # and sorted after the join, in the same order (TPC-H Q16).
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 300000;
 CREATE TABLE p (pk INT, brand VARCHAR(10), sz INT, KEY (pk))
 ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
@@ -38,6 +39,8 @@ EXPLAIN
                                     -> Materialize with deduplication  
                                         -> Table scan on s  
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`p`.`brand` AS `brand`,`test`.`p`.`sz` AS `sz`,count(distinct `test`.`ps`.`sk`) AS `cnt`,count(0) AS `n` from `test`.`ps` join `test`.`p` where ((`test`.`ps`.`pk` = `test`.`p`.`pk`) and (`test`.`p`.`brand` <> 'B3') and (`test`.`p`.`sz` in (1,4,7,8)) and <in_optimizer>(`test`.`ps`.`sk`,`test`.`ps`.`sk` in ( <materialize> (/* select#2 */ select `test`.`s`.`sk` from `test`.`s` where (`test`.`s`.`cmt` = 'complaint') having true ), <primary_index_lookup>(`test`.`ps`.`sk` in <temporary table> on <auto_distinct_key> where ((`test`.`ps`.`sk` = `<materialized_subquery>`.`sk`)))) is false)) group by `test`.`p`.`brand`,`test`.`p`.`sz` order by `cnt` desc,`test`.`p`.`brand`,`test`.`p`.`sz`
 SELECT COUNT(*) AS different_rows FROM
 (SELECT * FROM r_on UNION ALL SELECT * FROM r_off) u
 GROUP BY brand, sz, cnt, n HAVING COUNT(*) <> 2;

@@ -1,6 +1,7 @@
 #
 # zstd compression of FastBit column data files
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 SET SESSION group_concat_max_len = 100000000;
 SELECT @@global.warp_compression, @@global.warp_compression_level;

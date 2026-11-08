@@ -8,6 +8,7 @@
 # partitioning copy the table.  The results are compared with identical
 # InnoDB tables.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE TABLE src (id INT, d DATE, k INT, s VARCHAR(10), v DECIMAL(8,2))
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
@@ -1285,7 +1286,7 @@ Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM w WHERE d >= '2020-03-01' AND d < '2020-09-01' AND k = 3;
 EXPLAIN
 -> Aggregate: count(0)  
-    -> Table scan on w  
+    -> Table scan on w over partitions (p2020)  
 
 Warnings:
 Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`w` where ((`test`.`w`.`k` = 3) and (`test`.`w`.`d` >= DATE'2020-03-01') and (`test`.`w`.`d` < DATE'2020-09-01'))

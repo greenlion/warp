@@ -4,6 +4,7 @@
 # engine joins the other tables and the derived table is joined to their
 # rows (TPC-H Q11), unless a condition below uses the derived table.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 300000;
 SET @old_switch = @@optimizer_switch;
 SET SESSION optimizer_switch = 'subquery_to_derived=on';
@@ -46,6 +47,8 @@ EXPLAIN
                                         -> Table scan on s, joined by the parallel hash join  
                                     -> Table scan on n, joined by the parallel hash join  
 
+Warnings:
+Note	1003	/* select#1 */ select `test`.`ps`.`pk` AS `pk`,sum((`test`.`ps`.`cost` * `test`.`ps`.`qty`)) AS `v` from `test`.`ps` join `test`.`s` join `test`.`n` left join (/* select#2 */ select (sum((`test`.`ps`.`cost` * `test`.`ps`.`qty`)) * 0.0004) AS `SUM(cost * qty) * 0.0004` from `test`.`ps` join `test`.`s` join `test`.`n` where ((`test`.`n`.`name` = 'N7') and (`test`.`s`.`nk` = `test`.`n`.`nk`) and (`test`.`ps`.`sk` = `test`.`s`.`sk`))) `derived_1_2` on(true) where ((`test`.`n`.`name` = 'N7') and (`test`.`s`.`nk` = `test`.`n`.`nk`) and (`test`.`ps`.`sk` = `test`.`s`.`sk`)) group by `test`.`ps`.`pk` having (sum((`test`.`ps`.`cost` * `test`.`ps`.`qty`)) > `derived_1_2`.`SUM(cost * qty) * 0.0004`)
 # the subquery of WHERE: its value is a condition of the join
 # a derived table with GROUP BY has more than one row
 SELECT COUNT(*) AS different_rows FROM

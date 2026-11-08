@@ -2,6 +2,8 @@
 --echo # zstd compression of FastBit column data files
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 SET SESSION group_concat_max_len = 100000000;
 

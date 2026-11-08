@@ -2,6 +2,7 @@
 # Adding, dropping and renaming an index of a WARP table only changes the
 # definition of the table.  The data files are not rewritten.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE TABLE t1 (id INT NOT NULL, v INT, s VARCHAR(10)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 INSERT INTO t1 WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 50000)

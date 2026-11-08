@@ -6,6 +6,7 @@
 # Regression test: such conditions used to be accepted by the pushdown
 # without being applied, so every row was returned.
 #
+call mtr.add_suppression("MY-015655");
 CREATE TABLE w (id INT, k INT, s VARCHAR(20)) ENGINE=WARP
 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 CREATE TABLE i LIKE w;

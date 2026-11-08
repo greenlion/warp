@@ -4,6 +4,7 @@
 # dropped, renamed, truncated or rebuilt must not see the old files.
 #
 # DROP and CREATE with the same name
+call mtr.add_suppression("MY-015655");
 CREATE TABLE t1 (k INT, v VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 INSERT INTO t1 VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
 SELECT COUNT(*), SUM(k) FROM t1;

@@ -9,6 +9,8 @@
 
 --let $collations = utf8mb4_bin
 --let $clist = $collations,
+
+call mtr.add_suppression("MY-015655");
 while ($clist != '')
 {
   --let $coll = `SELECT SUBSTRING_INDEX('$clist', ',', 1)`

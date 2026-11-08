@@ -5,6 +5,7 @@
 # the WARP tables (suffix w) and against InnoDB copies of them (suffix i) and
 # a checksum of the rows is compared.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION warp_parallel_join_min_rows = 0;
 SET SESSION cte_max_recursion_depth = 10000;
 SET SESSION join_buffer_size = 2048;
@@ -110,7 +111,7 @@ EXPLAIN
                                 -> Table scan on d1_w, with parallel aggregation
 
 Warnings:
-Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join (/* select#2 */ select `test`.`d1_w`.`kk` AS `Name_exp_1` from `test`.`d1_w` group by `test`.`d1_w`.`kk` having (count(0) > 1000)) `derived_1_2` where ((`derived_1_2`.`Name_exp_1` = `d1`.`kk`) and (`d1`.`k` = `f`.`k1`))
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a` from `test`.`f_w` `f` join `test`.`d1_w` `d1` join (/* select#2 */ select `test`.`d1_w`.`kk` AS `Name_exp_1` from `test`.`d1_w` group by `test`.`d1_w`.`kk` having (count(0) > 1000)) `derived_1_2` where ((`derived_1_2`.`Name_exp_1` = `d1`.`kk`) and (`f`.`k1` = `d1`.`k`))
 # case 6: composite key
 900:1900154646063
 EXPLAIN FORMAT=TREE SELECT f.id, d3.z FROM f_w f JOIN d3_w d3 ON f.k1 = d3.x AND f.k2 = d3.y;
@@ -120,7 +121,7 @@ EXPLAIN
     -> Table scan on d3, joined by the parallel hash join
 
 Warnings:
-Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d3`.`z` AS `z` from `test`.`f_w` `f` join `test`.`d3_w` `d3` where ((`d3`.`y` = `f`.`k2`) and (`d3`.`x` = `f`.`k1`))
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d3`.`z` AS `z` from `test`.`f_w` `f` join `test`.`d3_w` `d3` where ((`f`.`k2` = `d3`.`y`) and (`f`.`k1` = `d3`.`x`))
 # case 7: a join condition that closes a cycle
 555:1168842444991
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k AND d1.kk = d2.k1;
@@ -228,7 +229,7 @@ Warnings:
 Note	1276	Field or reference 'test.f.k1' of SELECT #2 was resolved in SELECT #1
 Note	1276	Field or reference 'test.d1.b' of SELECT #2 was resolved in SELECT #1
 Note	1276	Field or reference 'test.f.id' of SELECT #2 was resolved in SELECT #1
-Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a` from `test`.`f_w` `f` join `test`.`d1_w` `d1` anti join (`test`.`f_w` `g`) on(((`g`.`k1` = `f`.`k1`) and (`g`.`v` <> `d1`.`b`) and (`g`.`id` < `f`.`id`))) where (`d1`.`k` = `f`.`k1`)
+Note	1003	/* select#1 */ select `f`.`id` AS `id`,`d1`.`a` AS `a` from `test`.`f_w` `f` join `test`.`d1_w` `d1` anti join (`test`.`f_w` `g`) on(((`g`.`k1` = `d1`.`k`) and (`g`.`v` <> `d1`.`b`) and (`g`.`id` < `f`.`id`))) where (`f`.`k1` = `d1`.`k`)
 # case 16: a semi join over the joined rows
 150:321467921698
 EXPLAIN FORMAT=TREE SELECT f.id, d1.a, d2.c FROM f_w f JOIN d1_w d1 ON f.k1 = d1.k JOIN d2_w d2 ON f.k2 = d2.k WHERE EXISTS (SELECT 1 FROM f_w g WHERE g.k2 = f.k2 AND g.v = d1.b + 40);

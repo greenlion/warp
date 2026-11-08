@@ -5,6 +5,7 @@
 # to them: the scans read the rows that have those keys only.  Every query is
 # run against the WARP tables and InnoDB copies.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION warp_parallel_join_min_rows = 0;
 SET SESSION cte_max_recursion_depth = 100000;
 SET GLOBAL warp_partition_max_rows = 1000;

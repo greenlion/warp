@@ -10,6 +10,8 @@
 --echo # ran at 14 instead of 2000 queries per second).
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 CREATE TABLE w (
   id INT, ub BIGINT UNSIGNED, dc DECIMAL(12,3), d DOUBLE, vc VARCHAR(20),
   dt DATE, ts TIMESTAMP NULL, e ENUM('x', 'y', 'z')

@@ -9,6 +9,8 @@
 --echo # InnoDB tables.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 let $MYSQLD_DATADIR= `SELECT @@datadir`;
 

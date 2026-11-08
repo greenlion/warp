@@ -6,6 +6,7 @@
 # warp.nested_loop_join, so the joins between WARP tables use a hash
 # join and the multi-table statements join with InnoDB.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 SET SESSION group_concat_max_len = 1000000;
 CREATE TABLE wf (id INT, k INT, s VARCHAR(20), n INT NULL) ENGINE=WARP

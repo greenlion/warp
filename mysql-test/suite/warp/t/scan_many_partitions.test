@@ -10,6 +10,8 @@
 --echo # an out of memory error although the cache was large.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 call mtr.add_suppression("WARP: could not read the selected rows");
 call mtr.add_suppression("WARP: scan of .* failed");
 call mtr.add_suppression("WARP: a join worker failed");

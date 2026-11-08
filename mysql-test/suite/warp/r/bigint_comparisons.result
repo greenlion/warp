@@ -9,6 +9,7 @@
 # BETWEEN.  FastBit now compares 64-bit integers exactly for =, !=,
 # <, <=, >, >=, BETWEEN and IN.
 #
+call mtr.add_suppression("MY-015655");
 CREATE TABLE w (id INT, b BIGINT, u BIGINT UNSIGNED) ENGINE=WARP;
 CREATE TABLE i LIKE w;
 ALTER TABLE i ENGINE=InnoDB;

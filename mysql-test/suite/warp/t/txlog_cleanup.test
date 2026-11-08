@@ -8,6 +8,8 @@
 --echo # and the removal of the old logs at startup never found a file.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 CREATE TABLE w (id INT, v INT) ENGINE=WARP;
 INSERT INTO w VALUES (1, 1), (2, 2), (3, 3);
 

@@ -14,6 +14,8 @@
 --echo #
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
+
+call mtr.add_suppression("MY-015655");
 call mtr.add_suppression("WARP: recovery cuts the partition");
 let $old_sync_commit= `SELECT @@global.warp_sync_commit`;
 let $old_sync_interval= `SELECT @@global.warp_sync_interval`;

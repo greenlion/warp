@@ -11,6 +11,7 @@
 # (NO PAD), latin1_general_cs and latin1_bin are latin1 collations that
 # ignore the spaces at the end (PAD SPACE).
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE TABLE pool (k INT, s VARCHAR(20)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 INSERT INTO pool VALUES

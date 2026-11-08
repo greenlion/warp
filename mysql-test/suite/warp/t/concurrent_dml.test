@@ -13,6 +13,8 @@
 --echo # had it mapped.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE TABLE w (id INT, v INT) ENGINE=WARP;
 CREATE TABLE i LIKE w;

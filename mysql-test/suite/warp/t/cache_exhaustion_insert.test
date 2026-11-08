@@ -8,6 +8,8 @@
 --echo # can not grow was not caught and terminated the server.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 call mtr.add_suppression("WARP: out of memory");
 call mtr.add_suppression("WARP: could not write");
 

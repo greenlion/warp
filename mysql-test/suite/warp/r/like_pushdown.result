@@ -3,6 +3,7 @@
 # evaluated by FastBit.  Every pattern is run against the WARP table and an
 # InnoDB copy.
 #
+call mtr.add_suppression("MY-015655");
 CREATE TABLE t_w (id INT, v VARCHAR(60) NOT NULL, n VARCHAR(60) NULL, ci VARCHAR(60) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_cs NOT NULL)
 ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 INSERT INTO t_w VALUES

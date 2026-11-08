@@ -8,6 +8,7 @@
 # Regression test: BETWEEN and the other comparisons of strings were not
 # pushed down, MySQL evaluated them for every row (SSB query 2.2).
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE TABLE pool (k INT, s VARCHAR(20)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 INSERT INTO pool VALUES

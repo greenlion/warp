@@ -8,6 +8,7 @@
 # worker thread that could not read a column silently treated its
 # partition as having no matching rows.
 #
+call mtr.add_suppression("MY-015655");
 call mtr.add_suppression("WARP: could not evaluate the pushed down condition");
 call mtr.add_suppression("WARP: a join worker failed");
 call mtr.add_suppression("WARP: join worker failed");

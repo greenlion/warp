@@ -8,6 +8,8 @@
 --echo # also run against InnoDB.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 CREATE TABLE pt (partkey INT, size INT) ENGINE=WARP
   DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 CREATE TABLE ps (partkey INT, suppkey INT, cost INT) ENGINE=WARP

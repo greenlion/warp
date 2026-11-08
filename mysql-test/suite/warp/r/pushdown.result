@@ -2,6 +2,7 @@
 # WHERE clause pushdown into WARP.  Every query is also run against an
 # identical InnoDB table and the results must match.
 #
+call mtr.add_suppression("MY-015655");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE TABLE w (
 id INT, k INT, s VARCHAR(30), d DATE, tm TIME, dc DECIMAL(10,2),

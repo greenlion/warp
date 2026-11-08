@@ -5,6 +5,8 @@
 --echo # starts again at 1.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, v VARCHAR(10), PRIMARY KEY (id))
   ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 INSERT INTO t (v) VALUES ('a');

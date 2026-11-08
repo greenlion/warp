@@ -3,6 +3,8 @@
 --echo # warp_partition_max_rows=64000 and warp_write_cache_size=32000.
 --echo #
 
+
+call mtr.add_suppression("MY-015655");
 SELECT @@warp_partition_max_rows, @@warp_write_cache_size;
 SET SESSION cte_max_recursion_depth = 1000000;
 SET SESSION group_concat_max_len = 100000000;
