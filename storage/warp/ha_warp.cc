@@ -2487,34 +2487,42 @@ void ha_warp::cleanup_pushdown_info() {
   }
   index_base_where = "";
   // free up memory used for pushdown filters
-  auto pushdown_info = get_pushdown_info(table->in_use, pd_alias().c_str());
-  
-  pushdown_mtx.lock();
-  auto it = pd_info.find(table->in_use);
-  if(it != pd_info.end()) {
-  
-    // remove the pushdown info for this table
-    auto it2 = it->second->find(pd_alias().c_str());
-    if(it2 != it->second->end()) {
-      it->second->erase(it2);
-    }
-    // if all of the tables are removed delete the pushdown info completely
-    if(it->second->size() == 0) {
-      delete it->second;
-      pd_info.erase(it);
+  /* pd_key is the key that the information was stored under (pd_alias
+     wrote it when it stored the information): the table reference that
+     a new key is made from can be gone (the statements that read a
+     table of a LOCK TABLES statement are over before the table is
+     unlocked).  Nothing was stored if the key is empty. */
+  if(!pd_key.empty()) {
+    auto pushdown_info = get_pushdown_info(table->in_use, pd_key.c_str());
+
+    pushdown_mtx.lock();
+    auto it = pd_info.find(table->in_use);
+    if(it != pd_info.end()) {
+
+      // remove the pushdown info for this table
+      auto it2 = it->second->find(pd_key.c_str());
+      if(it2 != it->second->end()) {
+        it->second->erase(it2);
+      }
+      // if all of the tables are removed delete the pushdown info completely
+      if(it->second->size() == 0) {
+        delete it->second;
+        pd_info.erase(it);
+      }
+
     }
 
+    if(pushdown_info != NULL) {
+      /* the pushdown information owns the FastBit objects stored on it,
+         whether they were opened by the join pushdown or by a scan */
+      delete pushdown_info->cursor;
+      delete pushdown_info->filtered_table;
+      delete pushdown_info->base_table;
+    }
+    delete pushdown_info;
+    pd_key.clear();
+    pushdown_mtx.unlock();
   }
-  
-  if(pushdown_info != NULL) {
-    /* the pushdown information owns the FastBit objects stored on it,
-       whether they were opened by the join pushdown or by a scan */
-    delete pushdown_info->cursor;
-    delete pushdown_info->filtered_table;
-    delete pushdown_info->base_table;
-  }
-  delete pushdown_info;
-  pushdown_mtx.unlock();
 
   /* end of the statement: nothing pushed down for it may be used again */
   push_where_clause = "";
