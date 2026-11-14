@@ -211,3 +211,14 @@ ENDIF()
 IF(NOT COMPILATION_COMMENT_SERVER)
   SET(COMPILATION_COMMENT_SERVER ${COMPILATION_COMMENT})
 ENDIF()
+
+# The release of the WARP storage engine that this server is built with.
+# It is added to the version comment (@@version_comment, mysqld --version,
+# the banner of the mysql client); @@version stays the version of MySQL,
+# which clients and tools parse.
+SET(WARP_VERSION "WARP 2.0 beta 4")
+FOREACH(comment_var COMPILATION_COMMENT COMPILATION_COMMENT_SERVER)
+  IF(NOT "${${comment_var}}" MATCHES "WARP ")
+    SET(${comment_var} "${${comment_var}} - ${WARP_VERSION}")
+  ENDIF()
+ENDFOREACH()
