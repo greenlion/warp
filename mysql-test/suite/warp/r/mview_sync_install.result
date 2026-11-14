@@ -1,0 +1,43 @@
+#
+# INSTALL PLUGIN WARP_MVIEW in a running server.  With persisted
+# plugin variables the statement sets them while it holds the plugin
+# mutex; the daemon thread that the plugin starts must not create its
+# session before the statement has ended (it used to deadlock, and
+# every new connection hung behind it).
+#
+call mtr.add_suppression("WARP_MVIEW");
+SELECT COUNT(*) AS daemon_loaded FROM information_schema.plugins WHERE PLUGIN_NAME = 'WARP_MVIEW';
+daemon_loaded
+0
+SET @size = @@global.warp_write_cache_size;
+SET PERSIST warp_write_cache_size = @size;
+CREATE TABLE t (id INT PRIMARY KEY, g INT, x INT) ENGINE=InnoDB;
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+CREATE MATERIALIZED VIEW mv_j ENGINE=InnoDB AS SELECT t.id, t.g, t.x FROM t;
+CREATE MATERIALIZED VIEW mv_a ENGINE=InnoDB AS SELECT g, COUNT(*) AS n, SUM(x) AS s FROM t GROUP BY g;
+# not maintained without the daemon
+INSERT INTO t VALUES (4, 2, 40);
+SELECT COUNT(*) FROM mv_j;
+COUNT(*)
+3
+INSTALL PLUGIN WARP_MVIEW SONAME 'WARP_PLUGIN';
+# a new connection works
+SELECT PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME = 'WARP_MVIEW';
+PLUGIN_STATUS
+ACTIVE
+# the daemon adopts the views and maintains them
+INSERT INTO t VALUES (5, 3, 50);
+UPDATE t SET x = x + 1 WHERE id = 1;
+DELETE FROM t WHERE id = 2;
+mv_j: 4 rows, 0 missing, 0 extra
+mv_a: 3 rows, 0 missing, 0 extra
+UNINSTALL PLUGIN WARP_MVIEW;
+# and again, after it was removed
+INSTALL PLUGIN WARP_MVIEW SONAME 'WARP_PLUGIN';
+INSERT INTO t VALUES (6, 3, 60);
+mv_j: 5 rows, 0 missing, 0 extra
+mv_a: 3 rows, 0 missing, 0 extra
+UNINSTALL PLUGIN WARP_MVIEW;
+RESET PERSIST warp_write_cache_size;
+DROP MATERIALIZED VIEW mv_j, mv_a;
+DROP TABLE t;

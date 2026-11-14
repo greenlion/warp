@@ -1,0 +1,46 @@
+--echo #
+--echo # The statements of materialized views in the binary log: the statement
+--echo # of the user, and no row of the view
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+call mtr.add_suppression("MY-015655");
+
+CREATE TABLE t1 (id INT PRIMARY KEY, g INT, v INT);
+INSERT INTO t1 VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+
+RESET BINARY LOGS AND GTIDS;
+
+CREATE MATERIALIZED VIEW mv_j ENGINE=InnoDB REFRESH MANUAL AS
+  SELECT id, v FROM t1 WHERE g = 1;
+CREATE MATERIALIZED VIEW mv_w ENGINE=WARP REFRESH MANUAL AS
+  SELECT id, v FROM t1;
+CREATE MATERIALIZED VIEW mv_a ENGINE=InnoDB REFRESH MANUAL AS
+  SELECT g, SUM(v) AS s FROM t1 GROUP BY g;
+CREATE MATERIALIZED VIEW mv_aw ENGINE=WARP REFRESH MANUAL AS
+  SELECT COUNT(*) AS c FROM t1;
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_j AS SELECT id FROM t1;
+INSERT INTO t1 VALUES (4, 1, 40);
+REFRESH MATERIALIZED VIEW mv_j;
+REFRESH MATERIALIZED VIEW mv_w;
+REFRESH MATERIALIZED VIEW mv_a;
+REFRESH MATERIALIZED VIEW mv_aw;
+ALTER MATERIALIZED VIEW mv_j REFRESH SYNCHRONOUS;
+--echo # Statements that fail are not logged
+--error ER_MVIEW_UNSUPPORTED_DEFINITION
+CREATE MATERIALIZED VIEW mv_bad AS SELECT id FROM t1 LIMIT 1;
+--error ER_MVIEW_NOT_A_MVIEW
+REFRESH MATERIALIZED VIEW t1;
+--error ER_MVIEW_IS_READ_ONLY
+DELETE FROM mv_j;
+SELECT * FROM mv_j ORDER BY id;
+SELECT * FROM mv_w ORDER BY id;
+SELECT * FROM mv_a ORDER BY g;
+SELECT * FROM mv_aw;
+DROP MATERIALIZED VIEW mv_j, mv_w;
+DROP MATERIALIZED VIEW IF EXISTS mv_a, mv_aw, no_such;
+
+--echo # The only rows are the row of t1; the views are statements
+--source include/rpl/deprecated/show_binlog_events.inc
+
+DROP TABLE t1;

@@ -1,0 +1,6 @@
+--echo #
+--echo # Materialized views over joins, stored in WARP
+--echo #
+call mtr.add_suppression("MY-015655");
+--let $mv_engine = WARP
+--source suite/warp/include/mview_join_engine.inc

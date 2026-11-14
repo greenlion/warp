@@ -463,6 +463,7 @@ SET(SQL_SHARED_SOURCES
   log.cc
   mdl.cc
   mdl_context_backup.cc
+  mview.cc
   migrate_keyring.cc
   mysqld.cc
   mysqld_thd_manager.cc
@@ -592,6 +593,7 @@ SET(SQL_SHARED_SOURCES
   sql_locale.cc
   sql_manager.cc
   sql_masking_policy.cc
+  sql_mview.cc
   sql_optimizer.cc
   sql_parse.cc
   sql_partition.cc

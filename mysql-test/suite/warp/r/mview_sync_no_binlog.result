@@ -1,0 +1,14 @@
+#
+# The WARP_MVIEW plugin loads without the binary log and says why it
+# does nothing
+#
+call mtr.add_suppression("WARP_MVIEW");
+SELECT @@global.log_bin;
+@@global.log_bin
+0
+SELECT PLUGIN_NAME, PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME = 'WARP_MVIEW';
+PLUGIN_NAME	PLUGIN_STATUS
+WARP_MVIEW	ACTIVE
+SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_state';
+VARIABLE_VALUE
+disabled: the binary log is not enabled (log_bin)

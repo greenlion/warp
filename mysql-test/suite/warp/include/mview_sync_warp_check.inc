@@ -1,0 +1,28 @@
+# Checks the views of mview_sync_warp.test against their defining queries.
+--let $mview = ww_left
+--let $mview_select = $sel_ww_left
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = ww_where
+--let $mview_select = $sel_ww_where
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = ww_cnt
+--let $mview_select = $sel_ww_cnt
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = ww_grp
+--let $mview_select = $sel_ww_grp
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = ww_ldist
+--let $mview_select = $sel_ww_ldist
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = iw_left
+--let $mview_select = $sel_iw_left
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = iw_grp
+--let $mview_select = $sel_iw_grp
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = wi_left
+--let $mview_select = $sel_wi_left
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = wi_grp
+--let $mview_select = $sel_wi_grp
+--source suite/warp/include/mview_sync_check.inc

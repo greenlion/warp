@@ -67,12 +67,16 @@ ENDIF()
 #)
 #ADD_SUBDIRECTORY(lemire_sorted_simd)
 
-SET(WARP_SOURCES ha_warp.cc ha_warp.h ha_warp_part.h)
+# warp_mview_*: the WARP_MVIEW daemon plugin of the same library, which
+# maintains the materialized views from the binary log (no FastBit there)
+SET(WARP_SOURCES ha_warp.cc ha_warp.h ha_warp_part.h
+  warp_mview.h warp_mview_daemon.cc warp_mview_rows.cc)
 
 # WARP is built as a loadable plugin, ha_warp.so, which contains FastBit, so
 # that it can be distributed apart from the server
 MYSQL_ADD_PLUGIN(warp ${WARP_SOURCES} STORAGE_ENGINE MODULE_ONLY
-  LINK_LIBRARIES extra::rapidjson)
+  # sql/binlog.h, used by the daemon, includes ankerl/unordered_dense.h
+  LINK_LIBRARIES extra::rapidjson extra::unordered_dense)
 # The static FastBit library does not contain the libraries it uses, they
 # are linked after it
 add_library(fastbit STATIC IMPORTED)

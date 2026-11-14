@@ -4413,6 +4413,13 @@ struct LEX : public Query_tables_list {
   /// This flag indicates that the CREATE VIEW statement contains the
   /// MATERIALIZED keyword.
   bool create_view_materialization;
+  /// CREATE MATERIALIZED VIEW ... ENGINE=; str is nullptr if not given.
+  LEX_CSTRING mview_engine;
+  /// REFRESH clause of a materialized view: -1 not given, 0 MANUAL,
+  /// 1 SYNCHRONOUS.
+  int8 mview_refresh_mode;
+  /// An ALGORITHM clause was given (not allowed for a materialized view).
+  bool mview_has_algorithm;
 
   /**
     @todo ensure that correct CONTEXT_ANALYSIS_ONLY is set for all preparation
@@ -4637,6 +4644,8 @@ struct LEX : public Query_tables_list {
   st_sp_chistics sp_chistics;
 
   bool only_view; /* used for SHOW CREATE TABLE/VIEW */
+  /// SHOW CREATE MATERIALIZED VIEW: the object must be a materialized view.
+  bool only_mview{false};
   /*
     view created to be run from definer (standard behaviour)
   */

@@ -326,15 +326,19 @@ class Sql_cmd_show_create_procedure : public Sql_cmd_show_noplan {
 
 class Sql_cmd_show_create_table : public Sql_cmd_show_noplan {
  public:
-  Sql_cmd_show_create_table(bool is_view, Table_ident *table_ident)
+  Sql_cmd_show_create_table(bool is_view, Table_ident *table_ident,
+                            bool is_mview = false)
       : Sql_cmd_show_noplan(SQLCOM_SHOW_CREATE),
-        m_is_view(is_view),
+        m_is_view(is_view || is_mview),
+        m_is_mview(is_mview),
         m_table_ident(table_ident) {}
   bool check_privileges(THD *thd) override;
   bool execute_inner(THD *thd) override;
 
  private:
   const bool m_is_view;
+  /// SHOW CREATE MATERIALIZED VIEW
+  const bool m_is_mview;
   Table_ident *const m_table_ident;
 };
 

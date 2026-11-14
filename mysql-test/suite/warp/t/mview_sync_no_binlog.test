@@ -1,0 +1,10 @@
+--echo #
+--echo # The WARP_MVIEW plugin loads without the binary log and says why it
+--echo # does nothing
+--echo #
+call mtr.add_suppression("WARP_MVIEW");
+SELECT @@global.log_bin;
+SELECT PLUGIN_NAME, PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME = 'WARP_MVIEW';
+--let $mview_state = disabled: the binary log is not enabled (log_bin)
+--source suite/warp/include/mview_sync_state.inc
+SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_state';

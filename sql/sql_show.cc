@@ -23,6 +23,7 @@
 
 // SHOW TABLE, SHOW DATABASES, etc.
 
+#include "sql/sql_mview.h"
 #include "sql/sql_show.h"
 
 #include <math.h>
@@ -378,6 +379,7 @@ bool Sql_cmd_show_create_table::execute_inner(THD *thd) {
   LEX *lex = thd->lex;
 
   lex->only_view = m_is_view;
+  lex->only_mview = m_is_mview;
   lex->sql_command = old_lex->sql_command;
 
   // Disable constant subquery evaluation as we won't be locking tables.
@@ -1169,6 +1171,7 @@ bool mysqld_show_create(THD *thd, Table_ref *table_list) {
   mem_root_deque<Item *> field_list(thd->mem_root);
   String buffer(buff, sizeof(buff), system_charset_info);
   bool error = true;
+  bool is_mview = false;
   DBUG_TRACE;
   DBUG_PRINT("enter",
              ("db: %s  table: %s", table_list->db, table_list->table_name));
@@ -1240,8 +1243,20 @@ bool mysqld_show_create(THD *thd, Table_ref *table_list) {
     }
   }
 
+  /* SHOW CREATE VIEW of a materialized view, which is a table. */
+  is_mview = thd->lex->only_view && !table_list->is_view() &&
+             table_list->table != nullptr &&
+             table_list->table->s->mview_kind == MVIEW_VIEW_TABLE;
+
+  /* SHOW CREATE MATERIALIZED VIEW of a view or a table */
+  if (thd->lex->only_mview && !is_mview) {
+    my_error(ER_MVIEW_NOT_A_MVIEW, MYF(0), table_list->db,
+             table_list->table_name);
+    goto exit;
+  }
+
   /* TODO: add environment variables show when it become possible */
-  if (thd->lex->only_view && !table_list->is_view()) {
+  if (thd->lex->only_view && !table_list->is_view() && !is_mview) {
     my_error(ER_WRONG_OBJECT, MYF(0), table_list->db, table_list->table_name,
              "VIEW");
     goto exit;
@@ -1254,15 +1269,20 @@ bool mysqld_show_create(THD *thd, Table_ref *table_list) {
   }
   if (table_list->is_view())
     view_store_create_info(thd, table_list, &buffer);
-  else if (store_create_info(thd, table_list, &buffer, nullptr,
+  else if (is_mview) {
+    if (mview_show_create(thd, table_list, &buffer)) goto exit;
+  } else if (store_create_info(thd, table_list, &buffer, nullptr,
                              false /* show_database */,
                              true /* SHOW CREATE TABLE */))
     goto exit;
 
-  if (table_list->is_view()) {
-    field_list.push_back(new Item_empty_string("View", NAME_CHAR_LEN));
+  if (table_list->is_view() || is_mview) {
+    const bool mview_names = thd->lex->only_mview;
     field_list.push_back(new Item_empty_string(
-        "Create View", max<uint>(buffer.length(), 1024U)));
+        mview_names ? "Materialized View" : "View", NAME_CHAR_LEN));
+    field_list.push_back(new Item_empty_string(
+        mview_names ? "Create Materialized View" : "Create View",
+        max<uint>(buffer.length(), 1024U)));
     field_list.push_back(
         new Item_empty_string("character_set_client", MY_CS_NAME_SIZE));
     field_list.push_back(
@@ -1279,7 +1299,7 @@ bool mysqld_show_create(THD *thd, Table_ref *table_list) {
     goto exit;
 
   protocol->start_row();
-  if (table_list->is_view())
+  if (table_list->is_view() || is_mview)
     protocol->store(table_list->table_name, system_charset_info);
   else {
     if (table_list->schema_table)
@@ -1299,6 +1319,12 @@ bool mysqld_show_create(THD *thd, Table_ref *table_list) {
     protocol->store(
         table_list->view_creation_ctx->get_connection_cl()->m_coll_name,
         system_charset_info);
+  } else if (is_mview) {
+    /* The text is printed in utf8mb4 and parsed with any connection. */
+    protocol->store_string(buffer.ptr(), buffer.length(), buffer.charset());
+    protocol->store(buffer.charset()->csname, system_charset_info);
+    protocol->store(my_charset_utf8mb4_0900_ai_ci.m_coll_name,
+                    system_charset_info);
   } else
     protocol->store_string(buffer.ptr(), buffer.length(), buffer.charset());
 

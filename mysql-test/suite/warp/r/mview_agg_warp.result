@@ -1,0 +1,285 @@
+#
+# Aggregate materialized views, stored in WARP
+#
+call mtr.add_suppression("MY-015655");
+#
+# Aggregate materialized views, ENGINE=WARP
+#
+CREATE TABLE prod (
+id INT NOT NULL PRIMARY KEY,
+name VARCHAR(20),
+kind CHAR(1)
+) ENGINE=ENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE sales (
+id INT NOT NULL PRIMARY KEY,
+prod_id INT,
+region CHAR(2),
+qty INT,
+price DECIMAL(10,2),
+day DATE
+) ENGINE=ENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE nothing (
+id INT NOT NULL PRIMARY KEY,
+v INT
+) ENGINE=ENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO prod VALUES (1, 'nut', 'a'), (2, 'bolt', 'a'), (3, 'gear', 'b'),
+(4, 'unsold', 'b');
+INSERT INTO sales VALUES
+(1, 1, 'eu', 3, 1.50, '2026-01-01'), (2, 1, 'eu', 5, 1.25, '2026-01-02'),
+(3, 2, 'us', NULL, 9.99, '2026-01-03'), (4, 3, NULL, 2, NULL, '2026-01-04'),
+(5, 3, NULL, 7, 20.00, NULL), (6, NULL, 'us', 1, 0.10, '2026-01-06'),
+(7, 2, 'ap', NULL, NULL, '2026-01-07');
+# COUNT(*) of a table: one row, and no table with a row per base row
+CREATE MATERIALIZED VIEW mv_cnt ENGINE=ENGINE REFRESH MANUAL AS SELECT COUNT(*) AS c FROM sales;
+SELECT * FROM mv_cnt;
+c
+7
+SELECT COUNT(*) FROM mv_cnt;
+COUNT(*)
+1
+SHOW TABLES;
+Tables_in_test
+mv_cnt
+mv_cnt$mv_state
+nothing
+prod
+sales
+SELECT COUNT(*) FROM `mv_cnt$mv_state`;
+COUNT(*)
+1
+SHOW CREATE TABLE mv_cnt;
+Table	Create Table
+mv_cnt	CREATE TABLE `mv_cnt` (
+  `mv$count` bigint DEFAULT NULL /*!80023 INVISIBLE */,
+  `c` bigint GENERATED ALWAYS AS (`mv$count`) STORED
+) ENGINE=ENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+# GROUP BY with every kind of state, NULL arguments and a NULL group
+CREATE MATERIALIZED VIEW mv_grp ENGINE=ENGINE REFRESH MANUAL AS SELECT region, COUNT(*) AS cnt, COUNT(qty) AS cnt_qty, SUM(qty) AS sum_qty, AVG(price) AS avg_price, MIN(price) AS min_price, MAX(day) AS max_day, AVG(qty) AS avg_qty FROM sales GROUP BY region;
+SELECT * FROM mv_grp ORDER BY region;
+region	cnt	cnt_qty	sum_qty	avg_price	min_price	max_day	avg_qty
+NULL	2	2	9	20.000000	20.00	2026-01-04	4.5000
+ap	1	0	NULL	NULL	NULL	2026-01-07	NULL
+eu	2	2	8	1.375000	1.25	2026-01-02	4.0000
+us	2	1	1	5.045000	0.10	2026-01-06	1.0000
+# mv_grp: 4 rows, 0 differ from the defining SELECT
+SHOW CREATE TABLE mv_grp;
+Table	Create Table
+mv_grp	CREATE TABLE `mv_grp` (
+  `mv$g0` char(2) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$count` bigint DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$s0` bigint DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$s1` decimal(32,0) DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$s2` bigint DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$s3` decimal(32,2) DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$s4` decimal(10,2) DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$s5` date DEFAULT NULL /*!80023 INVISIBLE */,
+  `region` char(2) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin GENERATED ALWAYS AS (`mv$g0`) STORED,
+  `cnt` bigint GENERATED ALWAYS AS (`mv$count`) STORED,
+  `cnt_qty` bigint GENERATED ALWAYS AS (`mv$s0`) STORED,
+  `sum_qty` decimal(32,0) GENERATED ALWAYS AS (`mv$s1`) STORED,
+  `avg_price` decimal(14,6) GENERATED ALWAYS AS ((`mv$s3` / nullif(`mv$s2`,0))) STORED,
+  `min_price` decimal(10,2) GENERATED ALWAYS AS (`mv$s4`) STORED,
+  `max_day` date GENERATED ALWAYS AS (`mv$s5`) STORED,
+  `avg_qty` decimal(14,4) GENERATED ALWAYS AS ((`mv$s1` / nullif(`mv$s0`,0))) STORED,
+  KEY `mv$ix_group` (`mv$g0`)
+) ENGINE=ENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+# The invisible columns: group, row count, states
+SELECT `mv$g0`, `mv$count`, `mv$s0`, `mv$s1`, `mv$s2`, `mv$s3`, `mv$s4`, `mv$s5`
+FROM mv_grp ORDER BY `mv$g0`;
+mv$g0	mv$count	mv$s0	mv$s1	mv$s2	mv$s3	mv$s4	mv$s5
+NULL	2	2	9	1	20.00	20.00	2026-01-04
+ap	1	0	NULL	0	NULL	NULL	2026-01-07
+eu	2	2	8	2	2.75	1.25	2026-01-02
+us	2	1	1	2	10.09	0.10	2026-01-06
+# Expressions over aggregates and over GROUP BY expressions
+CREATE MATERIALIZED VIEW mv_expr ENGINE=ENGINE REFRESH MANUAL AS SELECT qty % 2 AS parity, SUM(qty) / COUNT(*) AS per_row, SUM(price) * 2 + 1 AS twice, (qty % 2) + 10 AS shifted, CONCAT(MIN(region), '-', MAX(region)) AS regions, 'tag' AS tag FROM sales WHERE id < 100 GROUP BY qty % 2;
+SELECT * FROM mv_expr ORDER BY parity;
+parity	per_row	twice	shifted	regions	tag
+NULL	NULL	20.98	NULL	ap-us	tag
+0	2.0000	NULL	10	NULL	tag
+1	4.0000	46.70	11	eu-us	tag
+# mv_expr: 3 rows, 0 differ from the defining SELECT
+# SELECT DISTINCT
+CREATE MATERIALIZED VIEW mv_dist ENGINE=ENGINE REFRESH MANUAL AS SELECT DISTINCT region, qty IS NULL AS no_qty FROM sales;
+SELECT * FROM mv_dist ORDER BY region, no_qty;
+region	no_qty
+NULL	0
+ap	1
+eu	0
+us	0
+us	1
+# mv_dist: 5 rows, 0 differ from the defining SELECT
+# Aggregates that are stored as they are: COUNT(DISTINCT), GROUP_CONCAT
+CREATE MATERIALIZED VIEW mv_rec ENGINE=ENGINE REFRESH MANUAL AS SELECT region, COUNT(DISTINCT prod_id) AS prods, GROUP_CONCAT(id ORDER BY id) AS ids, SUM(DISTINCT qty) AS dsum, COUNT(*) AS cnt FROM sales GROUP BY region;
+SELECT * FROM mv_rec ORDER BY region;
+region	prods	ids	dsum	cnt
+NULL	1	4,5	9	2
+ap	1	7	NULL	1
+eu	1	1,2	8	2
+us	1	3,6	1	2
+# mv_rec: 4 rows, 0 differ from the defining SELECT
+# Aggregate over an inner join
+CREATE MATERIALIZED VIEW mv_join ENGINE=ENGINE REFRESH MANUAL AS SELECT p.kind, p.name, COUNT(*) AS cnt, SUM(s.qty * s.price) AS turnover, MAX(s.qty) AS max_qty FROM prod p JOIN sales s ON s.prod_id = p.id GROUP BY p.kind, p.name;
+SELECT * FROM mv_join ORDER BY kind, name;
+kind	name	cnt	turnover	max_qty
+a	bolt	2	NULL	NULL
+a	nut	2	10.75	5
+b	gear	2	140.00	7
+# mv_join: 3 rows, 0 differ from the defining SELECT
+# Aggregate over a LEFT join
+CREATE MATERIALIZED VIEW mv_left ENGINE=ENGINE REFRESH MANUAL AS SELECT p.name, COUNT(s.id) AS cnt, COUNT(*) AS cnt_rows, SUM(s.qty) AS qty, MIN(s.day) AS first_day FROM prod p LEFT JOIN sales s ON s.prod_id = p.id GROUP BY p.name;
+SELECT * FROM mv_left ORDER BY name;
+name	cnt	cnt_rows	qty	first_day
+bolt	2	2	NULL	2026-01-03
+gear	2	2	9	2026-01-04
+nut	2	2	8	2026-01-01
+unsold	0	1	NULL	NULL
+# mv_left: 4 rows, 0 differ from the defining SELECT
+# No GROUP BY over an empty table: one row
+CREATE MATERIALIZED VIEW mv_empty ENGINE=ENGINE REFRESH MANUAL AS SELECT COUNT(*) AS c, COUNT(v) AS cv, SUM(v) AS s, AVG(v) AS a, MIN(v) AS mn, MAX(v) AS mx FROM nothing;
+SELECT * FROM mv_empty;
+c	cv	s	a	mn	mx
+0	0	NULL	NULL	NULL	NULL
+# mv_empty: 1 rows, 0 differ from the defining SELECT
+# GROUP BY over an empty table: no row
+CREATE MATERIALIZED VIEW mv_empty_grp ENGINE=ENGINE REFRESH MANUAL AS
+SELECT v, COUNT(*) AS c FROM nothing GROUP BY v;
+SELECT COUNT(*) FROM mv_empty_grp;
+COUNT(*)
+0
+# The state table: one row with the binary log position of the contents
+SELECT COUNT(*), MIN(binlog_file LIKE 'binlog.0%'), MIN(binlog_pos > 4)
+FROM `mv_grp$mv_state`;
+COUNT(*)	MIN(binlog_file LIKE 'binlog.0%')	MIN(binlog_pos > 4)
+1	1	1
+SELECT binlog_pos INTO @mv_pos_before FROM `mv_grp$mv_state`;
+UPDATE `mv_grp$mv_state` SET binlog_pos = 4;
+ERROR HY000: Table 'test.mv_grp$mv_state' is the storage of a materialized view and cannot be modified directly.
+DROP TABLE `mv_grp$mv_state`;
+ERROR HY000: Table 'test.mv_grp$mv_state' is the storage of a materialized view and cannot be modified directly.
+DROP MATERIALIZED VIEW `mv_grp$mv_state`;
+ERROR HY000: 'test.mv_grp$mv_state' is not a materialized view.
+INSERT INTO mv_grp (`mv$g0`, `mv$count`) VALUES ('zz', 1);
+ERROR HY000: Table 'test.mv_grp' is the storage of a materialized view and cannot be modified directly.
+# What a table cannot hold
+CREATE MATERIALIZED VIEW mv_bad AS
+SELECT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 1;
+ERROR HY000: The definition of the materialized view is not supported: HAVING (a table cannot hide groups).
+CREATE MATERIALIZED VIEW mv_bad AS
+SELECT region, COUNT(*) FROM sales GROUP BY region WITH ROLLUP;
+ERROR HY000: The definition of the materialized view is not supported: GROUP BY with ROLLUP, CUBE or GROUPING SETS (a table cannot hold super-aggregate rows).
+CREATE MATERIALIZED VIEW mv_bad AS
+SELECT id, region, COUNT(*) FROM sales GROUP BY id;
+ERROR HY000: The definition of the materialized view is not supported: column `sales`.`region` must be a GROUP BY expression or inside an aggregate function.
+CREATE MATERIALIZED VIEW mv_bad AS
+SELECT DISTINCT region, COUNT(*) FROM sales GROUP BY region, qty;
+ERROR HY000: The definition of the materialized view is not supported: SELECT DISTINCT with GROUP BY or aggregate functions.
+CREATE MATERIALIZED VIEW mv_bad AS
+SELECT region, SUM(qty) OVER (PARTITION BY region) FROM sales;
+ERROR HY000: The definition of the materialized view is not supported: window functions.
+# Changes of the base tables are seen after REFRESH
+INSERT INTO sales VALUES (8, 4, 'eu', 10, 2.00, '2026-02-01'),
+(9, 1, 'za', NULL, NULL, NULL);
+UPDATE sales SET qty = 4, region = 'us' WHERE id = 1;
+UPDATE sales SET price = NULL WHERE id = 6;
+DELETE FROM sales WHERE id IN (4, 5);
+UPDATE prod SET kind = 'c' WHERE id = 2;
+INSERT INTO nothing VALUES (1, NULL), (2, 5);
+REFRESH MATERIALIZED VIEW mv_cnt;
+REFRESH MATERIALIZED VIEW mv_grp;
+REFRESH MATERIALIZED VIEW mv_expr;
+REFRESH MATERIALIZED VIEW mv_dist;
+REFRESH MATERIALIZED VIEW mv_rec;
+REFRESH MATERIALIZED VIEW mv_join;
+REFRESH MATERIALIZED VIEW mv_left;
+REFRESH MATERIALIZED VIEW mv_empty;
+REFRESH MATERIALIZED VIEW mv_empty_grp;
+SELECT * FROM mv_cnt;
+c
+7
+SELECT * FROM mv_grp ORDER BY region;
+region	cnt	cnt_qty	sum_qty	avg_price	min_price	max_day	avg_qty
+ap	1	0	NULL	NULL	NULL	2026-01-07	NULL
+eu	2	2	15	1.625000	1.25	2026-02-01	7.5000
+us	3	2	5	5.745000	1.50	2026-01-06	2.5000
+za	1	0	NULL	NULL	NULL	NULL	NULL
+# mv_grp: 4 rows, 0 differ from the defining SELECT
+SELECT * FROM mv_expr ORDER BY parity;
+parity	per_row	twice	shifted	regions	tag
+NULL	NULL	20.98	NULL	ap-za	tag
+0	7.0000	8.00	10	eu-us	tag
+1	3.0000	3.50	11	eu-us	tag
+# mv_expr: 3 rows, 0 differ from the defining SELECT
+SELECT * FROM mv_dist ORDER BY region, no_qty;
+region	no_qty
+ap	1
+eu	0
+us	0
+us	1
+za	1
+# mv_dist: 5 rows, 0 differ from the defining SELECT
+SELECT * FROM mv_rec ORDER BY region;
+region	prods	ids	dsum	cnt
+ap	1	7	NULL	1
+eu	2	2,8	15	2
+us	2	1,3,6	5	3
+za	1	9	NULL	1
+# mv_rec: 4 rows, 0 differ from the defining SELECT
+SELECT * FROM mv_join ORDER BY kind, name;
+kind	name	cnt	turnover	max_qty
+a	nut	3	12.25	5
+b	unsold	1	20.00	10
+c	bolt	2	NULL	NULL
+# mv_join: 3 rows, 0 differ from the defining SELECT
+SELECT * FROM mv_left ORDER BY name;
+name	cnt	cnt_rows	qty	first_day
+bolt	2	2	NULL	2026-01-03
+gear	0	1	NULL	NULL
+nut	3	3	9	2026-01-01
+unsold	1	1	10	2026-02-01
+# mv_left: 4 rows, 0 differ from the defining SELECT
+SELECT * FROM mv_empty;
+c	cv	s	a	mn	mx
+2	1	5	5.0000	5	5
+# mv_empty: 1 rows, 0 differ from the defining SELECT
+SELECT * FROM mv_empty_grp ORDER BY v;
+v	c
+NULL	1
+5	1
+# REFRESH records the new position
+SELECT COUNT(*), MIN(binlog_pos > @mv_pos_before) AS position_moved
+FROM `mv_grp$mv_state`;
+COUNT(*)	position_moved
+1	1
+# The one row of an aggregate without GROUP BY stays when the table empties
+DELETE FROM nothing;
+DELETE FROM sales;
+REFRESH MATERIALIZED VIEW mv_empty;
+REFRESH MATERIALIZED VIEW mv_cnt;
+REFRESH MATERIALIZED VIEW mv_grp;
+SELECT * FROM mv_empty;
+c	cv	s	a	mn	mx
+0	0	NULL	NULL	NULL	NULL
+SELECT * FROM mv_cnt;
+c
+0
+SELECT COUNT(*) FROM mv_grp;
+COUNT(*)
+0
+# SHOW CREATE VIEW gives a statement that makes the same view
+INSERT INTO sales VALUES (1, 1, 'eu', 3, 1.50, '2026-01-01'),
+(2, 2, 'eu', NULL, 2.50, '2026-01-02');
+SHOW CREATE VIEW mv_grp;
+View	Create View	character_set_client	collation_connection
+mv_grp	CREATE MATERIALIZED VIEW `mv_grp` (`region`, `cnt`, `cnt_qty`, `sum_qty`, `avg_price`, `min_price`, `max_day`, `avg_qty`) ENGINE=ENGINE REFRESH MANUAL AS select `test`.`sales`.`region` AS `region`,count(0) AS `cnt`,count(`test`.`sales`.`qty`) AS `cnt_qty`,sum(`test`.`sales`.`qty`) AS `sum_qty`,avg(`test`.`sales`.`price`) AS `avg_price`,min(`test`.`sales`.`price`) AS `min_price`,max(`test`.`sales`.`day`) AS `max_day`,avg(`test`.`sales`.`qty`) AS `avg_qty` from `test`.`sales` group by `test`.`sales`.`region`	utf8mb4	utf8mb4_0900_ai_ci
+DROP MATERIALIZED VIEW mv_grp;
+# mv_grp: 1 rows, 0 differ from the defining SELECT
+# The state tables are dropped with the views
+DROP MATERIALIZED VIEW mv_cnt, mv_grp, mv_expr, mv_dist, mv_rec, mv_join,
+mv_left, mv_empty, mv_empty_grp;
+SHOW TABLES;
+Tables_in_test
+nothing
+prod
+sales
+DROP TABLE prod, sales, nothing;

@@ -11100,6 +11100,33 @@ ER_MRS_UDFS_REGISTER_ERROR
 ER_MRS_BACKEND_INIT_ERROR
   eng "Failed to initialize backend."
 
+ER_MVIEW_UNSUPPORTED_CLAUSE
+  eng "Materialized views do not support the %s clause."
+
+ER_MVIEW_ALTER_DEFINITION
+  eng "Changing the definition of a materialized view is not supported, drop and re-create the materialized view."
+
+ER_MVIEW_UNSUPPORTED_DEFINITION
+  eng "The definition of the materialized view is not supported: %s."
+
+ER_MVIEW_UNSUPPORTED_TABLE
+  eng "Table '%-.192s.%-.192s' cannot be used in a materialized view: %s."
+
+ER_MVIEW_NO_PRIMARY_KEY
+  eng "Table '%-.192s.%-.192s' cannot be used in a materialized view: it has no PRIMARY KEY."
+
+ER_MVIEW_NOT_A_MVIEW
+  eng "'%-.192s.%-.192s' is not a materialized view."
+
+ER_MVIEW_IS_READ_ONLY
+  eng "Table '%-.192s.%-.192s' is the storage of a materialized view and cannot be modified directly."
+
+ER_MVIEW_USE_DROP_MVIEW
+  eng "'%-.192s.%-.192s' is a materialized view, use DROP MATERIALIZED VIEW."
+
+ER_MVIEW_BAD_METADATA
+  eng "The metadata of materialized view '%-.192s.%-.192s' cannot be read: %s."
+
 #
 #  End of "9.7 cal-ver compatibility lineage (starts from 26.7)" error messages (server-to-client).
 #

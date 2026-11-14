@@ -148,6 +148,7 @@ Note: YYTHD is passed as an argument to yyparse(), and subsequently to yylex().
 #include "sql/sql_import.h"                        // Sql_cmd_import_table
 #include "sql/sql_lex.h"
 #include "sql/sql_list.h"
+#include "sql/sql_mview.h"
 #include "sql/sql_parse.h"                        /* comp_*_creator */
 #include "sql/sql_plugin.h"                      // plugin_is_ready
 #include "sql/sql_profile.h"
@@ -1497,6 +1498,9 @@ CHARSET_INFO *warn_on_deprecated_user_defined_collation(
 %token<lexer.keyword> APPLIER_WORKER_COUNT_SYM       1244     /* MYSQL */
 %token<lexer.keyword> APPLIER_EVENT_MEMORY_LIMIT_SYM 1245     /* MYSQL */
 
+%token<lexer.keyword> REFRESH_SYM                    1246     /* MYSQL */
+%token<lexer.keyword> SYNCHRONOUS_SYM                1247     /* MYSQL */
+
 /*
   NOTE! When adding new non-standard keywords, make sure they are added to the
   list ident_keywords_unambiguous lest they become reserved keywords.
@@ -1630,6 +1634,7 @@ CHARSET_INFO *warn_on_deprecated_user_defined_collation(
   Bit field of MYSQL_START_TRANS_OPT_* flags.
 */
 %type <num> opt_start_transaction_option_list
+%type <num> mview_refresh_mode
 %type <num> start_transaction_option_list
 %type <num> start_transaction_option
 
@@ -2562,6 +2567,7 @@ simple_statement:
         | preload_stmt
         | prepare                       { $$= nullptr; }
         | purge                         { $$= nullptr; }
+        | refresh_mview_stmt            { $$= nullptr; }
         | release                       { $$= nullptr; }
         | rename                        { $$= nullptr; }
         | repair_table_stmt
@@ -8359,7 +8365,9 @@ alter_view_stmt:
           }
           view_tail
           {
-            MAKE_CMD_DDL_DUMMY();
+            /* ALTER MATERIALIZED VIEW has made its own command. */
+            if (Lex->m_sql_cmd == nullptr)
+              MAKE_CMD_DDL_DUMMY();
           }
         | ALTER definer_opt
           /*
@@ -13497,6 +13505,37 @@ drop_view_stmt:
               MYSQL_YYABORT;
             MAKE_CMD_DDL_DUMMY();
           }
+        | DROP MATERIALIZED_SYM VIEW_SYM if_exists table_list
+          {
+            LEX *lex= Lex;
+            lex->sql_command= SQLCOM_DROP_MATERIALIZED_VIEW;
+            lex->drop_if_exists= $4;
+            YYPS->m_lock_type= TL_UNLOCK;
+            YYPS->m_mdl_type= MDL_EXCLUSIVE;
+            if (Select->add_tables(YYTHD, $5, TL_OPTION_UPDATING,
+                                   YYPS->m_lock_type, YYPS->m_mdl_type))
+              MYSQL_YYABORT;
+            lex->m_sql_cmd= NEW_PTN Sql_cmd_drop_mview($4);
+            if (lex->m_sql_cmd == nullptr)
+              MYSQL_YYABORT; /* purecov: inspected */
+          }
+        ;
+
+refresh_mview_stmt:
+          REFRESH_SYM MATERIALIZED_SYM VIEW_SYM table_ident
+          {
+            THD *thd= YYTHD;
+            LEX *lex= thd->lex;
+            lex->sql_command= SQLCOM_REFRESH_MATERIALIZED_VIEW;
+            if (!lex->query_block->add_table_to_list(thd, $4, nullptr,
+                                                     TL_OPTION_UPDATING,
+                                                     TL_IGNORE,
+                                                     MDL_EXCLUSIVE))
+              MYSQL_YYABORT;
+            lex->m_sql_cmd= NEW_PTN Sql_cmd_refresh_mview();
+            if (lex->m_sql_cmd == nullptr)
+              MYSQL_YYABORT; /* purecov: inspected */
+          }
         ;
 
 drop_event_stmt:
@@ -14436,6 +14475,10 @@ show_create_view_stmt:
           SHOW CREATE VIEW_SYM table_ident
           {
             $$ = NEW_PTN PT_show_create_view(@$, $4);
+          }
+        | SHOW CREATE MATERIALIZED_SYM VIEW_SYM table_ident
+          {
+            $$ = NEW_PTN PT_show_create_mview(@$, $5);
           }
         ;
 
@@ -16059,6 +16102,7 @@ ident_keywords_ambiguous_2_labels:
         | NO_SYM
         | PRECEDES_SYM
         | PREPARE_SYM
+        | REFRESH_SYM
         | REPAIR
         | RESET_SYM
         | ROLLBACK_SYM
@@ -16499,6 +16543,7 @@ ident_keywords_unambiguous:
         | SUSPEND_SYM
         | SWAPS_SYM
         | SWITCHES_SYM
+        | SYNCHRONOUS_SYM
         | TABLES
         | TABLESPACE_SYM
         | TABLE_CHECKSUM_SYM
@@ -18323,11 +18368,20 @@ view_replace:
 
 view_algorithm:
           ALGORITHM_SYM EQ UNDEFINED_SYM
-          { Lex->create_view_algorithm= VIEW_ALGORITHM_UNDEFINED; }
+          {
+            Lex->create_view_algorithm= VIEW_ALGORITHM_UNDEFINED;
+            Lex->mview_has_algorithm= true;
+          }
         | ALGORITHM_SYM EQ MERGE_SYM
-          { Lex->create_view_algorithm= VIEW_ALGORITHM_MERGE; }
+          {
+            Lex->create_view_algorithm= VIEW_ALGORITHM_MERGE;
+            Lex->mview_has_algorithm= true;
+          }
         | ALGORITHM_SYM EQ TEMPTABLE_SYM
-          { Lex->create_view_algorithm= VIEW_ALGORITHM_TEMPTABLE; }
+          {
+            Lex->create_view_algorithm= VIEW_ALGORITHM_TEMPTABLE;
+            Lex->mview_has_algorithm= true;
+          }
         ;
 
 view_materialization:
@@ -18421,7 +18475,121 @@ view_tail:
                 set_derived_column_names(static_cast<Create_col_name_list* >(rawmem));
             }
           }
+          opt_mview_engine opt_mview_refresh view_body
+        ;
+
+opt_mview_engine:
+          %empty {}
+        | ENGINE_SYM opt_equal ident_or_text
+          {
+            Lex->mview_engine= to_lex_cstring($3);
+          }
+        ;
+
+opt_mview_refresh:
+          %empty {}
+        | REFRESH_SYM mview_refresh_mode
+          {
+            Lex->mview_refresh_mode= $2;
+          }
+        ;
+
+mview_refresh_mode:
+          SYNCHRONOUS_SYM { $$= 1; }
+        | MANUAL_SYM      { $$= 0; }
+        ;
+
+view_body:
           AS view_query_block
+          {
+            THD *thd= YYTHD;
+            LEX *lex= thd->lex;
+            const bool has_mview_clause=
+              lex->mview_engine.str != nullptr || lex->mview_refresh_mode >= 0;
+            if (!lex->create_view_materialization)
+            {
+              if (has_mview_clause)
+              {
+                /* ENGINE and REFRESH belong to CREATE MATERIALIZED VIEW. */
+                thd->syntax_error_at(@1);
+                MYSQL_YYABORT;
+              }
+            }
+            else
+            {
+              const char *bad_clause= nullptr;
+              if (lex->create_view_mode == enum_view_create_mode::VIEW_ALTER)
+              {
+                my_error(ER_MVIEW_ALTER_DEFINITION, MYF(0));
+                MYSQL_YYABORT;
+              }
+              if (lex->sphead)
+              {
+                my_error(ER_SP_BADSTATEMENT, MYF(0),
+                         "CREATE MATERIALIZED VIEW");
+                MYSQL_YYABORT;
+              }
+              if (lex->create_view_mode ==
+                  enum_view_create_mode::VIEW_CREATE_OR_REPLACE)
+                bad_clause= "OR REPLACE";
+              else if (lex->mview_has_algorithm)
+                bad_clause= "ALGORITHM";
+              else if (lex->definer != nullptr)
+                bad_clause= "DEFINER";
+              else if (lex->create_view_suid != VIEW_SUID_DEFAULT)
+                bad_clause= "SQL SECURITY";
+              else if (lex->create_view_type ==
+                       enum_view_type::JSON_DUALITY_VIEW)
+                bad_clause= "JSON DUALITY";
+              else if (lex->create_view_check != VIEW_CHECK_NONE)
+                bad_clause= "WITH CHECK OPTION";
+              if (bad_clause != nullptr)
+              {
+                my_error(ER_MVIEW_UNSUPPORTED_CLAUSE, MYF(0), bad_clause);
+                MYSQL_YYABORT;
+              }
+              lex->sql_command= SQLCOM_CREATE_MATERIALIZED_VIEW;
+              lex->m_sql_cmd= NEW_PTN Sql_cmd_create_mview();
+              if (lex->m_sql_cmd == nullptr)
+                MYSQL_YYABORT; /* purecov: inspected */
+            }
+          }
+        | %empty
+          {
+            /* ALTER MATERIALIZED VIEW v REFRESH {SYNCHRONOUS | MANUAL} */
+            THD *thd= YYTHD;
+            LEX *lex= thd->lex;
+            if (!lex->create_view_materialization ||
+                lex->create_view_mode != enum_view_create_mode::VIEW_ALTER ||
+                lex->mview_refresh_mode < 0 ||
+                lex->mview_engine.str != nullptr ||
+                lex->query_tables->derived_column_names() != nullptr)
+            {
+              thd->syntax_error();
+              MYSQL_YYABORT;
+            }
+            const char *bad_clause= nullptr;
+            if (lex->mview_has_algorithm)
+              bad_clause= "ALGORITHM";
+            else if (lex->definer != nullptr)
+              bad_clause= "DEFINER";
+            else if (lex->create_view_suid != VIEW_SUID_DEFAULT)
+              bad_clause= "SQL SECURITY";
+            else if (lex->create_view_type ==
+                     enum_view_type::JSON_DUALITY_VIEW)
+              bad_clause= "JSON DUALITY";
+            if (bad_clause != nullptr)
+            {
+              my_error(ER_MVIEW_UNSUPPORTED_CLAUSE, MYF(0), bad_clause);
+              MYSQL_YYABORT;
+            }
+            lex->sql_command= SQLCOM_ALTER_MATERIALIZED_VIEW;
+            lex->m_sql_cmd= NEW_PTN Sql_cmd_alter_mview(
+                lex->mview_refresh_mode == 1 ? Mview_refresh_mode::SYNCHRONOUS
+                                             : Mview_refresh_mode::MANUAL);
+            if (lex->m_sql_cmd == nullptr)
+              MYSQL_YYABORT; /* purecov: inspected */
+          }
         ;
 
 view_query_block:

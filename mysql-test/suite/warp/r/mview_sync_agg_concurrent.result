@@ -1,0 +1,131 @@
+#
+# WARP_MVIEW daemon, aggregate views: exactly once.  Concurrent writers
+# while the daemon locks the base tables, REFRESH while changes are
+# flowing, restart and crash must not count a change twice or lose it.
+#
+call mtr.add_suppression("WARP_MVIEW");
+call mtr.add_suppression("WARP: recovery cuts the partition");
+CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, g INT, x INT) ENGINE=InnoDB;
+CREATE TABLE u (id INT AUTO_INCREMENT PRIMARY KEY, t_g INT, y INT) ENGINE=InnoDB;
+INSERT INTO t (g, x) VALUES (0, 1), (1, 2), (2, 3), (3, 4);
+INSERT INTO u (t_g, y) VALUES (0, 10), (1, 20), (1, 30);
+CREATE MATERIALIZED VIEW m_fast ENGINE=InnoDB AS SELECT g, COUNT(*) AS n, SUM(x) AS sx FROM t GROUP BY g;
+CREATE MATERIALIZED VIEW m_one ENGINE=InnoDB AS SELECT COUNT(*) AS n, SUM(x) AS sx FROM t;
+CREATE MATERIALIZED VIEW m_minmax ENGINE=InnoDB AS SELECT g, MIN(x) AS mn, MAX(x) AS mx, COUNT(*) AS n FROM t GROUP BY g;
+CREATE MATERIALIZED VIEW m_join ENGINE=InnoDB AS SELECT t.g, COUNT(*) AS n, SUM(t.x * u.y) AS s FROM t JOIN u ON u.t_g = t.g GROUP BY t.g;
+CREATE MATERIALIZED VIEW m_left ENGINE=InnoDB AS SELECT t.g, COUNT(u.id) AS n, COUNT(DISTINCT u.y) AS dy FROM t LEFT JOIN u ON u.t_g = t.g GROUP BY t.g;
+CREATE PROCEDURE writer(seed INT, rounds INT)
+BEGIN
+DECLARE i INT DEFAULT 0;
+-- deadlocks between the writers roll a statement or a transaction back
+DECLARE CONTINUE HANDLER FOR 1213, 1205 BEGIN END;
+WHILE i < rounds DO
+INSERT INTO t (g, x) VALUES ((seed + i) MOD 7, i);
+IF i MOD 3 = 0 THEN
+INSERT INTO u (t_g, y) VALUES ((seed * 3 + i) MOD 9, i MOD 5);
+END IF;
+IF i MOD 4 = 0 THEN
+UPDATE t SET x = x + 1, g = (g + 1) MOD 7 WHERE id MOD 11 = (seed + i) MOD 11;
+END IF;
+IF i MOD 5 = 0 THEN
+START TRANSACTION;
+DELETE FROM t WHERE id MOD 13 = (seed + i) MOD 13 AND id > 4;
+UPDATE u SET y = y + 1 WHERE id MOD 3 = seed MOD 3;
+COMMIT;
+END IF;
+IF i MOD 7 = 0 THEN
+DELETE FROM u WHERE id MOD 17 = (seed + i) MOD 17;
+END IF;
+SET i = i + 1;
+END WHILE;
+END|
+m_fast: 0 missing, 0 extra
+m_one: 0 missing, 0 extra
+m_minmax: 0 missing, 0 extra
+m_join: 0 missing, 0 extra
+m_left: 0 missing, 0 extra
+#
+# Three writers at the same time
+#
+CALL writer(1, 300);
+CALL writer(2, 300);
+CALL writer(3, 300);
+# while they run: every view is one of the states of its tables
+# (never a negative or impossible count)
+SELECT COUNT(*) AS bad_groups FROM m_fast WHERE n <= 0;
+bad_groups
+0
+SELECT COUNT(*) AS rows_of_m_one FROM m_one;
+rows_of_m_one
+1
+SELECT COUNT(*) AS bad_groups FROM m_join WHERE n <= 0;
+bad_groups
+0
+m_fast: 0 missing, 0 extra
+m_one: 0 missing, 0 extra
+m_minmax: 0 missing, 0 extra
+m_join: 0 missing, 0 extra
+m_left: 0 missing, 0 extra
+#
+# REFRESH MATERIALIZED VIEW while changes are flowing
+#
+CALL writer(4, 300);
+CALL writer(5, 300);
+REFRESH MATERIALIZED VIEW m_fast;
+REFRESH MATERIALIZED VIEW m_join;
+REFRESH MATERIALIZED VIEW m_one;
+REFRESH MATERIALIZED VIEW m_left;
+REFRESH MATERIALIZED VIEW m_minmax;
+REFRESH MATERIALIZED VIEW m_fast;
+REFRESH MATERIALIZED VIEW m_join;
+m_fast: 0 missing, 0 extra
+m_one: 0 missing, 0 extra
+m_minmax: 0 missing, 0 extra
+m_join: 0 missing, 0 extra
+m_left: 0 missing, 0 extra
+# The base tables were locked for the views that read them, briefly
+# (with a snapshot) for the views whose tables are all InnoDB
+SELECT VARIABLE_VALUE > 0 AS pins FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_pins';
+pins
+1
+SELECT VARIABLE_VALUE > 0 AS snapshots FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_pin_snapshots';
+snapshots
+1
+SELECT VARIABLE_VALUE > 0 AS lock_time FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_pin_lock_microseconds';
+lock_time
+1
+#
+# Crash while the daemon is applying: what it has committed is not
+# applied again
+#
+SET GLOBAL warp_mview_batch_rows = 20;
+SET GLOBAL warp_mview_batch_transactions = 5;
+CALL writer(7, 200);
+# Kill the server
+# restart
+CALL writer(8, 20);
+m_fast: 0 missing, 0 extra
+m_one: 0 missing, 0 extra
+m_minmax: 0 missing, 0 extra
+m_join: 0 missing, 0 extra
+m_left: 0 missing, 0 extra
+# ... and once more, with the daemon stopped at the crash
+SET GLOBAL warp_mview_enabled = OFF;
+CALL writer(9, 50);
+# Kill the server
+# restart
+m_fast: 0 missing, 0 extra
+m_one: 0 missing, 0 extra
+m_minmax: 0 missing, 0 extra
+m_join: 0 missing, 0 extra
+m_left: 0 missing, 0 extra
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+stale_views
+0
+DROP PROCEDURE writer;
+DROP MATERIALIZED VIEW m_fast;
+DROP MATERIALIZED VIEW m_one;
+DROP MATERIALIZED VIEW m_minmax;
+DROP MATERIALIZED VIEW m_join;
+DROP MATERIALIZED VIEW m_left;
+DROP TABLE t, u;

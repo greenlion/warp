@@ -1,0 +1,119 @@
+#
+# WARP_MVIEW daemon with the WARP engine: views stored in WARP, base
+# tables in WARP, and both mixed with InnoDB.  A short test: the full
+# coverage of the daemon is in the InnoDB tests (mview_sync_join_*,
+# mview_sync_agg_*).
+#
+call mtr.add_suppression("WARP_MVIEW");
+CREATE TABLE wc (id INT NOT NULL, name VARCHAR(20), region VARCHAR(10), PRIMARY KEY (id)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE wo (id INT NOT NULL, c_id INT, amount INT, PRIMARY KEY (id)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE ic (id INT NOT NULL, name VARCHAR(20), region VARCHAR(10), PRIMARY KEY (id)) ENGINE=InnoDB;
+CREATE TABLE io (id INT NOT NULL, c_id INT, amount INT, PRIMARY KEY (id)) ENGINE=InnoDB;
+INSERT INTO wc VALUES (1, 'ann', 'north'), (2, 'bob', 'south'), (3, 'cy', NULL);
+INSERT INTO wo VALUES (10, 1, 15), (11, 1, 250), (12, 2, 99);
+INSERT INTO ic SELECT * FROM wc;
+INSERT INTO io SELECT * FROM wo;
+# WARP views over WARP tables
+CREATE MATERIALIZED VIEW ww_left ENGINE=WARP AS SELECT c.id AS cid, c.name, o.id AS oid, o.amount FROM wc c LEFT JOIN wo o ON o.c_id = c.id;
+CREATE MATERIALIZED VIEW ww_where ENGINE=WARP AS SELECT c.id AS cid, o.id AS oid, o.amount FROM wc c LEFT JOIN wo o ON o.c_id = c.id WHERE o.amount IS NULL OR o.amount < 100;
+CREATE MATERIALIZED VIEW ww_cnt ENGINE=WARP AS SELECT COUNT(*) AS n, SUM(amount) AS s FROM wo;
+CREATE MATERIALIZED VIEW ww_grp ENGINE=WARP AS SELECT c.region, COUNT(*) AS n, SUM(o.amount) AS s, MAX(o.amount) AS mx FROM wc c JOIN wo o ON o.c_id = c.id GROUP BY c.region;
+CREATE MATERIALIZED VIEW ww_ldist ENGINE=WARP AS SELECT c.id AS cid, COUNT(o.id) AS n, COUNT(DISTINCT o.amount) AS d FROM wc c LEFT JOIN wo o ON o.c_id = c.id GROUP BY c.id;
+# InnoDB views over WARP tables
+CREATE MATERIALIZED VIEW iw_left ENGINE=InnoDB AS SELECT c.id AS cid, c.name, o.id AS oid, o.amount FROM wc c LEFT JOIN wo o ON o.c_id = c.id;
+CREATE MATERIALIZED VIEW iw_grp ENGINE=InnoDB AS SELECT c_id, COUNT(*) AS n, SUM(amount) AS s FROM wo GROUP BY c_id;
+# WARP views over InnoDB tables
+CREATE MATERIALIZED VIEW wi_left ENGINE=WARP AS SELECT c.id AS cid, c.name, o.id AS oid, o.amount FROM ic c LEFT JOIN io o ON o.c_id = c.id;
+CREATE MATERIALIZED VIEW wi_grp ENGINE=WARP AS SELECT c_id, COUNT(*) AS n, SUM(amount) AS s FROM io GROUP BY c_id;
+ww_left: 4 rows, 0 missing, 0 extra
+ww_where: 3 rows, 0 missing, 0 extra
+ww_cnt: 1 rows, 0 missing, 0 extra
+ww_grp: 2 rows, 0 missing, 0 extra
+ww_ldist: 3 rows, 0 missing, 0 extra
+iw_left: 4 rows, 0 missing, 0 extra
+iw_grp: 2 rows, 0 missing, 0 extra
+wi_left: 4 rows, 0 missing, 0 extra
+wi_grp: 2 rows, 0 missing, 0 extra
+# inserts: a first match, a customer without orders, a new group
+INSERT INTO wo VALUES (13, 3, 5), (14, 2, 500);
+INSERT INTO wc VALUES (4, 'dee', 'west');
+INSERT INTO io VALUES (13, 3, 5), (14, 2, 500);
+INSERT INTO ic VALUES (4, 'dee', 'west');
+ww_left: 6 rows, 0 missing, 0 extra
+ww_where: 4 rows, 0 missing, 0 extra
+ww_cnt: 1 rows, 0 missing, 0 extra
+ww_grp: 3 rows, 0 missing, 0 extra
+ww_ldist: 4 rows, 0 missing, 0 extra
+iw_left: 6 rows, 0 missing, 0 extra
+iw_grp: 3 rows, 0 missing, 0 extra
+wi_left: 6 rows, 0 missing, 0 extra
+wi_grp: 3 rows, 0 missing, 0 extra
+# updates: across the WHERE, of a join column, of a group, of a key
+UPDATE wo SET amount = 50 WHERE id = 11;
+UPDATE wo SET c_id = 4 WHERE id = 12;
+UPDATE wc SET region = 'south' WHERE id = 1;
+UPDATE wc SET id = 40 WHERE id = 4;
+UPDATE io SET amount = 50 WHERE id = 11;
+UPDATE io SET c_id = 4 WHERE id = 12;
+UPDATE ic SET id = 40 WHERE id = 4;
+ww_left: 5 rows, 0 missing, 0 extra
+ww_where: 4 rows, 0 missing, 0 extra
+ww_cnt: 1 rows, 0 missing, 0 extra
+ww_grp: 2 rows, 0 missing, 0 extra
+ww_ldist: 4 rows, 0 missing, 0 extra
+iw_left: 5 rows, 0 missing, 0 extra
+iw_grp: 4 rows, 0 missing, 0 extra
+wi_left: 5 rows, 0 missing, 0 extra
+wi_grp: 4 rows, 0 missing, 0 extra
+# deletes: the last match, the maximum of a group, a customer
+BEGIN;
+DELETE FROM wo WHERE id = 13;
+DELETE FROM wo WHERE id = 14;
+DELETE FROM wc WHERE id = 2;
+COMMIT;
+DELETE FROM io WHERE id IN (13, 14);
+DELETE FROM ic WHERE id = 2;
+ww_left: 4 rows, 0 missing, 0 extra
+ww_where: 4 rows, 0 missing, 0 extra
+ww_cnt: 1 rows, 0 missing, 0 extra
+ww_grp: 1 rows, 0 missing, 0 extra
+ww_ldist: 3 rows, 0 missing, 0 extra
+iw_left: 4 rows, 0 missing, 0 extra
+iw_grp: 2 rows, 0 missing, 0 extra
+wi_left: 4 rows, 0 missing, 0 extra
+wi_grp: 2 rows, 0 missing, 0 extra
+# a transaction that is rolled back changes nothing
+BEGIN;
+INSERT INTO wo VALUES (99, 1, 1);
+DELETE FROM io;
+Warnings:
+Warning	6414	Combining the storage engines InnoDB and WARP is deprecated, but the statement or transaction updates both the InnoDB table test.io and the WARP table test.wo.
+ROLLBACK;
+# everything goes
+DELETE FROM wo;
+DELETE FROM io;
+ww_left: 3 rows, 0 missing, 0 extra
+ww_where: 3 rows, 0 missing, 0 extra
+ww_cnt: 1 rows, 0 missing, 0 extra
+ww_grp: 0 rows, 0 missing, 0 extra
+ww_ldist: 3 rows, 0 missing, 0 extra
+iw_left: 3 rows, 0 missing, 0 extra
+iw_grp: 0 rows, 0 missing, 0 extra
+wi_left: 3 rows, 0 missing, 0 extra
+wi_grp: 0 rows, 0 missing, 0 extra
+SELECT * FROM ww_cnt;
+n	s
+0	NULL
+SELECT * FROM ww_left ORDER BY cid;
+cid	name	oid	amount
+1	ann	NULL	NULL
+3	cy	NULL	NULL
+40	dee	NULL	NULL
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+stale_views
+0
+SELECT VARIABLE_VALUE AS full_refreshes FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes';
+full_refreshes
+0
+DROP MATERIALIZED VIEW ww_left, ww_where, ww_cnt, ww_grp, ww_ldist, iw_left, iw_grp, wi_left, wi_grp;
+DROP TABLE wc, wo, ic, io;

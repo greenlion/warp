@@ -93,7 +93,9 @@ static const std::set<String_type> default_valid_option_keys = {
     "view_valid",
     "gipk",
     "view_type",
-    "materialization_engine"};
+    "materialization_engine",
+    "mview",
+    "mview_def"};
 
 ///////////////////////////////////////////////////////////////////////////
 // Abstract_table_impl implementation.

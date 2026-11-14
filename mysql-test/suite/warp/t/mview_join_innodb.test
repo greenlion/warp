@@ -1,0 +1,5 @@
+--echo #
+--echo # Materialized views over joins, stored in InnoDB
+--echo #
+--let $mv_engine = InnoDB
+--source suite/warp/include/mview_join_engine.inc

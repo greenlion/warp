@@ -26,6 +26,7 @@
   Atomic rename of table;  RENAME TABLE t1 to t2, tmp to t1 [,...]
 */
 
+#include "sql/sql_mview.h"
 #include "sql/sql_rename.h"
 
 #include <string.h>
@@ -302,6 +303,8 @@ bool mysql_rename_tables(THD *thd, Table_ref *table_list) {
       my_error(ER_NO_SUCH_TABLE, MYF(0), table->db, table->table_name);
       return true;
     }
+    if (mview_check_table_change(thd, table->db, table->table_name, table_def))
+      return true;
   }
 
   for (ren_table = table_list; ren_table; ren_table = ren_table->next_local) {

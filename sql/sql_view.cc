@@ -21,6 +21,7 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
+#include "sql/sql_mview.h"
 #include "sql/sql_view.h"
 
 #include <sys/types.h>
@@ -1911,6 +1912,8 @@ bool mysql_drop_view(THD *thd, Table_ref *views) {
         non_existant_views.append(tbl_name);
       }
     } else if (base_table_with_same_name_exists) {
+      if (mview_check_drop_view(thd, view->db, view->table_name, at))
+        return true;
       if (thd->lex->drop_if_exists)
         push_warning_printf(thd, Sql_condition::SL_NOTE, ER_WRONG_OBJECT,
                             ER_THD(thd, ER_WRONG_OBJECT), view->db,

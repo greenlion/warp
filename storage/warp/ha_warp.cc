@@ -233,6 +233,7 @@ static void warp_purge_stop();
 
 #include <condition_variable>
 #include "warp_locks.h"
+#include "warp_mview.h"
 
 /* Status variables: Warp_history_locks is the number of history locks that
    exist (see warp_global_data::cleanup_history_locks), Warp_active_transactions
@@ -304,6 +305,24 @@ mysql_declare_plugin(warp){
   system_variables, /* system variables    */
   NULL,             /* config options                  */
   0,                /* flags                           */
+},
+/* The daemon that maintains the SYNCHRONOUS materialized views from the
+   binary log, see warp_mview.h */
+{
+  MYSQL_DAEMON_PLUGIN,
+  &warp_mview_daemon_descriptor,
+  "WARP_MVIEW",
+  "Justin Swanhart",
+  "Maintains table-backed materialized views from the binary log",
+  PLUGIN_LICENSE_GPL,
+  warp_mview_plugin_init,   /* Plugin Init */
+  NULL,                     /* Plugin check uninstall */
+  warp_mview_plugin_deinit, /* Plugin Deinit */
+  0x0100,
+  warp_mview_status_variables, /* status variables */
+  warp_mview_system_variables, /* system variables */
+  NULL,                        /* config options */
+  0,                           /* flags */
 } mysql_declare_plugin_end;
 
 /* The collations of the strings, by number, looked up once */

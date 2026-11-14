@@ -1,0 +1,60 @@
+--echo #
+--echo # INSTALL PLUGIN WARP_MVIEW in a running server.  With persisted
+--echo # plugin variables the statement sets them while it holds the plugin
+--echo # mutex; the daemon thread that the plugin starts must not create its
+--echo # session before the statement has ended (it used to deadlock, and
+--echo # every new connection hung behind it).
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+call mtr.add_suppression("WARP_MVIEW");
+
+SELECT COUNT(*) AS daemon_loaded FROM information_schema.plugins WHERE PLUGIN_NAME = 'WARP_MVIEW';
+SET @size = @@global.warp_write_cache_size;
+SET PERSIST warp_write_cache_size = @size;
+
+CREATE TABLE t (id INT PRIMARY KEY, g INT, x INT) ENGINE=InnoDB;
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+--let $sel_j = SELECT t.id, t.g, t.x FROM t
+--let $sel_a = SELECT g, COUNT(*) AS n, SUM(x) AS s FROM t GROUP BY g
+eval CREATE MATERIALIZED VIEW mv_j ENGINE=InnoDB AS $sel_j;
+eval CREATE MATERIALIZED VIEW mv_a ENGINE=InnoDB AS $sel_a;
+--echo # not maintained without the daemon
+INSERT INTO t VALUES (4, 2, 40);
+SELECT COUNT(*) FROM mv_j;
+
+--replace_result $WARP_PLUGIN WARP_PLUGIN
+eval INSTALL PLUGIN WARP_MVIEW SONAME '$WARP_PLUGIN';
+--echo # a new connection works
+--connect (con1, localhost, root,,)
+SELECT PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME = 'WARP_MVIEW';
+--disconnect con1
+--connection default
+
+--echo # the daemon adopts the views and maintains them
+INSERT INTO t VALUES (5, 3, 50);
+UPDATE t SET x = x + 1 WHERE id = 1;
+DELETE FROM t WHERE id = 2;
+--let $mview = mv_j
+--let $mview_select = $sel_j
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_a
+--let $mview_select = $sel_a
+--source suite/warp/include/mview_sync_check.inc
+
+UNINSTALL PLUGIN WARP_MVIEW;
+--echo # and again, after it was removed
+--replace_result $WARP_PLUGIN WARP_PLUGIN
+eval INSTALL PLUGIN WARP_MVIEW SONAME '$WARP_PLUGIN';
+INSERT INTO t VALUES (6, 3, 60);
+--let $mview = mv_j
+--let $mview_select = $sel_j
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_a
+--let $mview_select = $sel_a
+--source suite/warp/include/mview_sync_check.inc
+UNINSTALL PLUGIN WARP_MVIEW;
+
+RESET PERSIST warp_write_cache_size;
+DROP MATERIALIZED VIEW mv_j, mv_a;
+DROP TABLE t;

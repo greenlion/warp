@@ -1,0 +1,142 @@
+#
+# WARP_MVIEW daemon: full refreshes, DDL on base tables, stale views,
+# REFRESH MANUAL views, pause and resume
+#
+call mtr.add_suppression("WARP_MVIEW");
+call mtr.add_suppression("Materialized view .* is skipped");
+SELECT PLUGIN_NAME, PLUGIN_STATUS, PLUGIN_TYPE FROM information_schema.plugins WHERE PLUGIN_NAME = 'WARP_MVIEW';
+PLUGIN_NAME	PLUGIN_STATUS	PLUGIN_TYPE
+WARP_MVIEW	ACTIVE	DAEMON
+SHOW GLOBAL VARIABLES LIKE 'warp_mview%';
+Variable_name	Value
+warp_mview_adopt_refresh	ON
+warp_mview_batch_rows	10000
+warp_mview_batch_transactions	1000
+warp_mview_enabled	ON
+warp_mview_full_refresh_threshold	100000
+warp_mview_idle_wait_timeout	1000
+warp_mview_in_list_chunk_size	1000
+warp_mview_lock_wait_timeout	60
+warp_mview_pin_duty_percent	10
+warp_mview_pin_lock_wait_timeout	1
+warp_mview_pin_min_interval	0
+warp_mview_retry_limit	3
+CREATE TABLE a (id INT PRIMARY KEY, v INT, s VARCHAR(20)) ENGINE=InnoDB;
+CREATE TABLE b (id INT PRIMARY KEY, a_id INT, w INT) ENGINE=InnoDB;
+INSERT INTO a VALUES (1, 10, 'one'), (2, 20, 'two'), (3, 30, 'three');
+INSERT INTO b VALUES (1, 1, 100), (2, 1, 200), (3, 2, 300);
+CREATE MATERIALIZED VIEW mv_i ENGINE=InnoDB AS SELECT a.id, a.v, a.s, b.id AS bid, b.w FROM a LEFT JOIN b ON b.a_id = a.id;
+CREATE MATERIALIZED VIEW mv_w ENGINE=InnoDB AS SELECT a.id, a.v, a.s, b.id AS bid, b.w FROM a LEFT JOIN b ON b.a_id = a.id;
+CREATE MATERIALIZED VIEW mv_m ENGINE=InnoDB REFRESH MANUAL AS SELECT a.id, a.v, a.s, b.id AS bid, b.w FROM a LEFT JOIN b ON b.a_id = a.id;
+mv_i: 4 rows, 0 missing, 0 extra
+mv_w: 4 rows, 0 missing, 0 extra
+# The views cannot be changed by users
+INSERT INTO mv_i (id) VALUES (99);
+ERROR HY000: Table 'test.mv_i' is the storage of a materialized view and cannot be modified directly.
+DELETE FROM mv_w;
+ERROR HY000: Table 'test.mv_w' is the storage of a materialized view and cannot be modified directly.
+#
+# A REFRESH MANUAL view is not maintained
+#
+INSERT INTO a VALUES (4, 40, 'four');
+UPDATE b SET w = w + 1;
+mv_i: 5 rows, 0 missing, 0 extra
+mv_w: 5 rows, 0 missing, 0 extra
+SELECT COUNT(*) AS manual_rows, SUM(w) AS manual_w FROM mv_m;
+manual_rows	manual_w
+4	600
+# ... until it is changed to SYNCHRONOUS: the daemon refreshes it once
+# and maintains it from then on
+ALTER MATERIALIZED VIEW mv_m REFRESH SYNCHRONOUS;
+mv_m: 5 rows, 0 missing, 0 extra
+INSERT INTO b VALUES (4, 4, 400);
+mv_m: 5 rows, 0 missing, 0 extra
+ALTER MATERIALIZED VIEW mv_m REFRESH MANUAL;
+DELETE FROM b WHERE id = 4;
+mv_i: 5 rows, 0 missing, 0 extra
+SELECT COUNT(*) AS manual_has_b4 FROM mv_m WHERE bid = 4;
+manual_has_b4
+1
+#
+# More changed keys than warp_mview_full_refresh_threshold: the views
+# are rebuilt
+#
+SET GLOBAL warp_mview_full_refresh_threshold = 10;
+SET GLOBAL warp_mview_in_list_chunk_size = 3;
+mv_i: 105 rows, 0 missing, 0 extra
+mv_w: 105 rows, 0 missing, 0 extra
+views_were_refreshed
+1
+# below the threshold, with several IN lists per statement
+UPDATE a SET v = v + 1 WHERE id BETWEEN 100 AND 104;
+mv_i: 105 rows, 0 missing, 0 extra
+mv_w: 105 rows, 0 missing, 0 extra
+SET GLOBAL warp_mview_full_refresh_threshold = DEFAULT;
+SET GLOBAL warp_mview_in_list_chunk_size = DEFAULT;
+#
+# Pause and resume
+#
+SET GLOBAL warp_mview_enabled = OFF;
+DELETE FROM a WHERE id >= 100;
+INSERT INTO b VALUES (10, 3, 1000);
+# not applied while paused
+SELECT COUNT(*) AS rows_of_deleted_a FROM mv_i WHERE id >= 100;
+rows_of_deleted_a
+100
+SELECT COUNT(*) AS rows_of_new_b FROM mv_w WHERE bid = 10;
+rows_of_new_b
+0
+SET GLOBAL warp_mview_enabled = ON;
+mv_i: 5 rows, 0 missing, 0 extra
+mv_w: 5 rows, 0 missing, 0 extra
+#
+# TRUNCATE and ALTER of a base table: the views are refreshed
+#
+TRUNCATE TABLE b;
+mv_i: 4 rows, 0 missing, 0 extra
+mv_w: 4 rows, 0 missing, 0 extra
+INSERT INTO b VALUES (1, 1, 100), (2, 2, 200);
+mv_w: 4 rows, 0 missing, 0 extra
+# a column before the primary key moves its position in the row events
+ALTER TABLE a ADD COLUMN pre INT FIRST, MODIFY s VARCHAR(40);
+UPDATE a SET v = v * 2, s = CONCAT(s, ' after alter');
+INSERT INTO a (id, v, s) VALUES (50, 500, 'fifty');
+INSERT INTO b VALUES (3, 50, 300);
+mv_i: 5 rows, 0 missing, 0 extra
+mv_w: 5 rows, 0 missing, 0 extra
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+stale_views
+0
+#
+# DROP of a base table: the views become stale, the server keeps running
+#
+DROP TABLE b;
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+stale_views
+2
+SELECT VARIABLE_VALUE AS stale_view_list FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_view_list';
+stale_view_list
+test.mv_i,test.mv_w
+INSERT INTO a (id, v, s) VALUES (60, 600, 'sixty');
+SELECT 1 AS server_is_alive;
+server_is_alive
+1
+# The table comes back and the user refreshes: maintained again
+CREATE TABLE b (id INT PRIMARY KEY, a_id INT, w INT) ENGINE=InnoDB;
+INSERT INTO b VALUES (7, 60, 700);
+REFRESH MATERIALIZED VIEW mv_i;
+REFRESH MATERIALIZED VIEW mv_w;
+INSERT INTO b VALUES (8, 1, 800);
+UPDATE a SET v = -1 WHERE id = 60;
+mv_i: 6 rows, 0 missing, 0 extra
+mv_w: 6 rows, 0 missing, 0 extra
+# A dropped view is forgotten
+DROP MATERIALIZED VIEW mv_w;
+INSERT INTO b VALUES (9, 2, 900);
+mv_i: 6 rows, 0 missing, 0 extra
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+stale_views
+0
+DROP MATERIALIZED VIEW mv_i;
+DROP MATERIALIZED VIEW mv_m;
+DROP TABLE a, b;

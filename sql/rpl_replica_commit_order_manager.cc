@@ -692,6 +692,10 @@ bool Commit_order_manager::wait_for_its_turn_before_flush_stage(THD *thd) {
     case SQLCOM_DROP_TRIGGER:
     case SQLCOM_DROP_TABLE:
     case SQLCOM_DROP_VIEW:
+    case SQLCOM_CREATE_MATERIALIZED_VIEW:
+    case SQLCOM_DROP_MATERIALIZED_VIEW:
+    case SQLCOM_REFRESH_MATERIALIZED_VIEW:
+    case SQLCOM_ALTER_MATERIALIZED_VIEW:
     case SQLCOM_OPTIMIZE:
     case SQLCOM_REPAIR:
       return has_commit_order_manager(thd);

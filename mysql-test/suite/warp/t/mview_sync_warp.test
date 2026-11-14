@@ -1,0 +1,90 @@
+--echo #
+--echo # WARP_MVIEW daemon with the WARP engine: views stored in WARP, base
+--echo # tables in WARP, and both mixed with InnoDB.  A short test: the full
+--echo # coverage of the daemon is in the InnoDB tests (mview_sync_join_*,
+--echo # mview_sync_agg_*).
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+call mtr.add_suppression("WARP_MVIEW");
+
+--let $wopt = ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+eval CREATE TABLE wc (id INT NOT NULL, name VARCHAR(20), region VARCHAR(10), PRIMARY KEY (id)) $wopt;
+eval CREATE TABLE wo (id INT NOT NULL, c_id INT, amount INT, PRIMARY KEY (id)) $wopt;
+CREATE TABLE ic (id INT NOT NULL, name VARCHAR(20), region VARCHAR(10), PRIMARY KEY (id)) ENGINE=InnoDB;
+CREATE TABLE io (id INT NOT NULL, c_id INT, amount INT, PRIMARY KEY (id)) ENGINE=InnoDB;
+INSERT INTO wc VALUES (1, 'ann', 'north'), (2, 'bob', 'south'), (3, 'cy', NULL);
+INSERT INTO wo VALUES (10, 1, 15), (11, 1, 250), (12, 2, 99);
+INSERT INTO ic SELECT * FROM wc;
+INSERT INTO io SELECT * FROM wo;
+
+--let $sel_ww_left = SELECT c.id AS cid, c.name, o.id AS oid, o.amount FROM wc c LEFT JOIN wo o ON o.c_id = c.id
+--let $sel_ww_where = SELECT c.id AS cid, o.id AS oid, o.amount FROM wc c LEFT JOIN wo o ON o.c_id = c.id WHERE o.amount IS NULL OR o.amount < 100
+--let $sel_ww_cnt = SELECT COUNT(*) AS n, SUM(amount) AS s FROM wo
+--let $sel_ww_grp = SELECT c.region, COUNT(*) AS n, SUM(o.amount) AS s, MAX(o.amount) AS mx FROM wc c JOIN wo o ON o.c_id = c.id GROUP BY c.region
+--let $sel_ww_ldist = SELECT c.id AS cid, COUNT(o.id) AS n, COUNT(DISTINCT o.amount) AS d FROM wc c LEFT JOIN wo o ON o.c_id = c.id GROUP BY c.id
+--let $sel_iw_left = SELECT c.id AS cid, c.name, o.id AS oid, o.amount FROM wc c LEFT JOIN wo o ON o.c_id = c.id
+--let $sel_iw_grp = SELECT c_id, COUNT(*) AS n, SUM(amount) AS s FROM wo GROUP BY c_id
+--let $sel_wi_left = SELECT c.id AS cid, c.name, o.id AS oid, o.amount FROM ic c LEFT JOIN io o ON o.c_id = c.id
+--let $sel_wi_grp = SELECT c_id, COUNT(*) AS n, SUM(amount) AS s FROM io GROUP BY c_id
+
+--echo # WARP views over WARP tables
+eval CREATE MATERIALIZED VIEW ww_left ENGINE=WARP AS $sel_ww_left;
+eval CREATE MATERIALIZED VIEW ww_where ENGINE=WARP AS $sel_ww_where;
+eval CREATE MATERIALIZED VIEW ww_cnt ENGINE=WARP AS $sel_ww_cnt;
+eval CREATE MATERIALIZED VIEW ww_grp ENGINE=WARP AS $sel_ww_grp;
+eval CREATE MATERIALIZED VIEW ww_ldist ENGINE=WARP AS $sel_ww_ldist;
+--echo # InnoDB views over WARP tables
+eval CREATE MATERIALIZED VIEW iw_left ENGINE=InnoDB AS $sel_iw_left;
+eval CREATE MATERIALIZED VIEW iw_grp ENGINE=InnoDB AS $sel_iw_grp;
+--echo # WARP views over InnoDB tables
+eval CREATE MATERIALIZED VIEW wi_left ENGINE=WARP AS $sel_wi_left;
+eval CREATE MATERIALIZED VIEW wi_grp ENGINE=WARP AS $sel_wi_grp;
+
+--let $check = suite/warp/include/mview_sync_warp_check.inc
+--source $check
+
+--echo # inserts: a first match, a customer without orders, a new group
+INSERT INTO wo VALUES (13, 3, 5), (14, 2, 500);
+INSERT INTO wc VALUES (4, 'dee', 'west');
+INSERT INTO io VALUES (13, 3, 5), (14, 2, 500);
+INSERT INTO ic VALUES (4, 'dee', 'west');
+--source $check
+
+--echo # updates: across the WHERE, of a join column, of a group, of a key
+UPDATE wo SET amount = 50 WHERE id = 11;
+UPDATE wo SET c_id = 4 WHERE id = 12;
+UPDATE wc SET region = 'south' WHERE id = 1;
+UPDATE wc SET id = 40 WHERE id = 4;
+UPDATE io SET amount = 50 WHERE id = 11;
+UPDATE io SET c_id = 4 WHERE id = 12;
+UPDATE ic SET id = 40 WHERE id = 4;
+--source $check
+
+--echo # deletes: the last match, the maximum of a group, a customer
+BEGIN;
+DELETE FROM wo WHERE id = 13;
+DELETE FROM wo WHERE id = 14;
+DELETE FROM wc WHERE id = 2;
+COMMIT;
+DELETE FROM io WHERE id IN (13, 14);
+DELETE FROM ic WHERE id = 2;
+--source $check
+
+--echo # a transaction that is rolled back changes nothing
+BEGIN;
+INSERT INTO wo VALUES (99, 1, 1);
+DELETE FROM io;
+ROLLBACK;
+--echo # everything goes
+DELETE FROM wo;
+DELETE FROM io;
+--source $check
+
+SELECT * FROM ww_cnt;
+SELECT * FROM ww_left ORDER BY cid;
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+SELECT VARIABLE_VALUE AS full_refreshes FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes';
+
+DROP MATERIALIZED VIEW ww_left, ww_where, ww_cnt, ww_grp, ww_ldist, iw_left, iw_grp, wi_left, wi_grp;
+DROP TABLE wc, wo, ic, io;
