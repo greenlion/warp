@@ -167,10 +167,7 @@ static struct my_option options[] = {
 class EchoSession : public SocketServer::Session {
  public:
   EchoSession(NdbSocket &&s, bool sink, SSL_CTX *ctx)
-      : SocketServer::Session(m_secure_socket),
-        m_sink(sink),
-        m_ssl_ctx(ctx),
-        m_secure_socket(std::move(s)) {}
+      : m_sink(sink), m_ssl_ctx(ctx), m_secure_socket(std::move(s)) {}
   void runSession() override;
 
  private:
