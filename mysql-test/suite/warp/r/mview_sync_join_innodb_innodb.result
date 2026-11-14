@@ -1,0 +1,810 @@
+#
+# SYNCHRONOUS materialized join views in InnoDB over base tables in InnoDB,
+# maintained by the WARP_MVIEW daemon from the binary log
+#
+call mtr.add_suppression("WARP_MVIEW");
+# views: InnoDB, base tables: InnoDB
+INSERT INTO c VALUES (1, 'ann', 'north'), (2, 'bob', 'south'), (3, 'cy', 'north'), (4, 'dee', NULL);
+INSERT INTO o VALUES (10, 1, 15.50, '2026-01-01'), (11, 1, 250.00, '2026-01-02'), (12, 2, 99.99, '2026-01-02'), (13, NULL, 5.00, NULL);
+INSERT INTO i VALUES (10, 1, 'apple', 3), (10, 2, 'pear', 1), (11, 1, 'apple', 7), (12, 1, 'it''s', 2);
+INSERT INTO p VALUES ('apple', 'An apple', 0.50), ('pear', 'A pear', 0.75), ('it''s', 'quote \\ and backslash', 1.00), ('', 'empty key', 0.00);
+INSERT INTO e VALUES (1, NULL, 'root'), (2, 1, 'left'), (3, 1, 'right'), (18446744073709551615, 2, 'max');
+INSERT INTO k VALUES ('2026-01-01', 1.50, 'a', 'first'), ('2026-01-02', -2.25, 'b', 'second'), ('2026-01-02', 2.25, 'b', 'third');
+# Create the views
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+# Inner join: insert, update and delete on both sides
+INSERT INTO o VALUES (14, 3, 42.00, '2026-01-03');
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+UPDATE c SET name = 'ANN' WHERE id = 1;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+UPDATE o SET amount = amount + 1 WHERE c_id = 1;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+DELETE FROM o WHERE id = 14;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+# LEFT JOIN: customer 4 gains its first order, the order is updated,
+# moved to another customer, and customer 4 loses its last order
+INSERT INTO o VALUES (20, 4, 1.00, '2026-02-01');
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+UPDATE o SET amount = 2.00 WHERE id = 20;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+UPDATE o SET c_id = 3 WHERE id = 20;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+UPDATE o SET c_id = 4 WHERE id = 20;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+DELETE FROM o WHERE id = 20;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+# The WHERE of v_where: the only order of customer 3 fails the WHERE,
+# then passes it, then is removed
+INSERT INTO o VALUES (21, 3, 500.00, '2026-02-02');
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 3 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+UPDATE o SET amount = 50.00 WHERE id = 21;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+UPDATE o SET amount = 500.00 WHERE id = 21;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 3 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+DELETE FROM o WHERE id = 21;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 6 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+# RIGHT JOIN: an order without customer gets one, the customer goes away
+UPDATE o SET c_id = 2 WHERE id = 13;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 7 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 6 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+INSERT INTO c VALUES (5, 'eve', 'east');
+INSERT INTO o VALUES (22, 5, 7.00, '2026-02-03');
+v_inner: 5 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_wchain: 6 rows, 0 missing, 0 extra
+v_wchain2: 7 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+DELETE FROM c WHERE id = 5;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 7 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 6 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+DELETE FROM o WHERE id = 22;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 7 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 6 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+# Three tables and a product with a string key: changes at every level
+INSERT INTO i VALUES (12, 2, 'kiwi', 9);
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 6 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+INSERT INTO p VALUES ('kiwi', 'A kiwi', 2.00);
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 6 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+UPDATE p SET descr = 'Green kiwi' WHERE sku = 'kiwi';
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 6 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+UPDATE i SET sku = 'pear' WHERE o_id = 12 AND line = 2;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 6 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+UPDATE i SET sku = '' WHERE o_id = 10 AND line = 2;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 6 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+DELETE FROM p WHERE sku = 'it''s';
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_wchain: 5 rows, 0 missing, 0 extra
+v_wchain2: 6 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+DELETE FROM i WHERE o_id = 10;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_right: 4 rows, 0 missing, 0 extra
+v_chain: 7 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_wchain: 3 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 2 rows, 0 missing, 0 extra
+DELETE FROM o WHERE id = 12;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 3 rows, 0 missing, 0 extra
+v_wchain2: 4 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+# Self join: the boss changes its name, an employee changes its boss
+UPDATE e SET name = 'ROOT' WHERE id = 1;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 3 rows, 0 missing, 0 extra
+v_wchain2: 4 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+UPDATE e SET boss = 3 WHERE id = 18446744073709551615;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 3 rows, 0 missing, 0 extra
+v_wchain2: 4 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+INSERT INTO e VALUES (4, 18446744073709551615, 'below max');
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 5 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 3 rows, 0 missing, 0 extra
+v_wchain2: 4 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+DELETE FROM e WHERE id = 3;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 3 rows, 0 missing, 0 extra
+v_wchain2: 4 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+# Primary key updates: root tables and joined tables
+UPDATE c SET id = 100 WHERE id = 1;
+v_inner: 1 rows, 0 missing, 0 extra
+v_left: 4 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 4 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 4 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+UPDATE o SET id = id + 1000 WHERE c_id = 1;
+v_inner: 1 rows, 0 missing, 0 extra
+v_left: 4 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 4 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 4 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+UPDATE o SET c_id = 100 WHERE c_id = 1;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+UPDATE i SET line = line + 10 WHERE o_id = 11;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+UPDATE p SET sku = 'APPLE' WHERE sku = 'apple';
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+UPDATE e SET id = 7 WHERE id = 2;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 3 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+# Composite key of DATE, DECIMAL and VARCHAR
+INSERT INTO k VALUES ('2026-01-01', 0.00, '', 'zero'), ('1000-01-01', -9999.99, 'min', 'low'), ('9999-12-31', 9999.99, 'max', 'high');
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 6 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+UPDATE k SET note = 'changed' WHERE d = '2026-01-02' AND amt = -2.25;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 6 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+UPDATE k SET amt = amt + 1, tag = 'moved' WHERE d = '2026-01-02';
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 6 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+UPDATE k SET d = '2026-01-02' WHERE tag = 'min';
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 6 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+UPDATE o SET d = '9999-12-31' WHERE id = 13;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 6 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+DELETE FROM k WHERE amt < 0;
+v_inner: 3 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_right: 3 rows, 0 missing, 0 extra
+v_chain: 5 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 4 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_wchain: 4 rows, 0 missing, 0 extra
+v_wchain2: 5 rows, 0 missing, 0 extra
+v_wright: 1 rows, 0 missing, 0 extra
+# A transaction of several statements on several tables
+BEGIN;
+INSERT INTO c VALUES (6, 'fay', 'west'), (7, 'gus', 'west');
+INSERT INTO o VALUES (30, 6, 10.00, '2026-03-01'), (31, 6, 20.00, '2026-03-01'), (32, 7, 30.00, '2026-03-02');
+INSERT INTO i VALUES (30, 1, 'pear', 1), (31, 1, 'APPLE', 2), (32, 1, 'none', 3);
+UPDATE c SET name = 'FAY' WHERE id = 6;
+DELETE FROM o WHERE id = 31;
+INSERT INTO k VALUES ('2026-03-01', 1.00, 'x', 'march');
+COMMIT;
+v_inner: 5 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 7 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_wchain: 6 rows, 0 missing, 0 extra
+v_wchain2: 7 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+# A transaction that is rolled back changes nothing; the next one does
+BEGIN;
+INSERT INTO c VALUES (8, 'hal', 'west');
+UPDATE o SET amount = 0 WHERE id = 30;
+DELETE FROM i WHERE o_id = 32;
+ROLLBACK;
+INSERT INTO c VALUES (9, 'ivy', 'west');
+v_inner: 5 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 7 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+SELECT COUNT(*) FROM v_left WHERE cid = 8;
+COUNT(*)
+0
+SELECT amount FROM v_inner WHERE oid = 30;
+amount
+10.00
+# Views with a WHERE on the last table of a chain: rows that the WHERE
+# filters out are not in the view, and still change it when they go
+INSERT INTO c VALUES (50, 'whe', 'north');
+INSERT INTO o VALUES (40, 50, 1.00, '2026-05-01');
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 8 rows, 0 missing, 0 extra
+v_wchain2: 9 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+INSERT INTO i VALUES (40, 1, 'pear', 9);
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+# the row moves into the WHERE and out of it again
+UPDATE i SET qty = 2 WHERE o_id = 40;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 8 rows, 0 missing, 0 extra
+v_wchain2: 9 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+UPDATE i SET qty = 50 WHERE o_id = 40;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+# the row that is filtered out is deleted
+DELETE FROM i WHERE o_id = 40 AND line = 1;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 8 rows, 0 missing, 0 extra
+v_wchain2: 9 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+# two filtered rows; one, then the other leaves by an update of the key
+INSERT INTO i VALUES (40, 1, 'pear', 9), (40, 2, 'apple', 8);
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 10 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+UPDATE i SET o_id = 41 WHERE o_id = 40 AND line = 1;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+UPDATE i SET o_id = 41 WHERE o_id = 40 AND line = 2;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 8 rows, 0 missing, 0 extra
+v_wchain2: 9 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+UPDATE i SET o_id = 40 WHERE o_id = 41;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 10 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+# the order in the middle of the chain moves to another customer
+UPDATE o SET c_id = 3 WHERE id = 40;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 10 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+UPDATE o SET c_id = 50 WHERE id = 40;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 10 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+# the order and its filtered items go in one transaction
+BEGIN;
+DELETE FROM i WHERE o_id = 40;
+DELETE FROM o WHERE id = 40;
+COMMIT;
+v_inner: 5 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 8 rows, 0 missing, 0 extra
+v_wchain2: 9 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+# RIGHT JOIN with a WHERE on the NULL side
+INSERT INTO o VALUES (42, 50, 2.00, '2026-05-02');
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 8 rows, 0 missing, 0 extra
+v_wchain2: 9 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+UPDATE c SET region = 'west' WHERE id = 50;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 8 rows, 0 missing, 0 extra
+v_wchain2: 9 rows, 0 missing, 0 extra
+v_wright: 4 rows, 0 missing, 0 extra
+UPDATE c SET region = 'north' WHERE id = 50;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 9 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 8 rows, 0 missing, 0 extra
+v_wchain: 8 rows, 0 missing, 0 extra
+v_wchain2: 9 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+DELETE FROM c WHERE id = 50;
+v_inner: 5 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_right: 6 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 7 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 4 rows, 0 missing, 0 extra
+DELETE FROM o WHERE id = 42;
+v_inner: 5 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 7 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+# Many rows in one statement and in one transaction
+v_inner: 505 rows, 0 missing, 0 extra
+v_left: 558 rows, 0 missing, 0 extra
+v_right: 505 rows, 0 missing, 0 extra
+v_chain: 558 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 57 rows, 0 missing, 0 extra
+v_wchain: 307 rows, 0 missing, 0 extra
+v_wchain2: 558 rows, 0 missing, 0 extra
+v_wright: 503 rows, 0 missing, 0 extra
+DELETE FROM o WHERE id >= 100000 AND id MOD 3 = 0;
+v_inner: 339 rows, 0 missing, 0 extra
+v_left: 392 rows, 0 missing, 0 extra
+v_right: 339 rows, 0 missing, 0 extra
+v_chain: 392 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 57 rows, 0 missing, 0 extra
+v_wchain: 307 rows, 0 missing, 0 extra
+v_wchain2: 392 rows, 0 missing, 0 extra
+v_wright: 337 rows, 0 missing, 0 extra
+DELETE FROM c WHERE id >= 1000;
+DELETE FROM o WHERE id >= 100000;
+v_inner: 5 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_right: 5 rows, 0 missing, 0 extra
+v_chain: 8 rows, 0 missing, 0 extra
+v_self: 4 rows, 0 missing, 0 extra
+v_keys: 5 rows, 0 missing, 0 extra
+v_where: 7 rows, 0 missing, 0 extra
+v_wchain: 7 rows, 0 missing, 0 extra
+v_wchain2: 8 rows, 0 missing, 0 extra
+v_wright: 3 rows, 0 missing, 0 extra
+SET GLOBAL warp_mview_in_list_chunk_size = DEFAULT;
+# The contents, for the record
+SELECT * FROM v_left ORDER BY cid, oid;
+cid	name	oid	amount
+2	bob	13	5.00
+3	cy	NULL	NULL
+4	dee	NULL	NULL
+6	FAY	30	10.00
+7	gus	32	30.00
+9	ivy	NULL	NULL
+100	ANN	1010	16.50
+100	ANN	1011	251.00
+SELECT * FROM v_chain ORDER BY cid, oid, line;
+cid	oid	line	sku	qty	descr
+2	13	NULL	NULL	NULL	NULL
+3	NULL	NULL	NULL	NULL	NULL
+4	NULL	NULL	NULL	NULL	NULL
+6	30	1	pear	1	A pear
+7	32	1	none	3	NULL
+9	NULL	NULL	NULL	NULL	NULL
+100	1010	NULL	NULL	NULL	NULL
+100	1011	NULL	NULL	NULL	NULL
+SELECT * FROM v_self ORDER BY id;
+id	name	boss_name	boss_id
+1	ROOT	NULL	NULL
+4	below max	max	18446744073709551615
+7	left	ROOT	1
+18446744073709551615	max	NULL	NULL
+SELECT * FROM v_keys ORDER BY d, amt, tag, oid;
+d	amt	tag	note	oid
+2026-01-01	0.00		zero	1010
+2026-01-01	1.50	a	first	1010
+2026-01-02	3.25	moved	third	1011
+2026-03-01	1.00	x	march	30
+9999-12-31	9999.99	max	high	13
+# No view became stale and no statement of the daemon failed
+SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+VARIABLE_VALUE
+0
+DROP MATERIALIZED VIEW v_inner;
+DROP MATERIALIZED VIEW v_left;
+DROP MATERIALIZED VIEW v_right;
+DROP MATERIALIZED VIEW v_chain;
+DROP MATERIALIZED VIEW v_self;
+DROP MATERIALIZED VIEW v_keys;
+DROP MATERIALIZED VIEW v_where;
+DROP MATERIALIZED VIEW v_wchain;
+DROP MATERIALIZED VIEW v_wchain2;
+DROP MATERIALIZED VIEW v_wright;
+DROP TABLE c, o, i, p, e, k;

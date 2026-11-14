@@ -1493,6 +1493,8 @@ class MDL_context {
 
   /** @pre Only valid if we started waiting for lock. */
   inline uint get_deadlock_weight() const {
+    if (m_prefer_deadlock_victim)
+      return MDL_wait_for_subgraph::DEADLOCK_WEIGHT_CO;
     return m_force_dml_deadlock_weight
                ? MDL_wait_for_subgraph::DEADLOCK_WEIGHT_DML
                : m_waiting_for->get_deadlock_weight();
@@ -1524,6 +1526,19 @@ class MDL_context {
 
   void set_force_dml_deadlock_weight(bool force_dml_deadlock_weight) {
     m_force_dml_deadlock_weight = force_dml_deadlock_weight;
+  }
+
+  /**
+    Make this context the preferred victim of the deadlock detector, whatever
+    lock it waits for: its waits have the lowest weight.  For background
+    threads that take table locks on their own initiative (the materialized
+    view daemon) and can simply try again, so that a deadlock with them
+    never fails the statement of a user.
+
+    @note Can be changed only when the context is not waiting for a lock.
+  */
+  void set_prefer_deadlock_victim(bool prefer) {
+    m_prefer_deadlock_victim = prefer;
   }
 
   /**
@@ -1634,6 +1649,9 @@ class MDL_context {
           definition entry.
   */
   bool m_force_dml_deadlock_weight;
+
+  /** See set_prefer_deadlock_victim(). */
+  bool m_prefer_deadlock_victim{false};
 
   /**
     Read-write lock protecting m_waiting_for member.

@@ -568,6 +568,14 @@ void init_sql_command_flags() {
   sql_command_flags[SQLCOM_CREATE_VIEW] =
       CF_CHANGES_DATA | CF_REEXECUTION_FRAGILE | CF_AUTO_COMMIT_TRANS;
   sql_command_flags[SQLCOM_DROP_VIEW] = CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
+  sql_command_flags[SQLCOM_CREATE_MATERIALIZED_VIEW] =
+      CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
+  sql_command_flags[SQLCOM_DROP_MATERIALIZED_VIEW] =
+      CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
+  sql_command_flags[SQLCOM_REFRESH_MATERIALIZED_VIEW] =
+      CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
+  sql_command_flags[SQLCOM_ALTER_MATERIALIZED_VIEW] =
+      CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
   sql_command_flags[SQLCOM_CREATE_TRIGGER] =
       CF_CHANGES_DATA | CF_AUTO_COMMIT_TRANS;
   sql_command_flags[SQLCOM_DROP_TRIGGER] =
@@ -892,6 +900,10 @@ void init_sql_command_flags() {
   sql_command_flags[SQLCOM_ALTER_DB] |= CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_CREATE_VIEW] |= CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_DROP_VIEW] |= CF_DISALLOW_IN_RO_TRANS;
+  sql_command_flags[SQLCOM_CREATE_MATERIALIZED_VIEW] |= CF_DISALLOW_IN_RO_TRANS;
+  sql_command_flags[SQLCOM_DROP_MATERIALIZED_VIEW] |= CF_DISALLOW_IN_RO_TRANS;
+  sql_command_flags[SQLCOM_REFRESH_MATERIALIZED_VIEW] |= CF_DISALLOW_IN_RO_TRANS;
+  sql_command_flags[SQLCOM_ALTER_MATERIALIZED_VIEW] |= CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_CREATE_TRIGGER] |= CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_DROP_TRIGGER] |= CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_CREATE_EVENT] |= CF_DISALLOW_IN_RO_TRANS;
@@ -1048,6 +1060,10 @@ void init_sql_command_flags() {
   sql_command_flags[SQLCOM_DEALLOCATE_PREPARE] |= CF_ALLOW_PROTOCOL_PLUGIN;
   sql_command_flags[SQLCOM_CREATE_VIEW] |= CF_ALLOW_PROTOCOL_PLUGIN;
   sql_command_flags[SQLCOM_DROP_VIEW] |= CF_ALLOW_PROTOCOL_PLUGIN;
+  sql_command_flags[SQLCOM_CREATE_MATERIALIZED_VIEW] |= CF_ALLOW_PROTOCOL_PLUGIN;
+  sql_command_flags[SQLCOM_DROP_MATERIALIZED_VIEW] |= CF_ALLOW_PROTOCOL_PLUGIN;
+  sql_command_flags[SQLCOM_REFRESH_MATERIALIZED_VIEW] |= CF_ALLOW_PROTOCOL_PLUGIN;
+  sql_command_flags[SQLCOM_ALTER_MATERIALIZED_VIEW] |= CF_ALLOW_PROTOCOL_PLUGIN;
   sql_command_flags[SQLCOM_CREATE_TRIGGER] |= CF_ALLOW_PROTOCOL_PLUGIN;
   sql_command_flags[SQLCOM_DROP_TRIGGER] |= CF_ALLOW_PROTOCOL_PLUGIN;
   sql_command_flags[SQLCOM_XA_START] |= CF_ALLOW_PROTOCOL_PLUGIN;
@@ -1121,6 +1137,14 @@ void init_sql_command_flags() {
       CF_NEEDS_AUTOCOMMIT_OFF | CF_POTENTIAL_ATOMIC_DDL;
   sql_command_flags[SQLCOM_DROP_VIEW] |=
       CF_NEEDS_AUTOCOMMIT_OFF | CF_POTENTIAL_ATOMIC_DDL;
+  /*
+    The statements of materialized views make their internal statements and
+    the write to the binary log one transaction where the engine can.
+  */
+  sql_command_flags[SQLCOM_CREATE_MATERIALIZED_VIEW] |= CF_NEEDS_AUTOCOMMIT_OFF;
+  sql_command_flags[SQLCOM_DROP_MATERIALIZED_VIEW] |= CF_NEEDS_AUTOCOMMIT_OFF;
+  sql_command_flags[SQLCOM_REFRESH_MATERIALIZED_VIEW] |= CF_NEEDS_AUTOCOMMIT_OFF;
+  sql_command_flags[SQLCOM_ALTER_MATERIALIZED_VIEW] |= CF_NEEDS_AUTOCOMMIT_OFF;
   sql_command_flags[SQLCOM_ALTER_TABLESPACE] |=
       CF_NEEDS_AUTOCOMMIT_OFF | CF_POTENTIAL_ATOMIC_DDL;
   sql_command_flags[SQLCOM_CREATE_SPFUNCTION] |=
@@ -4760,7 +4784,11 @@ int mysql_execute_command(THD *thd, bool first_level) {
     case SQLCOM_DROP_SRS:
     case SQLCOM_CREATE_LIBRARY:
     case SQLCOM_DROP_LIBRARY:
-    case SQLCOM_ALTER_LIBRARY: {
+    case SQLCOM_ALTER_LIBRARY:
+    case SQLCOM_CREATE_MATERIALIZED_VIEW:
+    case SQLCOM_DROP_MATERIALIZED_VIEW:
+    case SQLCOM_REFRESH_MATERIALIZED_VIEW:
+    case SQLCOM_ALTER_MATERIALIZED_VIEW: {
       assert(lex->m_sql_cmd != nullptr);
 
       res = lex->m_sql_cmd->execute(thd);

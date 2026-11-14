@@ -1,0 +1,86 @@
+#
+# The statements of materialized views on a replica, with GTIDs: the
+# replica builds the views from its own tables
+#
+include/rpl/init_source_replica.inc
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+[connection master]
+call mtr.add_suppression("MY-015655");
+CREATE TABLE t1 (id INT PRIMARY KEY, g INT, v INT);
+INSERT INTO t1 VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+CREATE MATERIALIZED VIEW mv_j ENGINE=InnoDB REFRESH MANUAL AS
+SELECT id, v FROM t1 WHERE g = 1;
+CREATE MATERIALIZED VIEW mv_w ENGINE=WARP REFRESH MANUAL AS
+SELECT id, v FROM t1;
+CREATE MATERIALIZED VIEW mv_a ENGINE=InnoDB REFRESH MANUAL AS
+SELECT g, SUM(v) AS s, COUNT(*) AS c FROM t1 GROUP BY g;
+CREATE MATERIALIZED VIEW mv_aw ENGINE=WARP REFRESH MANUAL AS
+SELECT COUNT(*) AS c, MAX(v) AS m FROM t1;
+include/rpl/sync_to_replica.inc
+SELECT * FROM mv_j ORDER BY id;
+id	v
+1	10
+2	20
+SELECT * FROM mv_w ORDER BY id;
+id	v
+1	10
+2	20
+3	30
+SELECT * FROM mv_a ORDER BY g;
+g	s	c
+1	30	2
+2	30	1
+SELECT * FROM mv_aw;
+c	m
+3	30
+SHOW CREATE VIEW mv_a;
+View	Create View	character_set_client	collation_connection
+mv_a	CREATE MATERIALIZED VIEW `mv_a` (`g`, `s`, `c`) ENGINE=InnoDB REFRESH MANUAL AS select `test`.`t1`.`g` AS `g`,sum(`test`.`t1`.`v`) AS `s`,count(0) AS `c` from `test`.`t1` group by `test`.`t1`.`g`	utf8mb4	utf8mb4_0900_ai_ci
+DELETE FROM mv_j;
+ERROR HY000: Table 'test.mv_j' is the storage of a materialized view and cannot be modified directly.
+[connection master]
+INSERT INTO t1 VALUES (4, 2, 40);
+REFRESH MATERIALIZED VIEW mv_j;
+REFRESH MATERIALIZED VIEW mv_w;
+REFRESH MATERIALIZED VIEW mv_a;
+REFRESH MATERIALIZED VIEW mv_aw;
+ALTER MATERIALIZED VIEW mv_w REFRESH SYNCHRONOUS;
+DROP MATERIALIZED VIEW mv_j;
+include/rpl/sync_to_replica.inc
+SELECT * FROM mv_w ORDER BY id;
+id	v
+1	10
+2	20
+3	30
+4	40
+SELECT * FROM mv_a ORDER BY g;
+g	s	c
+1	30	2
+2	70	2
+SELECT * FROM mv_aw;
+c	m
+4	40
+SHOW CREATE VIEW mv_w;
+View	Create View	character_set_client	collation_connection
+mv_w	CREATE MATERIALIZED VIEW `mv_w` (`id`, `v`) ENGINE=WARP REFRESH SYNCHRONOUS AS select `test`.`t1`.`id` AS `id`,`test`.`t1`.`v` AS `v` from `test`.`t1`	utf8mb4	utf8mb4_0900_ai_ci
+SHOW TABLES;
+Tables_in_test
+mv_a
+mv_a$mv_state
+mv_aw
+mv_aw$mv_state
+mv_w
+t1
+# One GTID for every statement
+[connection master]
+include/rpl/sync_to_replica.inc
+include/assert.inc [The replica executed the GTIDs of the source]
+[connection master]
+DROP MATERIALIZED VIEW mv_w, mv_a, mv_aw;
+DROP TABLE t1;
+include/rpl/sync_to_replica.inc
+SHOW TABLES;
+Tables_in_test
+include/rpl/deinit.inc

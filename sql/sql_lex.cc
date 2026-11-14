@@ -421,6 +421,9 @@ void LEX::reset() {
   create_view_type = enum_view_type::UNDEFINED;
   create_view_algorithm = VIEW_ALGORITHM_UNDEFINED;
   create_view_materialization = false;
+  mview_engine = NULL_CSTR;
+  mview_refresh_mode = -1;
+  mview_has_algorithm = false;
   create_view_suid = true;
 
   context_stack.clear();

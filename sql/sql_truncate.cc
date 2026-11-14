@@ -21,6 +21,7 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
+#include "sql/sql_mview.h"
 #include "sql/sql_truncate.h"
 
 #include <stddef.h>
@@ -512,6 +513,10 @@ void Sql_cmd_truncate_table::truncate_base(THD *thd, Table_ref *table_ref) {
     return;
   }
   assert(table_def != nullptr);
+
+  if (mview_check_table_change(thd, table_ref->db, table_ref->table_name,
+                               table_def))
+    return;
 
   if (table_def->options().exists("secondary_engine")) {
     LEX_CSTRING secondary_engine;

@@ -1288,6 +1288,9 @@ bool Prepared_statement::prepare_query(THD *thd) {
     case SQLCOM_ROLLBACK:
     case SQLCOM_TRUNCATE:
     case SQLCOM_DROP_VIEW:
+    case SQLCOM_DROP_MATERIALIZED_VIEW:
+    case SQLCOM_REFRESH_MATERIALIZED_VIEW:
+    case SQLCOM_ALTER_MATERIALIZED_VIEW:
     case SQLCOM_REPAIR:
     case SQLCOM_ANALYZE:
     case SQLCOM_OPTIMIZE:

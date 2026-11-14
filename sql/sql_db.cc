@@ -96,6 +96,7 @@
 #include "sql/sql_const.h"
 #include "sql/sql_error.h"
 #include "sql/sql_handler.h"  // mysql_ha_rm_tables
+#include "sql/sql_mview.h"
 #include "sql/sql_table.h"    // build_table_filename
 #include "sql/system_variables.h"
 #include "sql/table.h"  // Table_ref
@@ -1093,6 +1094,9 @@ bool mysql_rm_db(THD *thd, const LEX_CSTRING &db, bool if_exists) {
   }
 
   thd->server_status |= SERVER_STATUS_DB_DROPPED;
+  /* The database may have had materialized views. */
+  mview_registry_changed();
+
   my_ok(thd, deleted_tables);
   return false;
 }

@@ -1,0 +1,84 @@
+#
+# WARP_MVIEW daemon: it continues from its saved binary log position
+# after a restart and after a crash of the server
+#
+call mtr.add_suppression("WARP_MVIEW");
+call mtr.add_suppression("WARP: recovery cuts the partition");
+CREATE TABLE a (id INT PRIMARY KEY, v INT, s VARCHAR(20)) ENGINE=InnoDB;
+CREATE TABLE b (id INT PRIMARY KEY, a_id INT, w INT) ENGINE=InnoDB;
+INSERT INTO a VALUES (1, 10, 'one'), (2, 20, 'two'), (3, 30, 'three');
+INSERT INTO b VALUES (1, 1, 100), (2, 1, 200), (3, 2, 300);
+CREATE MATERIALIZED VIEW mv_i ENGINE=InnoDB AS SELECT a.id, a.v, a.s, b.id AS bid, b.w FROM a LEFT JOIN b ON b.a_id = a.id;
+CREATE MATERIALIZED VIEW mv_w ENGINE=InnoDB AS SELECT a.id, a.v, a.s, b.id AS bid, b.w FROM a LEFT JOIN b ON b.a_id = a.id;
+mv_i: 4 rows, 0 missing, 0 extra
+mv_w: 4 rows, 0 missing, 0 extra
+#
+# Changes that the daemon has not applied when the server is shut down
+# are applied after the restart, without a refresh
+#
+SET GLOBAL warp_mview_enabled = OFF;
+INSERT INTO a VALUES (4, 40, 'four');
+UPDATE b SET a_id = 4 WHERE id = 3;
+DELETE FROM a WHERE id = 1;
+FLUSH BINARY LOGS;
+UPDATE a SET id = 22 WHERE id = 2;
+SELECT COUNT(*) AS not_applied_yet FROM mv_i WHERE id IN (1, 2);
+not_applied_yet
+3
+# restart
+mv_i: 3 rows, 0 missing, 0 extra
+mv_w: 3 rows, 0 missing, 0 extra
+# the restarted daemon did not need to refresh the views
+SELECT VARIABLE_VALUE AS full_refreshes FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes';
+full_refreshes
+0
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+stale_views
+0
+#
+# Changes made right before a restart
+#
+INSERT INTO b VALUES (5, 22, 500), (6, 22, 600);
+UPDATE a SET v = v + 1;
+# restart
+INSERT INTO a VALUES (5, 50, 'five');
+mv_i: 5 rows, 0 missing, 0 extra
+mv_w: 5 rows, 0 missing, 0 extra
+#
+# Crash: the transactions that are in the binary log are applied
+# (again) after the server has recovered
+#
+SET GLOBAL warp_mview_enabled = OFF;
+INSERT INTO a VALUES (6, 60, 'six'), (7, 70, 'seven');
+INSERT INTO b VALUES (7, 6, 700);
+DELETE FROM b WHERE id = 5;
+# Kill the server
+# restart
+mv_i: 6 rows, 0 missing, 0 extra
+mv_w: 6 rows, 0 missing, 0 extra
+# Crash while the daemon is working
+# Kill the server
+# restart
+DELETE FROM b WHERE id BETWEEN 200 AND 299;
+mv_i: 506 rows, 0 missing, 0 extra
+mv_w: 506 rows, 0 missing, 0 extra
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+stale_views
+0
+#
+# The saved position is lost (RESET BINARY LOGS AND GTIDS while the
+# daemon is paused): everything is refreshed, then maintained again
+#
+SET GLOBAL warp_mview_enabled = OFF;
+INSERT INTO a VALUES (8, 80, 'eight');
+RESET BINARY LOGS AND GTIDS;
+INSERT INTO b VALUES (8, 8, 800);
+SET GLOBAL warp_mview_enabled = ON;
+mv_i: 507 rows, 0 missing, 0 extra
+mv_w: 507 rows, 0 missing, 0 extra
+UPDATE a SET v = 0 WHERE id = 8;
+mv_i: 507 rows, 0 missing, 0 extra
+mv_w: 507 rows, 0 missing, 0 extra
+DROP MATERIALIZED VIEW mv_i;
+DROP MATERIALIZED VIEW mv_w;
+DROP TABLE a, b;

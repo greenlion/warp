@@ -188,6 +188,21 @@ static int lock_tables_check(THD *thd, TABLE **tables, size_t count,
         my_error(ER_OPEN_AS_READONLY, MYF(0), t->alias);
         return 1;
       }
+
+      /*
+        The table of a materialized view is written by its statements and
+        by the maintenance daemon only. SELECT ... FOR UPDATE locks it for
+        write too, but changes nothing (unless it is locked for a stored
+        function or a trigger of the statement).
+      */
+      if (t->s->mview_kind != 0 && !thd->mview_maintenance_mode &&
+          !(thd->lex->sql_command == SQLCOM_SELECT &&
+            t->pos_in_table_list != nullptr &&
+            !t->pos_in_table_list->prelocking_placeholder)) {
+        my_error(ER_MVIEW_IS_READ_ONLY, MYF(0), t->s->db.str,
+                 t->s->table_name.str);
+        return 1;
+      }
     }
 
     /*

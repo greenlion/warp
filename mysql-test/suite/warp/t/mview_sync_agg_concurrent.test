@@ -1,0 +1,147 @@
+--echo #
+--echo # WARP_MVIEW daemon, aggregate views: exactly once.  Concurrent writers
+--echo # while the daemon locks the base tables, REFRESH while changes are
+--echo # flowing, restart and crash must not count a change twice or lose it.
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--source include/not_valgrind.inc
+--source include/not_crashrep.inc
+
+call mtr.add_suppression("WARP_MVIEW");
+call mtr.add_suppression("WARP: recovery cuts the partition");
+
+CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, g INT, x INT) ENGINE=InnoDB;
+CREATE TABLE u (id INT AUTO_INCREMENT PRIMARY KEY, t_g INT, y INT) ENGINE=InnoDB;
+INSERT INTO t (g, x) VALUES (0, 1), (1, 2), (2, 3), (3, 4);
+INSERT INTO u (t_g, y) VALUES (0, 10), (1, 20), (1, 30);
+
+--let $sel_fast = SELECT g, COUNT(*) AS n, SUM(x) AS sx FROM t GROUP BY g
+--let $sel_one = SELECT COUNT(*) AS n, SUM(x) AS sx FROM t
+--let $sel_minmax = SELECT g, MIN(x) AS mn, MAX(x) AS mx, COUNT(*) AS n FROM t GROUP BY g
+--let $sel_join = SELECT t.g, COUNT(*) AS n, SUM(t.x * u.y) AS s FROM t JOIN u ON u.t_g = t.g GROUP BY t.g
+--let $sel_left = SELECT t.g, COUNT(u.id) AS n, COUNT(DISTINCT u.y) AS dy FROM t LEFT JOIN u ON u.t_g = t.g GROUP BY t.g
+eval CREATE MATERIALIZED VIEW m_fast ENGINE=InnoDB AS $sel_fast;
+eval CREATE MATERIALIZED VIEW m_one ENGINE=InnoDB AS $sel_one;
+eval CREATE MATERIALIZED VIEW m_minmax ENGINE=InnoDB AS $sel_minmax;
+eval CREATE MATERIALIZED VIEW m_join ENGINE=InnoDB AS $sel_join;
+eval CREATE MATERIALIZED VIEW m_left ENGINE=InnoDB AS $sel_left;
+
+delimiter |;
+CREATE PROCEDURE writer(seed INT, rounds INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  -- deadlocks between the writers roll a statement or a transaction back
+  DECLARE CONTINUE HANDLER FOR 1213, 1205 BEGIN END;
+  WHILE i < rounds DO
+    INSERT INTO t (g, x) VALUES ((seed + i) MOD 7, i);
+    IF i MOD 3 = 0 THEN
+      INSERT INTO u (t_g, y) VALUES ((seed * 3 + i) MOD 9, i MOD 5);
+    END IF;
+    IF i MOD 4 = 0 THEN
+      UPDATE t SET x = x + 1, g = (g + 1) MOD 7 WHERE id MOD 11 = (seed + i) MOD 11;
+    END IF;
+    IF i MOD 5 = 0 THEN
+      START TRANSACTION;
+      DELETE FROM t WHERE id MOD 13 = (seed + i) MOD 13 AND id > 4;
+      UPDATE u SET y = y + 1 WHERE id MOD 3 = seed MOD 3;
+      COMMIT;
+    END IF;
+    IF i MOD 7 = 0 THEN
+      DELETE FROM u WHERE id MOD 17 = (seed + i) MOD 17;
+    END IF;
+    SET i = i + 1;
+  END WHILE;
+END|
+delimiter ;|
+
+--let $check = suite/warp/include/mview_sync_agg_concurrent_check.inc
+--source $check
+
+--echo #
+--echo # Three writers at the same time
+--echo #
+--connect (w1, localhost, root,,)
+--connect (w2, localhost, root,,)
+--connect (w3, localhost, root,,)
+--connection w1
+--send CALL writer(1, 300)
+--connection w2
+--send CALL writer(2, 300)
+--connection w3
+--send CALL writer(3, 300)
+--connection default
+--echo # while they run: every view is one of the states of its tables
+--echo # (never a negative or impossible count)
+SELECT COUNT(*) AS bad_groups FROM m_fast WHERE n <= 0;
+SELECT COUNT(*) AS rows_of_m_one FROM m_one;
+SELECT COUNT(*) AS bad_groups FROM m_join WHERE n <= 0;
+--connection w1
+--reap
+--connection w2
+--reap
+--connection w3
+--reap
+--connection default
+--source $check
+
+--echo #
+--echo # REFRESH MATERIALIZED VIEW while changes are flowing
+--echo #
+--connection w1
+--send CALL writer(4, 300)
+--connection w2
+--send CALL writer(5, 300)
+--connection default
+REFRESH MATERIALIZED VIEW m_fast;
+REFRESH MATERIALIZED VIEW m_join;
+REFRESH MATERIALIZED VIEW m_one;
+REFRESH MATERIALIZED VIEW m_left;
+REFRESH MATERIALIZED VIEW m_minmax;
+REFRESH MATERIALIZED VIEW m_fast;
+REFRESH MATERIALIZED VIEW m_join;
+--connection w1
+--reap
+--connection w2
+--reap
+--connection default
+--source $check
+
+--disconnect w1
+--disconnect w2
+--disconnect w3
+
+--echo # The base tables were locked for the views that read them, briefly
+--echo # (with a snapshot) for the views whose tables are all InnoDB
+SELECT VARIABLE_VALUE > 0 AS pins FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_pins';
+SELECT VARIABLE_VALUE > 0 AS snapshots FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_pin_snapshots';
+SELECT VARIABLE_VALUE > 0 AS lock_time FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_pin_lock_microseconds';
+
+--echo #
+--echo # Crash while the daemon is applying: what it has committed is not
+--echo # applied again
+--echo #
+SET GLOBAL warp_mview_batch_rows = 20;
+SET GLOBAL warp_mview_batch_transactions = 5;
+CALL writer(7, 200);
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+CALL writer(8, 20);
+--source $check
+--echo # ... and once more, with the daemon stopped at the crash
+SET GLOBAL warp_mview_enabled = OFF;
+--let $mview_state = paused
+--source suite/warp/include/mview_sync_state.inc
+CALL writer(9, 50);
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+--source $check
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+
+DROP PROCEDURE writer;
+DROP MATERIALIZED VIEW m_fast;
+DROP MATERIALIZED VIEW m_one;
+DROP MATERIALIZED VIEW m_minmax;
+DROP MATERIALIZED VIEW m_join;
+DROP MATERIALIZED VIEW m_left;
+DROP TABLE t, u;

@@ -1,0 +1,63 @@
+--echo #
+--echo # SHOW CREATE MATERIALIZED VIEW
+--echo #
+CREATE TABLE c (id INT PRIMARY KEY, name VARCHAR(20), region VARCHAR(10)) ENGINE=InnoDB;
+CREATE TABLE o (id INT PRIMARY KEY, c_id INT, amount INT) ENGINE=InnoDB;
+INSERT INTO c VALUES (1, 'ann', 'north'), (2, 'bob', 'south'), (3, 'cy', NULL);
+INSERT INTO o VALUES (10, 1, 15), (11, 1, 250), (12, 2, 99);
+CREATE VIEW plain_v AS SELECT id FROM c;
+
+CREATE MATERIALIZED VIEW mv_join ENGINE=InnoDB REFRESH MANUAL AS
+  SELECT c.id AS cid, c.name, o.id AS oid, o.amount
+  FROM c LEFT JOIN o ON o.c_id = c.id WHERE c.region IS NULL OR c.region <> 'east';
+CREATE MATERIALIZED VIEW mv_agg (region, orders, total) ENGINE=InnoDB AS
+  SELECT c.region, COUNT(*), SUM(o.amount) FROM c JOIN o ON o.c_id = c.id GROUP BY c.region;
+CREATE MATERIALIZED VIEW mv_warp ENGINE=WARP REFRESH MANUAL AS SELECT id, amount FROM o;
+
+--echo # the statement, with the engine and the refresh mode
+SHOW CREATE MATERIALIZED VIEW mv_join;
+SHOW CREATE MATERIALIZED VIEW mv_agg;
+SHOW CREATE MATERIALIZED VIEW test.mv_warp;
+--echo # the refresh mode follows ALTER
+ALTER MATERIALIZED VIEW mv_join REFRESH SYNCHRONOUS;
+SHOW CREATE MATERIALIZED VIEW mv_join;
+
+--echo # SHOW CREATE VIEW and SHOW CREATE TABLE still work on it
+--replace_column 2 #
+SHOW CREATE VIEW mv_join;
+--replace_column 2 #
+SHOW CREATE TABLE mv_join;
+
+--echo # only for materialized views
+--error ER_MVIEW_NOT_A_MVIEW
+SHOW CREATE MATERIALIZED VIEW plain_v;
+--error ER_MVIEW_NOT_A_MVIEW
+SHOW CREATE MATERIALIZED VIEW c;
+--error ER_NO_SUCH_TABLE
+SHOW CREATE MATERIALIZED VIEW no_such;
+SHOW CREATE VIEW plain_v;
+
+--echo # the statement creates the same view again
+--let $stmt = query_get_value(SHOW CREATE MATERIALIZED VIEW mv_agg, Create Materialized View, 1)
+SELECT * FROM mv_agg ORDER BY region;
+DROP MATERIALIZED VIEW mv_agg;
+--disable_query_log
+eval $stmt;
+--enable_query_log
+SELECT * FROM mv_agg ORDER BY region;
+SHOW CREATE MATERIALIZED VIEW mv_agg;
+
+--echo # materialized and view are still not reserved words
+CREATE TABLE materialized (view INT PRIMARY KEY, materialized INT);
+SHOW CREATE TABLE materialized;
+DROP TABLE materialized;
+
+--echo # in a prepared statement
+PREPARE s FROM 'SHOW CREATE MATERIALIZED VIEW mv_warp';
+EXECUTE s;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+
+DROP MATERIALIZED VIEW mv_join, mv_agg, mv_warp;
+DROP VIEW plain_v;
+DROP TABLE c, o;

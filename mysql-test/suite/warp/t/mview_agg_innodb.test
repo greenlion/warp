@@ -1,0 +1,7 @@
+--echo #
+--echo # Aggregate materialized views, stored in InnoDB
+--echo #
+--source include/have_log_bin.inc
+call mtr.add_suppression("MY-015655");
+--let $mv_engine = InnoDB
+--source suite/warp/include/mview_agg_engine.inc

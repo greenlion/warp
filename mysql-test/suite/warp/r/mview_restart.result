@@ -1,0 +1,146 @@
+#
+# Materialized views are there after a restart of the server
+#
+call mtr.add_suppression("MY-015655");
+CREATE TABLE t1 (id INT PRIMARY KEY, g INT, v DECIMAL(10,2), s VARCHAR(10))
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, w INT);
+INSERT INTO t1 VALUES (1, 1, 1.50, 'a'), (2, 1, 2.50, 'b'), (3, 2, NULL, 'c');
+INSERT INTO t2 VALUES (1, 1, 10), (2, 1, 20), (3, 3, 30);
+CREATE MATERIALIZED VIEW mj_i ENGINE=InnoDB REFRESH MANUAL AS
+SELECT t1.id, t1.s, t2.w FROM t1 LEFT JOIN t2 ON t2.t1_id = t1.id;
+CREATE MATERIALIZED VIEW mj_w ENGINE=WARP REFRESH SYNCHRONOUS AS
+SELECT t1.id, t1.s, t2.w FROM t1 LEFT JOIN t2 ON t2.t1_id = t1.id;
+CREATE MATERIALIZED VIEW ma_i ENGINE=InnoDB REFRESH MANUAL AS
+SELECT g, COUNT(*) AS c, SUM(v) AS sv, AVG(v) AS av, MAX(s) AS ms
+FROM t1 GROUP BY g;
+CREATE MATERIALIZED VIEW ma_w ENGINE=WARP REFRESH MANUAL AS
+SELECT g, COUNT(*) AS c, SUM(v) AS sv, AVG(v) AS av, MAX(s) AS ms
+FROM t1 GROUP BY g;
+SELECT * FROM mj_i ORDER BY id, w;
+id	s	w
+1	a	10
+1	a	20
+2	b	NULL
+3	c	30
+SELECT * FROM mj_w ORDER BY id, w;
+id	s	w
+1	a	10
+1	a	20
+2	b	NULL
+3	c	30
+SELECT * FROM ma_i ORDER BY g;
+g	c	sv	av	ms
+1	2	4.00	2.000000	b
+2	1	NULL	NULL	c
+SELECT * FROM ma_w ORDER BY g;
+g	c	sv	av	ms
+1	2	4.00	2.000000	b
+2	1	NULL	NULL	c
+# restart
+# The contents
+SELECT * FROM mj_i ORDER BY id, w;
+id	s	w
+1	a	10
+1	a	20
+2	b	NULL
+3	c	30
+SELECT * FROM mj_w ORDER BY id, w;
+id	s	w
+1	a	10
+1	a	20
+2	b	NULL
+3	c	30
+SELECT * FROM ma_i ORDER BY g;
+g	c	sv	av	ms
+1	2	4.00	2.000000	b
+2	1	NULL	NULL	c
+SELECT * FROM ma_w ORDER BY g;
+g	c	sv	av	ms
+1	2	4.00	2.000000	b
+2	1	NULL	NULL	c
+SELECT COUNT(*), MIN(binlog_pos > 4) FROM `ma_i$mv_state`;
+COUNT(*)	MIN(binlog_pos > 4)
+1	1
+SELECT COUNT(*), MIN(binlog_pos > 4) FROM `ma_w$mv_state`;
+COUNT(*)	MIN(binlog_pos > 4)
+1	1
+# The definitions
+SHOW CREATE VIEW mj_i;
+View	Create View	character_set_client	collation_connection
+mj_i	CREATE MATERIALIZED VIEW `mj_i` (`id`, `s`, `w`) ENGINE=InnoDB REFRESH MANUAL AS select `test`.`t1`.`id` AS `id`,`test`.`t1`.`s` AS `s`,`test`.`t2`.`w` AS `w` from (`test`.`t1` left join `test`.`t2` on((`test`.`t2`.`t1_id` = `test`.`t1`.`id`)))	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW mj_w;
+View	Create View	character_set_client	collation_connection
+mj_w	CREATE MATERIALIZED VIEW `mj_w` (`id`, `s`, `w`) ENGINE=WARP REFRESH SYNCHRONOUS AS select `test`.`t1`.`id` AS `id`,`test`.`t1`.`s` AS `s`,`test`.`t2`.`w` AS `w` from (`test`.`t1` left join `test`.`t2` on((`test`.`t2`.`t1_id` = `test`.`t1`.`id`)))	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW ma_i;
+View	Create View	character_set_client	collation_connection
+ma_i	CREATE MATERIALIZED VIEW `ma_i` (`g`, `c`, `sv`, `av`, `ms`) ENGINE=InnoDB REFRESH MANUAL AS select `test`.`t1`.`g` AS `g`,count(0) AS `c`,sum(`test`.`t1`.`v`) AS `sv`,avg(`test`.`t1`.`v`) AS `av`,max(`test`.`t1`.`s`) AS `ms` from `test`.`t1` group by `test`.`t1`.`g`	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW ma_w;
+View	Create View	character_set_client	collation_connection
+ma_w	CREATE MATERIALIZED VIEW `ma_w` (`g`, `c`, `sv`, `av`, `ms`) ENGINE=WARP REFRESH MANUAL AS select `test`.`t1`.`g` AS `g`,count(0) AS `c`,sum(`test`.`t1`.`v`) AS `sv`,avg(`test`.`t1`.`v`) AS `av`,max(`test`.`t1`.`s`) AS `ms` from `test`.`t1` group by `test`.`t1`.`g`	utf8mb4	utf8mb4_0900_ai_ci
+# The guard
+DELETE FROM mj_i;
+ERROR HY000: Table 'test.mj_i' is the storage of a materialized view and cannot be modified directly.
+DELETE FROM mj_w;
+ERROR HY000: Table 'test.mj_w' is the storage of a materialized view and cannot be modified directly.
+UPDATE ma_i SET `mv$count` = 0;
+ERROR HY000: Table 'test.ma_i' is the storage of a materialized view and cannot be modified directly.
+DELETE FROM `ma_w$mv_state`;
+ERROR HY000: Table 'test.ma_w$mv_state' is the storage of a materialized view and cannot be modified directly.
+DROP VIEW ma_w;
+ERROR HY000: 'test.ma_w' is a materialized view, use DROP MATERIALIZED VIEW.
+# REFRESH and ALTER
+INSERT INTO t1 VALUES (4, 2, 4.00, 'd');
+INSERT INTO t2 VALUES (4, 4, 40);
+REFRESH MATERIALIZED VIEW mj_i;
+REFRESH MATERIALIZED VIEW mj_w;
+REFRESH MATERIALIZED VIEW ma_i;
+REFRESH MATERIALIZED VIEW ma_w;
+ALTER MATERIALIZED VIEW mj_w REFRESH MANUAL;
+ALTER MATERIALIZED VIEW ma_w REFRESH SYNCHRONOUS;
+SELECT * FROM mj_i ORDER BY id, w;
+id	s	w
+1	a	10
+1	a	20
+2	b	NULL
+3	c	30
+4	d	40
+SELECT * FROM mj_w ORDER BY id, w;
+id	s	w
+1	a	10
+1	a	20
+2	b	NULL
+3	c	30
+4	d	40
+SELECT * FROM ma_i ORDER BY g;
+g	c	sv	av	ms
+1	2	4.00	2.000000	b
+2	2	4.00	4.000000	d
+SELECT * FROM ma_w ORDER BY g;
+g	c	sv	av	ms
+1	2	4.00	2.000000	b
+2	2	4.00	4.000000	d
+# restart
+SELECT * FROM mj_w ORDER BY id, w;
+id	s	w
+1	a	10
+1	a	20
+2	b	NULL
+3	c	30
+4	d	40
+SELECT * FROM ma_w ORDER BY g;
+g	c	sv	av	ms
+1	2	4.00	2.000000	b
+2	2	4.00	4.000000	d
+SHOW CREATE VIEW mj_w;
+View	Create View	character_set_client	collation_connection
+mj_w	CREATE MATERIALIZED VIEW `mj_w` (`id`, `s`, `w`) ENGINE=WARP REFRESH MANUAL AS select `test`.`t1`.`id` AS `id`,`test`.`t1`.`s` AS `s`,`test`.`t2`.`w` AS `w` from (`test`.`t1` left join `test`.`t2` on((`test`.`t2`.`t1_id` = `test`.`t1`.`id`)))	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW ma_w;
+View	Create View	character_set_client	collation_connection
+ma_w	CREATE MATERIALIZED VIEW `ma_w` (`g`, `c`, `sv`, `av`, `ms`) ENGINE=WARP REFRESH SYNCHRONOUS AS select `test`.`t1`.`g` AS `g`,count(0) AS `c`,sum(`test`.`t1`.`v`) AS `sv`,avg(`test`.`t1`.`v`) AS `av`,max(`test`.`t1`.`s`) AS `ms` from `test`.`t1` group by `test`.`t1`.`g`	utf8mb4	utf8mb4_0900_ai_ci
+DROP MATERIALIZED VIEW mj_i, mj_w, ma_i, ma_w;
+SHOW TABLES;
+Tables_in_test
+t1
+t2
+DROP TABLE t1, t2;

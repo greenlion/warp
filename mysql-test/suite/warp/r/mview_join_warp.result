@@ -1,0 +1,192 @@
+#
+# Materialized views over joins, stored in WARP
+#
+call mtr.add_suppression("MY-015655");
+#
+# Join materialized views, ENGINE=WARP
+#
+CREATE TABLE cust (
+id INT NOT NULL PRIMARY KEY,
+name VARCHAR(20),
+region CHAR(2)
+) ENGINE=ENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE ord (
+id BIGINT NOT NULL PRIMARY KEY,
+cust_id INT,
+amount DECIMAL(10,2),
+placed DATE
+) ENGINE=ENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE item (
+ord_id BIGINT NOT NULL,
+line INT NOT NULL,
+sku VARCHAR(10),
+qty INT,
+PRIMARY KEY (ord_id, line)
+) ENGINE=ENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO cust VALUES (1, 'ann', 'eu'), (2, 'bob', 'eu'), (3, 'cy', 'us'),
+(4, NULL, 'us');
+INSERT INTO ord VALUES (10, 1, 15.50, '2026-01-01'), (11, 1, 4.25, '2026-01-02'),
+(12, 2, 100.00, '2026-02-01'), (13, NULL, 7.00, NULL),
+(14, 99, 1.00, '2026-03-01');
+INSERT INTO item VALUES (10, 1, 'nut', 3), (10, 2, 'bolt', 5), (12, 1, 'nut', 1);
+# Inner join
+CREATE MATERIALIZED VIEW mv_inner ENGINE=ENGINE REFRESH MANUAL AS SELECT c.id AS cid, c.name, o.id AS oid, o.amount FROM cust c JOIN ord o ON o.cust_id = c.id;
+SELECT * FROM mv_inner ORDER BY cid, oid;
+cid	name	oid	amount
+1	ann	10	15.50
+1	ann	11	4.25
+2	bob	12	100.00
+# mv_inner: 3 rows, 0 differ from the defining SELECT
+# LEFT joins, an expression, WHERE; NULL-extended rows
+CREATE MATERIALIZED VIEW mv_left ENGINE=ENGINE REFRESH MANUAL AS SELECT c.id AS cid, UPPER(c.name) AS uname, o.id AS oid, o.amount * 2 AS dbl, i.sku, COALESCE(i.qty, 0) AS qty FROM cust c LEFT JOIN ord o ON o.cust_id = c.id LEFT JOIN item i ON i.ord_id = o.id WHERE c.region IN ('eu', 'us');
+SELECT * FROM mv_left ORDER BY cid, oid, sku;
+cid	uname	oid	dbl	sku	qty
+1	ANN	10	31.00	bolt	5
+1	ANN	10	31.00	nut	3
+1	ANN	11	8.50	NULL	0
+2	BOB	12	200.00	nut	1
+3	CY	NULL	NULL	NULL	0
+4	NULL	NULL	NULL	NULL	0
+# mv_left: 6 rows, 0 differ from the defining SELECT
+# The invisible key columns: NULL for the NULL-extended instances
+SELECT cid, oid, `mv$pk0_0`, `mv$pk1_0`, `mv$pk2_0`, `mv$pk2_1` FROM mv_left
+ORDER BY cid, oid, `mv$pk2_1`;
+cid	oid	mv$pk0_0	mv$pk1_0	mv$pk2_0	mv$pk2_1
+1	10	1	10	10	1
+1	10	1	10	10	2
+1	11	1	11	NULL	NULL
+2	12	2	12	12	1
+3	NULL	3	NULL	NULL	NULL
+4	NULL	4	NULL	NULL	NULL
+# RIGHT join: the root is the outer table
+CREATE MATERIALIZED VIEW mv_right ENGINE=ENGINE REFRESH MANUAL AS SELECT o.id AS oid, o.placed, c.id AS cid, c.region FROM ord o RIGHT JOIN cust c ON o.cust_id = c.id;
+SELECT * FROM mv_right ORDER BY cid, oid;
+oid	placed	cid	region
+10	2026-01-01	1	eu
+11	2026-01-02	1	eu
+12	2026-02-01	2	eu
+NULL	NULL	3	us
+NULL	NULL	4	us
+# mv_right: 5 rows, 0 differ from the defining SELECT
+# Self join, with a column list
+CREATE MATERIALIZED VIEW mv_self (first_id, second_id, region) ENGINE=ENGINE REFRESH MANUAL AS SELECT a.id, b.id, a.region FROM cust a JOIN cust b ON a.region = b.region AND a.id < b.id;
+SELECT * FROM mv_self ORDER BY first_id, second_id;
+first_id	second_id	region
+1	2	eu
+3	4	us
+# mv_self: 2 rows, 0 differ from the defining SELECT
+# The layout: user columns, invisible key columns, their indexes
+SHOW CREATE TABLE mv_left;
+Table	Create Table
+mv_left	CREATE TABLE `mv_left` (
+  `cid` int DEFAULT NULL,
+  `uname` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
+  `oid` bigint DEFAULT NULL,
+  `dbl` decimal(11,2) DEFAULT NULL,
+  `sku` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
+  `qty` int DEFAULT NULL,
+  `mv$pk0_0` int DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$pk1_0` bigint DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$pk2_0` bigint DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$pk2_1` int DEFAULT NULL /*!80023 INVISIBLE */,
+  KEY `mv$ix_pk0` (`mv$pk0_0`),
+  KEY `mv$ix_pk1` (`mv$pk1_0`),
+  KEY `mv$ix_pk2` (`mv$pk2_0`,`mv$pk2_1`)
+) ENGINE=ENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+SELECT TABLE_NAME, COLUMN_NAME, EXTRA FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME LIKE 'mv\_%' AND EXTRA <> ''
+ORDER BY TABLE_NAME, ORDINAL_POSITION;
+TABLE_NAME	COLUMN_NAME	EXTRA
+mv_inner	mv$pk0_0	INVISIBLE
+mv_inner	mv$pk1_0	INVISIBLE
+mv_left	mv$pk0_0	INVISIBLE
+mv_left	mv$pk1_0	INVISIBLE
+mv_left	mv$pk2_0	INVISIBLE
+mv_left	mv$pk2_1	INVISIBLE
+mv_right	mv$pk0_0	INVISIBLE
+mv_right	mv$pk1_0	INVISIBLE
+mv_self	mv$pk0_0	INVISIBLE
+mv_self	mv$pk1_0	INVISIBLE
+SELECT TABLE_NAME, ENGINE, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME LIKE 'mv\_%' ORDER BY TABLE_NAME;
+TABLE_NAME	ENGINE	TABLE_TYPE
+mv_inner	ENGINE	BASE TABLE
+mv_left	ENGINE	BASE TABLE
+mv_right	ENGINE	BASE TABLE
+mv_self	ENGINE	BASE TABLE
+# Changes of the base tables are seen after REFRESH
+INSERT INTO cust VALUES (5, 'eve', 'eu');
+INSERT INTO ord VALUES (15, 5, 9.99, '2026-04-01'), (16, 3, 2.00, '2026-04-02');
+INSERT INTO item VALUES (15, 1, 'gear', 2), (11, 1, 'bolt', 7);
+UPDATE cust SET name = 'bobby', region = 'us' WHERE id = 2;
+UPDATE ord SET cust_id = 4 WHERE id = 13;
+DELETE FROM item WHERE ord_id = 10 AND line = 2;
+DELETE FROM ord WHERE id = 14;
+REFRESH MATERIALIZED VIEW mv_inner;
+REFRESH MATERIALIZED VIEW mv_left;
+REFRESH MATERIALIZED VIEW mv_right;
+REFRESH MATERIALIZED VIEW mv_self;
+SELECT * FROM mv_inner ORDER BY cid, oid;
+cid	name	oid	amount
+1	ann	10	15.50
+1	ann	11	4.25
+2	bobby	12	100.00
+3	cy	16	2.00
+4	NULL	13	7.00
+5	eve	15	9.99
+# mv_inner: 6 rows, 0 differ from the defining SELECT
+SELECT * FROM mv_left ORDER BY cid, oid, sku;
+cid	uname	oid	dbl	sku	qty
+1	ANN	10	31.00	nut	3
+1	ANN	11	8.50	bolt	7
+2	BOBBY	12	200.00	nut	1
+3	CY	16	4.00	NULL	0
+4	NULL	13	14.00	NULL	0
+5	EVE	15	19.98	gear	2
+# mv_left: 6 rows, 0 differ from the defining SELECT
+SELECT * FROM mv_right ORDER BY cid, oid;
+oid	placed	cid	region
+10	2026-01-01	1	eu
+11	2026-01-02	1	eu
+12	2026-02-01	2	us
+16	2026-04-02	3	us
+13	NULL	4	us
+15	2026-04-01	5	eu
+# mv_right: 6 rows, 0 differ from the defining SELECT
+SELECT * FROM mv_self ORDER BY first_id, second_id;
+first_id	second_id	region
+1	5	eu
+2	3	us
+2	4	us
+3	4	us
+# mv_self: 4 rows, 0 differ from the defining SELECT
+# REFRESH of an emptied join
+DELETE FROM ord;
+REFRESH MATERIALIZED VIEW mv_inner;
+REFRESH MATERIALIZED VIEW mv_left;
+SELECT COUNT(*) FROM mv_inner;
+COUNT(*)
+0
+SELECT * FROM mv_left ORDER BY cid;
+cid	uname	oid	dbl	sku	qty
+1	ANN	NULL	NULL	NULL	0
+2	BOBBY	NULL	NULL	NULL	0
+3	CY	NULL	NULL	NULL	0
+4	NULL	NULL	NULL	NULL	0
+5	EVE	NULL	NULL	NULL	0
+# SHOW CREATE VIEW gives a statement that makes the same view
+SHOW CREATE VIEW mv_self;
+View	Create View	character_set_client	collation_connection
+mv_self	CREATE MATERIALIZED VIEW `mv_self` (`first_id`, `second_id`, `region`) ENGINE=ENGINE REFRESH MANUAL AS select `a`.`id` AS `id`,`b`.`id` AS `id`,`a`.`region` AS `region` from (`test`.`cust` `a` join `test`.`cust` `b` on(((`a`.`region` = `b`.`region`) and (`a`.`id` < `b`.`id`))))	utf8mb4	utf8mb4_0900_ai_ci
+DROP MATERIALIZED VIEW mv_left;
+# mv_left: 5 rows, 0 differ from the defining SELECT
+SHOW CREATE VIEW mv_left;
+View	Create View	character_set_client	collation_connection
+mv_left	CREATE MATERIALIZED VIEW `mv_left` (`cid`, `uname`, `oid`, `dbl`, `sku`, `qty`) ENGINE=ENGINE REFRESH MANUAL AS select `c`.`id` AS `cid`,upper(`c`.`name`) AS `uname`,`o`.`id` AS `oid`,(`o`.`amount` * 2) AS `dbl`,`i`.`sku` AS `sku`,coalesce(`i`.`qty`,0) AS `qty` from ((`test`.`cust` `c` left join `test`.`ord` `o` on((`o`.`cust_id` = `c`.`id`))) left join `test`.`item` `i` on((`i`.`ord_id` = `o`.`id`))) where (`c`.`region` in ('eu','us'))	utf8mb4	utf8mb4_0900_ai_ci
+DROP MATERIALIZED VIEW mv_inner, mv_left, mv_right, mv_self;
+SHOW TABLES;
+Tables_in_test
+cust
+item
+ord
+DROP TABLE cust, ord, item;

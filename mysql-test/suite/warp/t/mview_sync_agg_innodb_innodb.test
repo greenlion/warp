@@ -1,0 +1,9 @@
+--echo #
+--echo # SYNCHRONOUS aggregate materialized views in InnoDB over base tables in
+--echo # InnoDB, maintained by the WARP_MVIEW daemon from the binary log
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--let $view_engine = InnoDB
+--let $base_engine = InnoDB
+--source suite/warp/include/mview_sync_agg.inc

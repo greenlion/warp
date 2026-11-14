@@ -964,6 +964,14 @@ struct TABLE_SHARE {
   bool is_view{false};
   /// Materialized view, materialized directly by a storage engine
   bool is_mv_se_materialized{false};
+
+  /**
+    The table is the storage of a materialized view (Mview_table_kind in
+    sql/sql_mview.h: 0 no, 1 the view table, 2 the binlog position table of an
+    aggregate view). Filled in
+    from the data dictionary options of the table.
+  */
+  uint8 mview_kind{0};
   bool m_open_in_progress{false}; /* True: alloc'ed, false: def opened */
   mysql::binlog::event::Table_id table_map_id; /* for row-based replication */
 

@@ -603,6 +603,13 @@ static bool fill_share_from_dd(THD *thd, TABLE_SHARE *share,
                                const dd::Table *tab_obj) {
   const dd::Properties &table_options = tab_obj->options();
 
+  // Storage of a materialized view (see sql/sql_mview.h).
+  if (table_options.exists("mview")) {
+    uint32 mview_kind = 0;
+    if (!table_options.get("mview", &mview_kind) && (mview_kind == 1 || mview_kind == 2))
+      share->mview_kind = static_cast<uint8>(mview_kind);
+  }
+
   // Secondary storage engine.
   if (table_options.exists("secondary_engine")) {
     table_options.get("secondary_engine", &share->secondary_engine,

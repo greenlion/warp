@@ -1,0 +1,9 @@
+--echo #
+--echo # SYNCHRONOUS materialized join views in InnoDB over base tables in InnoDB,
+--echo # maintained by the WARP_MVIEW daemon from the binary log
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--let $view_engine = InnoDB
+--let $base_engine = InnoDB
+--source suite/warp/include/mview_sync_join.inc

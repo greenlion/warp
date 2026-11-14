@@ -1,0 +1,81 @@
+#
+# SHOW CREATE MATERIALIZED VIEW
+#
+CREATE TABLE c (id INT PRIMARY KEY, name VARCHAR(20), region VARCHAR(10)) ENGINE=InnoDB;
+CREATE TABLE o (id INT PRIMARY KEY, c_id INT, amount INT) ENGINE=InnoDB;
+INSERT INTO c VALUES (1, 'ann', 'north'), (2, 'bob', 'south'), (3, 'cy', NULL);
+INSERT INTO o VALUES (10, 1, 15), (11, 1, 250), (12, 2, 99);
+CREATE VIEW plain_v AS SELECT id FROM c;
+CREATE MATERIALIZED VIEW mv_join ENGINE=InnoDB REFRESH MANUAL AS
+SELECT c.id AS cid, c.name, o.id AS oid, o.amount
+FROM c LEFT JOIN o ON o.c_id = c.id WHERE c.region IS NULL OR c.region <> 'east';
+CREATE MATERIALIZED VIEW mv_agg (region, orders, total) ENGINE=InnoDB AS
+SELECT c.region, COUNT(*), SUM(o.amount) FROM c JOIN o ON o.c_id = c.id GROUP BY c.region;
+CREATE MATERIALIZED VIEW mv_warp ENGINE=WARP REFRESH MANUAL AS SELECT id, amount FROM o;
+# the statement, with the engine and the refresh mode
+SHOW CREATE MATERIALIZED VIEW mv_join;
+Materialized View	Create Materialized View	character_set_client	collation_connection
+mv_join	CREATE MATERIALIZED VIEW `mv_join` (`cid`, `name`, `oid`, `amount`) ENGINE=InnoDB REFRESH MANUAL AS select `test`.`c`.`id` AS `cid`,`test`.`c`.`name` AS `name`,`test`.`o`.`id` AS `oid`,`test`.`o`.`amount` AS `amount` from (`test`.`c` left join `test`.`o` on((`test`.`o`.`c_id` = `test`.`c`.`id`))) where ((`test`.`c`.`region` is null) or (`test`.`c`.`region` <> 'east'))	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE MATERIALIZED VIEW mv_agg;
+Materialized View	Create Materialized View	character_set_client	collation_connection
+mv_agg	CREATE MATERIALIZED VIEW `mv_agg` (`region`, `orders`, `total`) ENGINE=InnoDB REFRESH SYNCHRONOUS AS select `test`.`c`.`region` AS `region`,count(0) AS `COUNT(*)`,sum(`test`.`o`.`amount`) AS `SUM(o.amount)` from (`test`.`c` join `test`.`o` on((`test`.`o`.`c_id` = `test`.`c`.`id`))) group by `test`.`c`.`region`	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE MATERIALIZED VIEW test.mv_warp;
+Materialized View	Create Materialized View	character_set_client	collation_connection
+mv_warp	CREATE MATERIALIZED VIEW `mv_warp` (`id`, `amount`) ENGINE=WARP REFRESH MANUAL AS select `test`.`o`.`id` AS `id`,`test`.`o`.`amount` AS `amount` from `test`.`o`	utf8mb4	utf8mb4_0900_ai_ci
+# the refresh mode follows ALTER
+ALTER MATERIALIZED VIEW mv_join REFRESH SYNCHRONOUS;
+SHOW CREATE MATERIALIZED VIEW mv_join;
+Materialized View	Create Materialized View	character_set_client	collation_connection
+mv_join	CREATE MATERIALIZED VIEW `mv_join` (`cid`, `name`, `oid`, `amount`) ENGINE=InnoDB REFRESH SYNCHRONOUS AS select `test`.`c`.`id` AS `cid`,`test`.`c`.`name` AS `name`,`test`.`o`.`id` AS `oid`,`test`.`o`.`amount` AS `amount` from (`test`.`c` left join `test`.`o` on((`test`.`o`.`c_id` = `test`.`c`.`id`))) where ((`test`.`c`.`region` is null) or (`test`.`c`.`region` <> 'east'))	utf8mb4	utf8mb4_0900_ai_ci
+# SHOW CREATE VIEW and SHOW CREATE TABLE still work on it
+SHOW CREATE VIEW mv_join;
+View	Create View	character_set_client	collation_connection
+mv_join	#	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE TABLE mv_join;
+Table	Create Table
+mv_join	#
+# only for materialized views
+SHOW CREATE MATERIALIZED VIEW plain_v;
+ERROR HY000: 'test.plain_v' is not a materialized view.
+SHOW CREATE MATERIALIZED VIEW c;
+ERROR HY000: 'test.c' is not a materialized view.
+SHOW CREATE MATERIALIZED VIEW no_such;
+ERROR 42S02: Table 'test.no_such' doesn't exist
+SHOW CREATE VIEW plain_v;
+View	Create View	character_set_client	collation_connection
+plain_v	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `plain_v` AS select `c`.`id` AS `id` from `c`	utf8mb4	utf8mb4_0900_ai_ci
+# the statement creates the same view again
+SELECT * FROM mv_agg ORDER BY region;
+region	orders	total
+north	2	265
+south	1	99
+DROP MATERIALIZED VIEW mv_agg;
+SELECT * FROM mv_agg ORDER BY region;
+region	orders	total
+north	2	265
+south	1	99
+SHOW CREATE MATERIALIZED VIEW mv_agg;
+Materialized View	Create Materialized View	character_set_client	collation_connection
+mv_agg	CREATE MATERIALIZED VIEW `mv_agg` (`region`, `orders`, `total`) ENGINE=InnoDB REFRESH SYNCHRONOUS AS select `test`.`c`.`region` AS `region`,count(0) AS `COUNT(*)`,sum(`test`.`o`.`amount`) AS `SUM(o.amount)` from (`test`.`c` join `test`.`o` on((`test`.`o`.`c_id` = `test`.`c`.`id`))) group by `test`.`c`.`region`	utf8mb4	utf8mb4_0900_ai_ci
+# materialized and view are still not reserved words
+CREATE TABLE materialized (view INT PRIMARY KEY, materialized INT);
+SHOW CREATE TABLE materialized;
+Table	Create Table
+materialized	CREATE TABLE `materialized` (
+  `view` int NOT NULL,
+  `materialized` int DEFAULT NULL,
+  PRIMARY KEY (`view`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP TABLE materialized;
+# in a prepared statement
+PREPARE s FROM 'SHOW CREATE MATERIALIZED VIEW mv_warp';
+EXECUTE s;
+Materialized View	Create Materialized View	character_set_client	collation_connection
+mv_warp	CREATE MATERIALIZED VIEW `mv_warp` (`id`, `amount`) ENGINE=WARP REFRESH MANUAL AS select `test`.`o`.`id` AS `id`,`test`.`o`.`amount` AS `amount` from `test`.`o`	utf8mb4	utf8mb4_0900_ai_ci
+EXECUTE s;
+Materialized View	Create Materialized View	character_set_client	collation_connection
+mv_warp	CREATE MATERIALIZED VIEW `mv_warp` (`id`, `amount`) ENGINE=WARP REFRESH MANUAL AS select `test`.`o`.`id` AS `id`,`test`.`o`.`amount` AS `amount` from `test`.`o`	utf8mb4	utf8mb4_0900_ai_ci
+DEALLOCATE PREPARE s;
+DROP MATERIALIZED VIEW mv_join, mv_agg, mv_warp;
+DROP VIEW plain_v;
+DROP TABLE c, o;

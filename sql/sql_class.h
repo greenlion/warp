@@ -2408,6 +2408,13 @@ class THD : public MDL_context_owner,
   */
   bool is_operating_substatement_implicitly;
 
+  /**
+    The session may change the tables of materialized views with ordinary
+    DML and DDL: it is the maintenance daemon, or it executes the internal
+    statements of CREATE / REFRESH / DROP MATERIALIZED VIEW (sql/mview.h).
+  */
+  bool mview_maintenance_mode{false};
+
  private:
   /**
     Stores the result of ROW_COUNT() function.

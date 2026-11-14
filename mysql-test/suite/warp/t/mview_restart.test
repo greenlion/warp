@@ -1,0 +1,77 @@
+--echo #
+--echo # Materialized views are there after a restart of the server
+--echo #
+--source include/have_log_bin.inc
+call mtr.add_suppression("MY-015655");
+
+CREATE TABLE t1 (id INT PRIMARY KEY, g INT, v DECIMAL(10,2), s VARCHAR(10))
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, w INT);
+INSERT INTO t1 VALUES (1, 1, 1.50, 'a'), (2, 1, 2.50, 'b'), (3, 2, NULL, 'c');
+INSERT INTO t2 VALUES (1, 1, 10), (2, 1, 20), (3, 3, 30);
+
+CREATE MATERIALIZED VIEW mj_i ENGINE=InnoDB REFRESH MANUAL AS
+  SELECT t1.id, t1.s, t2.w FROM t1 LEFT JOIN t2 ON t2.t1_id = t1.id;
+CREATE MATERIALIZED VIEW mj_w ENGINE=WARP REFRESH SYNCHRONOUS AS
+  SELECT t1.id, t1.s, t2.w FROM t1 LEFT JOIN t2 ON t2.t1_id = t1.id;
+CREATE MATERIALIZED VIEW ma_i ENGINE=InnoDB REFRESH MANUAL AS
+  SELECT g, COUNT(*) AS c, SUM(v) AS sv, AVG(v) AS av, MAX(s) AS ms
+  FROM t1 GROUP BY g;
+CREATE MATERIALIZED VIEW ma_w ENGINE=WARP REFRESH MANUAL AS
+  SELECT g, COUNT(*) AS c, SUM(v) AS sv, AVG(v) AS av, MAX(s) AS ms
+  FROM t1 GROUP BY g;
+
+SELECT * FROM mj_i ORDER BY id, w;
+SELECT * FROM mj_w ORDER BY id, w;
+SELECT * FROM ma_i ORDER BY g;
+SELECT * FROM ma_w ORDER BY g;
+
+--source include/restart_mysqld.inc
+
+--echo # The contents
+SELECT * FROM mj_i ORDER BY id, w;
+SELECT * FROM mj_w ORDER BY id, w;
+SELECT * FROM ma_i ORDER BY g;
+SELECT * FROM ma_w ORDER BY g;
+SELECT COUNT(*), MIN(binlog_pos > 4) FROM `ma_i$mv_state`;
+SELECT COUNT(*), MIN(binlog_pos > 4) FROM `ma_w$mv_state`;
+--echo # The definitions
+SHOW CREATE VIEW mj_i;
+SHOW CREATE VIEW mj_w;
+SHOW CREATE VIEW ma_i;
+SHOW CREATE VIEW ma_w;
+--echo # The guard
+--error ER_MVIEW_IS_READ_ONLY
+DELETE FROM mj_i;
+--error ER_MVIEW_IS_READ_ONLY
+DELETE FROM mj_w;
+--error ER_MVIEW_IS_READ_ONLY
+UPDATE ma_i SET `mv$count` = 0;
+--error ER_MVIEW_IS_READ_ONLY
+DELETE FROM `ma_w$mv_state`;
+--error ER_MVIEW_USE_DROP_MVIEW
+DROP VIEW ma_w;
+--echo # REFRESH and ALTER
+INSERT INTO t1 VALUES (4, 2, 4.00, 'd');
+INSERT INTO t2 VALUES (4, 4, 40);
+REFRESH MATERIALIZED VIEW mj_i;
+REFRESH MATERIALIZED VIEW mj_w;
+REFRESH MATERIALIZED VIEW ma_i;
+REFRESH MATERIALIZED VIEW ma_w;
+ALTER MATERIALIZED VIEW mj_w REFRESH MANUAL;
+ALTER MATERIALIZED VIEW ma_w REFRESH SYNCHRONOUS;
+SELECT * FROM mj_i ORDER BY id, w;
+SELECT * FROM mj_w ORDER BY id, w;
+SELECT * FROM ma_i ORDER BY g;
+SELECT * FROM ma_w ORDER BY g;
+
+--source include/restart_mysqld.inc
+
+SELECT * FROM mj_w ORDER BY id, w;
+SELECT * FROM ma_w ORDER BY g;
+SHOW CREATE VIEW mj_w;
+SHOW CREATE VIEW ma_w;
+
+DROP MATERIALIZED VIEW mj_i, mj_w, ma_i, ma_w;
+SHOW TABLES;
+DROP TABLE t1, t2;

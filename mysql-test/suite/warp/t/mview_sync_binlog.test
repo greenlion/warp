@@ -1,0 +1,161 @@
+--echo #
+--echo # WARP_MVIEW daemon and the forms of the binary log: rotation,
+--echo # compressed transactions, binlog_row_image, partial JSON updates,
+--echo # XA transactions
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+
+call mtr.add_suppression("WARP_MVIEW");
+
+CREATE TABLE a (pad1 VARCHAR(10), id INT NOT NULL, j JSON, v INT, t TEXT, id2 CHAR(3) NOT NULL, f FLOAT, bits BIT(10), PRIMARY KEY (id, id2)) ENGINE=InnoDB;
+CREATE TABLE b (id INT PRIMARY KEY, a_id INT, a_id2 CHAR(3), w INT) ENGINE=InnoDB;
+INSERT INTO a VALUES ('p', 1, '{"k": 1, "pad": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}', 10, 'text one', 'aa', 1.5, b'101'), ('q', 2, NULL, 20, NULL, 'bb', NULL, NULL), (NULL, 3, '[1, 2, 3]', 30, REPEAT('long ', 1000), 'cc', -0.25, b'1111111111');
+INSERT INTO b VALUES (1, 1, 'aa', 100), (2, 1, 'aa', 200), (3, 2, 'bb', 300);
+
+--let $mview_select = SELECT a.id, a.id2, a.v, JSON_EXTRACT(a.j, '$.k') AS k, LENGTH(a.t) AS tl, b.id AS bid, b.w FROM a LEFT JOIN b ON b.a_id = a.id AND b.a_id2 = a.id2
+eval CREATE MATERIALIZED VIEW mv_i ENGINE=InnoDB AS $mview_select;
+eval CREATE MATERIALIZED VIEW mv_w ENGINE=InnoDB AS $mview_select;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+
+--echo #
+--echo # Rotation of the binary log, also in the middle of the work
+--echo #
+INSERT INTO b VALUES (4, 3, 'cc', 400);
+FLUSH BINARY LOGS;
+UPDATE a SET v = v + 1;
+FLUSH BINARY LOGS;
+FLUSH BINARY LOGS;
+DELETE FROM b WHERE id = 1;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+--echo # while the daemon is paused
+SET GLOBAL warp_mview_enabled = OFF;
+--let $mview_state = paused
+--source suite/warp/include/mview_sync_state.inc
+INSERT INTO a (id, id2, v) VALUES (4, 'dd', 40);
+FLUSH BINARY LOGS;
+INSERT INTO b VALUES (5, 4, 'dd', 500);
+FLUSH BINARY LOGS;
+UPDATE b SET w = w + 1;
+SET GLOBAL warp_mview_enabled = ON;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+
+--echo #
+--echo # binlog_transaction_compression
+--echo #
+SET SESSION binlog_transaction_compression = ON;
+BEGIN;
+INSERT INTO a (id, id2, v, t) VALUES (5, 'ee', 50, REPEAT('compress me ', 500));
+INSERT INTO b VALUES (6, 5, 'ee', 600), (7, 5, 'ee', 700);
+UPDATE a SET v = v + 1 WHERE id <= 2;
+COMMIT;
+DELETE FROM b WHERE id = 2;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+SET SESSION binlog_transaction_compression = OFF;
+
+--echo #
+--echo # binlog_row_image = MINIMAL and NOBLOB: the after image has the key
+--echo # only when it changes
+--echo #
+SET SESSION binlog_row_image = MINIMAL;
+UPDATE a SET v = v + 100 WHERE id = 1;
+UPDATE b SET w = w + 100 WHERE id = 3;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+UPDATE a SET id = 11 WHERE id = 1;
+UPDATE a SET id2 = 'zz', v = 0 WHERE id = 2;
+UPDATE b SET a_id = 11 WHERE a_id = 1;
+UPDATE b SET id = 33 WHERE id = 3;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+INSERT INTO a (id, id2, v) VALUES (6, 'ff', 60);
+DELETE FROM a WHERE id = 4;
+DELETE FROM b WHERE id = 5;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+SET SESSION binlog_row_image = NOBLOB;
+UPDATE a SET t = 'short', v = v + 1 WHERE id = 3;
+UPDATE a SET id = 12 WHERE id = 3;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+SET SESSION binlog_row_image = FULL;
+
+--echo #
+--echo # Partial JSON updates (PARTIAL_UPDATE_ROWS events)
+--echo #
+SET SESSION binlog_row_value_options = PARTIAL_JSON;
+UPDATE a SET j = JSON_SET(j, '$.k', 2), v = v + 1 WHERE id = 11;
+UPDATE a SET j = JSON_REPLACE(j, '$.k', 3) WHERE id = 11;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+SET SESSION binlog_row_image = MINIMAL;
+UPDATE a SET j = JSON_SET(j, '$.k', 4) WHERE id = 11;
+UPDATE a SET j = JSON_SET(j, '$.k', 5), id2 = 'ab' WHERE id = 11;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+SET SESSION binlog_row_image = FULL;
+SET SESSION binlog_row_value_options = '';
+
+--echo #
+--echo # XA transactions: applied at XA COMMIT, not at all after XA ROLLBACK
+--echo #
+XA START 'x1';
+INSERT INTO a (id, id2, v) VALUES (70, 'xa', 700);
+XA END 'x1';
+XA PREPARE 'x1';
+XA COMMIT 'x1';
+XA START 'x2';
+INSERT INTO a (id, id2, v) VALUES (71, 'xa', 710);
+XA END 'x2';
+XA PREPARE 'x2';
+XA ROLLBACK 'x2';
+XA START 'x3';
+UPDATE a SET v = v + 1 WHERE id = 70;
+XA END 'x3';
+XA COMMIT 'x3' ONE PHASE;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+
+--echo #
+--echo # A change logged as a statement: the views are refreshed
+--echo #
+SET SESSION binlog_format = STATEMENT;
+UPDATE a SET v = v + 1000 WHERE id = 70;
+SET SESSION binlog_format = ROW;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+
+SELECT * FROM mv_i ORDER BY id, id2, bid;
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+
+DROP MATERIALIZED VIEW mv_i;
+DROP MATERIALIZED VIEW mv_w;
+DROP TABLE a, b;

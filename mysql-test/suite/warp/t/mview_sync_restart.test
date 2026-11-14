@@ -1,0 +1,118 @@
+--echo #
+--echo # WARP_MVIEW daemon: it continues from its saved binary log position
+--echo # after a restart and after a crash of the server
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+# kill_mysqld.inc
+--source include/not_valgrind.inc
+--source include/not_crashrep.inc
+
+call mtr.add_suppression("WARP_MVIEW");
+call mtr.add_suppression("WARP: recovery cuts the partition");
+
+CREATE TABLE a (id INT PRIMARY KEY, v INT, s VARCHAR(20)) ENGINE=InnoDB;
+CREATE TABLE b (id INT PRIMARY KEY, a_id INT, w INT) ENGINE=InnoDB;
+INSERT INTO a VALUES (1, 10, 'one'), (2, 20, 'two'), (3, 30, 'three');
+INSERT INTO b VALUES (1, 1, 100), (2, 1, 200), (3, 2, 300);
+
+--let $mview_select = SELECT a.id, a.v, a.s, b.id AS bid, b.w FROM a LEFT JOIN b ON b.a_id = a.id
+eval CREATE MATERIALIZED VIEW mv_i ENGINE=InnoDB AS $mview_select;
+eval CREATE MATERIALIZED VIEW mv_w ENGINE=InnoDB AS $mview_select;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+--source suite/warp/include/mview_sync_wait.inc
+--let $refreshes = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes'`
+
+--echo #
+--echo # Changes that the daemon has not applied when the server is shut down
+--echo # are applied after the restart, without a refresh
+--echo #
+SET GLOBAL warp_mview_enabled = OFF;
+--let $mview_state = paused
+--source suite/warp/include/mview_sync_state.inc
+INSERT INTO a VALUES (4, 40, 'four');
+UPDATE b SET a_id = 4 WHERE id = 3;
+DELETE FROM a WHERE id = 1;
+FLUSH BINARY LOGS;
+UPDATE a SET id = 22 WHERE id = 2;
+SELECT COUNT(*) AS not_applied_yet FROM mv_i WHERE id IN (1, 2);
+--source include/restart_mysqld.inc
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+--echo # the restarted daemon did not need to refresh the views
+SELECT VARIABLE_VALUE AS full_refreshes FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes';
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+
+--echo #
+--echo # Changes made right before a restart
+--echo #
+INSERT INTO b VALUES (5, 22, 500), (6, 22, 600);
+UPDATE a SET v = v + 1;
+--source include/restart_mysqld.inc
+INSERT INTO a VALUES (5, 50, 'five');
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+
+--echo #
+--echo # Crash: the transactions that are in the binary log are applied
+--echo # (again) after the server has recovered
+--echo #
+SET GLOBAL warp_mview_enabled = OFF;
+--let $mview_state = paused
+--source suite/warp/include/mview_sync_state.inc
+INSERT INTO a VALUES (6, 60, 'six'), (7, 70, 'seven');
+INSERT INTO b VALUES (7, 6, 700);
+DELETE FROM b WHERE id = 5;
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+
+--echo # Crash while the daemon is working
+--disable_query_log
+INSERT INTO a WITH RECURSIVE n(x) AS (SELECT 100 UNION ALL SELECT x + 1 FROM n WHERE x < 599) SELECT x, x, CONCAT('n', x) FROM n;
+INSERT INTO b WITH RECURSIVE n(x) AS (SELECT 100 UNION ALL SELECT x + 1 FROM n WHERE x < 599) SELECT x, x, x FROM n;
+UPDATE a SET v = v + 1 WHERE id >= 100;
+--enable_query_log
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+DELETE FROM b WHERE id BETWEEN 200 AND 299;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+
+--echo #
+--echo # The saved position is lost (RESET BINARY LOGS AND GTIDS while the
+--echo # daemon is paused): everything is refreshed, then maintained again
+--echo #
+SET GLOBAL warp_mview_enabled = OFF;
+--let $mview_state = paused
+--source suite/warp/include/mview_sync_state.inc
+INSERT INTO a VALUES (8, 80, 'eight');
+RESET BINARY LOGS AND GTIDS;
+INSERT INTO b VALUES (8, 8, 800);
+SET GLOBAL warp_mview_enabled = ON;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+UPDATE a SET v = 0 WHERE id = 8;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+
+DROP MATERIALIZED VIEW mv_i;
+DROP MATERIALIZED VIEW mv_w;
+DROP TABLE a, b;

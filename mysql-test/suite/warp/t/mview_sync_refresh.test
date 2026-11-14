@@ -1,0 +1,160 @@
+--echo #
+--echo # WARP_MVIEW daemon: full refreshes, DDL on base tables, stale views,
+--echo # REFRESH MANUAL views, pause and resume
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+
+call mtr.add_suppression("WARP_MVIEW");
+call mtr.add_suppression("Materialized view .* is skipped");
+
+SELECT PLUGIN_NAME, PLUGIN_STATUS, PLUGIN_TYPE FROM information_schema.plugins WHERE PLUGIN_NAME = 'WARP_MVIEW';
+SHOW GLOBAL VARIABLES LIKE 'warp_mview%';
+
+CREATE TABLE a (id INT PRIMARY KEY, v INT, s VARCHAR(20)) ENGINE=InnoDB;
+CREATE TABLE b (id INT PRIMARY KEY, a_id INT, w INT) ENGINE=InnoDB;
+INSERT INTO a VALUES (1, 10, 'one'), (2, 20, 'two'), (3, 30, 'three');
+INSERT INTO b VALUES (1, 1, 100), (2, 1, 200), (3, 2, 300);
+
+--let $sel = SELECT a.id, a.v, a.s, b.id AS bid, b.w FROM a LEFT JOIN b ON b.a_id = a.id
+eval CREATE MATERIALIZED VIEW mv_i ENGINE=InnoDB AS $sel;
+eval CREATE MATERIALIZED VIEW mv_w ENGINE=InnoDB AS $sel;
+eval CREATE MATERIALIZED VIEW mv_m ENGINE=InnoDB REFRESH MANUAL AS $sel;
+--let $mview_select = $sel
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+
+--echo # The views cannot be changed by users
+--error ER_MVIEW_IS_READ_ONLY
+INSERT INTO mv_i (id) VALUES (99);
+--error ER_MVIEW_IS_READ_ONLY
+DELETE FROM mv_w;
+
+--echo #
+--echo # A REFRESH MANUAL view is not maintained
+--echo #
+INSERT INTO a VALUES (4, 40, 'four');
+UPDATE b SET w = w + 1;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+--source suite/warp/include/mview_sync_wait.inc
+SELECT COUNT(*) AS manual_rows, SUM(w) AS manual_w FROM mv_m;
+--echo # ... until it is changed to SYNCHRONOUS: the daemon refreshes it once
+--echo # and maintains it from then on
+ALTER MATERIALIZED VIEW mv_m REFRESH SYNCHRONOUS;
+--let $mview = mv_m
+--source suite/warp/include/mview_sync_check.inc
+INSERT INTO b VALUES (4, 4, 400);
+--source suite/warp/include/mview_sync_check.inc
+ALTER MATERIALIZED VIEW mv_m REFRESH MANUAL;
+--source suite/warp/include/mview_sync_wait.inc
+DELETE FROM b WHERE id = 4;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--source suite/warp/include/mview_sync_wait.inc
+SELECT COUNT(*) AS manual_has_b4 FROM mv_m WHERE bid = 4;
+
+--echo #
+--echo # More changed keys than warp_mview_full_refresh_threshold: the views
+--echo # are rebuilt
+--echo #
+--let $refreshes = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes'`
+SET GLOBAL warp_mview_full_refresh_threshold = 10;
+SET GLOBAL warp_mview_in_list_chunk_size = 3;
+--disable_query_log
+INSERT INTO a WITH RECURSIVE n(x) AS (SELECT 100 UNION ALL SELECT x + 1 FROM n WHERE x < 199) SELECT x, x, CONCAT('n', x) FROM n;
+--enable_query_log
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+--disable_query_log
+eval SELECT VARIABLE_VALUE - $refreshes >= 2 AS views_were_refreshed FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes';
+--enable_query_log
+--echo # below the threshold, with several IN lists per statement
+UPDATE a SET v = v + 1 WHERE id BETWEEN 100 AND 104;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+SET GLOBAL warp_mview_full_refresh_threshold = DEFAULT;
+SET GLOBAL warp_mview_in_list_chunk_size = DEFAULT;
+
+--echo #
+--echo # Pause and resume
+--echo #
+SET GLOBAL warp_mview_enabled = OFF;
+--let $mview_state = paused
+--source suite/warp/include/mview_sync_state.inc
+DELETE FROM a WHERE id >= 100;
+INSERT INTO b VALUES (10, 3, 1000);
+--echo # not applied while paused
+SELECT COUNT(*) AS rows_of_deleted_a FROM mv_i WHERE id >= 100;
+SELECT COUNT(*) AS rows_of_new_b FROM mv_w WHERE bid = 10;
+SET GLOBAL warp_mview_enabled = ON;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+
+--echo #
+--echo # TRUNCATE and ALTER of a base table: the views are refreshed
+--echo #
+TRUNCATE TABLE b;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+INSERT INTO b VALUES (1, 1, 100), (2, 2, 200);
+--source suite/warp/include/mview_sync_check.inc
+--echo # a column before the primary key moves its position in the row events
+ALTER TABLE a ADD COLUMN pre INT FIRST, MODIFY s VARCHAR(40);
+UPDATE a SET v = v * 2, s = CONCAT(s, ' after alter');
+INSERT INTO a (id, v, s) VALUES (50, 500, 'fifty');
+INSERT INTO b VALUES (3, 50, 300);
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+
+--echo #
+--echo # DROP of a base table: the views become stale, the server keeps running
+--echo #
+DROP TABLE b;
+--let $wait_condition = SELECT VARIABLE_VALUE = 2 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views'
+--source include/wait_condition.inc
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+SELECT VARIABLE_VALUE AS stale_view_list FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_view_list';
+INSERT INTO a (id, v, s) VALUES (60, 600, 'sixty');
+--source suite/warp/include/mview_sync_wait.inc
+SELECT 1 AS server_is_alive;
+
+--echo # The table comes back and the user refreshes: maintained again
+CREATE TABLE b (id INT PRIMARY KEY, a_id INT, w INT) ENGINE=InnoDB;
+INSERT INTO b VALUES (7, 60, 700);
+REFRESH MATERIALIZED VIEW mv_i;
+REFRESH MATERIALIZED VIEW mv_w;
+--let $wait_condition = SELECT VARIABLE_VALUE = 0 FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views'
+--source include/wait_condition.inc
+INSERT INTO b VALUES (8, 1, 800);
+UPDATE a SET v = -1 WHERE id = 60;
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = mv_w
+--source suite/warp/include/mview_sync_check.inc
+
+--echo # A dropped view is forgotten
+DROP MATERIALIZED VIEW mv_w;
+INSERT INTO b VALUES (9, 2, 900);
+--let $mview = mv_i
+--source suite/warp/include/mview_sync_check.inc
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+
+DROP MATERIALIZED VIEW mv_i;
+DROP MATERIALIZED VIEW mv_m;
+DROP TABLE a, b;

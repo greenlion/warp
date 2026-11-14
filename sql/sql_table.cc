@@ -176,6 +176,7 @@
 #include "sql/sql_handler.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_list.h"
+#include "sql/sql_mview.h"
 #include "sql/sql_masking_policy.h"
 #include "sql/sql_parse.h"  // test_if_data_home_dir
 #include "sql/sql_partition.h"
@@ -2215,6 +2216,13 @@ static bool rm_table_sort_into_groups(THD *thd, Drop_tables_ctx *drop_ctx,
     else if (abstract_table_def->type() == dd::enum_table_type::BASE_TABLE) {
       const dd::Table *table_def =
           dynamic_cast<const dd::Table *>(abstract_table_def);
+
+      /* The table of a materialized view goes with the view (or with its
+         database). */
+      if (!drop_ctx->drop_database &&
+          mview_check_table_change(thd, table->db, table->table_name,
+                                   abstract_table_def))
+        return true;
 
       handlerton *hton{nullptr};
       if (dd::table_storage_engine(thd, table_def, &hton)) return true;
@@ -17439,6 +17447,13 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
   DEBUG_SYNC(thd, "alter_opened_table");
 
   if (error) return true;
+
+  /* The table of a materialized view is changed by its statements only. */
+  if (table_list->table != nullptr &&
+      mview_check_table_change(
+          thd, table_list->db, table_list->table_name,
+          static_cast<Mview_table_kind>(table_list->table->s->mview_kind)))
+    return true;
 
   // If we are removing a functional index, add any related hidden generated
   // columns to the drop list as well.

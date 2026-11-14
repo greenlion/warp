@@ -1,0 +1,547 @@
+#
+# Materialized views: syntax, checks of the definition, the guard of
+# the tables, privileges
+#
+call mtr.add_suppression("MY-015655");
+# REFRESH and SYNCHRONOUS are not reserved words
+CREATE TABLE refresh (refresh INT PRIMARY KEY, synchronous INT, manual INT,
+materialized INT);
+INSERT INTO refresh VALUES (1, 2, 3, 4);
+SELECT refresh, synchronous, manual, materialized FROM refresh AS synchronous;
+refresh	synchronous	manual	materialized
+1	2	3	4
+CREATE TABLE synchronous (id INT PRIMARY KEY, refresh INT);
+DROP TABLE refresh, synchronous;
+CREATE TABLE t1 (id INT PRIMARY KEY, a INT, name VARCHAR(20));
+CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, b DECIMAL(10,2));
+CREATE TABLE nopk (id INT, a INT);
+CREATE TABLE uniq (id INT NOT NULL UNIQUE, a INT);
+INSERT INTO t1 VALUES (1, 10, 'one'), (2, 20, 'two'), (3, 30, NULL);
+INSERT INTO t2 VALUES (1, 1, 1.50), (2, 1, 2.50), (3, 9, 3.50);
+CREATE VIEW plain_v AS SELECT id, a FROM t1;
+CREATE TEMPORARY TABLE tmp (id INT PRIMARY KEY, a INT);
+CREATE FUNCTION f1(x INT) RETURNS INT DETERMINISTIC RETURN x + 1;
+#
+# Syntax
+#
+CREATE MATERIALIZED VIEW mv1 AS SELECT id, a FROM t1;
+# The default is the default engine and REFRESH SYNCHRONOUS
+SHOW CREATE VIEW mv1;
+View	Create View	character_set_client	collation_connection
+mv1	CREATE MATERIALIZED VIEW `mv1` (`id`, `a`) ENGINE=InnoDB REFRESH SYNCHRONOUS AS select `test`.`t1`.`id` AS `id`,`test`.`t1`.`a` AS `a` from `test`.`t1`	utf8mb4	utf8mb4_0900_ai_ci
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv1 AS SELECT id FROM t1;
+Warnings:
+Note	1050	Table 'mv1' already exists
+CREATE MATERIALIZED VIEW mv1 AS SELECT id FROM t1;
+ERROR 42S01: Table 'mv1' already exists
+CREATE MATERIALIZED VIEW t2 AS SELECT id FROM t1;
+ERROR 42S01: Table 't2' already exists
+CREATE MATERIALIZED VIEW test.mv2 (x, y) ENGINE = InnoDB REFRESH MANUAL
+AS SELECT id, name FROM t1 WHERE a > 10;
+CREATE MATERIALIZED VIEW mv3 ENGINE WARP REFRESH SYNCHRONOUS
+AS SELECT t1.id, t2.b FROM t1 JOIN t2 ON t2.t1_id = t1.id;
+CREATE MATERIALIZED VIEW mv4 REFRESH MANUAL AS SELECT id FROM t1;
+SHOW CREATE VIEW mv2;
+View	Create View	character_set_client	collation_connection
+mv2	CREATE MATERIALIZED VIEW `mv2` (`x`, `y`) ENGINE=InnoDB REFRESH MANUAL AS select `test`.`t1`.`id` AS `id`,`test`.`t1`.`name` AS `name` from `test`.`t1` where (`test`.`t1`.`a` > 10)	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW mv3;
+View	Create View	character_set_client	collation_connection
+mv3	CREATE MATERIALIZED VIEW `mv3` (`id`, `b`) ENGINE=WARP REFRESH SYNCHRONOUS AS select `test`.`t1`.`id` AS `id`,`test`.`t2`.`b` AS `b` from (`test`.`t1` join `test`.`t2` on((`test`.`t2`.`t1_id` = `test`.`t1`.`id`)))	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW mv4;
+View	Create View	character_set_client	collation_connection
+mv4	CREATE MATERIALIZED VIEW `mv4` (`id`) ENGINE=InnoDB REFRESH MANUAL AS select `test`.`t1`.`id` AS `id` from `test`.`t1`	utf8mb4	utf8mb4_0900_ai_ci
+SELECT * FROM mv2 ORDER BY x;
+x	y
+2	two
+3	NULL
+SELECT * FROM mv3 ORDER BY id, b;
+id	b
+1	1.50
+1	2.50
+# A materialized view is a table, with invisible columns
+SHOW CREATE TABLE mv3;
+Table	Create Table
+mv3	CREATE TABLE `mv3` (
+  `id` int DEFAULT NULL,
+  `b` decimal(10,2) DEFAULT NULL,
+  `mv$pk0_0` int DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$pk1_0` int DEFAULT NULL /*!80023 INVISIBLE */,
+  KEY `mv$ix_pk0` (`mv$pk0_0`),
+  KEY `mv$ix_pk1` (`mv$pk1_0`)
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+SELECT TABLE_NAME, TABLE_TYPE, ENGINE FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME LIKE 'mv_' ORDER BY TABLE_NAME;
+TABLE_NAME	TABLE_TYPE	ENGINE
+mv1	BASE TABLE	InnoDB
+mv2	BASE TABLE	InnoDB
+mv3	BASE TABLE	WARP
+mv4	BASE TABLE	InnoDB
+# The default engine
+SET default_storage_engine = WARP;
+CREATE MATERIALIZED VIEW mv5 AS SELECT id, name FROM t1;
+SET default_storage_engine = DEFAULT;
+CREATE MATERIALIZED VIEW mv6 AS SELECT id, name FROM t1;
+SELECT TABLE_NAME, ENGINE FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME IN ('mv5', 'mv6') ORDER BY TABLE_NAME;
+TABLE_NAME	ENGINE
+mv5	WARP
+mv6	InnoDB
+# The strings of a WARP table have a collation that WARP stores
+SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME IN ('mv5', 'mv6')
+AND COLUMN_NAME = 'name' ORDER BY TABLE_NAME;
+TABLE_NAME	COLUMN_NAME	COLLATION_NAME
+mv5	name	utf8mb4_bin
+mv6	name	utf8mb4_0900_ai_ci
+SELECT * FROM mv5 ORDER BY id;
+id	name
+1	one
+2	two
+3	NULL
+CREATE MATERIALIZED VIEW mv7 ENGINE=no_such_engine AS SELECT id FROM t1;
+ERROR 42000: Unknown storage engine 'no_such_engine'
+# Clauses of views that a materialized view does not have
+CREATE OR REPLACE MATERIALIZED VIEW mv1 AS SELECT id FROM t1;
+ERROR HY000: Materialized views do not support the OR REPLACE clause.
+CREATE ALGORITHM=MERGE MATERIALIZED VIEW mv7 AS SELECT id FROM t1;
+ERROR HY000: Materialized views do not support the ALGORITHM clause.
+CREATE MATERIALIZED DEFINER=root@localhost VIEW mv7 AS SELECT id FROM t1;
+ERROR HY000: Materialized views do not support the DEFINER clause.
+CREATE MATERIALIZED SQL SECURITY INVOKER VIEW mv7 AS SELECT id FROM t1;
+ERROR HY000: Materialized views do not support the SQL SECURITY clause.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1 WITH CHECK OPTION;
+ERROR HY000: Materialized views do not support the WITH CHECK OPTION clause.
+ALTER MATERIALIZED VIEW mv1 AS SELECT id FROM t1;
+ERROR HY000: Changing the definition of a materialized view is not supported, drop and re-create the materialized view.
+CREATE VIEW v7 ENGINE=InnoDB AS SELECT id FROM t1;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'AS SELECT id FROM t1' at line 1
+CREATE VIEW v7 REFRESH MANUAL AS SELECT id FROM t1;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'AS SELECT id FROM t1' at line 1
+ALTER VIEW plain_v REFRESH MANUAL;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1
+ALTER MATERIALIZED VIEW mv1;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1
+ALTER MATERIALIZED VIEW mv1 ENGINE=InnoDB REFRESH MANUAL;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1
+REFRESH MATERIALIZED VIEW;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1
+REFRESH VIEW mv1;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'VIEW mv1' at line 1
+# Plain views are as they were
+CREATE OR REPLACE ALGORITHM=MERGE VIEW plain_v AS SELECT id, a, name FROM t1;
+ALTER VIEW plain_v AS SELECT id, name FROM t1;
+SHOW CREATE VIEW plain_v;
+View	Create View	character_set_client	collation_connection
+plain_v	CREATE ALGORITHM=MERGE DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `plain_v` AS select `t1`.`id` AS `id`,`t1`.`name` AS `name` from `t1`	utf8mb4	utf8mb4_0900_ai_ci
+SELECT * FROM plain_v ORDER BY id;
+id	name
+1	one
+2	two
+3	NULL
+#
+# ALTER MATERIALIZED VIEW ... REFRESH
+#
+ALTER MATERIALIZED VIEW mv1 REFRESH MANUAL;
+SHOW CREATE VIEW mv1;
+View	Create View	character_set_client	collation_connection
+mv1	CREATE MATERIALIZED VIEW `mv1` (`id`, `a`) ENGINE=InnoDB REFRESH MANUAL AS select `test`.`t1`.`id` AS `id`,`test`.`t1`.`a` AS `a` from `test`.`t1`	utf8mb4	utf8mb4_0900_ai_ci
+ALTER MATERIALIZED VIEW test.mv1 REFRESH SYNCHRONOUS;
+SHOW CREATE VIEW mv1;
+View	Create View	character_set_client	collation_connection
+mv1	CREATE MATERIALIZED VIEW `mv1` (`id`, `a`) ENGINE=InnoDB REFRESH SYNCHRONOUS AS select `test`.`t1`.`id` AS `id`,`test`.`t1`.`a` AS `a` from `test`.`t1`	utf8mb4	utf8mb4_0900_ai_ci
+ALTER MATERIALIZED VIEW t1 REFRESH MANUAL;
+ERROR HY000: 'test.t1' is not a materialized view.
+ALTER MATERIALIZED VIEW plain_v REFRESH MANUAL;
+ERROR HY000: 'test.plain_v' is not a materialized view.
+ALTER MATERIALIZED VIEW no_such REFRESH MANUAL;
+ERROR HY000: 'test.no_such' is not a materialized view.
+REFRESH MATERIALIZED VIEW t1;
+ERROR HY000: 'test.t1' is not a materialized view.
+REFRESH MATERIALIZED VIEW plain_v;
+ERROR HY000: 'test.plain_v' is not a materialized view.
+REFRESH MATERIALIZED VIEW no_such;
+ERROR HY000: 'test.no_such' is not a materialized view.
+#
+# Definitions that are not supported
+#
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1 UNION SELECT id FROM t2;
+ERROR HY000: The definition of the materialized view is not supported: set operations (UNION, INTERSECT, EXCEPT).
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1 INTERSECT SELECT id FROM t2;
+ERROR HY000: The definition of the materialized view is not supported: set operations (UNION, INTERSECT, EXCEPT).
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1 EXCEPT SELECT id FROM t2;
+ERROR HY000: The definition of the materialized view is not supported: set operations (UNION, INTERSECT, EXCEPT).
+CREATE MATERIALIZED VIEW mv7 AS
+SELECT id FROM t1 WHERE id IN (SELECT t1_id FROM t2);
+ERROR HY000: The definition of the materialized view is not supported: subqueries.
+CREATE MATERIALIZED VIEW mv7 AS
+SELECT id, (SELECT MAX(b) FROM t2) AS m FROM t1;
+ERROR HY000: The definition of the materialized view is not supported: subqueries.
+CREATE MATERIALIZED VIEW mv7 AS
+SELECT t1.id FROM t1 JOIN t2 ON t2.t1_id = t1.id AND EXISTS (SELECT 1 FROM t2);
+ERROR HY000: The definition of the materialized view is not supported: subqueries.
+CREATE MATERIALIZED VIEW mv7 AS SELECT d.id FROM (SELECT id FROM t1) AS d;
+ERROR HY000: The definition of the materialized view is not supported: derived tables.
+CREATE MATERIALIZED VIEW mv7 AS
+WITH c AS (SELECT id FROM t1) SELECT id FROM c;
+ERROR HY000: The definition of the materialized view is not supported: common table expressions.
+CREATE MATERIALIZED VIEW mv7 AS
+SELECT j.x FROM t1, JSON_TABLE('[1]', '$[*]' COLUMNS (x INT PATH '$')) AS j;
+ERROR HY000: The definition of the materialized view is not supported: table functions.
+CREATE MATERIALIZED VIEW mv7 AS SELECT 1 AS one;
+ERROR HY000: The definition of the materialized view is not supported: the SELECT has no tables.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1 LIMIT 2;
+ERROR HY000: The definition of the materialized view is not supported: LIMIT.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1 ORDER BY id;
+ERROR HY000: The definition of the materialized view is not supported: ORDER BY.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1 FOR UPDATE;
+ERROR HY000: The definition of the materialized view is not supported: locking clauses (FOR UPDATE, FOR SHARE).
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1 FOR SHARE;
+ERROR HY000: The definition of the materialized view is not supported: locking clauses (FOR UPDATE, FOR SHARE).
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1 FORCE INDEX (PRIMARY);
+ERROR HY000: The definition of the materialized view is not supported: index hints.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id INTO @x FROM t1;
+ERROR HY000: View's SELECT contains a 'INTO' clause
+CREATE MATERIALIZED VIEW mv7 AS
+SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM t1;
+ERROR HY000: The definition of the materialized view is not supported: window functions.
+# Functions that do not give the same value every time
+CREATE MATERIALIZED VIEW mv7 AS SELECT id, RAND() AS r FROM t1;
+ERROR HY000: The definition of the materialized view is not supported: function 'rand' is not deterministic or depends on the session.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1 WHERE a < UNIX_TIMESTAMP();
+ERROR HY000: The definition of the materialized view is not supported: function 'unix_timestamp' is not deterministic or depends on the session.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id, NOW() AS n FROM t1;
+ERROR HY000: The definition of the materialized view is not supported: function 'now' is not deterministic or depends on the session.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id, UUID() AS u FROM t1;
+ERROR HY000: The definition of the materialized view is not supported: function 'uuid' is not deterministic or depends on the session.
+CREATE MATERIALIZED VIEW mv7 AS
+SELECT t1.id FROM t1 JOIN t2 ON t2.t1_id = t1.id AND t2.b > RAND();
+ERROR HY000: The definition of the materialized view is not supported: function 'rand' is not deterministic or depends on the session.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id, CURRENT_USER() AS u FROM t1;
+ERROR HY000: The definition of the materialized view is not supported: function 'current_user' is not deterministic or depends on the session.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id, f1(a) AS f FROM t1;
+ERROR HY000: The definition of the materialized view is not supported: stored functions.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id, @uv AS v FROM t1;
+ERROR HY000: View's SELECT contains a variable or parameter
+CREATE MATERIALIZED VIEW mv7 AS SELECT id, @@sort_buffer_size AS v FROM t1;
+ERROR HY000: View's SELECT contains a variable or parameter
+# Tables that are not base tables with a primary key
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM plain_v;
+ERROR HY000: Table 'test.plain_v' cannot be used in a materialized view: it is a view.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM tmp;
+ERROR HY000: Table 'test.tmp' cannot be used in a materialized view: it is a temporary table.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM mv1;
+ERROR HY000: Table 'test.mv1' cannot be used in a materialized view: it is a materialized view.
+CREATE MATERIALIZED VIEW mv7 AS
+SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES;
+ERROR HY000: Table 'information_schema.TABLES' cannot be used in a materialized view: it is a view.
+CREATE MATERIALIZED VIEW mv7 AS
+SELECT THREAD_ID FROM performance_schema.threads;
+ERROR HY000: Table 'performance_schema.threads' cannot be used in a materialized view: it is a system table.
+CREATE MATERIALIZED VIEW mv7 AS SELECT Help_topic_id FROM mysql.help_topic;
+ERROR HY000: Table 'mysql.help_topic' cannot be used in a materialized view: it is a system table.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM nopk;
+ERROR HY000: Table 'test.nopk' cannot be used in a materialized view: it has no PRIMARY KEY.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM uniq;
+ERROR HY000: Table 'test.uniq' cannot be used in a materialized view: it has no PRIMARY KEY.
+CREATE MATERIALIZED VIEW mv7 AS
+SELECT t1.id FROM t1 LEFT JOIN nopk ON nopk.id = t1.id;
+ERROR HY000: Table 'test.nopk' cannot be used in a materialized view: it has no PRIMARY KEY.
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM no_such_table;
+ERROR 42S02: Table 'test.no_such_table' doesn't exist
+CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM mv7;
+ERROR 42S02: Table 'test.mv7' doesn't exist
+# Names
+CREATE DATABASE mvdb2;
+CREATE TABLE mvdb2.t1 (id INT PRIMARY KEY);
+# Two tables with one alias cannot be told apart by the alias
+CREATE MATERIALIZED VIEW mv7 AS
+SELECT test.t1.id FROM test.t1 JOIN mvdb2.t1 ON TRUE;
+ERROR 42000: Not unique table/alias: 't1'
+DROP DATABASE mvdb2;
+CREATE MATERIALIZED VIEW mv7 AS SELECT id AS `mv$x` FROM t1;
+ERROR 42000: Incorrect column name 'mv$x'
+CREATE MATERIALIZED VIEW mv7 (`MV$y`) AS SELECT id FROM t1;
+ERROR 42000: Incorrect column name 'MV$y'
+CREATE MATERIALIZED VIEW mv7 (x) AS SELECT id, a FROM t1;
+ERROR HY000: In definition of view, derived table or common table expression, SELECT list and column names list have different column counts
+CREATE MATERIALIZED VIEW mv7 AS SELECT id, id FROM t1;
+ERROR 42S21: Duplicate column name 'id'
+CREATE MATERIALIZED VIEW mv7 (x, X) AS SELECT id, a FROM t1;
+ERROR 42S21: Duplicate column name 'X'
+# Nothing is left of a statement that failed
+SHOW TABLES LIKE 'mv7%';
+Tables_in_test (mv7%)
+# An expression without a name gets one
+CREATE MATERIALIZED VIEW mv7 AS SELECT id, '' FROM t1;
+SHOW CREATE VIEW mv7;
+View	Create View	character_set_client	collation_connection
+mv7	CREATE MATERIALIZED VIEW `mv7` (`id`, `Name_exp_2`) ENGINE=InnoDB REFRESH SYNCHRONOUS AS select `test`.`t1`.`id` AS `id`,'' AS `` from `test`.`t1`	utf8mb4	utf8mb4_0900_ai_ci
+DROP MATERIALIZED VIEW mv7;
+# A statement that fails while the view is filled leaves nothing
+SET sql_mode = '';
+CREATE TABLE big (id INT PRIMARY KEY, v BIGINT UNSIGNED);
+INSERT INTO big VALUES (1, 18446744073709551615);
+CREATE MATERIALIZED VIEW mv7 AS SELECT id, v + 1 AS w FROM big;
+ERROR 22003: BIGINT UNSIGNED value is out of range in '(`test`.`big`.`v` + 1)'
+SET sql_mode = DEFAULT;
+SHOW TABLES LIKE 'mv7%';
+Tables_in_test (mv7%)
+DROP TABLE big;
+#
+# Prepared statements and stored programs
+#
+PREPARE s FROM 'CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1';
+ERROR HY000: This command is not supported in the prepared statement protocol yet
+PREPARE s FROM 'REFRESH MATERIALIZED VIEW mv2';
+INSERT INTO t1 VALUES (4, 40, 'four');
+EXECUTE s;
+INSERT INTO t1 VALUES (5, 50, 'five');
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SELECT * FROM mv2 ORDER BY x;
+x	y
+2	two
+3	NULL
+4	four
+5	five
+CREATE PROCEDURE p1() CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM t1;
+ERROR 0A000: CREATE MATERIALIZED VIEW is not allowed in stored procedures
+CREATE PROCEDURE p1() REFRESH MATERIALIZED VIEW mv2;
+INSERT INTO t1 VALUES (6, 60, 'six');
+CALL p1();
+DELETE FROM t1 WHERE id = 4;
+CALL p1();
+SELECT * FROM mv2 ORDER BY x;
+x	y
+2	two
+3	NULL
+5	five
+6	six
+DROP PROCEDURE p1;
+# Not in a function: the statement commits
+CREATE FUNCTION f2() RETURNS INT
+BEGIN REFRESH MATERIALIZED VIEW mv2; RETURN 1; END|
+ERROR HY000: Explicit or implicit commit is not allowed in stored function or trigger.
+# REFRESH commits the transaction of the session
+BEGIN;
+INSERT INTO t1 VALUES (7, 70, 'seven');
+REFRESH MATERIALIZED VIEW mv2;
+ROLLBACK;
+SELECT * FROM mv2 ORDER BY x;
+x	y
+2	two
+3	NULL
+5	five
+6	six
+7	seven
+# Not under LOCK TABLES
+LOCK TABLES t1 READ;
+REFRESH MATERIALIZED VIEW mv2;
+ERROR HY000: Can't execute the given command because you have active locked tables or an active transaction
+UNLOCK TABLES;
+#
+# The tables of materialized views are not changed directly
+#
+INSERT INTO mv2 VALUES (100, 'x');
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+INSERT INTO mv2 SELECT id, name FROM t1;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+REPLACE INTO mv2 VALUES (100, 'x');
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+UPDATE mv2 SET y = 'x';
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+UPDATE mv2, t2 SET mv2.y = 'x' WHERE mv2.x = t2.id;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+DELETE FROM mv2;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+DELETE mv2 FROM mv2, t2 WHERE mv2.x = t2.id;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+DELETE FROM mv3 WHERE id = 1;
+ERROR HY000: Table 'test.mv3' is the storage of a materialized view and cannot be modified directly.
+TRUNCATE TABLE mv2;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+TRUNCATE TABLE mv3;
+ERROR HY000: Table 'test.mv3' is the storage of a materialized view and cannot be modified directly.
+ALTER TABLE mv2 ADD COLUMN z INT;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+ALTER TABLE mv2 RENAME TO mv2_renamed;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+ALTER TABLE mv3 ENGINE=InnoDB;
+ERROR HY000: Table 'test.mv3' is the storage of a materialized view and cannot be modified directly.
+CREATE INDEX ix ON mv2 (x);
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+DROP INDEX `mv$ix_pk0` ON mv2;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+RENAME TABLE mv2 TO mv2_renamed;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+DROP TABLE mv2;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+DROP TABLE IF EXISTS t2, mv3;
+ERROR HY000: Table 'test.mv3' is the storage of a materialized view and cannot be modified directly.
+DROP VIEW mv2;
+ERROR HY000: 'test.mv2' is a materialized view, use DROP MATERIALIZED VIEW.
+DROP VIEW IF EXISTS mv2;
+ERROR HY000: 'test.mv2' is a materialized view, use DROP MATERIALIZED VIEW.
+LOCK TABLES mv2 WRITE;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+LOAD DATA INFILE 'no_such_file' INTO TABLE mv2;
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+# A trigger or a function of another statement does not write either
+CREATE TRIGGER trg AFTER INSERT ON t2 FOR EACH ROW
+INSERT INTO mv2 VALUES (NEW.id, 'trg');
+INSERT INTO t2 VALUES (50, 1, 1.00);
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+DROP TRIGGER trg;
+CREATE FUNCTION f3() RETURNS INT BEGIN DELETE FROM mv2; RETURN 1; END|
+SELECT f3();
+ERROR HY000: Table 'test.mv2' is the storage of a materialized view and cannot be modified directly.
+DROP FUNCTION f3;
+# Reading is not restricted
+SELECT COUNT(*) FROM mv2;
+COUNT(*)
+5
+SELECT x FROM mv2 WHERE x = 2 FOR UPDATE;
+x
+2
+SELECT x FROM mv2 WHERE x = 2 FOR SHARE;
+x
+2
+LOCK TABLES mv2 READ;
+SELECT COUNT(*) FROM mv2;
+COUNT(*)
+5
+UNLOCK TABLES;
+CREATE TABLE copy_of_mv2 AS SELECT * FROM mv2;
+CREATE TABLE like_mv2 LIKE mv2;
+INSERT INTO like_mv2 (x, y) VALUES (1, 'plain table');
+ANALYZE TABLE mv2;
+Table	Op	Msg_type	Msg_text
+test.mv2	analyze	status	OK
+DROP TABLE copy_of_mv2, like_mv2;
+# The tables are as they were
+SELECT * FROM mv2 ORDER BY x;
+x	y
+2	two
+3	NULL
+5	five
+6	six
+7	seven
+SELECT * FROM t2 ORDER BY id;
+id	t1_id	b
+1	1	1.50
+2	1	2.50
+3	9	3.50
+# The base tables are changed and dropped freely
+ALTER TABLE t2 ADD COLUMN c INT;
+ALTER TABLE t2 DROP COLUMN c;
+#
+# DROP MATERIALIZED VIEW
+#
+DROP MATERIALIZED VIEW t1;
+ERROR HY000: 'test.t1' is not a materialized view.
+DROP MATERIALIZED VIEW plain_v;
+ERROR HY000: 'test.plain_v' is not a materialized view.
+DROP MATERIALIZED VIEW no_such;
+ERROR HY000: 'test.no_such' is not a materialized view.
+DROP MATERIALIZED VIEW IF EXISTS t1;
+ERROR HY000: 'test.t1' is not a materialized view.
+# Nothing is dropped if a name is wrong
+DROP MATERIALIZED VIEW mv4, no_such;
+ERROR HY000: 'test.no_such' is not a materialized view.
+SELECT COUNT(*) FROM mv4;
+COUNT(*)
+3
+DROP MATERIALIZED VIEW IF EXISTS mv4, no_such, test.mv5;
+Warnings:
+Note	6585	'test.no_such' is not a materialized view.
+DROP MATERIALIZED VIEW mv6;
+SHOW TABLES;
+Tables_in_test
+mv1
+mv2
+mv3
+nopk
+plain_v
+t1
+t2
+uniq
+#
+# Privileges
+#
+CREATE DATABASE mvdb;
+CREATE TABLE mvdb.b1 (id INT PRIMARY KEY, a INT);
+CREATE TABLE mvdb.secret (id INT PRIMARY KEY, s INT);
+INSERT INTO mvdb.b1 VALUES (1, 1);
+CREATE MATERIALIZED VIEW mvdb.mv_root REFRESH MANUAL AS SELECT id FROM mvdb.b1;
+CREATE USER mvuser@localhost;
+GRANT SELECT ON mvdb.b1 TO mvuser@localhost;
+GRANT SELECT ON mvdb.mv_root TO mvuser@localhost;
+# No CREATE, ALTER, DROP privilege
+CREATE MATERIALIZED VIEW mvdb.mv8 AS SELECT id FROM mvdb.b1;
+ERROR 42000: CREATE command denied to user 'mvuser'@'localhost' for table 'mv8'
+REFRESH MATERIALIZED VIEW mvdb.mv_root;
+ERROR 42000: ALTER command denied to user 'mvuser'@'localhost' for table 'mv_root'
+ALTER MATERIALIZED VIEW mvdb.mv_root REFRESH MANUAL;
+ERROR 42000: ALTER command denied to user 'mvuser'@'localhost' for table 'mv_root'
+DROP MATERIALIZED VIEW mvdb.mv_root;
+ERROR 42000: DROP command denied to user 'mvuser'@'localhost' for table 'mv_root'
+GRANT CREATE, ALTER, DROP ON mvdb.* TO mvuser@localhost;
+# No SELECT privilege on a base table
+CREATE MATERIALIZED VIEW mvdb.mv8 AS SELECT id FROM mvdb.secret;
+ERROR 42000: SELECT command denied to user 'mvuser'@'localhost' for table 'secret'
+CREATE MATERIALIZED VIEW mvdb.mv8 AS
+SELECT b1.id FROM mvdb.b1 AS b1 JOIN mvdb.secret AS secret ON secret.id = b1.id;
+ERROR 42000: SELECT command denied to user 'mvuser'@'localhost' for table 'secret'
+# CREATE on the schema and SELECT on the base tables
+CREATE MATERIALIZED VIEW mvdb.mv8 REFRESH MANUAL AS SELECT id, a FROM mvdb.b1;
+CREATE MATERIALIZED VIEW mvdb.mv9 REFRESH MANUAL AS SELECT COUNT(*) AS c FROM mvdb.b1;
+# The user who made the view does not read or write it for that
+SELECT * FROM mvdb.mv8;
+ERROR 42000: SELECT command denied to user 'mvuser'@'localhost' for table 'mv8'
+INSERT INTO mvdb.mv8 VALUES (1, 1);
+ERROR 42000: INSERT command denied to user 'mvuser'@'localhost' for table 'mv8'
+REFRESH MATERIALIZED VIEW mvdb.mv8;
+REFRESH MATERIALIZED VIEW mvdb.mv9;
+ALTER MATERIALIZED VIEW mvdb.mv8 REFRESH SYNCHRONOUS;
+DROP MATERIALIZED VIEW mvdb.mv8, mvdb.mv9;
+DROP USER mvuser@localhost;
+DROP DATABASE mvdb;
+#
+# DROP DATABASE drops the materialized views of the database
+#
+CREATE DATABASE mvdb;
+CREATE TABLE mvdb.t (id INT PRIMARY KEY, g INT);
+INSERT INTO mvdb.t VALUES (1, 1), (2, 1);
+CREATE MATERIALIZED VIEW mvdb.mv_j AS SELECT id FROM mvdb.t;
+CREATE MATERIALIZED VIEW mvdb.mv_a ENGINE=WARP AS
+SELECT g, COUNT(*) AS c FROM mvdb.t GROUP BY g;
+USE mvdb;
+SHOW TABLES;
+Tables_in_mvdb
+mv_a
+mv_a$mv_state
+mv_j
+t
+SHOW CREATE VIEW mv_a;
+View	Create View	character_set_client	collation_connection
+mv_a	CREATE MATERIALIZED VIEW `mv_a` (`g`, `c`) ENGINE=WARP REFRESH SYNCHRONOUS AS select `mvdb`.`t`.`g` AS `g`,count(0) AS `c` from `mvdb`.`t` group by `mvdb`.`t`.`g`	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW test.mv2;
+View	Create View	character_set_client	collation_connection
+mv2	CREATE MATERIALIZED VIEW `test`.`mv2` (`x`, `y`) ENGINE=InnoDB REFRESH MANUAL AS select `test`.`t1`.`id` AS `id`,`test`.`t1`.`name` AS `name` from `test`.`t1` where (`test`.`t1`.`a` > 10)	utf8mb4	utf8mb4_0900_ai_ci
+USE test;
+DROP DATABASE mvdb;
+# The view of a table that is dropped is not refreshed any more
+CREATE TABLE gone (id INT PRIMARY KEY);
+CREATE MATERIALIZED VIEW mv9 REFRESH MANUAL AS SELECT id FROM gone;
+DROP TABLE gone;
+REFRESH MATERIALIZED VIEW mv9;
+ERROR 42S02: Table 'test.gone' doesn't exist
+SELECT COUNT(*) FROM mv9;
+COUNT(*)
+0
+DROP MATERIALIZED VIEW mv9;
+DROP MATERIALIZED VIEW mv1, mv2, mv3;
+DROP VIEW plain_v;
+DROP FUNCTION f1;
+DROP TEMPORARY TABLE tmp;
+DROP TABLE t1, t2, nopk, uniq;

@@ -211,6 +211,15 @@ const char *Command_maps::sql_commands[] = {"select",
                                             "create_library",
                                             "drop_library",
                                             "show_create_library",
+                                            "alter_library",
+                                            "show_status_library",
+                                            "create_masking_policy",
+                                            "drop_masking_policy",
+                                            "show_create_masking_policy",
+                                            "create_materialized_view",
+                                            "drop_materialized_view",
+                                            "refresh_materialized_view",
+                                            "alter_materialized_view",
                                             ""};
 // keep the empty string last and add new elements before it.
 

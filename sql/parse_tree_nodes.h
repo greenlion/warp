@@ -3810,6 +3810,20 @@ class PT_show_create_view final : public PT_show_base {
   Sql_cmd_show_create_table m_sql_cmd;
 };
 
+/// Parse tree node for SHOW CREATE MATERIALIZED VIEW statement
+
+class PT_show_create_mview final : public PT_show_base {
+ public:
+  PT_show_create_mview(const POS &pos, Table_ident *table_ident)
+      : PT_show_base(pos, SQLCOM_SHOW_CREATE),
+        m_sql_cmd(true, table_ident, true) {}
+
+  Sql_cmd *make_cmd(THD *thd) override;
+
+ private:
+  Sql_cmd_show_create_table m_sql_cmd;
+};
+
 /// Parse tree node for SHOW DATABASES statement
 
 class PT_show_databases final : public PT_show_filter_base {
