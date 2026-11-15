@@ -641,17 +641,36 @@ struct Tracked_table {
   std::string table;
   /// The columns that are decoded from the row images.
   std::vector<unsigned> columns;
-  /// The primary key columns (positions among the columns of the table).
-  std::vector<unsigned> pk_ordinals;
 };
 
-/** The distinct old and new primary keys of the rows of one table. */
+/**
+  The distinct old and new row keys (Mview_table::pk_columns) of the
+  changed rows of one table, as SQL literals: "1" or "(1,'a')".  Keys with
+  a NULL are kept apart: they are compared with <=>, not with IN.
+*/
 struct Key_sets {
   std::unordered_set<std::string> old_keys;
   std::unordered_set<std::string> new_keys;
+  std::unordered_set<std::string> old_null_keys;
+  std::unordered_set<std::string> new_null_keys;
   bool bad{false};
   std::string why;
+  size_t size() const {
+    return old_keys.size() + new_keys.size() + old_null_keys.size() +
+           new_null_keys.size();
+  }
 };
+
+/** The key sets of a table instance: views may have other row keys for
+    the same table (the table changed between their CREATEs). */
+static std::string key_set_id(const Mview_table &table) {
+  std::string id = table.db;
+  id.push_back('\0');
+  id += table.table;
+  id.push_back('\0');
+  for (unsigned ordinal : table.pk_ordinals) id += std::to_string(ordinal) + ",";
+  return id;
+}
 
 /** What the daemon remembers about a view between registry loads. */
 struct Known_view {
@@ -789,6 +808,9 @@ class Daemon {
   bool insert_keys(const std::string &head, const std::string &tail,
                    const std::unordered_set<std::string> &keys, bool as_values,
                    bool single_column, Sql_error *error);
+  bool insert_null_keys(const std::string &head, const std::string &lhs,
+                        const std::unordered_set<std::string> &keys,
+                        Sql_error *error);
   void make_key_sets(std::map<std::string, Key_sets> *keys, unsigned from_trx);
   /* Join views with a WHERE read their base tables to map old rows to
      root keys, so they are applied only with the base tables locked, all
@@ -1494,11 +1516,7 @@ static bool definition_usable(const Mview_def &def, std::string *why) {
       return false;
     }
     for (const Mview_table &table : def.tables) {
-      if (table.pk_columns.empty()) {
-        *why = "base table " + table.db + "." + table.table +
-               " has no primary key";
-        return false;
-      }
+      /* an empty row key: every change of the table refreshes the view */
       if (table.pk_columns.size() != table.key_columns.size()) {
         *why = "the key columns of " + table.db + "." + table.table +
                " are inconsistent";
@@ -1838,9 +1856,8 @@ bool Daemon::load_registry() {
       Tracked_table &t = tracked[key];
       t.db = table.db;
       t.table = table.table;
-      t.pk_ordinals = table.pk_ordinals;
-      /* Join views need the primary key, aggregate views every column
-         they reference. */
+      /* Join views need the row key, aggregate views every column they
+         reference. */
       std::set<unsigned> &wanted = columns[key];
       wanted.insert(table.pk_ordinals.begin(), table.pk_ordinals.end());
       if (def.is_aggregate || view.join_where)
@@ -2457,7 +2474,7 @@ Daemon::Read_result Daemon::read_batch(std::string *why) {
 /* ------------------------------------------------------------------ */
 
 
-/* The primary keys of the changed rows of every table of the batch */
+/* The row keys of the changed rows of every table of the batch */
 /* A join view with a WHERE has changes of instances other than its root
    that are not applied: it must be applied with its base tables locked. */
 bool Daemon::join_where_needs_pin(size_t view) const {
@@ -2479,28 +2496,36 @@ bool Daemon::join_where_needs_pin(size_t view) const {
 
 void Daemon::make_key_sets(std::map<std::string, Key_sets> *keys,
                            unsigned from_trx) {
-  std::set<std::string> join_tables;
+  /* the row keys of the instances of the join views (key_set_id()) */
+  std::map<std::string, const Mview_table *> instances;
   for (size_t i = 0; i < views.size(); i++) {
     if (views[i].is_aggregate || !(rt[i].maintained || rt[i].needs_refresh))
       continue;
     for (const Mview_table &table : views[i].tables)
-      join_tables.insert(table_key(table.db, table.table));
+      instances.emplace(key_set_id(table), &table);
   }
-  for (const auto &entry : batch.changes.tables) {
-    if (!join_tables.count(entry.first)) continue;
-    Key_sets &sets = (*keys)[entry.first];
-    auto table = tracked.find(entry.first);
-    if (table == tracked.end()) {
+  for (const auto &instance : instances) {
+    const Mview_table &table = *instance.second;
+    const std::string tkey = table_key(table.db, table.table);
+    auto changes = batch.changes.tables.find(tkey);
+    if (changes == batch.changes.tables.end()) continue;
+    const auto &entry = *changes;
+    Key_sets &sets = (*keys)[instance.first];
+    if (tracked.find(tkey) == tracked.end()) {
       sets.bad = true;
       sets.why = "the table is not tracked any more";
       continue;
     }
     std::vector<unsigned> slots;
-    for (unsigned ordinal : table->second.pk_ordinals) {
+    if (table.pk_ordinals.empty()) {
+      sets.bad = true;
+      sets.why = "it has no columns that can identify its rows";
+    }
+    for (unsigned ordinal : table.pk_ordinals) {
       const int slot = entry.second.slot(ordinal);
       if (slot < 0) {
         sets.bad = true;
-        sets.why = "the primary key was not decoded";
+        sets.why = "the row key was not decoded";
         break;
       }
       slots.push_back(static_cast<unsigned>(slot));
@@ -2513,6 +2538,7 @@ void Daemon::make_key_sets(std::map<std::string, Key_sets> *keys,
       if (row.trx < from_trx) continue;
       old_key.clear();
       new_key.clear();
+      bool old_null = false, new_null = false;
       const bool has_old = row.kind != Row_change::INSERT;
       const bool has_new = row.kind != Row_change::DELETE;
       if (!single) {
@@ -2535,21 +2561,26 @@ void Daemon::make_key_sets(std::map<std::string, Key_sets> *keys,
           if (!wanted) continue;
           const Cell *cell = image == 0 ? before : after;
           std::string &key = image == 0 ? old_key : new_key;
-          if (cell == nullptr || cell->state != Cell_state::VALUE ||
-              !cell->exact) {
+          const bool null_value = cell != nullptr &&
+                                  cell->state == Cell_state::SQL_NULL &&
+                                  table.key_nullable;
+          if (!null_value &&
+              (cell == nullptr || cell->state != Cell_state::VALUE ||
+               !cell->exact)) {
             sets.bad = true;
             if (cell == nullptr || cell->state == Cell_state::ABSENT)
-              sets.why = "a primary key column is not in the row image";
+              sets.why = "a row key column is not in the row image";
             else if (cell->state == Cell_state::SQL_NULL)
               sets.why = "a primary key column is NULL";
             else if (cell->state == Cell_state::UNSUPPORTED)
               sets.why = cell->literal;
             else
-              sets.why = "a primary key column has no exact literal (FLOAT)";
+              sets.why = "a row key column has no exact literal (FLOAT)";
             break;
           }
+          if (null_value) (image == 0 ? old_null : new_null) = true;
           if (k) key.push_back(',');
-          key.append(cell->literal);
+          key.append(null_value ? std::string("NULL") : cell->literal);
         }
       }
       if (sets.bad) break;
@@ -2557,23 +2588,25 @@ void Daemon::make_key_sets(std::map<std::string, Key_sets> *keys,
         old_key.push_back(')');
         new_key.push_back(')');
       }
-      if (has_old) sets.old_keys.insert(old_key);
-      if (has_new) sets.new_keys.insert(new_key);
+      if (has_old) (old_null ? sets.old_null_keys : sets.old_keys).insert(old_key);
+      if (has_new) (new_null ? sets.new_null_keys : sets.new_keys).insert(new_key);
     }
     if (sets.bad) {
       sets.old_keys.clear();
       sets.new_keys.clear();
-      if (logged_undecodable.insert(entry.first).second)
+      sets.old_null_keys.clear();
+      sets.new_null_keys.clear();
+      if (logged_undecodable.insert(instance.first).second)
         wmv_log(WARNING_LEVEL,
-                "the primary keys of the changed rows of %s cannot be used "
+                "the row keys of the changed rows of %s cannot be used "
                 "(%s); its materialized views are refreshed completely",
-                printable_key(entry.first).c_str(), sets.why.c_str());
+                printable_key(tkey).c_str(), sets.why.c_str());
     }
   }
 }
 
 /* Make the temporary table K of a view: one row per root key that is
-   recomputed, with the column types of the primary key of the root. */
+   recomputed, with the column types of the row key of the root. */
 bool Daemon::ensure_key_table(size_t view, Sql_error *error) {
   View_rt &v = rt[view];
   if (v.tmp_ready) return false;
@@ -2596,9 +2629,12 @@ bool Daemon::ensure_key_table(size_t view, Sql_error *error) {
   select += " FROM " + qname(root.db, root.table) + " AS " + qi(root.alias) +
             " LIMIT 0";
   /* The primary key only removes duplicates; a key that cannot be
-     indexed (a prefix of a TEXT column) works without it. */
-  if (exec("CREATE TEMPORARY TABLE " + v.key_table + " (PRIMARY KEY (" + cols +
-           "))" + select,
+     indexed (a prefix of a TEXT column) works without it.  A nullable root
+     key gets a UNIQUE key: a PRIMARY KEY would make its columns NOT NULL
+     and INSERT IGNORE would turn NULLs into zeros. */
+  if (exec("CREATE TEMPORARY TABLE " + v.key_table +
+               (root.key_nullable ? " (UNIQUE KEY (" : " (PRIMARY KEY (") +
+               cols + "))" + select,
            error)) {
     exec("ROLLBACK");
     if (is_transient(error->code)) return true;
@@ -2660,6 +2696,28 @@ bool Daemon::insert_keys(const std::string &head, const std::string &tail,
 }
 
 /**
+  Run head + "lhs <=> key OR ..." + ")" for keys with a NULL,
+  sv_in_list_chunk_size at a time.
+*/
+bool Daemon::insert_null_keys(const std::string &head, const std::string &lhs,
+                              const std::unordered_set<std::string> &keys,
+                              Sql_error *error) {
+  const size_t chunk = sv_in_list_chunk_size ? sv_in_list_chunk_size : 1;
+  std::string sql;
+  size_t n = 0;
+  for (const std::string &key : keys) {
+    sql += (n == 0 ? head : std::string(" OR ")) + lhs + " <=> " + key;
+    if (++n == chunk) {
+      if (exec(sql + ")", error)) return true;
+      sql.clear();
+      n = 0;
+    }
+  }
+  if (n > 0 && exec(sql + ")", error)) return true;
+  return false;
+}
+
+/**
   One attempt to apply the batch to a join view, in one transaction:
 
     K := root keys of the changed rows
@@ -2709,7 +2767,7 @@ bool Daemon::apply_view_once(size_t view,
 
   for (size_t t = 0; t < def.tables.size(); t++) {
     const Mview_table &table = def.tables[t];
-    auto sets = keys.find(table_key(table.db, table.table));
+    auto sets = keys.find(key_set_id(table));
     if (sets == keys.end()) continue;
     const bool single = table.pk_columns.size() == 1;
 
@@ -2717,7 +2775,11 @@ bool Daemon::apply_view_once(size_t view,
       /* the old and the new keys of the root are root keys */
       const std::string head = insert_k + "VALUES ";
       if (insert_keys(head, "", sets->second.old_keys, true, single, error) ||
-          insert_keys(head, "", sets->second.new_keys, true, single, error))
+          insert_keys(head, "", sets->second.new_keys, true, single, error) ||
+          insert_keys(head, "", sets->second.old_null_keys, true, single,
+                      error) ||
+          insert_keys(head, "", sets->second.new_null_keys, true, single,
+                      error))
         return true;
       continue;
     }
@@ -2736,18 +2798,24 @@ bool Daemon::apply_view_once(size_t view,
       alias_pk_list = "(" + alias_pk_list + ")";
     }
     /* old keys: the rows of the view that were made from the row */
-    if (insert_keys(insert_k + "SELECT DISTINCT " + detail_root_list +
-                        " FROM " + v.name + " AS `warp_mvd` WHERE " +
-                        detail_t_list + " IN (",
-                    ")", sets->second.old_keys, false, single, error))
+    const std::string old_head = insert_k + "SELECT DISTINCT " +
+                                 detail_root_list + " FROM " + v.name +
+                                 " AS `warp_mvd` WHERE ";
+    if (insert_keys(old_head + detail_t_list + " IN (", ")",
+                    sets->second.old_keys, false, single, error) ||
+        insert_null_keys(old_head + "(", detail_t_list,
+                         sets->second.old_null_keys, error))
       return true;
     /* new keys: the root rows the row joins with now.  The condition on
        the table makes the outer joins towards it inner joins.  The WHERE
        of the view is not applied: a root row whose only match fails it
        loses its NULL-extended row. */
-    if (insert_keys(insert_k + "SELECT DISTINCT " + root_pk_list + " " +
-                        def.from_sql + " WHERE " + alias_pk_list + " IN (",
-                    ")", sets->second.new_keys, false, single, error))
+    const std::string new_head = insert_k + "SELECT DISTINCT " +
+                                 root_pk_list + " " + def.from_sql + " WHERE ";
+    if (insert_keys(new_head + alias_pk_list + " IN (", ")",
+                    sets->second.new_keys, false, single, error) ||
+        insert_null_keys(new_head + "(", alias_pk_list,
+                         sets->second.new_null_keys, error))
       return true;
   }
 
@@ -2778,10 +2846,10 @@ bool Daemon::apply_view_once(size_t view,
     }
     for (size_t target : changed) {
       const Mview_table &table = def.tables[target];
-      std::string matched;
-      for (const std::string &column : table.pk_columns)
-        matched += std::string(matched.empty() ? "" : " AND ") +
-                   qi(table.alias) + "." + qi(column) + " IS NOT NULL";
+      /* a row of the delta table, not a NULL-extended row: the sign
+         column is never NULL, a column of the row key may be */
+      const std::string matched =
+          qi(table.alias) + ".`mv$sign` IS NOT NULL";
       std::vector<size_t> others;
       for (size_t t : changed)
         if (t != target) others.push_back(t);
@@ -2819,7 +2887,8 @@ bool Daemon::apply_view_once(size_t view,
     std::string on;
     for (size_t k = 0; k < root.pk_columns.size(); k++) {
       if (k) on += " AND ";
-      on += "`warp_mvd`." + qi(root.key_columns[k]) + " = `warp_mvk`." +
+      on += "`warp_mvd`." + qi(root.key_columns[k]) +
+            (root.key_nullable ? " <=> `warp_mvk`." : " = `warp_mvk`.") +
             v.key_cols[k];
     }
     if (exec("DELETE `warp_mvd` FROM " + v.name + " AS `warp_mvd` JOIN " +
@@ -2836,9 +2905,18 @@ bool Daemon::apply_view_once(size_t view,
     std::string sql = "INSERT INTO " + v.name + " (" + def.detail_columns +
                       ") " + def.detail_select + " " + def.from_sql + " WHERE ";
     if (!def.where_sql.empty()) sql += "(" + def.where_sql + ") AND ";
-    sql += (root_single ? root_pk_list : "(" + root_pk_list + ")") +
-           " IN (SELECT " + k_select + " FROM " + v.key_table +
-           " AS `warp_mvk`)";
+    if (root.key_nullable) {
+      std::string match;
+      for (size_t k = 0; k < root.pk_columns.size(); k++)
+        match += std::string(k ? " AND " : "") + qi(root.alias) + "." +
+                 qi(root.pk_columns[k]) + " <=> `warp_mvk`." + v.key_cols[k];
+      sql += "EXISTS (SELECT 1 FROM " + v.key_table + " AS `warp_mvk` WHERE " +
+             match + ")";
+    } else {
+      sql += (root_single ? root_pk_list : "(" + root_pk_list + ")") +
+             " IN (SELECT " + k_select + " FROM " + v.key_table +
+             " AS `warp_mvk`)";
+    }
     if (exec(sql, error)) return true;
   }
 
@@ -4179,12 +4257,16 @@ Apply_result Daemon::apply_batch(bool allow_defer) {
     for (const Mview_table &table : def.tables) {
       const std::string key = table_key(table.db, table.table);
       if (refresh_tables.count(key)) depends = true;
-      auto sets = keys.find(key);
+      auto sets = keys.find(key_set_id(table));
       if (sets != keys.end()) {
         if (sets->second.bad) bad_keys = true;
-        key_count += sets->second.old_keys.size() + sets->second.new_keys.size();
+        key_count += sets->second.size();
       }
     }
+    /* no root keys to recompute: a root without row key columns */
+    if (!def.is_aggregate && key_count > 0 &&
+        def.tables[def.root].pk_columns.empty())
+      bad_keys = true;
     /* already refreshed for these requests while applying this batch */
     if (depends) {
       auto done = refreshed.find(v.name);
@@ -4230,14 +4312,15 @@ Apply_result Daemon::apply_batch(bool allow_defer) {
       bad_keys = false;
       key_count = 0;
       for (const Mview_table &table : def.tables) {
-        auto sets = own_keys.find(table_key(table.db, table.table));
+        auto sets = own_keys.find(key_set_id(table));
         if (sets == own_keys.end()) continue;
         if (sets->second.bad) bad_keys = true;
-        key_count +=
-            sets->second.old_keys.size() + sets->second.new_keys.size();
+        key_count += sets->second.size();
       }
+      if (key_count > 0 && def.tables[def.root].pk_columns.empty())
+        bad_keys = true;
       if (bad_keys) {
-        result = refresh_view(i, "the primary keys of changed rows cannot "
+        result = refresh_view(i, "the row keys of changed rows cannot "
                                  "be used");
       } else if (key_count == 0) {
         join_where_done(i);
@@ -4256,7 +4339,7 @@ Apply_result Daemon::apply_batch(bool allow_defer) {
       }
       if (result == Apply_result::OK) join_where_done(i);
     } else if (bad_keys) {
-      result = refresh_view(i, "the primary keys of changed rows cannot be "
+      result = refresh_view(i, "the row keys of changed rows cannot be "
                                "used");
     } else if (key_count == 0) {
       continue;

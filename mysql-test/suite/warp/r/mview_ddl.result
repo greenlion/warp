@@ -64,9 +64,8 @@ Table	Create Table
 mv3	CREATE TABLE `mv3` (
   `id` int DEFAULT NULL,
   `b` decimal(10,2) DEFAULT NULL,
-  `mv$pk0_0` int DEFAULT NULL /*!80023 INVISIBLE */,
   `mv$pk1_0` int DEFAULT NULL /*!80023 INVISIBLE */,
-  KEY `mv$ix_pk0` (`mv$pk0_0`),
+  KEY `mv$ix_pk0` (`id`),
   KEY `mv$ix_pk1` (`mv$pk1_0`)
 ) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 SELECT TABLE_NAME, TABLE_TYPE, ENGINE FROM INFORMATION_SCHEMA.TABLES
@@ -239,13 +238,12 @@ SELECT THREAD_ID FROM performance_schema.threads;
 ERROR HY000: Table 'performance_schema.threads' cannot be used in a materialized view: it is a system table.
 CREATE MATERIALIZED VIEW mv7 AS SELECT Help_topic_id FROM mysql.help_topic;
 ERROR HY000: Table 'mysql.help_topic' cannot be used in a materialized view: it is a system table.
+# Tables without a PRIMARY KEY: another row key
 CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM nopk;
-ERROR HY000: Table 'test.nopk' cannot be used in a materialized view: it has no PRIMARY KEY.
-CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM uniq;
-ERROR HY000: Table 'test.uniq' cannot be used in a materialized view: it has no PRIMARY KEY.
-CREATE MATERIALIZED VIEW mv7 AS
-SELECT t1.id FROM t1 LEFT JOIN nopk ON nopk.id = t1.id;
-ERROR HY000: Table 'test.nopk' cannot be used in a materialized view: it has no PRIMARY KEY.
+CREATE MATERIALIZED VIEW mv8 AS SELECT id FROM uniq;
+CREATE MATERIALIZED VIEW mv9 AS
+SELECT t1.id, nopk.a FROM t1 LEFT JOIN nopk ON nopk.id = t1.id;
+DROP MATERIALIZED VIEW mv7, mv8, mv9;
 CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM no_such_table;
 ERROR 42S02: Table 'test.no_such_table' doesn't exist
 CREATE MATERIALIZED VIEW mv7 AS SELECT id FROM mv7;

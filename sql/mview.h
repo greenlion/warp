@@ -32,7 +32,9 @@
   --------------
   Join view (no aggregation): the view table V holds the user's columns
   plus one set of INVISIBLE columns per joined table instance holding that
-  instance's primary key (NULL for a NULL-extended outer join row).
+  instance's row key (NULL for a NULL-extended outer join row), see
+  Mview_key_kind.  A key column that the user's columns already hold is
+  not stored twice.
 
   Aggregate view (GROUP BY, aggregate functions or SELECT DISTINCT): V
   holds ONE ROW PER GROUP and nothing per base row:
@@ -48,9 +50,9 @@
   --------------------------------------------------
   The "root" is a table instance that is never NULL-extended, so every
   view row carries a non-NULL root key.  For a batch of changed base rows
-  the daemon maps the old primary keys of changed rows to root keys
-  through V's key columns and the new primary keys through the view's own
-  join, deletes the rows of those root keys and re-inserts them with the
+  the daemon maps the old row keys of changed rows to root keys
+  through V's key columns and the new row keys through the view's own
+  join (with <=> where a key column is nullable), deletes the rows of those root keys and re-inserts them with the
   detail select restricted to those root keys.  Idempotent.
 
   Maintenance of an aggregate view
@@ -95,19 +97,47 @@ enum class Mview_refresh_mode {
   SYNCHRONOUS = 1 ///< Maintained by the binlog daemon.
 };
 
+/**
+  What the row key of a base table instance (Mview_table::pk_columns) is.
+
+  A join view is maintained by recomputing the view rows of the root keys
+  that changed (see above).  That is correct for any set of columns of the
+  root: every view row whose root has one of the keys is deleted and every
+  row of the join whose root has one of them is inserted again, so a key
+  that is not unique only makes more rows be recomputed, and duplicate
+  rows of a base table come and go together.  The same holds for the keys
+  of the other instances, which are only mapped to root keys.  A key is
+  therefore chosen for every table, primary key or not.
+*/
+enum class Mview_key_kind {
+  PRIMARY,  ///< the PRIMARY KEY of the table
+  UNIQUE,   ///< a UNIQUE key of NOT NULL columns (no PRIMARY KEY)
+  COLUMNS,  ///< no such key: every column whose values compare exactly
+            ///< (not FLOAT, BLOB, TEXT, JSON, spatial, generated)
+  NONE      ///< aggregate views of tables without such a key: none
+};
+
 /** One instance (alias) of a base table in the view's FROM clause. */
 struct Mview_table {
   std::string db;     ///< Base table schema.
   std::string table;  ///< Base table name.
   std::string alias;  ///< Alias used in the SQL fragments below.
-  /// Primary key column names in the base table, in key order.
+  /// The row key of the instance (see Mview_key_kind): column names in
+  /// the base table, in key order.  Empty for Mview_key_kind::NONE, and
+  /// for COLUMNS when no column qualifies: then every change of the table
+  /// refreshes the view completely.
   std::vector<std::string> pk_columns;
+  Mview_key_kind key_kind{Mview_key_kind::PRIMARY};
+  /// Some column of pk_columns is nullable in the current definition of
+  /// the table: keys are compared with <=>.  Filled in at load time.
+  bool key_nullable{false};
   /// 0-based positions of pk_columns among the base table's columns, as
   /// they appear in a binlog Table_map event.  Filled in from the current
   /// table definition when the metadata is loaded.
   std::vector<unsigned> pk_ordinals;
-  /// Join views: names of the INVISIBLE columns of V that hold this
-  /// instance's primary key; same order as pk_columns.
+  /// Join views: names of the columns of V that hold this instance's row
+  /// key; same order as pk_columns.  An INVISIBLE column of its own, or a
+  /// column of the user that is exactly that column of the instance.
   std::vector<std::string> key_columns;
   /// Aggregate views: every column of this instance that the view
   /// references anywhere (select list, ON, WHERE, GROUP BY), plus the
