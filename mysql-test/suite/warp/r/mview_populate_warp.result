@@ -4,7 +4,7 @@
 # base tables and views: WARP
 SET SESSION mview_populate_threads = 4;
 # v_fd: 16670 rows, 0 differ from the defining SELECT
-# The layout: a key per table
+# The layout: an INVISIBLE AUTO_INCREMENT PRIMARY KEY, a key per table
 SHOW CREATE TABLE v_fd;
 Table	Create Table
 v_fd	CREATE TABLE `v_fd` (
@@ -14,6 +14,8 @@ v_fd	CREATE TABLE `v_fd` (
   `amt` int DEFAULT NULL,
   `y` int DEFAULT NULL,
   `mv$pk1_0` int DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$row_id` bigint unsigned NOT NULL AUTO_INCREMENT /*!80023 INVISIBLE */,
+  PRIMARY KEY (`mv$row_id`),
   KEY `mv$ix_pk0` (`id`),
   KEY `mv$ix_pk1` (`mv$pk1_0`)
 ) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
@@ -24,6 +26,8 @@ v_left	CREATE TABLE `v_left` (
   `amt` int DEFAULT NULL,
   `name` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
   `mv$pk1_0` int DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$row_id` bigint unsigned NOT NULL AUTO_INCREMENT /*!80023 INVISIBLE */,
+  PRIMARY KEY (`mv$row_id`),
   KEY `mv$ix_pk0` (`id`),
   KEY `mv$ix_pk1` (`mv$pk1_0`)
 ) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

@@ -86,6 +86,8 @@ mv_left	CREATE TABLE `mv_left` (
   `qty` int DEFAULT NULL,
   `mv$pk2_0` bigint DEFAULT NULL /*!80023 INVISIBLE */,
   `mv$pk2_1` int DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$row_id` bigint unsigned NOT NULL AUTO_INCREMENT /*!80023 INVISIBLE */,
+  PRIMARY KEY (`mv$row_id`),
   KEY `mv$ix_pk0` (`cid`),
   KEY `mv$ix_pk1` (`oid`),
   KEY `mv$ix_pk2` (`mv$pk2_0`,`mv$pk2_1`)
@@ -94,8 +96,12 @@ SELECT TABLE_NAME, COLUMN_NAME, EXTRA FROM INFORMATION_SCHEMA.COLUMNS
 WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME LIKE 'mv\_%' AND EXTRA <> ''
 ORDER BY TABLE_NAME, ORDINAL_POSITION;
 TABLE_NAME	COLUMN_NAME	EXTRA
+mv_inner	mv$row_id	auto_increment INVISIBLE
 mv_left	mv$pk2_0	INVISIBLE
 mv_left	mv$pk2_1	INVISIBLE
+mv_left	mv$row_id	auto_increment INVISIBLE
+mv_right	mv$row_id	auto_increment INVISIBLE
+mv_self	mv$row_id	auto_increment INVISIBLE
 SELECT TABLE_NAME, ENGINE, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES
 WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME LIKE 'mv\_%' ORDER BY TABLE_NAME;
 TABLE_NAME	ENGINE	TABLE_TYPE
