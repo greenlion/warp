@@ -52,7 +52,8 @@ SELECT * FROM mv_left ORDER BY cid, oid, sku;
 --let $mv_select = $sel_left
 --source suite/warp/include/mview_check.inc
 --echo # The invisible key columns: NULL for the NULL-extended instances
-SELECT cid, oid, `mv$pk0_0`, `mv$pk1_0`, `mv$pk2_0`, `mv$pk2_1` FROM mv_left
+# (the keys of c and o are the columns cid and oid of the user)
+SELECT cid, oid, `mv$pk2_0`, `mv$pk2_1` FROM mv_left
 ORDER BY cid, oid, `mv$pk2_1`;
 
 --echo # RIGHT join: the root is the outer table

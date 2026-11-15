@@ -1,0 +1,9 @@
+--echo #
+--echo # SYNCHRONOUS materialized views (in InnoDB) of base tables (in InnoDB) without
+--echo # a PRIMARY KEY, maintained by the WARP_MVIEW daemon
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--let $view_engine = InnoDB
+--let $base_engine = InnoDB
+--source suite/warp/include/mview_sync_nopk.inc

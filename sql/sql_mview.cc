@@ -475,13 +475,66 @@ bool check_opened_tables(LEX *lex) {
         my_strcasecmp(system_charset_info, tr->db, "mysql") == 0 ||
         my_strcasecmp(system_charset_info, tr->db, "sys") == 0)
       return unsupported_table(tr, "it is a system table");
-    if (share->primary_key == MAX_KEY ||
-        strcmp(tr->table->key_info[share->primary_key].name, "PRIMARY") != 0) {
-      my_error(ER_MVIEW_NO_PRIMARY_KEY, MYF(0), tr->db, tr->table_name);
-      return true;
-    }
+    /* A table without a PRIMARY KEY gets another row key, see
+       choose_row_key(). */
   }
   return false;
+}
+
+/**
+  Can the column be part of a row key made of columns: the maintenance
+  compares the values it decodes from row images to it exactly, and puts
+  them in IN-lists.
+*/
+bool row_key_column(const Field *field) {
+  if (field->is_hidden_by_system() || field->is_gcol()) return false;
+  if (field->is_flag_set(BLOB_FLAG)) return false;  // TEXT, JSON, spatial...
+  switch (field->real_type()) {
+    case MYSQL_TYPE_FLOAT:  // no exact literal
+    case MYSQL_TYPE_JSON:
+    case MYSQL_TYPE_GEOMETRY:
+    case MYSQL_TYPE_VECTOR:
+    case MYSQL_TYPE_TYPED_ARRAY:
+    case MYSQL_TYPE_NULL:
+      return false;
+    default:
+      return true;
+  }
+}
+
+/**
+  The row key of a base table instance (see Mview_key_kind): the PRIMARY
+  KEY; else the UNIQUE key of NOT NULL columns that the server uses in its
+  place; else, for a join view, every column that row_key_column() accepts;
+  else (aggregate views do not use it) none.
+*/
+void choose_row_key(const TABLE *table, bool aggregate, Mview_key_kind *kind,
+                    std::vector<const Field *> *fields) {
+  fields->clear();
+  const TABLE_SHARE *share = table->s;
+  if (share->primary_key != MAX_KEY) {
+    const KEY &key = table->key_info[share->primary_key];
+    bool usable = true;
+    for (uint part = 0; part < key.user_defined_key_parts; part++) {
+      /* The column: the field of a key part on a prefix is another one. */
+      const Field *field = table->field[key.key_part[part].fieldnr - 1];
+      if (field->is_hidden_by_system()) usable = false;  // functional
+      fields->push_back(field);
+    }
+    if (usable && !fields->empty()) {
+      *kind = strcmp(key.name, "PRIMARY") == 0 ? Mview_key_kind::PRIMARY
+                                               : Mview_key_kind::UNIQUE;
+      return;
+    }
+    fields->clear();
+  }
+  if (aggregate) {
+    *kind = Mview_key_kind::NONE;
+    return;
+  }
+  *kind = Mview_key_kind::COLUMNS;
+  for (uint f = 0; f < share->fields; f++)
+    if (row_key_column(table->field[f])) fields->push_back(table->field[f]);
 }
 
 /**
@@ -801,7 +854,8 @@ bool user_column_names(Table_ref *view, Query_block *qb,
   same columns under the alias (see Mview_def::from_template).
 */
 bool build_tables(THD *thd, Query_block *qb,
-                  const std::vector<Item *> &group_items, Mview_def *def) {
+                  const std::vector<Item *> &group_items, bool aggregate,
+                  Mview_def *def) {
   /* The definition, for SHOW CREATE VIEW, as a view prints it. */
   {
     StringBuffer<1024> buffer(sql_text_charset);
@@ -811,6 +865,7 @@ bool build_tables(THD *thd, Query_block *qb,
 
   /* The table instances, in the order of the leaves of the join. */
   std::vector<Table_ref *> leaves;
+  std::vector<std::vector<const Field *>> row_keys;
   bool root_found = false;
   for (Table_ref *tr = qb->leaf_tables; tr != nullptr; tr = tr->next_leaf) {
     Mview_table mt;
@@ -829,16 +884,15 @@ bool build_tables(THD *thd, Query_block *qb,
       def->root = def->tables.size();
       root_found = true;
     }
-    const TABLE *table = tr->table;
-    const KEY &pk = table->key_info[table->s->primary_key];
-    for (uint part = 0; part < pk.user_defined_key_parts; part++) {
-      /* The column: the field of a key part on a prefix is another one. */
-      mt.pk_columns.emplace_back(
-          table->field[pk.key_part[part].fieldnr - 1]->field_name);
+    std::vector<const Field *> key_fields;
+    choose_row_key(tr->table, aggregate, &mt.key_kind, &key_fields);
+    for (const Field *field : key_fields) {
+      mt.pk_columns.emplace_back(field->field_name);
       mt.pk_ordinals.push_back(0);  // see mview_fill_pk_ordinals()
     }
     def->tables.push_back(std::move(mt));
     leaves.push_back(tr);
+    row_keys.push_back(std::move(key_fields));
   }
   if (!root_found)
     return unsupported("every table is on the inner side of an outer join");
@@ -848,9 +902,8 @@ bool build_tables(THD *thd, Query_block *qb,
   for (size_t i = 0; i < leaves.size(); i++) {
     const TABLE *table = leaves[i]->table;
     referenced[i].assign(table->s->fields, false);
-    const KEY &pk = table->key_info[table->s->primary_key];
-    for (uint part = 0; part < pk.user_defined_key_parts; part++)
-      referenced[i][pk.key_part[part].fieldnr - 1] = true;
+    for (const Field *field : row_keys[i])
+      referenced[i][field->field_index()] = true;
   }
   bool foreign_column = false;
   auto collect = [&](Item *root) -> bool {
@@ -939,13 +992,24 @@ bool build_join_view(THD *thd, Table_ref *view, Query_block *qb, bool warp,
 
   /* The user columns. */
   def->detail_select = "SELECT ";
+  /* The user columns that are a column of a table instance, as they are */
+  struct Plain_column {
+    const Field *base;
+    const std::string *name;
+    std::string type;
+  };
+  std::vector<Plain_column> plain_columns;
   size_t pos = 0;
   for (Item *item : qb->visible_fields()) {
     const std::string &name = build->user_columns[pos];
     Field *field = result_field(thd, item, &tmp_table);
     if (field == nullptr) return true;
-    build->column_definitions.push_back(
-        column_definition(name, column_type(field, warp), false));
+    const std::string type = column_type(field, warp);
+    build->column_definitions.push_back(column_definition(name, type, false));
+    if (item->real_item()->type() == Item::FIELD_ITEM) {
+      const Field *base = down_cast<Item_field *>(item->real_item())->field;
+      if (base != nullptr) plain_columns.push_back({base, &name, type});
+    }
     if (pos != 0) {
       def->detail_select += ", ";
       def->detail_columns += ", ";
@@ -955,37 +1019,62 @@ bool build_join_view(THD *thd, Table_ref *view, Query_block *qb, bool warp,
     pos++;
   }
 
-  /* The key columns: the primary key of every table instance. */
+  /* The key columns: the row key of every table instance (see
+     choose_row_key()), in a column of the user that is exactly the column
+     of the instance, else in an INVISIBLE column. */
   size_t instance = 0;
   for (Table_ref *tr = qb->leaf_tables; tr != nullptr;
        tr = tr->next_leaf, instance++) {
     Mview_table &mt = def->tables[instance];
     const TABLE *table = tr->table;
-    const KEY &pk = table->key_info[table->s->primary_key];
+    Mview_key_kind kind;
     std::vector<const Field *> key_fields;
-    std::string index_columns;
-    for (uint part = 0; part < pk.user_defined_key_parts; part++) {
-      const Field *field = table->field[pk.key_part[part].fieldnr - 1];
-      const std::string key_column = std::string(MVIEW_INTERNAL_PREFIX) +
-                                     "pk" + std::to_string(instance) + "_" +
-                                     std::to_string(part);
+    choose_row_key(table, false, &kind, &key_fields);
+    assert(kind == mt.key_kind && key_fields.size() == mt.pk_columns.size());
+    std::vector<std::string> index_columns;
+    for (size_t part = 0; part < key_fields.size(); part++) {
+      const Field *field = key_fields[part];
+      const std::string type = column_type(field, warp);
+      std::string key_column;
+      for (const Plain_column &plain : plain_columns) {
+        if (plain.base->table == table &&
+            plain.base->field_index() == field->field_index() &&
+            plain.type == type) {
+          key_column = *plain.name;
+          break;
+        }
+      }
+      if (key_column.empty()) {
+        key_column = std::string(MVIEW_INTERNAL_PREFIX) + "pk" +
+                     std::to_string(instance) + "_" + std::to_string(part);
+        build->column_definitions.push_back(
+            column_definition(key_column, type, true));
+        def->detail_select += ", " + quote(mt.alias) + "." +
+                              quote(field->field_name) + " AS " +
+                              quote(key_column);
+        def->detail_columns += ", " + quote(key_column);
+      }
       mt.key_columns.push_back(key_column);
-      build->column_definitions.push_back(
-          column_definition(key_column, column_type(field, warp), true));
-      def->detail_select += ", " + quote(mt.alias) + "." +
-                            quote(field->field_name) + " AS " +
-                            quote(key_column);
-      def->detail_columns += ", " + quote(key_column);
-      if (part != 0) index_columns += ", ";
-      index_columns += quote(key_column);
-      key_fields.push_back(field);
+      index_columns.push_back(quote(key_column));
     }
-    if (indexable(key_fields, warp))
+    /* A wide key of all the columns of a table: its first columns that
+       can be indexed narrow the rows down just as well. */
+    size_t indexed = std::min<size_t>(key_fields.size(), 16);
+    while (indexed > 0 &&
+           !indexable(std::vector<const Field *>(key_fields.begin(),
+                                                 key_fields.begin() + indexed),
+                      warp))
+      indexed--;
+    if (indexed > 0) {
+      std::string columns;
+      for (size_t k = 0; k < indexed; k++)
+        columns += (k ? ", " : "") + index_columns[k];
       build->index_definitions.push_back(
           "KEY " +
           quote(std::string(MVIEW_INTERNAL_PREFIX) + "ix_pk" +
                 std::to_string(instance)) +
-          " (" + index_columns + ")");
+          " (" + columns + ")");
+    }
   }
   return false;
 }
@@ -1420,7 +1509,8 @@ bool analyse_definition(THD *thd, Table_ref *view, bool warp, Mview_def *def,
     /* Print the way the internal statements are parsed: sql_mode=''. */
     const sql_mode_t saved_sql_mode = thd->variables.sql_mode;
     thd->variables.sql_mode = 0;
-    res = build_tables(thd, qb, analysis.group_items, def) ||
+    res = build_tables(thd, qb, analysis.group_items, analysis.is_aggregate,
+                       def) ||
           (analysis.is_aggregate
                ? build_aggregate_view(thd, view, qb, warp,
                                       analysis.group_items, def, build)

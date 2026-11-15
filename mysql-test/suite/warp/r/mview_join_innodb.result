@@ -48,15 +48,15 @@ cid	uname	oid	dbl	sku	qty
 4	NULL	NULL	NULL	NULL	0
 # mv_left: 6 rows, 0 differ from the defining SELECT
 # The invisible key columns: NULL for the NULL-extended instances
-SELECT cid, oid, `mv$pk0_0`, `mv$pk1_0`, `mv$pk2_0`, `mv$pk2_1` FROM mv_left
+SELECT cid, oid, `mv$pk2_0`, `mv$pk2_1` FROM mv_left
 ORDER BY cid, oid, `mv$pk2_1`;
-cid	oid	mv$pk0_0	mv$pk1_0	mv$pk2_0	mv$pk2_1
-1	10	1	10	10	1
-1	10	1	10	10	2
-1	11	1	11	NULL	NULL
-2	12	2	12	12	1
-3	NULL	3	NULL	NULL	NULL
-4	NULL	4	NULL	NULL	NULL
+cid	oid	mv$pk2_0	mv$pk2_1
+1	10	10	1
+1	10	10	2
+1	11	NULL	NULL
+2	12	12	1
+3	NULL	NULL	NULL
+4	NULL	NULL	NULL
 # RIGHT join: the root is the outer table
 CREATE MATERIALIZED VIEW mv_right ENGINE=ENGINE REFRESH MANUAL AS SELECT o.id AS oid, o.placed, c.id AS cid, c.region FROM ord o RIGHT JOIN cust c ON o.cust_id = c.id;
 SELECT * FROM mv_right ORDER BY cid, oid;
@@ -84,28 +84,18 @@ mv_left	CREATE TABLE `mv_left` (
   `dbl` decimal(11,2) DEFAULT NULL,
   `sku` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
   `qty` int DEFAULT NULL,
-  `mv$pk0_0` int DEFAULT NULL /*!80023 INVISIBLE */,
-  `mv$pk1_0` bigint DEFAULT NULL /*!80023 INVISIBLE */,
   `mv$pk2_0` bigint DEFAULT NULL /*!80023 INVISIBLE */,
   `mv$pk2_1` int DEFAULT NULL /*!80023 INVISIBLE */,
-  KEY `mv$ix_pk0` (`mv$pk0_0`),
-  KEY `mv$ix_pk1` (`mv$pk1_0`),
+  KEY `mv$ix_pk0` (`cid`),
+  KEY `mv$ix_pk1` (`oid`),
   KEY `mv$ix_pk2` (`mv$pk2_0`,`mv$pk2_1`)
 ) ENGINE=ENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 SELECT TABLE_NAME, COLUMN_NAME, EXTRA FROM INFORMATION_SCHEMA.COLUMNS
 WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME LIKE 'mv\_%' AND EXTRA <> ''
 ORDER BY TABLE_NAME, ORDINAL_POSITION;
 TABLE_NAME	COLUMN_NAME	EXTRA
-mv_inner	mv$pk0_0	INVISIBLE
-mv_inner	mv$pk1_0	INVISIBLE
-mv_left	mv$pk0_0	INVISIBLE
-mv_left	mv$pk1_0	INVISIBLE
 mv_left	mv$pk2_0	INVISIBLE
 mv_left	mv$pk2_1	INVISIBLE
-mv_right	mv$pk0_0	INVISIBLE
-mv_right	mv$pk1_0	INVISIBLE
-mv_self	mv$pk0_0	INVISIBLE
-mv_self	mv$pk1_0	INVISIBLE
 SELECT TABLE_NAME, ENGINE, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES
 WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME LIKE 'mv\_%' ORDER BY TABLE_NAME;
 TABLE_NAME	ENGINE	TABLE_TYPE

@@ -185,6 +185,9 @@ bool get(const rapidjson::Value &obj, const char *key, std::string *value) {
 const char *const state_kind_names[] = {"COUNT_STAR", "COUNT", "SUM",
                                         "MIN",        "MAX",   "RECOMPUTE"};
 
+/* Mview_key_kind; metadata without "key_kind" has a PRIMARY KEY. */
+const char *const key_kind_names[] = {"PRIMARY", "UNIQUE", "COLUMNS", "NONE"};
+
 bool get(const rapidjson::Value &obj, const char *key, bool *value) {
   const auto it = obj.FindMember(key);
   if (it == obj.MemberEnd() || !it->value.IsBool()) return true;
@@ -229,6 +232,7 @@ std::string mview_def_to_json(const Mview_def &def,
     put(&w, "table", t.table);
     put(&w, "alias", t.alias);
     put(&w, "pk", t.pk_columns);
+    put(&w, "key_kind", key_kind_names[static_cast<int>(t.key_kind)]);
     put(&w, "key_columns", t.key_columns);
     put(&w, "ref_columns", t.ref_columns);
     w.Key("null_supplying");
@@ -329,8 +333,30 @@ bool mview_def_from_dd(const char *db, const dd::Abstract_table &table,
         get(t, "alias", &mt.alias) || get(t, "pk", &mt.pk_columns) ||
         get(t, "key_columns", &mt.key_columns) ||
         get(t, "ref_columns", &mt.ref_columns) ||
-        get(t, "null_supplying", &mt.null_supplying) ||
-        mt.pk_columns.empty()) {
+        get(t, "null_supplying", &mt.null_supplying)) {
+      *reason = "the list of tables of the definition is broken";
+      return true;
+    }
+    if (t.HasMember("key_kind")) {
+      std::string kind;
+      bool known = !get(t, "key_kind", &kind);
+      if (known) {
+        known = false;
+        for (int k = 0; k < 4 && !known; k++) {
+          if (kind == key_kind_names[k]) {
+            mt.key_kind = static_cast<Mview_key_kind>(k);
+            known = true;
+          }
+        }
+      }
+      if (!known) {
+        *reason = "the list of tables of the definition is broken";
+        return true;
+      }
+    }
+    /* Only a key of all the usable columns may be empty. */
+    if (mt.pk_columns.empty() != (mt.key_kind == Mview_key_kind::NONE) &&
+        mt.key_kind != Mview_key_kind::COLUMNS) {
       *reason = "the list of tables of the definition is broken";
       return true;
     }
@@ -344,7 +370,8 @@ bool mview_def_from_dd(const char *db, const dd::Abstract_table &table,
     bool broken = get(doc, "detail_columns", &def->detail_columns) ||
                   get(doc, "detail_select", &def->detail_select);
     for (const Mview_table &mt : def->tables)
-      broken = broken || mt.pk_columns.size() != mt.key_columns.size();
+      broken = broken || mt.pk_columns.size() != mt.key_columns.size() ||
+               mt.key_kind == Mview_key_kind::NONE;
     if (broken) {
       *reason = "the join of the definition is incomplete";
       return true;
@@ -443,38 +470,55 @@ void skip_warning(const Mview_def &def, const std::string &reason) {
   table.  The ordinals are positions among the columns of a binlog
   Table_map event: all the columns of the table but those hidden by the
   storage engine and the hidden generated columns of functional indexes
-  (see Table_map_log_event and ReplicatedColumnsView).
+  (see Table_map_log_event and ReplicatedColumnsView).  Also fills in
+  Mview_table::key_nullable.
+
+  A row key that is the PRIMARY KEY has to be it still.  Any other key
+  only has to exist: the maintenance is correct for any key columns (see
+  Mview_key_kind), a key that is not unique any more only costs time.
 
   @retval false success
   @retval true  the table is not usable any more, see reason
 */
 bool fill_pk_ordinals(const dd::Table &base, Mview_table *mt,
                       std::string *reason) {
-  const dd::Index *pk = nullptr;
-  for (const dd::Index *index : base.indexes()) {
-    if (index->type() == dd::Index::IT_PRIMARY && !index->is_hidden()) {
-      pk = index;
-      break;
+  const std::string name = "'" + mt->db + "." + mt->table + "'";
+  if (mt->key_kind == Mview_key_kind::PRIMARY) {
+    const dd::Index *pk = nullptr;
+    for (const dd::Index *index : base.indexes()) {
+      if (index->type() == dd::Index::IT_PRIMARY && !index->is_hidden()) {
+        pk = index;
+        break;
+      }
+    }
+    if (pk == nullptr) {
+      *reason = "table " + name + " has no PRIMARY KEY any more";
+      return true;
+    }
+    std::vector<std::string> pk_columns;
+    for (const dd::Index_element *element : pk->elements()) {
+      if (element->is_hidden()) continue;
+      pk_columns.emplace_back(element->column().name().c_str());
+    }
+    bool same = pk_columns.size() == mt->pk_columns.size();
+    for (size_t i = 0; same && i < pk_columns.size(); i++) {
+      same = my_strcasecmp(system_charset_info, pk_columns[i].c_str(),
+                           mt->pk_columns[i].c_str()) == 0;
+    }
+    if (!same) {
+      *reason = "the PRIMARY KEY of table " + name + " has changed";
+      return true;
     }
   }
-  const std::string name = "'" + mt->db + "." + mt->table + "'";
-  if (pk == nullptr) {
-    *reason = "table " + name + " has no PRIMARY KEY any more";
-    return true;
-  }
-  std::vector<std::string> pk_columns;
-  for (const dd::Index_element *element : pk->elements()) {
-    if (element->is_hidden()) continue;
-    pk_columns.emplace_back(element->column().name().c_str());
-  }
-  bool same = pk_columns.size() == mt->pk_columns.size();
-  for (size_t i = 0; same && i < pk_columns.size(); i++) {
-    same = my_strcasecmp(system_charset_info, pk_columns[i].c_str(),
-                         mt->pk_columns[i].c_str()) == 0;
-  }
-  if (!same) {
-    *reason = "the PRIMARY KEY of table " + name + " has changed";
-    return true;
+  mt->key_nullable = false;
+  for (const std::string &key_column : mt->pk_columns) {
+    for (const dd::Column *column : base.columns()) {
+      if (my_strcasecmp(system_charset_info, column->name().c_str(),
+                        key_column.c_str()) == 0) {
+        if (column->is_nullable()) mt->key_nullable = true;
+        break;
+      }
+    }
   }
   mt->pk_ordinals.clear();
   mt->ref_ordinals.clear();

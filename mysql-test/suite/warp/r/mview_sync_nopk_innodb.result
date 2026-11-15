@@ -1,0 +1,307 @@
+#
+# SYNCHRONOUS materialized views (in InnoDB) of base tables (in InnoDB) without
+# a PRIMARY KEY, maintained by the WARP_MVIEW daemon
+#
+call mtr.add_suppression("WARP_MVIEW");
+# views: InnoDB, base tables: InnoDB
+INSERT INTO c VALUES (1, 'ann', 'north'), (1, 'ann', 'north'), (2, 'bob', 'south'),
+(NULL, 'nul', NULL), (3, NULL, 'north');
+INSERT INTO o VALUES (10, 1, 15, 1.5), (11, 1, 250, 2.5), (12, 2, 99, NULL),
+(13, NULL, 5, 3), (14, 3, NULL, 4), (14, 3, NULL, 4);
+INSERT INTO u VALUES (1, 1), (2, NULL), (3, 2);
+INSERT INTO pkt VALUES (1, 1), (2, 2), (3, NULL);
+INSERT INTO w VALUES (10, 0.5), (11, NULL);
+# Create the views
+# The row keys: user columns that are key columns are not stored twice
+SHOW CREATE TABLE v_inner;
+Table	Create Table
+v_inner	CREATE TABLE `v_inner` (
+  `cid` int DEFAULT NULL,
+  `name` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
+  `oid` int DEFAULT NULL,
+  `amount` int DEFAULT NULL,
+  `f` float DEFAULT NULL,
+  `mv$pk0_2` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$pk1_1` int DEFAULT NULL /*!80023 INVISIBLE */,
+  KEY `mv$ix_pk0` (`cid`,`name`,`mv$pk0_2`),
+  KEY `mv$ix_pk1` (`oid`,`mv$pk1_1`,`amount`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+SHOW CREATE TABLE v_uniq;
+Table	Create Table
+v_uniq	CREATE TABLE `v_uniq` (
+  `id` int DEFAULT NULL,
+  `x` int DEFAULT NULL,
+  `name` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
+  `mv$pk1_0` int DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$pk1_2` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL /*!80023 INVISIBLE */,
+  KEY `mv$ix_pk0` (`id`),
+  KEY `mv$ix_pk1` (`mv$pk1_0`,`name`,`mv$pk1_2`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 4 rows, 0 missing, 0 extra
+v_mixed: 3 rows, 0 missing, 0 extra
+v_nokey: 6 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 2 rows, 0 missing, 0 extra
+# Duplicate rows: one of two goes
+DELETE FROM c WHERE id = 1 LIMIT 1;
+v_inner: 5 rows, 0 missing, 0 extra
+v_left: 6 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_uniq: 3 rows, 0 missing, 0 extra
+v_mixed: 2 rows, 0 missing, 0 extra
+v_nokey: 6 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 2 rows, 0 missing, 0 extra
+DELETE FROM o WHERE id = 14 LIMIT 1;
+v_inner: 4 rows, 0 missing, 0 extra
+v_left: 5 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_uniq: 3 rows, 0 missing, 0 extra
+v_mixed: 2 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 2 rows, 0 missing, 0 extra
+# Duplicate rows: one of two changes, then both
+INSERT INTO c VALUES (1, 'ann', 'north');
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_uniq: 4 rows, 0 missing, 0 extra
+v_mixed: 3 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 2 rows, 0 missing, 0 extra
+UPDATE c SET region = 'east' WHERE id = 1 LIMIT 1;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_uniq: 4 rows, 0 missing, 0 extra
+v_mixed: 3 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+UPDATE c SET name = 'anna' WHERE id = 1;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_uniq: 4 rows, 0 missing, 0 extra
+v_mixed: 3 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+# NULLs in row keys
+UPDATE c SET name = 'null id' WHERE id IS NULL;
+v_inner: 6 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_uniq: 4 rows, 0 missing, 0 extra
+v_mixed: 3 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+UPDATE c SET id = 2 WHERE id IS NULL;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 4 rows, 0 missing, 0 extra
+UPDATE c SET name = NULL, region = NULL WHERE name = 'bob';
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+UPDATE o SET c_id = NULL WHERE id = 12;
+v_inner: 5 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 2 rows, 0 missing, 0 extra
+UPDATE o SET amount = NULL WHERE id = 10;
+v_inner: 5 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 2 rows, 0 missing, 0 extra
+UPDATE o SET amount = 20, c_id = 2 WHERE id = 13;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 7 rows, 0 missing, 0 extra
+v_where: 5 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+INSERT INTO c VALUES (NULL, NULL, NULL), (NULL, NULL, NULL);
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 9 rows, 0 missing, 0 extra
+v_where: 7 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+DELETE FROM c WHERE id IS NULL AND name IS NULL LIMIT 1;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+# A column that is not in the row key (FLOAT)
+UPDATE o SET f = f + 10;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+# The WHERE of v_where: rows that go in and out of it
+UPDATE o SET amount = 500 WHERE id = 13;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 4 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+UPDATE o SET amount = 1 WHERE amount = 500;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+# UNIQUE key and PRIMARY KEY tables
+UPDATE u SET x = 3 WHERE id = 2;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+UPDATE u SET id = 7 WHERE id = 1;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 4 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+UPDATE pkt SET v = 3 WHERE id = 3;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 5 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+DELETE FROM pkt WHERE id = 1;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 3 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+# No usable row key: the views are refreshed
+UPDATE w SET g = 7 WHERE f = 11;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 3 rows, 0 missing, 0 extra
+v_nokey: 5 rows, 0 missing, 0 extra
+v_rootnokey: 2 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+INSERT INTO w VALUES (12, 1.25), (12, 1.25);
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 3 rows, 0 missing, 0 extra
+v_nokey: 6 rows, 0 missing, 0 extra
+v_rootnokey: 4 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+DELETE FROM w WHERE f = 10;
+v_inner: 7 rows, 0 missing, 0 extra
+v_left: 8 rows, 0 missing, 0 extra
+v_where: 6 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 3 rows, 0 missing, 0 extra
+v_nokey: 6 rows, 0 missing, 0 extra
+v_rootnokey: 3 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+# One transaction changes several tables
+BEGIN;
+INSERT INTO c VALUES (4, 'dee', 'west'), (4, 'dee', 'west');
+INSERT INTO o VALUES (15, 4, 7, NULL), (16, 4, NULL, NULL);
+UPDATE c SET region = 'south' WHERE id = 3;
+DELETE FROM o WHERE id = 11;
+UPDATE u SET x = 4 WHERE id = 3;
+COMMIT;
+v_inner: 9 rows, 0 missing, 0 extra
+v_left: 10 rows, 0 missing, 0 extra
+v_where: 10 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 3 rows, 0 missing, 0 extra
+v_nokey: 7 rows, 0 missing, 0 extra
+v_rootnokey: 3 rows, 0 missing, 0 extra
+v_agg: 5 rows, 0 missing, 0 extra
+# binlog_row_image=MINIMAL: the before image of a table without a
+# PRIMARY KEY has every column, the after image the changed ones
+SET SESSION binlog_row_image = MINIMAL;
+UPDATE c SET name = 'min' WHERE id = 4 LIMIT 1;
+UPDATE o SET amount = amount + 1 WHERE c_id = 4;
+DELETE FROM c WHERE id = 3;
+INSERT INTO c VALUES (5, 'eve', NULL);
+SET SESSION binlog_row_image = FULL;
+v_inner: 8 rows, 0 missing, 0 extra
+v_left: 10 rows, 0 missing, 0 extra
+v_where: 10 rows, 0 missing, 0 extra
+v_uniq: 5 rows, 0 missing, 0 extra
+v_mixed: 2 rows, 0 missing, 0 extra
+v_nokey: 7 rows, 0 missing, 0 extra
+v_rootnokey: 3 rows, 0 missing, 0 extra
+v_agg: 4 rows, 0 missing, 0 extra
+# Everything goes
+DELETE FROM o;
+DELETE FROM c;
+v_inner: 0 rows, 0 missing, 0 extra
+v_left: 0 rows, 0 missing, 0 extra
+v_where: 0 rows, 0 missing, 0 extra
+v_uniq: 3 rows, 0 missing, 0 extra
+v_mixed: 0 rows, 0 missing, 0 extra
+v_nokey: 0 rows, 0 missing, 0 extra
+v_rootnokey: 3 rows, 0 missing, 0 extra
+v_agg: 0 rows, 0 missing, 0 extra
+DROP MATERIALIZED VIEW v_inner, v_left, v_where, v_uniq, v_mixed, v_nokey,
+v_rootnokey, v_agg;
+DROP TABLE c, o, u, pkt, w;
