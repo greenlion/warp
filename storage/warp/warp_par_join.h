@@ -1659,7 +1659,7 @@ struct warp_pj_prober {
   const std::vector<warp_star_col> &nulls;
   size_t row = 0;
   uint32_t ordinal = 0;
-  uint32_t chosen[WARP_PJ_MAX_LEVELS];
+  uint32_t chosen[WARP_PJ_MAX_LEVELS] = {};
   std::vector<uint32_t> *out = nullptr;
   warp_pj_sink *sink = nullptr;
   void *local = nullptr;

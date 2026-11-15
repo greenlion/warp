@@ -160,22 +160,6 @@ static bool warp_partition_reserved(const std::string &data_dir, uint64_t number
   return warp_reserved_partitions.count(std::make_pair(data_dir, number)) != 0;
 }
 
-/* does the partition have the index of a column? (the queries make them) */
-static bool warp_partition_has_indexes(const std::string &part_dir) {
-  DIR *dir = opendir(part_dir.c_str());
-  if(dir == nullptr) return false;
-  bool found = false;
-  while(struct dirent *entry = readdir(dir)) {
-    const size_t len = strlen(entry->d_name);
-    if(len > 4 && strcmp(entry->d_name + len - 4, ".idx") == 0) {
-      found = true;
-      break;
-    }
-  }
-  closedir(dir);
-  return found;
-}
-
 /* The locks of a table that is dropped or renamed (by another name) are not
    used again.  Code that still holds them keeps them. */
 static void warp_forget_table_locks(const std::string &data_dir) {

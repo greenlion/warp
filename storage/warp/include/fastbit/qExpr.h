@@ -233,7 +233,7 @@ protected:
     qRange(TYPE t) : qExpr(t) {};
 
 private:
-    qRange(const qRange&) {}; // no copy constructor allowed, must use dup
+    qRange(const qRange&) : qExpr() {}; // no copy constructor allowed, must use dup
     qRange& operator=(const qRange&);
 }; // ibis::qRange
 
@@ -950,7 +950,7 @@ namespace ibis {
 	    variable(const char* var)
 		: name(ibis::util::strnewdup(var)), myBar(0), varind(0) {}
 	    variable(const variable& v)
-		: name(ibis::util::strnewdup(v.name)), decor(v.decor),
+		: term(), name(ibis::util::strnewdup(v.name)), decor(v.decor),
                   myBar(v.myBar), varind(v.varind) {}
 	    virtual ~variable() {delete [] name;}
 
@@ -1027,7 +1027,7 @@ namespace ibis {
 	    /// 't' or 'T', or it equals to "1".
 	    virtual bool isTrue() const {
 		return(str != 0 && (*str == 't' || *str == 'T' ||
-				    (*str == '1' && *str == 0)));}
+				    (*str == '1' && str[1] == 0)));}
 
 	    virtual uint32_t nItems() const {return 1U;}
 	    virtual void print(std::ostream& out) const {out << str;}
@@ -1162,7 +1162,7 @@ namespace ibis {
 	    customFunction1(const func1 &ft)
                 : fun_(ft.dup()) {}
 	    customFunction1(const customFunction1 &rhs)
-                : fun_(rhs.fun_->dup()) {
+                : term(), fun_(rhs.fun_->dup()) {
                 if (rhs.getLeft() != 0) {
                     setLeft(rhs.getLeft()->dup());
                 }
@@ -1246,7 +1246,7 @@ namespace ibis {
 	    stringFunction1(const sfunc1 &ft)
                 : fun_(ft.dup()) {}
 	    stringFunction1(const stringFunction1 &rhs)
-                : fun_(rhs.fun_->dup()) {
+                : term(), fun_(rhs.fun_->dup()) {
                 if (rhs.getLeft() != 0) {
                     setLeft(rhs.getLeft()->dup());
                 }
