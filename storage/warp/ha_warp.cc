@@ -8958,7 +8958,7 @@ retry_lock:
   if(it == row_locks.end()) {
     // row is not locked so lock can proceed without
     // checking anything further!
-    row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+    add_row_lock(rowid, new_lock);
     lock_mtx.unlock();
     return lock_type;
   } else {
@@ -9000,7 +9000,7 @@ retry_lock:
           }
           new_lock.waiting_on = 0;
           row_locks.erase(it2);
-          row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+          add_row_lock(rowid, new_lock);
           lock_mtx.unlock();
           return lock_type;
         }
@@ -9046,7 +9046,7 @@ retry_lock:
         // will sleep a bit if spinlocks are exhausted and 
         // will error out if lock_wait_timeout is exhausted
         new_lock.waiting_on = test_lock.waiting_on;
-        row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+        add_row_lock(rowid, new_lock);
         warp_lock_log_conflict("sh-waiting", rowid, trx->trx_id, test_lock,
                                row_locks.size());
         lock_mtx.unlock();
@@ -9061,7 +9061,7 @@ retry_lock:
         warp_lock_log_conflict("deadlock-detected", rowid, trx->trx_id, test_lock,
                                row_locks.size());
         new_lock.lock_type = LOCK_DEADLOCK;
-        row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+        add_row_lock(rowid, new_lock);
         lock_mtx.unlock();
         return LOCK_DEADLOCK;
       } else {
@@ -9076,7 +9076,7 @@ retry_lock:
 
   new_lock.waiting_on = 0;
   // insert the new lock
-  row_locks.emplace(std::pair<uint64_t, warp_lock>(rowid, new_lock));
+  add_row_lock(rowid, new_lock);
   
   lock_mtx.unlock();
   return lock_type;
@@ -9542,18 +9542,24 @@ int warp_global_data::downgrade_to_history_lock(uint64_t rowid, warp_trx* trx) {
 
 int warp_global_data::free_locks(warp_trx* trx) {
   lock_mtx.lock();
-  /* erase() returns the iterator following the erased element, so all
-     the locks of the transaction are released in a single pass over the
-     map.  Deleting and continuing (rather than restarting from begin())
-     keeps the total cost linear in the size of the map: a restart after
-     every erase made a commit that holds K locks in a map of N locks
-     cost O(K*N) lock scans while holding the engine-wide mutex. */
-  for(auto it = row_locks.begin(); it != row_locks.end();) {
-    if(it->second.holder == trx->trx_id) {
-      it = row_locks.erase(it);
-    } else {
-      ++it;
+  /* Only the rows the transaction has locked are looked at
+     (trx_lock_rowids): the cost of a commit is the number of its own
+     locks.  Walking all of row_locks made every commit cost the locks of
+     all the transactions while it held the engine-wide mutex, so parallel
+     loads into a table with a unique key took turns. */
+  auto rows = trx_lock_rowids.find(trx->trx_id);
+  if(rows != trx_lock_rowids.end()) {
+    for(uint64_t rowid : rows->second) {
+      auto range = row_locks.equal_range(rowid);
+      for(auto it = range.first; it != range.second;) {
+        if(it->second.holder == trx->trx_id) {
+          it = row_locks.erase(it);
+        } else {
+          ++it;
+        }
+      }
     }
+    trx_lock_rowids.erase(rows);
   }
   lock_mtx.unlock();
   return 0;

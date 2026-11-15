@@ -901,6 +901,15 @@ class warp_global_data {
 
   //rowid, warp_lock object
   std::unordered_multimap<uint64_t, warp_lock> row_locks;
+  /* trx_id, the rows it has entries for in row_locks (a row may repeat;
+     an entry may be gone already).  free_locks() looks at these rows
+     only, not at the locks of every transaction.  Protected by lock_mtx,
+     like row_locks; every entry is added with add_row_lock(). */
+  std::unordered_map<uint64_t, std::vector<uint64_t>> trx_lock_rowids;
+  void add_row_lock(uint64_t rowid, const warp_lock &lock) {
+    row_locks.emplace(rowid, lock);
+    trx_lock_rowids[lock.holder].push_back(rowid);
+  }
   
   // rowid, trx_id
   std::unordered_map<uint64_t, uint64_t> history_locks;
