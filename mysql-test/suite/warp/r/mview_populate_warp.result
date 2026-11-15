@@ -1,0 +1,68 @@
+#
+# Materialized join views filled by several sessions (WARP)
+#
+# base tables and views: WARP
+SET SESSION mview_populate_threads = 4;
+# v_fd: 16670 rows, 0 differ from the defining SELECT
+# The layout: a key per table
+SHOW CREATE TABLE v_fd;
+Table	Create Table
+v_fd	CREATE TABLE `v_fd` (
+  `id` bigint DEFAULT NULL,
+  `d_id` int DEFAULT NULL,
+  `c_id` int DEFAULT NULL,
+  `amt` int DEFAULT NULL,
+  `y` int DEFAULT NULL,
+  `mv$pk1_0` int DEFAULT NULL /*!80023 INVISIBLE */,
+  KEY `mv$ix_pk0` (`id`),
+  KEY `mv$ix_pk1` (`mv$pk1_0`)
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+SHOW CREATE TABLE v_left;
+Table	Create Table
+v_left	CREATE TABLE `v_left` (
+  `id` bigint DEFAULT NULL,
+  `amt` int DEFAULT NULL,
+  `name` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
+  `mv$pk1_0` int DEFAULT NULL /*!80023 INVISIBLE */,
+  KEY `mv$ix_pk0` (`id`),
+  KEY `mv$ix_pk1` (`mv$pk1_0`)
+) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+# v_where: 3668 rows, 0 differ from the defining SELECT
+# v_left: 20000 rows, 0 differ from the defining SELECT
+# v_s: 3 rows, 0 differ from the defining SELECT
+# v_n: 6 rows, 0 differ from the defining SELECT
+# Filled by several sessions: v_fd, v_where, v_left and v_n (4 each);
+# v_s alone (no integer column)
+parallel: 4, sessions: 16
+# REFRESH
+INSERT INTO f VALUES (999999, 3, 1, 1);
+REFRESH MATERIALIZED VIEW v_fd;
+# v_fd: 16671 rows, 0 differ from the defining SELECT
+# One session
+SET SESSION mview_populate_threads = 1;
+DELETE FROM f WHERE id = 999999;
+REFRESH MATERIALIZED VIEW v_fd;
+# v_fd: 16670 rows, 0 differ from the defining SELECT
+DROP MATERIALIZED VIEW v_left;
+CREATE MATERIALIZED VIEW v_left ENGINE=WARP AS SELECT f.id, f.amt, c.name FROM f LEFT JOIN c ON c.id = f.c_id;
+# v_left: 20000 rows, 0 differ from the defining SELECT
+# An error in a session: nothing is left behind
+SET SESSION mview_populate_threads = 4;
+CREATE MATERIALIZED VIEW v_err ENGINE=WARP AS
+SELECT f.id, IF(f.id = 7 * 15000 - 3000, JSON_EXTRACT('not json', '$.a'), NULL) AS q FROM f;
+ERROR 22032: Invalid JSON text in argument 1 to function json_extract: "Invalid value." at position 1.
+SHOW TABLES LIKE 'v\_err';
+Tables_in_test (v\_err)
+# KILL QUERY stops the sessions, rolls them back, drops the table
+SET SESSION mview_populate_threads = 4;
+ERROR 70100: Query execution was interrupted
+SHOW TABLES LIKE 'v\_kill';
+Tables_in_test (v\_kill)
+# no session is left
+SELECT COUNT(*) FROM performance_schema.threads
+WHERE PROCESSLIST_INFO LIKE 'INSERT INTO `test`.`v\_kill`%';
+COUNT(*)
+0
+SET SESSION mview_populate_threads = DEFAULT;
+DROP MATERIALIZED VIEW v_fd, v_where, v_left, v_s, v_n;
+DROP TABLE f, d, c, s, n;

@@ -4847,6 +4847,15 @@ static Sys_var_ulong Sys_max_execution_time(
     HINT_UPDATEABLE SESSION_VAR(max_execution_time), CMD_LINE(REQUIRED_ARG),
     VALID_RANGE(0, ULONG_MAX), DEFAULT(0), BLOCK_SIZE(1));
 
+static Sys_var_ulong Sys_mview_populate_threads(
+    "mview_populate_threads",
+    "Number of sessions that CREATE MATERIALIZED VIEW (and REFRESH of a view "
+    "in WARP) fill a join view with, each with a range of the rows of its "
+    "first table. 0 means one per CPU, at most 32; 1 fills it in the "
+    "session of the statement.",
+    SESSION_VAR(mview_populate_threads), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, 256), DEFAULT(0), BLOCK_SIZE(1));
+
 static const char *ssl_fips_mode_names[] = {"OFF", "ON", "STRICT", nullptr};
 static Sys_var_enum Sys_ssl_fips_mode(
     "ssl_fips_mode",

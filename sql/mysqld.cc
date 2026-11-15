@@ -884,6 +884,7 @@ MySQL clients support the protocol:
 #include "sql/sql_list.h"
 #include "sql/sql_locale.h"   // MY_LOCALE
 #include "sql/sql_manager.h"  // start_handle_manager
+#include "sql/sql_mview.h"  // mview_populate_parallel
 #include "sql/sql_parse.h"    // check_stack_overrun
 #include "sql/sql_plugin.h"   // opt_plugin_dir
 #include "sql/sql_plugin_ref.h"
@@ -11879,6 +11880,10 @@ SHOW_VAR status_vars[] = {
      SHOW_SCOPE_GLOBAL},
     {"Max_used_connections_time", (char *)&show_max_used_connections_time,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Mview_populate_parallel", (char *)&mview_populate_parallel,
+     SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
+    {"Mview_populate_sessions", (char *)&mview_populate_sessions,
+     SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
     {"Not_flushed_delayed_rows", (char *)&delayed_rows_in_use,
      SHOW_LONG_NOFLUSH, SHOW_SCOPE_GLOBAL},
     {"Open_files", (char *)&my_file_opened, SHOW_LONG_NOFLUSH,

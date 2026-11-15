@@ -141,6 +141,10 @@ bool mview_check_drop_view(THD *thd, const char *db, const char *table_name,
 */
 bool mview_show_create(THD *thd, Table_ref *table_ref, String *buffer);
 
+/** Status: views filled by several sessions, and the sessions. */
+extern unsigned long long mview_populate_parallel;
+extern unsigned long long mview_populate_sessions;
+
 /** Note in the registry that something changed (see mview_registry_version).
  */
 void mview_registry_changed();
