@@ -30,7 +30,13 @@
 #include "sql/sql_mview.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "lex_string.h"
@@ -59,6 +65,10 @@
 #include "sql/item_sum.h"
 #include "sql/mdl.h"
 #include "sql/mysqld.h"
+#include "sql/mysqld_thd_manager.h"
+#include "sql/protocol_classic.h"
+#include "sql/dd/types/column.h"
+#include "sql/statement/protocol_local.h"
 #include "sql/nested_join.h"
 #include "sql/query_options.h"
 #include "sql/sql_base.h"
@@ -153,6 +163,17 @@ class Mview_locks {
       return true;
     for (MDL_request *r : all) m_tickets.push_back(r->ticket);
     return false;
+  }
+
+  /// The lock of a table taken by lock(); nullptr if there is none.
+  MDL_ticket *find(const std::string &db, const std::string &name) const {
+    for (MDL_ticket *ticket : m_tickets) {
+      const MDL_key *key = ticket->get_key();
+      if (key->mdl_namespace() == MDL_key::TABLE &&
+          db == key->db_name() && name == key->name())
+        return ticket;
+    }
+    return nullptr;
   }
 
  private:
@@ -282,6 +303,50 @@ class Internal_session {
     }
     return false;
   }
+
+  /**
+    Execute a statement that returns one result set.
+
+    @param[out] rows  The rows; a NULL is (true, "").
+    @retval true the statement failed (reported)
+  */
+  bool query(const std::string &sql,
+             std::vector<std::vector<std::pair<bool, std::string>>> *rows) {
+    rows->clear();
+    LEX_STRING text;
+    if (lex_string_strmake(m_thd->mem_root, &text, sql.data(), sql.size()))
+      return true;
+    Ed_connection connection(m_thd);
+    sp_rcontext *const sp_runtime_ctx = m_thd->sp_runtime_ctx;
+    m_thd->sp_runtime_ctx = nullptr;
+    const bool error = connection.execute_direct(text);
+    m_thd->sp_runtime_ctx = sp_runtime_ctx;
+    if (error) {
+      if (!m_thd->is_error()) {
+        const unsigned int code = connection.get_last_errno();
+        my_message(code != 0 ? code : ER_UNKNOWN_ERROR,
+                   connection.get_last_error(), MYF(0));
+      }
+      return true;
+    }
+    Ed_result_set *result = connection.get_result_sets();
+    if (result == nullptr) return false;
+    List<Ed_row> &list = *result;
+    for (Ed_row &row : list) {
+      std::vector<std::pair<bool, std::string>> values;
+      for (size_t i = 0; i < row.size(); i++) {
+        const Ed_column &column = row[i];
+        if (column.str == nullptr)
+          values.emplace_back(true, std::string());
+        else
+          values.emplace_back(false, std::string(column.str, column.length));
+      }
+      rows->push_back(std::move(values));
+    }
+    return false;
+  }
+
+  THD *thd() const { return m_thd; }
 
  private:
   THD *m_thd;
@@ -1407,6 +1472,327 @@ std::string string_literal(const std::string &text) {
   return res;
 }
 
+/* ------------------------------------------------------------------ */
+/* Filling a join view in parallel                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+  The rows of a join view are divided by ranges of an integer column of its
+  root table: every row of the view has exactly one row of the root (it is
+  never NULL-extended), so the ranges divide the rows of the view.  Sessions
+  of their own fill the ranges, each in one transaction; when all of them
+  are done they all commit, or all roll back.  While they run the statement
+  holds the view with MDL_SHARED_UPGRADABLE instead of MDL_EXCLUSIVE (no
+  other DDL; the sessions can write to it) and the base tables with
+  MDL_SHARED_READ_ONLY as before (the sessions can read them, nobody can
+  change them).  Readers of the view see no rows of the sessions before
+  they commit.
+*/
+
+using Wide = __int128;
+
+}  // namespace
+
+ulonglong mview_populate_parallel = 0;
+ulonglong mview_populate_sessions = 0;
+
+namespace {
+
+bool parse_wide(const std::string &text, Wide *value) {
+  size_t i = 0;
+  const bool negative = !text.empty() && text[0] == '-';
+  if (negative) i = 1;
+  if (i >= text.size()) return true;
+  Wide v = 0;
+  for (; i < text.size(); i++) {
+    if (text[i] < '0' || text[i] > '9') return true;
+    v = v * 10 + (text[i] - '0');
+  }
+  *value = negative ? -v : v;
+  return false;
+}
+
+std::string wide_string(Wide value) {
+  if (value == 0) return "0";
+  const bool negative = value < 0;
+  unsigned __int128 u = negative ? -static_cast<unsigned __int128>(value)
+                                 : static_cast<unsigned __int128>(value);
+  std::string text;
+  while (u != 0) {
+    text.push_back(static_cast<char>('0' + static_cast<int>(u % 10)));
+    u /= 10;
+  }
+  if (negative) text.push_back('-');
+  std::reverse(text.begin(), text.end());
+  return text;
+}
+
+/**
+  Conditions that divide the rows of a join view into at most `parts`
+  ranges of an integer column of its root table (the first of its row key,
+  else of the columns the view references), plus the rows where the column
+  is NULL.  Empty if there is no such column or it has too few values.
+*/
+bool split_rows(Internal_session *session, const Mview_def &def, size_t parts,
+                std::vector<std::string> *conditions) {
+  conditions->clear();
+  const Mview_table &root = def.tables[def.root];
+  THD *thd = session->thd();
+  const dd::Table *table = nullptr;
+  if (thd->dd_client()->acquire(root.db.c_str(), root.table.c_str(), &table))
+    return true;
+  if (table == nullptr) return false;
+  auto is_integer = [&](const std::string &name) {
+    for (const dd::Column *column : table->columns()) {
+      if (my_strcasecmp(system_charset_info, column->name().c_str(),
+                        name.c_str()) != 0)
+        continue;
+      if (column->is_virtual()) return false;
+      switch (column->type()) {
+        case dd::enum_column_types::TINY:
+        case dd::enum_column_types::SHORT:
+        case dd::enum_column_types::INT24:
+        case dd::enum_column_types::LONG:
+        case dd::enum_column_types::LONGLONG:
+          return true;
+        default:
+          return false;
+      }
+    }
+    return false;
+  };
+  std::string column;
+  for (const std::vector<std::string> *names :
+       {&root.pk_columns, &root.ref_columns}) {
+    for (const std::string &name : *names) {
+      if (is_integer(name)) {
+        column = name;
+        break;
+      }
+    }
+    if (!column.empty()) break;
+  }
+  if (column.empty()) return false;
+
+  std::vector<std::vector<std::pair<bool, std::string>>> rows;
+  /* as text: the internal protocol stores numbers in binary */
+  if (session->query("SELECT CAST(MIN(" + quote(column) +
+                         ") AS CHAR), CAST(MAX(" + quote(column) +
+                         ") AS CHAR) FROM " + qualified(root.db, root.table),
+                     &rows))
+    return true;
+  Wide low, high;
+  if (rows.size() != 1 || rows[0].size() != 2 || rows[0][0].first ||
+      rows[0][1].first || parse_wide(rows[0][0].second, &low) ||
+      parse_wide(rows[0][1].second, &high) || high < low)
+    return false;
+  const Wide span = high - low + 1;
+  const Wide n = std::min<Wide>(span, static_cast<Wide>(parts));
+  if (n < 2) return false;
+  const std::string ref = quote(root.alias) + "." + quote(column);
+  for (Wide i = 0; i < n; i++) {
+    const Wide from = low + span * i / n;
+    if (i + 1 < n)
+      conditions->push_back(ref + " >= " + wide_string(from) + " AND " + ref +
+                            " < " + wide_string(low + span * (i + 1) / n));
+    else
+      conditions->push_back(ref + " >= " + wide_string(from) + " AND " + ref +
+                            " <= " + wide_string(high));
+  }
+  conditions->push_back(ref + " IS NULL");
+  return false;
+}
+
+/** What the sessions that fill a view share. */
+struct Populate_work {
+  /// INSERT ... SELECT ... WHERE [(<where>) AND ]: a condition follows.
+  std::string statement;
+  std::vector<std::string> conditions;
+  ulong lock_wait_timeout{0};
+  std::atomic<size_t> next{0};
+  std::atomic<bool> stop{false};
+
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::vector<THD *> sessions;  ///< to kill them
+  size_t running{0};  ///< sessions that have not filled their ranges yet
+  int decision{0};    ///< 1: commit, -1: roll back
+  uint error{0};
+  std::string message;
+
+  void fail(uint code, const char *text) {
+    std::lock_guard<std::mutex> guard(mutex);
+    if (error == 0) {
+      error = code != 0 ? code : ER_UNKNOWN_ERROR;
+      message = text;
+    }
+    stop = true;
+  }
+  void fail(THD *thd) {
+    if (thd->is_error())
+      fail(thd->get_stmt_da()->mysql_errno(),
+           thd->get_stmt_da()->message_text());
+    else
+      fail(ER_QUERY_INTERRUPTED, ER_THD(thd, ER_QUERY_INTERRUPTED));
+  }
+};
+
+/** A session for a thread that fills a view, as the sessions of the
+    maintenance daemon (storage/warp/warp_mview_daemon.cc). */
+THD *make_populate_session(const void *stack_base, ulong lock_wait_timeout) {
+  THD *thd = new (std::nothrow) THD;
+  if (thd == nullptr) return nullptr;
+  thd->set_new_thread_id();
+  thd->capture_stack_base(stack_base);
+  thd->store_globals();
+  thd->set_command(COM_DAEMON);
+  thd->system_thread = SYSTEM_THREAD_BACKGROUND;
+  thd->get_protocol_classic()->set_client_capabilities(0);
+  thd->security_context()->skip_grants();
+  thd->get_protocol_classic()->init_net(nullptr);
+  thd->init_query_mem_roots();
+  lex_start(thd);
+  thd->real_id = my_thread_self();
+  thd->set_time();
+  thd->variables.lock_wait_timeout = lock_wait_timeout;
+  Global_THD_manager::get_instance()->add_thd(thd);
+  return thd;
+}
+
+void destroy_populate_session(THD *thd) {
+  thd->get_protocol_classic()->end_net();
+  thd->release_resources();
+  Global_THD_manager::get_instance()->remove_thd(thd);
+  delete thd;
+}
+
+/** A thread that fills ranges until there are none left, then waits for
+    the decision to commit or roll back. */
+void populate_worker(Populate_work *work) {
+  my_thread_init();
+  int stack_base;
+  THD *thd = make_populate_session(&stack_base, work->lock_wait_timeout);
+  if (thd == nullptr) {
+    work->fail(ER_OUT_OF_RESOURCES, ER_DEFAULT(ER_OUT_OF_RESOURCES));
+  } else {
+    std::lock_guard<std::mutex> guard(work->mutex);
+    work->sessions.push_back(thd);
+  }
+  bool failed = thd == nullptr;
+  if (thd != nullptr) {
+    Internal_session session(thd);
+    /* one transaction for all the ranges */
+    thd->variables.option_bits &= ~OPTION_AUTOCOMMIT;
+    thd->variables.option_bits |= OPTION_NOT_AUTOCOMMIT;
+    while (!work->stop) {
+      const size_t i = work->next++;
+      if (i >= work->conditions.size()) break;
+      if (session.run(work->statement + "(" + work->conditions[i] + ")")) {
+        failed = true;
+        work->fail(thd);
+        break;
+      }
+    }
+    {
+      std::unique_lock<std::mutex> guard(work->mutex);
+      work->running--;
+      work->changed.notify_all();
+      work->changed.wait(guard, [work] { return work->decision != 0; });
+    }
+    const bool commit = work->decision > 0 && !failed;
+    if (commit_or_rollback(thd, !commit) && commit) work->fail(thd);
+  } else {
+    std::lock_guard<std::mutex> guard(work->mutex);
+    work->running--;
+    work->changed.notify_all();
+  }
+  if (thd != nullptr) {
+    {
+      std::lock_guard<std::mutex> guard(work->mutex);
+      work->sessions.erase(
+          std::find(work->sessions.begin(), work->sessions.end(), thd));
+    }
+    destroy_populate_session(thd);
+  }
+  my_thread_end();
+}
+
+/**
+  Fill an empty join view with mview_populate_threads sessions.
+
+  @param[out] done  the view was filled (or the sessions failed); false
+                    if it is for the caller to fill it alone
+  @retval true error (reported); the rows are not committed, or only some
+               of them if a commit failed
+*/
+bool populate_parallel(Internal_session *session, const Mview_def &def,
+                       Mview_locks *locks, bool *done) {
+  *done = false;
+  THD *thd = session->thd();
+  size_t threads = thd->variables.mview_populate_threads;
+  if (threads == 0)
+    threads = std::min<size_t>(
+        32, std::max<size_t>(1, std::thread::hardware_concurrency()));
+  if (threads < 2 || def.is_aggregate || locks == nullptr) return false;
+  MDL_ticket *ticket = locks->find(def.db, def.name);
+  if (ticket == nullptr || ticket->get_type() != MDL_EXCLUSIVE) return false;
+
+  Populate_work work;
+  if (split_rows(session, def, threads * 8, &work.conditions)) return true;
+  if (work.conditions.empty()) return false;
+  *done = true;
+  work.statement = "INSERT INTO " + qualified(def.db, def.name) + " (" +
+                   def.detail_columns + ") " + def.detail_select + " " +
+                   def.from_sql + " WHERE ";
+  if (!def.where_sql.empty()) work.statement += "(" + def.where_sql + ") AND ";
+  work.lock_wait_timeout = thd->variables.lock_wait_timeout;
+  const size_t workers = std::min(threads, work.conditions.size());
+
+  ticket->downgrade_lock(MDL_SHARED_UPGRADABLE);
+  __atomic_fetch_add(&mview_populate_parallel, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&mview_populate_sessions, workers, __ATOMIC_RELAXED);
+  std::vector<std::thread> pool;
+  work.running = workers;
+  try {
+    for (size_t i = 0; i < workers; i++) pool.emplace_back(populate_worker, &work);
+  } catch (...) {
+    work.fail(ER_CANT_CREATE_THREAD, "cannot start a thread to fill the view");
+    std::lock_guard<std::mutex> guard(work.mutex);
+    work.running -= workers - pool.size();
+  }
+  {
+    std::unique_lock<std::mutex> guard(work.mutex);
+    while (work.running > 0) {
+      work.changed.wait_for(guard, std::chrono::milliseconds(100));
+      if (thd->killed && !work.stop) {
+        work.stop = true;
+        for (THD *worker : work.sessions) {
+          mysql_mutex_lock(&worker->LOCK_thd_data);
+          worker->awake(THD::KILL_QUERY);
+          mysql_mutex_unlock(&worker->LOCK_thd_data);
+        }
+      }
+    }
+    work.decision = work.error == 0 && !thd->killed ? 1 : -1;
+    work.changed.notify_all();
+  }
+  for (std::thread &worker : pool) worker.join();
+
+  /* The statement has the view to itself again (REFRESH stores the
+     definition, a failed CREATE drops the table). */
+  const bool upgrade_failed = thd->mdl_context.upgrade_shared_lock(
+      ticket, MDL_EXCLUSIVE, thd->variables.lock_wait_timeout);
+  if (thd->killed) {
+    thd->send_kill_message();
+    return true;
+  }
+  if (work.error != 0) {
+    my_message(work.error, work.message.c_str(), MYF(0));
+    return true;
+  }
+  return upgrade_failed;
+}
+
 /**
   Empty the tables of the view and fill them from the base tables, on
   which the caller holds shared read-only metadata locks: the rows are
@@ -1417,7 +1803,8 @@ std::string string_literal(const std::string &text) {
   caller commits or rolls back (WARP empties with TRUNCATE, which commits:
   it does not reclaim the space of deleted rows otherwise).
 */
-bool populate(Internal_session *session, const Mview_def &def, bool empty) {
+bool populate(Internal_session *session, const Mview_def &def, bool empty,
+              Mview_locks *locks) {
   const bool truncate = is_warp(def.engine);
   if (!empty) {
     const std::string table = qualified(def.db, def.name);
@@ -1442,6 +1829,13 @@ bool populate(Internal_session *session, const Mview_def &def, bool empty) {
                      "VALUES (" + string_literal(file) + ", " +
                      std::to_string(position) + ")"))
       return true;
+  }
+  /* A join view that is empty (also after TRUNCATE, which committed) can
+     be filled by several sessions; DELETE keeps its rows locked. */
+  if (!def.is_aggregate && (empty || truncate)) {
+    bool done = false;
+    if (populate_parallel(session, def, locks, &done)) return true;
+    if (done) return false;
   }
   return session->run(insert_statement(def));
 }
@@ -1675,7 +2069,7 @@ bool create_mview(THD *thd, Table_ref *view) {
     if (def.is_aggregate)
       tdc_remove_table(thd, TDC_RT_REMOVE_ALL, db, def.state_name.c_str(),
                        false);
-    if (!failed) failed = populate(&session, def, true);
+    if (!failed) failed = populate(&session, def, true, &locks);
   }
   if (!failed) failed = binlog_and_commit(thd);
   if (failed) {
@@ -1823,7 +2217,7 @@ bool Sql_cmd_refresh_mview::execute(THD *thd) {
   bool failed;
   {
     Internal_session session(thd);
-    failed = populate(&session, def, false);
+    failed = populate(&session, def, false, &locks);
   }
   if (!failed) failed = store_definition(thd, def, user_columns);
   if (failed) {

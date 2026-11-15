@@ -750,6 +750,12 @@ The following options may be given as the first argument:
  --min-examined-row-limit=# 
  Don't write queries to slow log that examine fewer rows
  than that
+ --mview-populate-threads=# 
+ Number of sessions that CREATE MATERIALIZED VIEW (and
+ REFRESH of a view in WARP) fill a join view with, each
+ with a range of the rows of its first table. 0 means one
+ per CPU, at most 32; 1 fills it in the session of the
+ statement.
  --myisam-block-size=# 
  Block size to be used for MyISAM index pages
  --myisam-data-pointer-size=# 
@@ -1866,6 +1872,7 @@ max-user-connections 0
 max-write-lock-count 18446744073709551615
 memlock FALSE
 min-examined-row-limit 0
+mview-populate-threads 0
 myisam-block-size 1024
 myisam-data-pointer-size 6
 myisam-max-sort-file-size 9223372036853727232

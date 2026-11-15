@@ -352,6 +352,9 @@ struct System_variables {
   ulong session_track_gtids;  // see enum_session_track_gtids
 
   ulong max_execution_time;
+  /// Sessions that fill a materialized view (sql/sql_mview.cc); 0: one
+  /// per CPU, at most 32.
+  ulong mview_populate_threads;
 
   char *track_sysvars_ptr;
   bool session_track_schema;

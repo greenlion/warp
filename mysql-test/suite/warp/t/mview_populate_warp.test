@@ -1,0 +1,5 @@
+--echo #
+--echo # Materialized join views filled by several sessions (WARP)
+--echo #
+--let $engine = WARP
+--source suite/warp/include/mview_populate_engine.inc

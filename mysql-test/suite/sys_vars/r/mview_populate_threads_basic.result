@@ -1,0 +1,37 @@
+# mview_populate_threads: sessions that fill a materialized view
+SELECT @@global.mview_populate_threads, @@session.mview_populate_threads;
+@@global.mview_populate_threads	@@session.mview_populate_threads
+0	0
+SET @start_global = @@global.mview_populate_threads;
+SET @@global.mview_populate_threads = 8;
+SET @@session.mview_populate_threads = 1;
+SELECT @@global.mview_populate_threads, @@session.mview_populate_threads;
+@@global.mview_populate_threads	@@session.mview_populate_threads
+8	1
+SET @@session.mview_populate_threads = 256;
+SELECT @@session.mview_populate_threads;
+@@session.mview_populate_threads
+256
+SET @@session.mview_populate_threads = 257;
+Warnings:
+Warning	1292	Truncated incorrect mview_populate_threads value: '257'
+SELECT @@session.mview_populate_threads;
+@@session.mview_populate_threads
+256
+SET @@session.mview_populate_threads = -1;
+Warnings:
+Warning	1292	Truncated incorrect mview_populate_threads value: '-1'
+SELECT @@session.mview_populate_threads;
+@@session.mview_populate_threads
+0
+SET @@session.mview_populate_threads = 'a';
+ERROR 42000: Incorrect argument type to variable 'mview_populate_threads'
+SET @@session.mview_populate_threads = DEFAULT;
+SELECT @@session.mview_populate_threads;
+@@session.mview_populate_threads
+8
+SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_variables
+WHERE VARIABLE_NAME = 'mview_populate_threads';
+VARIABLE_NAME	VARIABLE_VALUE
+mview_populate_threads	8
+SET @@global.mview_populate_threads = @start_global;
