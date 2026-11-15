@@ -332,7 +332,7 @@ static void warp_gj_eval(const warp_gj_ctx &c, const warp_gj_nodes &nodes, int i
 struct warp_gj_compiler {
   THD *thd;
   warp_pj_plan *pj;
-  warp_gj_nodes nodes;
+  warp_gj_nodes nodes{};
   bool failed = false;
 
   /* the columns that the aggregation reads: the number of a column in the columns of its table */

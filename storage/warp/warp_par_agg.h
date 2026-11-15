@@ -401,7 +401,7 @@ static void warp_pa_adopt_avg(THD *thd, Item_sum *item) {
 /* the part of the work that does not depend on the data                  */
 /* ---------------------------------------------------------------------- */
 
-static const warp_i128 warp_pa_pow10(int n) {
+static warp_i128 warp_pa_pow10(int n) {
   warp_i128 v = 1;
   while(n-- > 0) v *= 10;
   return v;
@@ -1910,7 +1910,7 @@ static bool warp_pa_execute(warp_pa_plan &plan, std::string *error) {
   std::mutex error_mutex;
   std::string first_error;
   std::shared_ptr<ibis::util::ThreadBudget> budget = ibis::util::ThreadBudget::current();
-  auto worker = [&](size_t id) {
+  auto worker = [&](size_t /* id */) {
     ibis::util::ThreadBudgetScope scope(budget);
     try {
       for(;;) {

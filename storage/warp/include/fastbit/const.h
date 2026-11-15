@@ -48,7 +48,7 @@
 //  #define __USE_UNIX98
 //  #endif
 #ifndef HAVE_STRUCT_TIMESPEC
-#if defined(__CYGWIN__) || defined(__MINGW32__) || (_MSC_VER+0 >= 1900)
+#if defined(__CYGWIN__) || defined(__MINGW32__) || (defined(_MSC_VER) && _MSC_VER+0 >= 1900)
 #  define HAVE_STRUCT_TIMESPEC
 #endif
 #endif
@@ -508,8 +508,7 @@ namespace ibis { // forward definition of all the classes in IBIS
 
     /// A case-insensitive version of less for comparing names of tables,
     /// columns, and other resources.
-    struct lessi :
-	public std::binary_function< const char*, const char*, bool > {
+    struct lessi {
 	bool operator()(const char* x, const char* y) const {
 	    return (x && y ? stricmp(x, y) < 0 : false);
 	}

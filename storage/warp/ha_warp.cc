@@ -7954,7 +7954,7 @@ void warp_trx::apply_log_deletes() {
         break;
 
       case delete_marker:
-        fread(&rowid, sizeof(uint64_t), 1, log);
+        sz = fread(&rowid, sizeof(uint64_t), 1, log);
         if(sz != 1) {
           sql_print_error("transaction log read failed");
           assert(false);
@@ -9126,17 +9126,16 @@ bool warp_global_data::was_shutdown_clean() {
 }
 
 uint64_t warp_global_data::get_state_and_return_version() {
-  struct on_disk_state state_record1;
-  struct on_disk_state state_record2;
+  /* a record that is not in the file is invalid: its counter is zero */
+  struct on_disk_state state_record1{};
+  struct on_disk_state state_record2{};
   struct on_disk_state* state_record;
   
-  fread(&state_record1, sizeof(struct on_disk_state), 1, fp);
-  if(ferror(fp) != 0) {
+  if(fread(&state_record1, sizeof(struct on_disk_state), 1, fp) != 1 && ferror(fp) != 0) {
       sql_print_error("Failed to read state record one from warp_state");
     return 0;
   }
-  fread(&state_record2, sizeof(struct on_disk_state), 1, fp);
-  if(ferror(fp) != 0) {
+  if(fread(&state_record2, sizeof(struct on_disk_state), 1, fp) != 1 && ferror(fp) != 0) {
     sql_print_error("Failed to read state record two from warp_state");
     return 0;
   }

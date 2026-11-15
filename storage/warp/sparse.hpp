@@ -256,9 +256,9 @@ private:
     // start recovery
     int mode=MODE_SET;
     fseek(log,-BLOCK_SIZE,SEEK_END);
-    unsigned long long marker;
-    fread(&marker, BLOCK_SIZE, 1, log);
-    if(marker!=0) {
+    /* a log that is too short to hold the commit marker is not committed */
+    unsigned long long marker = 0;
+    if(fread(&marker, BLOCK_SIZE, 1, log) != 1 || marker!=0) {
       mode = MODE_UNSET;
     }
     fseek(log,0,SEEK_SET);
@@ -345,7 +345,8 @@ public:
 
     /* read in the first block of bits */
     bits = 0;
-    fread(&bits, BLOCK_SIZE, 1, fp);
+    /* an empty bitmap has no first block: its bits are zero */
+    if(fread(&bits, BLOCK_SIZE, 1, fp) != 1) bits = 0;
     fseek(fp, 0, SEEK_SET);
         
     fpos = 0;
