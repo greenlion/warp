@@ -224,6 +224,41 @@ extern std::atomic<uint64_t> mview_registry_version;
 bool mview_load_all(THD *thd, std::vector<Mview_def> *defs);
 
 /**
+  The views whose contents the maintenance daemon keeps up to date.
+
+  The daemon publishes the set whenever it changes (a registry load, a view
+  that becomes stale or is in sync again) and clears it when it stops.  A
+  view is in the set with the epoch of the definition that is maintained;
+  a SYNCHRONOUS view that is not in the set with its current epoch (the
+  daemon is not running, the view is stale, it was refreshed or created
+  again and the daemon has not caught up yet) is not known to be current.
+  Readers (the query rewrite plugin mview_rewrite) call
+  mview_is_maintained() from any thread.
+
+  @param views  (schema, view name, epoch) of every maintained view.
+*/
+struct Mview_maintained {
+  std::string db;
+  std::string name;
+  uint64_t epoch{0};
+};
+void mview_set_maintained(const std::vector<Mview_maintained> &views);
+/** The daemon stopped: no view is maintained any more. */
+void mview_clear_maintained();
+/**
+  The daemon has applied the binary log up to the position (file name
+  without directories, offset): every maintained view has every
+  transaction that ends at or before it.
+*/
+void mview_set_applied_position(const std::string &file, uint64_t pos);
+/** The position of mview_set_applied_position(); false if the daemon does
+    not run. */
+bool mview_get_applied_position(std::string *file, uint64_t *pos);
+/** Is the view maintained, with this definition? */
+bool mview_is_maintained(const std::string &db, const std::string &name,
+                         uint64_t epoch);
+
+/**
   Allow or forbid the session to change the contents of materialized view
   tables with ordinary DML.  User sessions are never allowed; the daemon's
   session and REFRESH MATERIALIZED VIEW turn this on.

@@ -1,0 +1,75 @@
+#
+# MVIEW_REWRITE with views maintained by the WARP_MVIEW daemon: a view
+# with REFRESH SYNCHRONOUS is used while the daemon keeps it current.
+#
+call mtr.add_suppression("WARP_MVIEW");
+CREATE TABLE sales (id INT PRIMARY KEY, region VARCHAR(10) NOT NULL,
+product INT NOT NULL, amount DECIMAL(10,2) NOT NULL) ENGINE=InnoDB
+DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO sales VALUES (1, 'north', 1, 10.00), (2, 'north', 2, 5.50),
+(3, 'south', 1, 7.25), (4, 'east', 3, 1.00);
+CREATE MATERIALIZED VIEW sales_by_region AS
+SELECT region, product, COUNT(*) AS n, SUM(amount) AS total,
+MAX(amount) AS biggest
+FROM sales GROUP BY region, product;
+# used once the daemon maintains it
+SELECT region, SUM(amount), COUNT(*), MAX(amount) FROM sales GROUP BY region;
+# rewritten
+SELECT `sales_by_region`.`mv$g0` AS `region`, SUM(`sales_by_region`.`mv$s1`) AS `SUM(amount)`, CAST(COALESCE(SUM(`sales_by_region`.`mv$count`),0) AS SIGNED) AS `COUNT(*)`, MAX(`sales_by_region`.`mv$s2`) AS `MAX(amount)` FROM `test`.`sales_by_region` `sales_by_region` GROUP BY `sales_by_region`.`mv$g0`
+# changes are applied by the daemon; the view is used again after it
+INSERT INTO sales VALUES (5, 'south', 2, 3.00), (6, 'west', 1, 100.00);
+UPDATE sales SET amount = amount + 1 WHERE region = 'north';
+DELETE FROM sales WHERE id = 4;
+SELECT region, SUM(amount), COUNT(*), MAX(amount) FROM sales GROUP BY region;
+# rewritten
+SELECT `sales_by_region`.`mv$g0` AS `region`, SUM(`sales_by_region`.`mv$s1`) AS `SUM(amount)`, CAST(COALESCE(SUM(`sales_by_region`.`mv$count`),0) AS SIGNED) AS `COUNT(*)`, MAX(`sales_by_region`.`mv$s2`) AS `MAX(amount)` FROM `test`.`sales_by_region` `sales_by_region` GROUP BY `sales_by_region`.`mv$g0`
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+# rewritten
+SELECT `sales_by_region`.`mv$g1` AS `product`, (SUM(`sales_by_region`.`mv$s1`) / NULLIF(SUM(`sales_by_region`.`mv$s0`),0)) AS `AVG(amount)` FROM `test`.`sales_by_region` `sales_by_region` WHERE ((`sales_by_region`.`mv$g0` in ('north','south'))) GROUP BY `sales_by_region`.`mv$g1`
+# Read your writes: a session that committed a change does not use the
+# view before the daemon has applied the change (a lock on the view
+# holds the daemon up); other sessions may
+LOCK TABLES sales_by_region READ;
+SET SESSION mview_rewrite_trace = ON;
+INSERT INTO sales VALUES (7, 'north', 3, 2.00);
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+product	AVG(amount)
+1	9.125000
+2	4.750000
+3	2.000000
+Warnings:
+Note	1105	mview_rewrite: positions: (binary log positions)
+Note	1105	mview_rewrite: view `test`.`sales_by_region`: the WARP_MVIEW daemon has not applied the last transaction of this session yet
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+SELECT SQL_TEXT FROM performance_schema.events_statements_history
+WHERE THREAD_ID = PS_CURRENT_THREAD_ID() ORDER BY EVENT_ID DESC LIMIT 1;
+SQL_TEXT
+SELECT `sales_by_region`.`mv$g1` AS `product`, (SUM(`sales_by_region`.`mv$s1`) / NULLIF(SUM(`sales_by_region`.`mv$s0`),0)) AS `AVG(amount)` FROM `test`.`sales_by_region` `sales_by_region` WHERE ((`sales_by_region`.`mv$g0` in ('north','south'))) GROUP BY `sales_by_region`.`mv$g1`
+UNLOCK TABLES;
+SET SESSION mview_rewrite_trace = OFF;
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+# rewritten
+SELECT `sales_by_region`.`mv$g1` AS `product`, (SUM(`sales_by_region`.`mv$s1`) / NULLIF(SUM(`sales_by_region`.`mv$s0`),0)) AS `AVG(amount)` FROM `test`.`sales_by_region` `sales_by_region` WHERE ((`sales_by_region`.`mv$g0` in ('north','south'))) GROUP BY `sales_by_region`.`mv$g1`
+# REFRESH MANUAL: not used unless mview_rewrite_use_manual_views
+ALTER MATERIALIZED VIEW sales_by_region REFRESH MANUAL;
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+# not rewritten
+SET SESSION mview_rewrite_use_manual_views = ON;
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+# rewritten
+SELECT `sales_by_region`.`mv$g1` AS `product`, (SUM(`sales_by_region`.`mv$s1`) / NULLIF(SUM(`sales_by_region`.`mv$s0`),0)) AS `AVG(amount)` FROM `test`.`sales_by_region` `sales_by_region` WHERE ((`sales_by_region`.`mv$g0` in ('north','south'))) GROUP BY `sales_by_region`.`mv$g1`
+SET SESSION mview_rewrite_use_manual_views = OFF;
+ALTER MATERIALIZED VIEW sales_by_region REFRESH SYNCHRONOUS;
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+# rewritten
+SELECT `sales_by_region`.`mv$g1` AS `product`, (SUM(`sales_by_region`.`mv$s1`) / NULLIF(SUM(`sales_by_region`.`mv$s0`),0)) AS `AVG(amount)` FROM `test`.`sales_by_region` `sales_by_region` WHERE ((`sales_by_region`.`mv$g0` in ('north','south'))) GROUP BY `sales_by_region`.`mv$g1`
+# without the daemon no SYNCHRONOUS view is known to be current
+UNINSTALL PLUGIN WARP_MVIEW;
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+# not rewritten
+INSTALL PLUGIN WARP_MVIEW SONAME 'WARP_PLUGIN';
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+# rewritten
+SELECT `sales_by_region`.`mv$g1` AS `product`, (SUM(`sales_by_region`.`mv$s1`) / NULLIF(SUM(`sales_by_region`.`mv$s0`),0)) AS `AVG(amount)` FROM `test`.`sales_by_region` `sales_by_region` WHERE ((`sales_by_region`.`mv$g0` in ('north','south'))) GROUP BY `sales_by_region`.`mv$g1`
+DROP MATERIALIZED VIEW sales_by_region;
+DROP TABLE sales;
