@@ -234,6 +234,40 @@ if ($w != $i)
   --echo MISMATCH after the rollback
 }
 
+--echo # a column of the select list that a condition makes constant: MySQL
+--echo # removes it from the GROUP BY, the engine returns it with the groups
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT SUM(v) AS c0, g1 AS c1, g3 AS c2 FROM f_w WHERE g3 = 'b2' GROUP BY g1, g3) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT SUM(v) AS c0, g1 AS c1, g3 AS c2 FROM f_i WHERE g3 = 'b2' GROUP BY g1, g3) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH for a string column of a condition
+}
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT COUNT(*) AS c0, g2 AS c1, g1 AS c2 FROM f_w WHERE g1 = 2 AND v > 0 GROUP BY g2, g1) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2))), 0)) FROM (SELECT COUNT(*) AS c0, g2 AS c1, g1 AS c2 FROM f_i WHERE g1 = 2 AND v > 0 GROUP BY g2, g1) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH for an integer column of a condition
+}
+SELECT SUM(v), g1, g3 FROM f_w WHERE g3 = 'b2' AND g1 >= 2 GROUP BY g1, g3 ORDER BY g1, g3;
+--echo # the engine aggregates and returns the value of the column of a row of the group
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT SUM(v), g1, g3 FROM f_w WHERE g3 = 'b2' GROUP BY g1, g3;
+--echo # a column that is not in the GROUP BY (ONLY_FULL_GROUP_BY off): one row a group
+SET @saved_sql_mode = @@sql_mode;
+SET SESSION sql_mode = '';
+let $w = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT id AS c0, s AS c1, d1 AS c2, SUM(v) AS c3 FROM f_w GROUP BY id) q`;
+let $i = `SELECT CONCAT(COUNT(*), ':', IFNULL(SUM(CRC32(CONCAT_WS('|', c0, c1, c2, c3))), 0)) FROM (SELECT id AS c0, s AS c1, d1 AS c2, SUM(v) AS c3 FROM f_i GROUP BY id) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH for columns that are not in the GROUP BY
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT id, s, d1, SUM(v) FROM f_w GROUP BY id;
+SET SESSION sql_mode = @saved_sql_mode;
+
 --echo # the engine aggregates: the table is scanned once and the groups are the rows
 --replace_regex /  *\(cost=[^)]*\)//
 EXPLAIN FORMAT=TREE SELECT g1, SUM(d1), COUNT(*) FROM f_w GROUP BY g1;
