@@ -23,6 +23,8 @@ v_inner	CREATE TABLE `v_inner` (
   `f` float DEFAULT NULL,
   `mv$pk0_2` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL /*!80023 INVISIBLE */,
   `mv$pk1_1` int DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$row_id` bigint unsigned NOT NULL AUTO_INCREMENT /*!80023 INVISIBLE */,
+  PRIMARY KEY (`mv$row_id`),
   KEY `mv$ix_pk0` (`cid`,`name`,`mv$pk0_2`),
   KEY `mv$ix_pk1` (`oid`,`mv$pk1_1`,`amount`)
 ) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
@@ -34,6 +36,8 @@ v_uniq	CREATE TABLE `v_uniq` (
   `name` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
   `mv$pk1_0` int DEFAULT NULL /*!80023 INVISIBLE */,
   `mv$pk1_2` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$row_id` bigint unsigned NOT NULL AUTO_INCREMENT /*!80023 INVISIBLE */,
+  PRIMARY KEY (`mv$row_id`),
   KEY `mv$ix_pk0` (`id`),
   KEY `mv$ix_pk1` (`mv$pk1_0`,`name`,`mv$pk1_2`)
 ) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

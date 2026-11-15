@@ -65,6 +65,8 @@ mv3	CREATE TABLE `mv3` (
   `id` int DEFAULT NULL,
   `b` decimal(10,2) DEFAULT NULL,
   `mv$pk1_0` int DEFAULT NULL /*!80023 INVISIBLE */,
+  `mv$row_id` bigint unsigned NOT NULL AUTO_INCREMENT /*!80023 INVISIBLE */,
+  PRIMARY KEY (`mv$row_id`),
   KEY `mv$ix_pk0` (`id`),
   KEY `mv$ix_pk1` (`mv$pk1_0`)
 ) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

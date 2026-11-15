@@ -75,6 +75,7 @@ SELECT * FROM mv_self ORDER BY first_id, second_id;
 --source suite/warp/include/mview_check.inc
 
 --echo # The layout: user columns, invisible key columns, their indexes
+--replace_regex / AUTO_INCREMENT=[0-9]+//
 --replace_result $mv_engine ENGINE
 SHOW CREATE TABLE mv_left;
 SELECT TABLE_NAME, COLUMN_NAME, EXTRA FROM INFORMATION_SCHEMA.COLUMNS

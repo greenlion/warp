@@ -1141,6 +1141,12 @@ bool build_join_view(THD *thd, Table_ref *view, Query_block *qb, bool warp,
           " (" + columns + ")");
     }
   }
+
+  /* An INVISIBLE AUTO_INCREMENT PRIMARY KEY: the statements that fill the
+     view never name it (detail_columns), the engine numbers the rows. */
+  build->column_definitions.push_back(
+      quote(std::string(MVIEW_INTERNAL_PREFIX) + "row_id") +
+      " bigint unsigned NOT NULL AUTO_INCREMENT INVISIBLE PRIMARY KEY");
   return false;
 }
 

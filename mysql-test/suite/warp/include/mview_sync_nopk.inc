@@ -55,7 +55,9 @@ eval CREATE MATERIALIZED VIEW v_agg ENGINE=$view_engine AS $sel_agg;
 --enable_query_log
 
 --echo # The row keys: user columns that are key columns are not stored twice
+--replace_regex / AUTO_INCREMENT=[0-9]+//
 SHOW CREATE TABLE v_inner;
+--replace_regex / AUTO_INCREMENT=[0-9]+//
 SHOW CREATE TABLE v_uniq;
 
 --let $mview_sync_nopk_check = suite/warp/include/mview_sync_nopk_check.inc

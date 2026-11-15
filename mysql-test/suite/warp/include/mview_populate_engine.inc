@@ -37,8 +37,10 @@ eval CREATE MATERIALIZED VIEW v_n ENGINE=$engine AS $sel_n;
 --let $mv_view = v_fd
 --let $mv_select = ($sel_fd)
 --source suite/warp/include/mview_check.inc
---echo # The layout: a key per table
+--echo # The layout: an INVISIBLE AUTO_INCREMENT PRIMARY KEY, a key per table
+--replace_regex / AUTO_INCREMENT=[0-9]+//
 SHOW CREATE TABLE v_fd;
+--replace_regex / AUTO_INCREMENT=[0-9]+//
 SHOW CREATE TABLE v_left;
 --let $mv_view = v_where
 --let $mv_select = ($sel_where)
