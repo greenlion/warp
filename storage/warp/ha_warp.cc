@@ -7931,7 +7931,11 @@ void warp_global_data::cleanup_history_locks() {
 /* Applies the deletes in the log of the transaction to the delete bitmap.
    The caller holds commit_mtx. */
 void warp_trx::apply_log_deletes() {
-  if(log == NULL) {
+  /* Only the deletes are applied.  A transaction that deleted nothing does
+     not read its log: the log has a record for every row it inserted, and
+     the commits of the group are applied one after the other under
+     commit_mtx. */
+  if(log == NULL || !has_deletes) {
     return;
   }
   int sz = 0;
@@ -7949,8 +7953,13 @@ void warp_trx::apply_log_deletes() {
         break;
 
       case insert_marker:
-        // insertions are already written to disk
-        fseek(log, sizeof(uint64_t), SEEK_CUR);
+        /* insertions are already written to disk; the rowid is read, not
+           skipped with fseek, which would drop the read buffer of the
+           stream for every record */
+        if(fread(&rowid, sizeof(uint64_t), 1, log) != 1) {
+          sql_print_error("transaction log read failed");
+          assert(false);
+        }
         break;
 
       case delete_marker:
