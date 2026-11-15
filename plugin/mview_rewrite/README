@@ -1,0 +1,116 @@
+MVIEW_REWRITE: answering queries from materialized views
+=======================================================
+
+A post-parse query rewrite plugin.  A SELECT that can be computed from a
+materialized view (CREATE MATERIALIZED VIEW, see sql/mview.h) is rewritten
+to read the view.  The view matching is the algorithm of
+
+  J. Goldstein, P.-A. Larson: Optimizing Queries Using Materialized Views:
+  A Practical, Scalable Solution.  SIGMOD 2001.
+
+  INSTALL PLUGIN MVIEW_REWRITE SONAME 'mview_rewrite.so';
+
+The server adds a note to a rewritten statement ("Query '...' rewritten to
+'...' by a query rewrite plugin"), and EXPLAIN shows the plan of the
+rewritten statement.
+
+
+What is matched
+---------------
+
+A query block with inner joins (comma, JOIN ... ON), WHERE, GROUP BY,
+aggregate functions, HAVING, DISTINCT, ORDER BY and LIMIT, against views
+with inner joins (views with outer joins are not used):
+
+- Column equivalence classes; the equijoin, range and residual subsumption
+  tests; compensating equalities, ranges (numbers, ASCII strings in the
+  collation of the column, dates and datetimes) and residual conditions
+  (section 3.1).  Residual conditions match textually, with column
+  references compared through the equivalence classes, and are computed
+  from output expressions of the view when it has them.
+- Tables of the view that the query does not have, when they are joined by
+  NOT NULL foreign keys to unique keys (or the query rejects the NULLs):
+  the foreign key join graph (section 3.2).  mview_rewrite_use_foreign_keys
+  turns this off (foreign keys may be violated with foreign_key_checks=0).
+- Aggregate views (section 3.3): the same groups (the stored states are
+  read), or coarser groups (COUNT, SUM, MIN, MAX and AVG are rolled up from
+  the states; MIN, MAX, BIT_AND, BIT_OR and DISTINCT aggregates of group
+  expressions are computed over the groups), and SELECT DISTINCT of group
+  expressions.  Conditions on an aggregate view must be on its group
+  expressions.
+- A view may replace some of the tables of the query; the other tables are
+  joined to it (the view-matching rule applied to a subexpression).
+  mview_rewrite_partial turns this off.
+- The filter tree of section 4: lattice indexes over the hubs of the
+  views, their residual conditions and, for aggregate views, their tables.
+  mview_rewrite_use_filter_tree=OFF tests every view (the rewrite is the
+  same).
+
+The optimizer of MySQL cannot compare the costs of rewrites at parse
+time; among the views that match the plugin takes the one that replaces
+the most tables, then one that aggregates, then one with the same groups,
+then fewer extra tables and fewer compensating conditions.  A join view
+that would replace one table without filtering it is not used.
+
+
+Which views answer a statement
+------------------------------
+
+- REFRESH SYNCHRONOUS views while the WARP_MVIEW daemon maintains them
+  (not stale, the definition it maintains is the current one).  They trail
+  the commits of their base tables by the delay of the daemon; a session
+  that committed a change does not use them before the daemon has applied
+  that change (read your writes, from the binary log positions).
+- REFRESH MANUAL views only with mview_rewrite_use_manual_views=ON: they
+  hold the data of their last refresh.
+- The user needs SELECT on the base tables (as for the original statement)
+  and on the view.
+
+
+Statements that are not rewritten
+---------------------------------
+
+Prepared statements and statements of stored programs; subqueries,
+derived tables, CTEs, set operations, outer joins, NATURAL and USING joins,
+window functions, ROLLUP; locking reads, SELECT ... INTO, optimizer hints,
+SQL_CALC_FOUND_ROWS; tables with partition selection or TABLESAMPLE,
+temporary tables; statements in a transaction that has changed data, under
+LOCK TABLES, of replication threads, of users with SKIP_QUERY_REWRITE;
+sessions with ANSI_QUOTES or NO_BACKSLASH_ESCAPES, a character_set_client
+other than the character set of collation_connection, or another
+collation_connection than the default of the server.
+
+A string column of a WARP view stores a binary collation: it does not
+stand for a column of another collation.
+
+
+Variables
+---------
+
+  mview_rewrite_enabled             ON   rewrite statements
+  mview_rewrite_use_manual_views    OFF  use REFRESH MANUAL views
+  mview_rewrite_use_foreign_keys    ON   eliminate extra tables of views
+  mview_rewrite_partial             ON   views for some of the tables
+  mview_rewrite_use_filter_tree     ON   search candidates with the tree
+  mview_rewrite_trace               OFF  notes on why views are not used
+
+  Status: Mview_rewrite_statements, Mview_rewrite_rewritten,
+  Mview_rewrite_candidates (views tested in full),
+  Mview_rewrite_registry_loads, Mview_rewrite_views.
+
+The definitions of the views are loaded by a thread of the plugin when the
+materialized views change; while that load runs, a statement that holds
+metadata locks is not rewritten instead of waiting.
+
+
+Files
+-----
+
+  mview_rewrite.h            the algorithm and the data structures
+  mview_rewrite_plugin.cc    the plugin, the registry and its loader
+  mv_catalog.cc              table definitions from the data dictionary
+  mv_expr.cc                 expressions and query blocks
+  mv_match.cc                view matching, the rewritten statement
+  mv_filter.cc               lattice index and filter tree
+
+Tests: mysql-test/suite/warp/t/mview_rewrite.test, mview_rewrite_sync.test.

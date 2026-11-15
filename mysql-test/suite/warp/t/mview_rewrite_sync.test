@@ -1,0 +1,80 @@
+--echo #
+--echo # MVIEW_REWRITE with views maintained by the WARP_MVIEW daemon: a view
+--echo # with REFRESH SYNCHRONOUS is used while the daemon keeps it current.
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+call mtr.add_suppression("WARP_MVIEW");
+
+--let $q_check = suite/warp/include/mview_rewrite_check.inc
+CREATE TABLE sales (id INT PRIMARY KEY, region VARCHAR(10) NOT NULL,
+  product INT NOT NULL, amount DECIMAL(10,2) NOT NULL) ENGINE=InnoDB
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO sales VALUES (1, 'north', 1, 10.00), (2, 'north', 2, 5.50),
+  (3, 'south', 1, 7.25), (4, 'east', 3, 1.00);
+CREATE MATERIALIZED VIEW sales_by_region AS
+  SELECT region, product, COUNT(*) AS n, SUM(amount) AS total,
+         MAX(amount) AS biggest
+  FROM sales GROUP BY region, product;
+
+--echo # used once the daemon maintains it
+--let $mvr_query = SELECT region, SUM(amount), COUNT(*), MAX(amount) FROM sales GROUP BY region
+--source suite/warp/include/mview_rewrite_wait.inc
+--source $q_check
+
+--echo # changes are applied by the daemon; the view is used again after it
+INSERT INTO sales VALUES (5, 'south', 2, 3.00), (6, 'west', 1, 100.00);
+UPDATE sales SET amount = amount + 1 WHERE region = 'north';
+DELETE FROM sales WHERE id = 4;
+--source suite/warp/include/mview_sync_wait.inc
+--source $q_check
+--let $mvr_query = SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product
+--source $q_check
+
+--echo # Read your writes: a session that committed a change does not use the
+--echo # view before the daemon has applied the change (a lock on the view
+--echo # holds the daemon up); other sessions may
+connect (locker, localhost, root,,);
+LOCK TABLES sales_by_region READ;
+connect (writer, localhost, root,,);
+SET SESSION mview_rewrite_trace = ON;
+INSERT INTO sales VALUES (7, 'north', 3, 2.00);
+--replace_regex /positions: .*/positions: (binary log positions)/
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+connect (reader, localhost, root,,);
+--disable_result_log
+SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
+--enable_result_log
+SELECT SQL_TEXT FROM performance_schema.events_statements_history
+WHERE THREAD_ID = PS_CURRENT_THREAD_ID() ORDER BY EVENT_ID DESC LIMIT 1;
+connection locker;
+UNLOCK TABLES;
+connection writer;
+--source suite/warp/include/mview_sync_wait.inc
+SET SESSION mview_rewrite_trace = OFF;
+--source $q_check
+disconnect locker;
+disconnect reader;
+disconnect writer;
+connection default;
+
+--echo # REFRESH MANUAL: not used unless mview_rewrite_use_manual_views
+ALTER MATERIALIZED VIEW sales_by_region REFRESH MANUAL;
+--source $q_check
+SET SESSION mview_rewrite_use_manual_views = ON;
+--source $q_check
+SET SESSION mview_rewrite_use_manual_views = OFF;
+ALTER MATERIALIZED VIEW sales_by_region REFRESH SYNCHRONOUS;
+--source suite/warp/include/mview_rewrite_wait.inc
+--source $q_check
+
+--echo # without the daemon no SYNCHRONOUS view is known to be current
+UNINSTALL PLUGIN WARP_MVIEW;
+--source $q_check
+--replace_result $WARP_PLUGIN WARP_PLUGIN
+eval INSTALL PLUGIN WARP_MVIEW SONAME '$WARP_PLUGIN';
+--source suite/warp/include/mview_rewrite_wait.inc
+--source $q_check
+
+DROP MATERIALIZED VIEW sales_by_region;
+DROP TABLE sales;

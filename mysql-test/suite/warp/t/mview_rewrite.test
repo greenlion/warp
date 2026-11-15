@@ -1,0 +1,320 @@
+--echo #
+--echo # MVIEW_REWRITE: answering queries from materialized views (view
+--echo # matching of Goldstein and Larson, SIGMOD 2001).  Every statement is
+--echo # run with and without the plugin and must give the same rows.
+--echo #
+
+--let $q_check = suite/warp/include/mview_rewrite_check.inc
+
+--echo # A small TPC-H like schema with foreign keys
+CREATE TABLE nation (n_nationkey INT PRIMARY KEY, n_name VARCHAR(25) NOT NULL);
+CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_name VARCHAR(25) NOT NULL,
+  c_nationkey INT NOT NULL, c_acctbal DECIMAL(12,2),
+  FOREIGN KEY (c_nationkey) REFERENCES nation (n_nationkey));
+CREATE TABLE orders (o_orderkey INT PRIMARY KEY, o_custkey INT NOT NULL,
+  o_orderstatus CHAR(1) NOT NULL, o_totalprice DECIMAL(12,2) NOT NULL,
+  o_orderdate DATE NOT NULL,
+  FOREIGN KEY (o_custkey) REFERENCES customer (c_custkey));
+CREATE TABLE part (p_partkey INT PRIMARY KEY, p_name VARCHAR(55) NOT NULL,
+  p_retailprice DECIMAL(12,2));
+CREATE TABLE lineitem (l_orderkey INT NOT NULL, l_linenumber INT NOT NULL,
+  l_partkey INT NOT NULL, l_quantity INT NOT NULL,
+  l_extendedprice DECIMAL(12,2) NOT NULL, l_discount DECIMAL(4,2),
+  l_shipdate DATE NOT NULL, l_commitdate DATE NOT NULL,
+  PRIMARY KEY (l_orderkey, l_linenumber),
+  FOREIGN KEY (l_orderkey) REFERENCES orders (o_orderkey),
+  FOREIGN KEY (l_partkey) REFERENCES part (p_partkey));
+
+INSERT INTO nation VALUES (0, 'ALGERIA'), (1, 'BRAZIL'), (2, 'CANADA'),
+  (3, 'EGYPT'), (4, 'FRANCE');
+INSERT INTO customer
+  WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 30)
+  SELECT k, CONCAT('Customer#', k), k % 5, (k * 37 % 1000) - 100 FROM s;
+INSERT INTO part
+  WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 20)
+  SELECT k, CONCAT(ELT(k % 4 + 1, 'steel', 'copper', 'brass', 'tin'), ' ',
+                   ELT(k % 3 + 1, 'bolt', 'nut', 'pipe')), 10 + k FROM s;
+INSERT INTO orders
+  WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 120)
+  SELECT k, (k * 7 % 30) + 1, ELT(k % 3 + 1, 'F', 'O', 'P'),
+         (k * 13 % 500) + 0.25, DATE'2025-01-01' + INTERVAL (k * 3 % 365) DAY
+  FROM s;
+INSERT INTO lineitem
+  WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 4)
+  SELECT o_orderkey, k, ((o_orderkey * 5 + k) % 20) + 1,
+         (o_orderkey + k) % 10 + 1,
+         ((o_orderkey + k) % 10 + 1) * (((o_orderkey * 5 + k) % 20) + 11),
+         (o_orderkey % 5) / 100,
+         o_orderdate + INTERVAL ((o_orderkey + k) % 3) DAY,
+         o_orderdate + INTERVAL (o_orderkey % 2) DAY
+  FROM orders, s WHERE k <= o_orderkey % 4 + 1;
+
+SET SESSION mview_rewrite_use_manual_views = ON;
+
+--echo #
+--echo # Join views (section 3.1)
+--echo #
+--echo # Example 2 of the paper: compensating equality, ranges and residual
+--echo # predicate; the residual predicate is computed from an output
+--echo # expression of the view.
+CREATE MATERIALIZED VIEW v2 REFRESH MANUAL AS
+  SELECT l_orderkey, l_linenumber, o_custkey, l_partkey, l_shipdate,
+         o_orderdate, l_quantity * l_extendedprice AS gross_revenue
+  FROM lineitem, orders, part
+  WHERE l_orderkey = o_orderkey AND l_partkey = p_partkey
+    AND p_partkey >= 5 AND o_custkey >= 5 AND o_custkey <= 25
+    AND p_name LIKE '%steel%';
+
+--let $mvr_query = SELECT l_orderkey, o_custkey, l_partkey, l_quantity * l_extendedprice FROM lineitem, orders, part WHERE l_orderkey = o_orderkey AND l_partkey = p_partkey AND l_partkey >= 5 AND l_partkey <= 16 AND o_custkey = 12 AND o_orderdate = l_shipdate AND p_name LIKE '%steel%' AND l_quantity * l_extendedprice > 100
+--source $q_check
+--echo # the same with JOIN ... ON, other spellings and an ORDER BY
+--let $mvr_query = SELECT o.o_custkey, l.l_orderkey AS k FROM part p JOIN lineitem l ON p.p_partkey = l.l_partkey JOIN orders o ON o.o_orderkey = l.l_orderkey WHERE 16 >= l.l_partkey AND p.p_partkey BETWEEN 5 AND 16 AND o.o_custkey IN (12) AND p.p_name LIKE '%steel%' ORDER BY k DESC, 1
+--source $q_check
+--echo # an aggregation over the join view
+--let $mvr_query = SELECT o_custkey, COUNT(*) AS n, SUM(l_quantity * l_extendedprice) AS g, MAX(l_shipdate) FROM lineitem, orders, part WHERE l_orderkey = o_orderkey AND l_partkey = p_partkey AND p_partkey >= 7 AND o_custkey BETWEEN 10 AND 20 AND p_name LIKE '%steel%' GROUP BY o_custkey HAVING COUNT(*) > 1
+--source $q_check
+--echo # the view is more restricted than the query: not used
+--let $mvr_query = SELECT l_orderkey, o_custkey FROM lineitem, orders, part WHERE l_orderkey = o_orderkey AND l_partkey = p_partkey AND l_partkey >= 2 AND o_custkey = 12 AND p_name LIKE '%steel%'
+--source $q_check
+--let $mvr_query = SELECT l_orderkey, o_custkey FROM lineitem, orders, part WHERE l_orderkey = o_orderkey AND l_partkey = p_partkey AND l_partkey >= 5 AND o_custkey = 12
+--source $q_check
+--echo # an output that the view does not have: not used
+--let $mvr_query = SELECT l_orderkey, p_name FROM lineitem, orders, part WHERE l_orderkey = o_orderkey AND l_partkey = p_partkey AND l_partkey >= 5 AND o_custkey = 12 AND p_name LIKE '%steel%'
+--source $q_check
+--echo # the reasons, with mview_rewrite_trace
+SET SESSION mview_rewrite_trace = ON;
+SELECT l_orderkey, o_custkey FROM lineitem, orders, part WHERE l_orderkey = o_orderkey AND l_partkey = p_partkey AND l_partkey >= 2 AND o_custkey = 12 AND p_name LIKE '%steel%' AND l_orderkey < 0;
+SET SESSION mview_rewrite_trace = OFF;
+
+--echo # SELECT *, ranges on strings and dates
+CREATE MATERIALIZED VIEW v_ord REFRESH MANUAL AS
+  SELECT * FROM orders
+  WHERE o_orderstatus = 'F' AND o_orderdate >= '2025-03-01';
+--let $mvr_query = SELECT * FROM orders WHERE o_orderstatus = 'F' AND o_orderdate BETWEEN DATE'2025-04-01' AND '2025-05-01' ORDER BY o_orderkey
+--source $q_check
+--let $mvr_query = SELECT o_orderkey FROM orders WHERE o_orderstatus = 'F' AND o_orderdate > '2025-02-28' AND o_totalprice < 100
+--source $q_check
+--let $mvr_query = SELECT o_orderkey FROM orders WHERE o_orderstatus BETWEEN 'F' AND 'G' AND o_orderdate >= '2025-03-01'
+--source $q_check
+DROP MATERIALIZED VIEW v_ord;
+
+--echo #
+--echo # Views with extra tables (section 3.2): Example 3 of the paper.  The
+--echo # orders and the customer of a lineitem exist (NOT NULL foreign keys
+--echo # to primary keys): the join does not change the lineitems.
+--echo #
+CREATE MATERIALIZED VIEW v3 REFRESH MANUAL AS
+  SELECT c_custkey, c_name, c_nationkey, l_orderkey, l_linenumber, l_partkey,
+         l_quantity, l_shipdate, l_commitdate
+  FROM lineitem, orders, customer
+  WHERE l_orderkey = o_orderkey AND o_custkey = c_custkey
+    AND o_orderkey >= 20;
+--let $mvr_query = SELECT l_orderkey, l_partkey, l_quantity FROM lineitem WHERE l_orderkey BETWEEN 30 AND 45 AND l_shipdate = l_commitdate
+--source $q_check
+--let $mvr_query = SELECT l_orderkey, o_custkey, l_quantity FROM lineitem JOIN orders ON l_orderkey = o_orderkey WHERE o_orderkey > 100
+--source $q_check
+--echo # without the foreign keys, the view is not used
+SET SESSION mview_rewrite_use_foreign_keys = OFF;
+--let $mvr_query = SELECT l_orderkey, l_partkey, l_quantity FROM lineitem WHERE l_orderkey BETWEEN 30 AND 45 AND l_shipdate = l_commitdate
+--source $q_check
+SET SESSION mview_rewrite_use_foreign_keys = ON;
+--echo # the query does not restrict the view range: not used
+--let $mvr_query = SELECT l_orderkey, l_partkey FROM lineitem WHERE l_orderkey < 30
+--source $q_check
+
+--echo #
+--echo # A view for some of the tables of the query: the other tables are
+--echo # joined to the view
+--echo #
+--let $mvr_query = SELECT n_name, COUNT(*), SUM(l_quantity) FROM lineitem, orders, customer, nation WHERE l_orderkey = o_orderkey AND o_custkey = c_custkey AND c_nationkey = n_nationkey AND l_orderkey >= 50 GROUP BY n_name
+--source $q_check
+--let $mvr_query = SELECT p_name, l_orderkey, l_quantity FROM lineitem, orders, customer, part WHERE l_orderkey = o_orderkey AND o_custkey = c_custkey AND l_partkey = p_partkey AND l_orderkey BETWEEN 50 AND 52 ORDER BY 2, 1, 3
+--source $q_check
+SET SESSION mview_rewrite_partial = OFF;
+--source $q_check
+SET SESSION mview_rewrite_partial = ON;
+--echo # a table that stays has the name of the view as its alias: the view
+--echo # gets another alias
+--let $mvr_query = SELECT v3.n_name, COUNT(*) FROM lineitem, orders, customer, nation v3 WHERE l_orderkey = o_orderkey AND o_custkey = c_custkey AND c_nationkey = v3.n_nationkey AND l_orderkey >= 50 GROUP BY v3.n_name
+--source $q_check
+--echo # c_name depends on the GROUP BY column c_custkey (its primary key);
+--echo # the view does not know: ANY_VALUE() without ONLY_FULL_GROUP_BY
+--let $mvr_query = SELECT c_custkey, c_name, SUM(l_quantity) FROM lineitem, orders, customer, nation WHERE l_orderkey = o_orderkey AND o_custkey = c_custkey AND c_nationkey = n_nationkey AND l_orderkey >= 50 AND n_name = 'BRAZIL' GROUP BY c_custkey
+--source $q_check
+SET @sql_mode = @@sql_mode;
+SET SESSION sql_mode = '';
+--source $q_check
+SET SESSION sql_mode = @sql_mode;
+
+--echo #
+--echo # Aggregate views (section 3.3)
+--echo #
+--echo # The view of Example 4 of the paper
+CREATE MATERIALIZED VIEW v4 REFRESH MANUAL AS
+  SELECT o_custkey, COUNT(*) AS cnt,
+         SUM(l_quantity * l_extendedprice) AS revenue
+  FROM lineitem, orders WHERE l_orderkey = o_orderkey GROUP BY o_custkey;
+--echo # the same groups
+--let $mvr_query = SELECT o_custkey, SUM(l_quantity * l_extendedprice) AS rev, COUNT(*) FROM lineitem JOIN orders ON l_orderkey = o_orderkey GROUP BY o_custkey
+--source $q_check
+--echo # coarser groups: the groups of the view are added up
+--let $mvr_query = SELECT COUNT(*), SUM(l_quantity * l_extendedprice), AVG(l_quantity * l_extendedprice) FROM lineitem, orders WHERE o_orderkey = l_orderkey
+--source $q_check
+--echo # no row: COUNT is 0 and SUM is NULL as without the view
+--let $mvr_query = SELECT COUNT(*), SUM(l_quantity * l_extendedprice) FROM lineitem, orders WHERE o_orderkey = l_orderkey AND o_custkey = 1000
+--source $q_check
+--echo # compensating range on a group column, HAVING, ORDER BY and LIMIT
+--let $mvr_query = SELECT o_custkey, SUM(l_quantity * l_extendedprice) AS rev FROM lineitem, orders WHERE l_orderkey = o_orderkey AND o_custkey BETWEEN 3 AND 20 GROUP BY o_custkey HAVING SUM(l_quantity * l_extendedprice) > 500 ORDER BY rev DESC, o_custkey LIMIT 5
+--source $q_check
+--echo # Example 4 needs pre-aggregation of the query, which is not done
+--let $mvr_query = SELECT c_nationkey, SUM(l_quantity * l_extendedprice) FROM lineitem, orders, customer WHERE l_orderkey = o_orderkey AND o_custkey = c_custkey GROUP BY c_nationkey
+--source $q_check
+--echo # a condition on a column that is not a group column: not used
+--let $mvr_query = SELECT o_custkey, COUNT(*) FROM lineitem, orders WHERE l_orderkey = o_orderkey AND l_quantity > 5 GROUP BY o_custkey
+--source $q_check
+
+--echo # MIN, MAX, two group columns
+CREATE MATERIALIZED VIEW v5 REFRESH MANUAL AS
+  SELECT o_custkey, o_orderstatus, COUNT(*) AS n, SUM(o_totalprice) AS total,
+         MIN(o_totalprice) AS lo, MAX(o_totalprice) AS hi,
+         MIN(o_orderdate) AS first_date
+  FROM orders GROUP BY o_custkey, o_orderstatus;
+--let $mvr_query = SELECT o_orderstatus, COUNT(*), MAX(o_totalprice), MIN(o_orderdate) FROM orders GROUP BY o_orderstatus
+--source $q_check
+--let $mvr_query = SELECT o_orderstatus, AVG(o_totalprice), SUM(o_totalprice) FROM orders WHERE o_custkey = 7 GROUP BY o_orderstatus
+--source $q_check
+--let $mvr_query = SELECT o_custkey, o_orderstatus, SUM(o_totalprice), MIN(o_totalprice) FROM orders GROUP BY o_orderstatus, o_custkey
+--source $q_check
+--let $mvr_query = SELECT o_custkey + 1 AS c, COUNT(*) FROM orders GROUP BY o_custkey + 1
+--source $q_check
+--let $mvr_query = SELECT COUNT(DISTINCT o_orderstatus), COUNT(DISTINCT o_custkey), MAX(o_custkey) FROM orders WHERE o_custkey > 10
+--source $q_check
+--echo # SELECT DISTINCT from the groups
+--let $mvr_query = SELECT DISTINCT o_orderstatus FROM orders WHERE o_custkey > 20
+--source $q_check
+--echo # not from the groups: SUM(DISTINCT) of a value, a row per order
+--let $mvr_query = SELECT SUM(DISTINCT o_totalprice) FROM orders
+--source $q_check
+--let $mvr_query = SELECT o_orderkey, o_custkey FROM orders WHERE o_custkey = 3
+--source $q_check
+
+--echo #
+--echo # When views are not used
+--echo #
+--echo # outer joins, subqueries, locking reads
+--let $mvr_query = SELECT o_custkey, COUNT(*) FROM orders LEFT JOIN lineitem ON l_orderkey = o_orderkey GROUP BY o_custkey
+--source $q_check
+--let $mvr_query = SELECT o_custkey, COUNT(*) FROM orders WHERE o_custkey IN (SELECT c_custkey FROM customer) GROUP BY o_custkey
+--source $q_check
+SELECT o_custkey, COUNT(*) FROM orders GROUP BY o_custkey LIMIT 1 FOR UPDATE;
+SHOW WARNINGS;
+--echo # optimizer hints and multi-statements
+SELECT /*+ MAX_EXECUTION_TIME(100000) */ o_custkey, COUNT(*) FROM orders GROUP BY o_custkey ORDER BY 1 LIMIT 1;
+SHOW WARNINGS;
+--echo # REFRESH MANUAL views are used only with mview_rewrite_use_manual_views
+SET SESSION mview_rewrite_use_manual_views = OFF;
+--let $mvr_query = SELECT o_custkey, COUNT(*) FROM orders GROUP BY o_custkey
+--source $q_check
+SET SESSION mview_rewrite_use_manual_views = ON;
+--source $q_check
+--echo # a transaction that has changed data: the views do not have it
+BEGIN;
+INSERT INTO orders VALUES (1000, 1, 'F', 1.00, '2026-01-01');
+SELECT o_custkey, COUNT(*) FROM orders WHERE o_custkey = 1 GROUP BY o_custkey;
+SHOW WARNINGS;
+ROLLBACK;
+BEGIN;
+SELECT o_custkey, COUNT(*) FROM orders WHERE o_custkey = 1 GROUP BY o_custkey;
+SHOW WARNINGS;
+COMMIT;
+--echo # prepared statements are not rewritten
+PREPARE s FROM 'SELECT o_custkey, COUNT(*) FROM orders WHERE o_custkey = 1 GROUP BY o_custkey';
+EXECUTE s;
+SHOW WARNINGS;
+DEALLOCATE PREPARE s;
+--echo # EXPLAIN shows the plan of the rewritten statement, with the view
+--replace_regex /\(cost=.*\)/(...)/
+EXPLAIN FORMAT=TREE SELECT o_custkey, COUNT(*) FROM orders WHERE o_custkey = 1 GROUP BY o_custkey;
+
+--echo # A SYNCHRONOUS view is used only while the WARP_MVIEW daemon keeps it
+--echo # current (the daemon is not loaded here)
+CREATE MATERIALIZED VIEW v6 AS
+  SELECT p_name, COUNT(*) AS n FROM part GROUP BY p_name;
+--let $mvr_query = SELECT p_name, COUNT(*) FROM part GROUP BY p_name
+--source $q_check
+
+--echo # The privileges of the user: SELECT on the view too
+CREATE DATABASE mvr;
+CREATE TABLE mvr.t (id INT PRIMARY KEY, g INT, v INT);
+INSERT INTO mvr.t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+CREATE MATERIALIZED VIEW mvr.tv REFRESH MANUAL AS
+  SELECT g, SUM(v) AS s FROM mvr.t GROUP BY g;
+CREATE USER mvr_user;
+GRANT SELECT ON mvr.t TO mvr_user;
+connect (con1, localhost, mvr_user,,);
+SET SESSION mview_rewrite_use_manual_views = ON;
+SET SESSION mview_rewrite_trace = ON;
+SELECT g, SUM(v) FROM mvr.t GROUP BY g;
+connection default;
+GRANT SELECT ON mvr.tv TO mvr_user;
+connection con1;
+SELECT g, SUM(v) FROM mvr.t GROUP BY g;
+--echo # without SELECT on the base table the statement fails as before
+connection default;
+REVOKE SELECT ON mvr.t FROM mvr_user;
+connection con1;
+--error ER_TABLEACCESS_DENIED_ERROR
+SELECT g, SUM(v) FROM mvr.t GROUP BY g;
+disconnect con1;
+connection default;
+DROP USER mvr_user;
+DROP DATABASE mvr;
+
+--echo # A view that is dropped or created again is not used any more
+DROP MATERIALIZED VIEW v5;
+--let $mvr_query = SELECT o_orderstatus, COUNT(*) FROM orders GROUP BY o_orderstatus
+--source $q_check
+CREATE MATERIALIZED VIEW v5 REFRESH MANUAL AS
+  SELECT o_orderstatus, COUNT(*) AS n FROM orders WHERE o_custkey > 3
+  GROUP BY o_orderstatus;
+--source $q_check
+--let $mvr_query = SELECT o_orderstatus, COUNT(*) FROM orders WHERE o_custkey > 3 GROUP BY o_orderstatus
+--source $q_check
+--let $mvr_query = SELECT o_orderstatus, COUNT(*) FROM orders WHERE o_custkey > 5 GROUP BY o_orderstatus
+--source $q_check
+--echo # REFRESH: the new contents are used
+--let $mvr_query = SELECT o_orderstatus, COUNT(*) FROM orders WHERE o_custkey > 3 GROUP BY o_orderstatus
+INSERT INTO orders VALUES (1000, 9, 'F', 1.00, '2026-01-01');
+REFRESH MATERIALIZED VIEW v5;
+--source $q_check
+
+--echo #
+--echo # A WARP view stores strings in binary collations: its string columns
+--echo # do not stand for columns of other collations
+--echo #
+CREATE TABLE tw (id INT PRIMARY KEY, name VARCHAR(10), v INT)
+  DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+INSERT INTO tw VALUES (1, 'a', 1), (2, 'A', 2), (3, 'b', 3);
+CREATE MATERIALIZED VIEW vw ENGINE=WARP REFRESH MANUAL AS
+  SELECT name, COUNT(*) AS n, SUM(v) AS s FROM tw GROUP BY name;
+--let $mvr_query = SELECT name, COUNT(*) FROM tw GROUP BY name
+--source $q_check
+--let $mvr_query = SELECT COUNT(*), SUM(v) FROM tw
+--source $q_check
+
+--echo #
+--echo # The filter tree: the views it leaves out
+--echo #
+--let $c0 = query_get_value(SHOW GLOBAL STATUS LIKE 'Mview_rewrite_candidates', Value, 1)
+SELECT COUNT(*) FROM nation;
+--let $c1 = query_get_value(SHOW GLOBAL STATUS LIKE 'Mview_rewrite_candidates', Value, 1)
+SET SESSION mview_rewrite_use_filter_tree = OFF;
+SELECT COUNT(*) FROM nation;
+SET SESSION mview_rewrite_use_filter_tree = ON;
+--let $c2 = query_get_value(SHOW GLOBAL STATUS LIKE 'Mview_rewrite_candidates', Value, 1)
+--expr $with_tree = $c1 - $c0
+--expr $without_tree = $c2 - $c1
+--echo # views tested with the filter tree: $with_tree, without: $without_tree
+
+DROP MATERIALIZED VIEW v2, v3, v4, v5, v6, vw;
+DROP TABLE lineitem, orders, part, customer, nation, tw;

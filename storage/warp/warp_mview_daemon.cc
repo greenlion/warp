@@ -1334,6 +1334,7 @@ void Daemon::load_state() {
   have_saved_position = true;
   saved_file = file_name;
   saved_pos = pos;
+  mview_set_applied_position(saved_file, saved_pos);
   known = std::move(views_read);
   known_names = std::move(names_read);
   publish_stale();
@@ -1406,8 +1407,18 @@ void Daemon::publish_stale() {
       list += entry.first;
   }
   st_stale_views.store(count);
-  std::lock_guard<std::mutex> guard(status_mutex);
-  st_stale_list = list;
+  {
+    std::lock_guard<std::mutex> guard(status_mutex);
+    st_stale_list = list;
+  }
+
+  /* the views that are current, for the query rewrite plugin */
+  std::vector<Mview_maintained> current;
+  for (size_t i = 0; i < views.size() && i < rt.size(); i++) {
+    if (!rt[i].maintained || rt[i].needs_refresh) continue;
+    current.push_back({views[i].db, views[i].name, views[i].epoch});
+  }
+  mview_set_maintained(current);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2009,6 +2020,7 @@ bool Daemon::init_position() {
     saved_file = linfo.log_file_name;
     saved_pos = current.pos;
     have_saved_position = true;
+    mview_set_applied_position(saved_file, saved_pos);
     wmv_log(INFORMATION_LEVEL, "starting at the end of the binary log (%s, %llu)",
             saved_file.c_str(), static_cast<unsigned long long>(saved_pos));
     save_state();
@@ -4277,6 +4289,7 @@ Apply_result Daemon::apply_batch(bool allow_defer) {
     saved_file = batch.end_file;
     saved_pos = batch.end_pos;
     have_saved_position = true;
+    mview_set_applied_position(saved_file, saved_pos);
   }
   /* The file is synced: for batches that changed no view, at most once a
      second (and when the daemon stops). */
@@ -4389,6 +4402,7 @@ void Daemon::run(const void *stack_base) {
           saved_file = batch.end_file;
           saved_pos = batch.end_pos;
           state_dirty = true;
+          mview_set_applied_position(saved_file, saved_pos);
           batch.clear();
         }
         if (state_dirty && std::chrono::steady_clock::now() - last_state_save >=
@@ -4516,6 +4530,7 @@ void Daemon::run(const void *stack_base) {
           st_full_refreshes.load(), st_pins.load(), st_pin_failures.load(),
           st_snapshots.load(), st_pin_lock_us.load() / 1000,
           st_pin_wait_us.load() / 1000);
+  mview_clear_maintained();
   destroy_session();
   set_state("stopped");
 }

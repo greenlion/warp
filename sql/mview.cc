@@ -31,6 +31,8 @@
 #include <rapidjson/writer.h>
 
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -61,6 +63,59 @@ std::atomic<uint64_t> mview_registry_version{1};
 
 void mview_registry_changed() {
   mview_registry_version.fetch_add(1, std::memory_order_release);
+}
+
+namespace {
+std::mutex maintained_mutex;
+/// "schema\0name" -> epoch of the maintained definition.
+std::map<std::string, uint64_t> maintained_views;
+
+bool applied_known = false;
+std::string applied_file;
+uint64_t applied_pos = 0;
+
+std::string maintained_key(const std::string &db, const std::string &name) {
+  std::string key = db;
+  key.push_back('\0');
+  key += name;
+  return key;
+}
+}  // namespace
+
+void mview_set_maintained(const std::vector<Mview_maintained> &views) {
+  std::map<std::string, uint64_t> map;
+  for (const Mview_maintained &view : views)
+    map[maintained_key(view.db, view.name)] = view.epoch;
+  const std::lock_guard<std::mutex> guard(maintained_mutex);
+  maintained_views.swap(map);
+}
+
+void mview_clear_maintained() {
+  const std::lock_guard<std::mutex> guard(maintained_mutex);
+  maintained_views.clear();
+  applied_known = false;
+}
+
+void mview_set_applied_position(const std::string &file, uint64_t pos) {
+  const std::lock_guard<std::mutex> guard(maintained_mutex);
+  applied_known = true;
+  applied_file = file;
+  applied_pos = pos;
+}
+
+bool mview_get_applied_position(std::string *file, uint64_t *pos) {
+  const std::lock_guard<std::mutex> guard(maintained_mutex);
+  if (!applied_known) return false;
+  *file = applied_file;
+  *pos = applied_pos;
+  return true;
+}
+
+bool mview_is_maintained(const std::string &db, const std::string &name,
+                         uint64_t epoch) {
+  const std::lock_guard<std::mutex> guard(maintained_mutex);
+  const auto it = maintained_views.find(maintained_key(db, name));
+  return it != maintained_views.end() && it->second == epoch;
 }
 
 void mview_set_maintenance_mode(THD *thd, bool on) {
