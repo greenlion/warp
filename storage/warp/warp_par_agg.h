@@ -171,6 +171,13 @@ struct warp_pa_plan {
   std::vector<warp_pa_col> cols;        // every column that is read
   std::vector<int> key_cols;            // the columns of the groups: GROUP BY, then the DISTINCT columns
   size_t group_cols = 0;                // the first group_cols of key_cols are the GROUP BY columns
+  /* Columns that MySQL reads above the aggregation that are not columns of
+     the groups (a column that a condition makes constant, which MySQL removes
+     from the GROUP BY; any column that is not in it, with ONLY_FULL_GROUP_BY
+     off): a group has the value of one of its rows, as MySQL would read it
+     from the first row of the group.  Their cells follow those of key_cols;
+     they are not part of the key of the group. */
+  std::vector<int> carry_cols;
   std::vector<warp_pa_agg> aggs;
   std::vector<warp_pa_having> having;
   /* The groups with the same GROUP BY columns are next to each other: the
@@ -955,6 +962,60 @@ static std::shared_ptr<warp_pa_plan> warp_pa_make_plan(THD *thd, AccessPath *agg
         }
       }
     }
+    /* A column of a pushed condition is read by MySQL only for the
+       condition, unless the query also reads it outside of an aggregate (the
+       select list, HAVING, ORDER BY): then MySQL reads its value from the
+       rows of the engine, which only have the columns of the groups.  It is
+       not in the GROUP BY when the condition makes it constant
+       (WHERE b = 'x' GROUP BY a, b: MySQL removes b from the GROUP BY). */
+    {
+      std::map<uint, int> total, inside;
+      std::vector<Item_sum *> sums;
+      auto count = [&](Item *root, std::map<uint, int> *counts, bool collect_sums) {
+        if(root == nullptr) return;
+        WalkItem(root, enum_walk::PREFIX, [&](Item *i) {
+          if(collect_sums && i->type() == Item::SUM_FUNC_ITEM) {
+            sums.push_back(down_cast<Item_sum *>(i));
+          }
+          if(i->type() == Item::FIELD_ITEM) {
+            Field *f = down_cast<Item_field *>(i)->field;
+            if(f != nullptr && f->table == table) ++(*counts)[f->field_index()];
+          }
+          return false;
+        });
+      };
+      auto add = [&](Item *root) { count(root, &total, true); };
+      if(join->query_block != nullptr) {
+        for(Item *item : join->query_block->fields) add(item);
+        add(join->query_block->having_cond());
+        for(ORDER *o = join->query_block->order_list.first; o != nullptr; o = o->next) {
+          add(*o->item);
+        }
+      }
+      if(join->fields != nullptr) {
+        for(Item *item : *join->fields) add(item);
+      }
+      add(join->having_cond);
+      for(Item_sum *sum : sums) count(sum, &inside, false);
+      for(const auto &entry : total) {
+        auto in = inside.find(entry.first);
+        if(entry.second <= (in == inside.end() ? 0 : in->second)) continue;
+        /* read outside of an aggregate: a column of the groups, or carried */
+        bool is_key = false;
+        for(int c : plan->key_cols) {
+          if(plan->cols[c].field == entry.first) is_key = true;
+        }
+        if(is_key) continue;
+        const int slot = warp_pa_add_col(plan.get(), table->field[entry.first]);
+        if(slot < 0) {
+          return (warp_pa_no(__LINE__), none);
+        }
+        if(std::find(plan->carry_cols.begin(), plan->carry_cols.end(), slot) == plan->carry_cols.end()) {
+          plan->carry_cols.push_back(slot);
+        }
+        allowed.insert(entry.first);
+      }
+    }
     for(int c : plan->key_cols) allowed.insert(plan->cols[c].field);
     for(const auto &agg : plan->aggs) {
       if(!agg.replaced) continue;
@@ -1322,9 +1383,10 @@ static void warp_pa_slice(const warp_pa_plan &plan, const std::vector<warp_pa_lo
                           const std::vector<uint32_t> &hit_rows, const std::vector<uint8_t> &invisible,
                           size_t lo, size_t hi, warp_pa_worker *worker) {
   const size_t nkeys = plan.key_cols.size();
+  const size_t ncells = nkeys + plan.carry_cols.size();
   std::string key;
   std::string collation_key;
-  std::vector<warp_pa_cell> cells(nkeys);
+  std::vector<warp_pa_cell> cells(ncells);
   for(size_t i = lo; i < hi; ++i) {
     const size_t row = hit_rows[i];
     if(!invisible.empty() && invisible[row]) {
@@ -1338,37 +1400,41 @@ static void warp_pa_slice(const warp_pa_plan &plan, const std::vector<warp_pa_lo
     }
     /* the group */
     key.clear();
-    for(size_t k = 0; k < nkeys; ++k) {
-      const int c = plan.key_cols[k];
+    for(size_t k = 0; k < ncells; ++k) {
+      /* the carried columns have cells, they are not in the key */
+      const bool in_key = k < nkeys;
+      const int c = in_key ? plan.key_cols[k] : plan.carry_cols[k - nkeys];
       const warp_pa_col &col = plan.cols[c];
       const warp_pa_loaded &ld = loaded[c];
       warp_pa_cell &cell = cells[k];
       cell.null = ld.has_nulls && ld.nulls.get(row) != 0;
       if(cell.null) {
-        key.push_back('\1');
+        if(in_key) key.push_back('\1');
         continue;
       }
-      key.push_back('\0');
+      if(in_key) key.push_back('\0');
       switch(col.kind) {
         case PA_INT:
           cell.i = ld.ints.get(row);
-          key.append((const char *)&cell.i, sizeof(cell.i));
+          if(in_key) key.append((const char *)&cell.i, sizeof(cell.i));
           break;
         case PA_DEC:
           cell.i = ld.dec[i];
-          key.append((const char *)&cell.i, sizeof(cell.i));
+          if(in_key) key.append((const char *)&cell.i, sizeof(cell.i));
           break;
         case PA_REAL:
           cell.d = ld.is_float ? (double)ld.floats[row] : ld.doubles[row];
           if(cell.d == 0) cell.d = 0;   // -0 and 0 are one value
-          key.append((const char *)&cell.d, sizeof(cell.d));
+          if(in_key) key.append((const char *)&cell.d, sizeof(cell.d));
           break;
         default: {
           const std::string &s = (*ld.strs)[i];
-          warp_pa_collation_key(col.cs, s, &collation_key);
-          const uint32_t length = (uint32_t)collation_key.size();
-          key.append((const char *)&length, sizeof(length));
-          key.append(collation_key);
+          if(in_key) {
+            warp_pa_collation_key(col.cs, s, &collation_key);
+            const uint32_t length = (uint32_t)collation_key.size();
+            key.append((const char *)&length, sizeof(length));
+            key.append(collation_key);
+          }
           cell.s = s;
         }
       }
@@ -2182,8 +2248,9 @@ int ha_warp::pa_next(uchar *) {
   }
   /* the columns of the group in the record of the table */
   my_bitmap_map *old_write = tmp_use_all_columns(table, table->write_set);
-  for(size_t k = 0; k < plan.key_cols.size(); ++k) {
-    const warp_pa_col &col = plan.cols[plan.key_cols[k]];
+  const size_t nkeys = plan.key_cols.size();
+  for(size_t k = 0; k < nkeys + plan.carry_cols.size() && k < group.cells.size(); ++k) {
+    const warp_pa_col &col = plan.cols[k < nkeys ? plan.key_cols[k] : plan.carry_cols[k - nkeys]];
     const warp_pa_cell &cell = group.cells[k];
     Field *field = table->field[col.field];
     if(cell.null) {
@@ -2294,6 +2361,9 @@ static bool warp_pa_install(THD *thd, std::shared_ptr<warp_pa_plan> plan, Access
                             AccessPath *stream) {
   /* the fields that the engine sets must be in the read set */
   for(int slot_index : plan->key_cols) {
+    bitmap_set_bit(plan->table->read_set, plan->cols[slot_index].field);
+  }
+  for(int slot_index : plan->carry_cols) {
     bitmap_set_bit(plan->table->read_set, plan->cols[slot_index].field);
   }
   /* the constants that replace the arguments, the classes of COUNT and AVG */

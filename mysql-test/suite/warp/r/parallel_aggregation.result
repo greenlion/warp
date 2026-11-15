@@ -1204,6 +1204,36 @@ INSERT INTO f_i VALUES (9000, 1, 1, 'new', 'new', 1, 1, 1.5, 2.25, 1, 1, 'new', 
 7:40007:3931.98
 ROLLBACK;
 7:78000:7861.02
+# a column of the select list that a condition makes constant: MySQL
+# removes it from the GROUP BY, the engine returns it with the groups
+7:7281365980
+50:138569192362
+SELECT SUM(v), g1, g3 FROM f_w WHERE g3 = 'b2' AND g1 >= 2 GROUP BY g1, g3 ORDER BY g1, g3;
+SUM(v)	g1	g3
+2283	2	b2
+2193	3	b2
+# the engine aggregates and returns the value of the column of a row of the group
+EXPLAIN FORMAT=TREE SELECT SUM(v), g1, g3 FROM f_w WHERE g3 = 'b2' GROUP BY g1, g3;
+EXPLAIN
+-> Table scan on <temporary>
+    -> Aggregate using temporary table
+        -> Table scan on f_w, with parallel aggregation
+
+Warnings:
+Note	1003	/* select#1 */ select sum(0) AS `SUM(v)`,`test`.`f_w`.`g1` AS `g1`,`test`.`f_w`.`g3` AS `g3` from `test`.`f_w` where (`test`.`f_w`.`g3` = 'b2') group by `test`.`f_w`.`g1`
+# a column that is not in the GROUP BY (ONLY_FULL_GROUP_BY off): one row a group
+SET @saved_sql_mode = @@sql_mode;
+SET SESSION sql_mode = '';
+4000:8593436562041
+EXPLAIN FORMAT=TREE SELECT id, s, d1, SUM(v) FROM f_w GROUP BY id;
+EXPLAIN
+-> Table scan on <temporary>
+    -> Aggregate using temporary table
+        -> Table scan on f_w, with parallel aggregation
+
+Warnings:
+Note	1003	/* select#1 */ select `test`.`f_w`.`id` AS `id`,`test`.`f_w`.`s` AS `s`,`test`.`f_w`.`d1` AS `d1`,sum(0) AS `SUM(v)` from `test`.`f_w` group by `test`.`f_w`.`id`
+SET SESSION sql_mode = @saved_sql_mode;
 # the engine aggregates: the table is scanned once and the groups are the rows
 EXPLAIN FORMAT=TREE SELECT g1, SUM(d1), COUNT(*) FROM f_w GROUP BY g1;
 EXPLAIN
