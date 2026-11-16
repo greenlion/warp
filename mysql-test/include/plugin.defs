@@ -46,6 +46,7 @@ ha_federated                            plugin_output_directory  no FEDERATED_PL
 ha_partition                            plugin_output_directory  no PARTITION_PLUGIN  partition
 ha_mock                                 plugin_output_directory  no MOCK_PLUGIN
 ha_warp                                 plugin_output_directory  no WARP_PLUGIN WARP
+ha_rapid                                plugin_output_directory  no RAPID_PLUGIN
 mypluglib                               plugin_output_directory  no SIMPLE_PARSER
 libpluginmecab                          plugin_output_directory  no MECAB
 adt_null                                plugin_output_directory  no AUDIT_NULL

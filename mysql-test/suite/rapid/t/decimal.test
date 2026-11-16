@@ -1,0 +1,37 @@
+--disable_query_log
+eval INSTALL PLUGIN rapid SONAME 'ha_rapid.so';
+--enable_query_log
+
+--echo #
+--echo # Test RAPID DECIMAL type support
+--echo #
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  price DECIMAL(10,2),
+  rate DECIMAL(5,4),
+  big_decimal DECIMAL(20,6)
+) SECONDARY_ENGINE RAPID;
+
+ALTER TABLE t1 SECONDARY_LOAD;
+
+INSERT INTO t1 VALUES 
+  (1, 123.45, 0.0525, 123456.789012),
+  (2, -999.99, -1.2345, -987654.321098),
+  (3, 0.01, 0.0001, 0.000001);
+
+--echo # Wait for binlog replication
+--sleep 2
+
+SET SESSION secondary_engine_cost_threshold = 0;
+
+SELECT * FROM t1 ORDER BY id;
+SELECT id, price FROM t1 WHERE price > 100 ORDER BY id;
+SELECT SUM(price) FROM t1;
+
+ALTER TABLE t1 SECONDARY_UNLOAD;
+DROP TABLE t1;
+
+--disable_query_log
+UNINSTALL PLUGIN rapid;
+--enable_query_log

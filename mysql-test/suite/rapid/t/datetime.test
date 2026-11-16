@@ -1,0 +1,126 @@
+--disable_query_log
+eval INSTALL PLUGIN rapid SONAME 'ha_rapid.so';
+--enable_query_log
+
+--echo #
+--echo # Test RAPID with date and time types
+--echo #
+
+CREATE TABLE t_datetime (
+  id INT PRIMARY KEY,
+  col_date DATE,
+  col_time TIME,
+  col_datetime DATETIME,
+  col_timestamp TIMESTAMP,
+  -- Test fractional seconds with different precisions
+  col_time_fsp0 TIME(0),
+  col_time_fsp3 TIME(3),
+  col_time_fsp6 TIME(6),
+  col_datetime_fsp0 DATETIME(0),
+  col_datetime_fsp3 DATETIME(3),
+  col_datetime_fsp6 DATETIME(6)
+) SECONDARY_ENGINE RAPID;
+
+--echo # Insert test data before loading
+INSERT INTO t_datetime VALUES 
+  (1, '2024-01-15', '14:30:00', '2024-01-15 14:30:00', '2024-01-15 14:30:00',
+   '14:30:00', '14:30:00.123', '14:30:00.123456',
+   '2024-01-15 14:30:00', '2024-01-15 14:30:00.123', '2024-01-15 14:30:00.123456');
+
+INSERT INTO t_datetime VALUES 
+  (2, '2000-12-31', '23:59:59', '2000-12-31 23:59:59', '2024-01-01 00:00:00',
+   '23:59:59', '23:59:59.999', '23:59:59.999999',
+   '2000-12-31 23:59:59', '2000-12-31 23:59:59.999', '2000-12-31 23:59:59.999999');
+
+INSERT INTO t_datetime VALUES 
+  (3, '1000-01-01', '00:00:00', '1000-01-01 00:00:00', '2024-12-31 12:00:00',
+   '00:00:00', '00:00:00.001', '00:00:00.000001',
+   '1000-01-01 00:00:00', '1000-01-01 00:00:00.001', '1000-01-01 00:00:00.000001');
+
+ALTER TABLE t_datetime SECONDARY_LOAD;
+
+--echo # Insert more data via binlog replication with fractional seconds
+INSERT INTO t_datetime VALUES 
+  (4, '2025-06-15', '09:15:30', '2025-06-15 09:15:30', '2025-06-15 09:15:30',
+   '09:15:30', '09:15:30.654', '09:15:30.654321',
+   '2025-06-15 09:15:30', '2025-06-15 09:15:30.654', '2025-06-15 09:15:30.654321');
+
+--echo # Wait for binlog replication
+--sleep 2
+
+SET SESSION secondary_engine_cost_threshold = 0;
+
+--echo # Query all data
+SELECT * FROM t_datetime ORDER BY id;
+
+--echo # Test COUNT
+SELECT COUNT(*) FROM t_datetime;
+
+--echo # Test WHERE with DATE
+SELECT id, col_date FROM t_datetime WHERE col_date > '2024-01-01' ORDER BY id;
+
+--echo # Test WHERE with TIME
+SELECT id, col_time FROM t_datetime WHERE col_time > '12:00:00' ORDER BY id;
+
+--echo # Test WHERE with DATETIME
+SELECT id, col_datetime FROM t_datetime WHERE col_datetime >= '2024-01-01 00:00:00' ORDER BY id;
+
+--echo # Test MIN/MAX with DATE
+SELECT MIN(col_date), MAX(col_date) FROM t_datetime;
+
+--echo # Test MIN/MAX with DATETIME
+SELECT MIN(col_datetime), MAX(col_datetime) FROM t_datetime;
+
+--echo # Test aggregates with multiple date types
+SELECT COUNT(*), MIN(col_date), MAX(col_time) FROM t_datetime;
+
+--echo # Test fractional seconds columns with precision 0
+SELECT id, col_time_fsp0, col_datetime_fsp0 FROM t_datetime ORDER BY id;
+
+--echo # Test fractional seconds columns with precision 3
+SELECT id, col_time_fsp3, col_datetime_fsp3 FROM t_datetime ORDER BY id;
+
+--echo # Test fractional seconds columns with precision 6
+SELECT id, col_time_fsp6, col_datetime_fsp6 FROM t_datetime ORDER BY id;
+
+--echo # Test NULL handling
+INSERT INTO t_datetime (id) VALUES (5);
+--sleep 2
+SELECT id, col_date, col_time, col_datetime FROM t_datetime WHERE id = 5;
+
+--echo # Test with NOW function for fractional seconds
+INSERT INTO t_datetime VALUES 
+  (6, CURDATE(), CURTIME(), NOW(), NOW(),
+   CURTIME(0), CURTIME(3), CURTIME(6),
+   NOW(0), NOW(3), NOW(6));
+--sleep 2
+--echo # Verify NOW row was inserted with fractional seconds (actual timestamp values will vary)
+SELECT COUNT(*) FROM t_datetime WHERE id = 6;
+
+ALTER TABLE t_datetime SECONDARY_UNLOAD;
+DROP TABLE t_datetime;
+
+--echo # Test DATETIME without fractional seconds
+CREATE TABLE t_datetime_no_frac (
+  id INT PRIMARY KEY,
+  col_datetime DATETIME,
+  col_timestamp TIMESTAMP
+) SECONDARY_ENGINE RAPID;
+
+INSERT INTO t_datetime_no_frac VALUES (1, '2024-06-15 10:30:45', '2024-06-15 10:30:45');
+
+ALTER TABLE t_datetime_no_frac SECONDARY_LOAD;
+
+INSERT INTO t_datetime_no_frac VALUES (2, '2025-12-25 23:59:59', '2025-12-25 23:59:59');
+--sleep 2
+
+SET SESSION secondary_engine_cost_threshold = 0;
+
+SELECT * FROM t_datetime_no_frac ORDER BY id;
+
+ALTER TABLE t_datetime_no_frac SECONDARY_UNLOAD;
+DROP TABLE t_datetime_no_frac;
+
+--disable_query_log
+UNINSTALL PLUGIN rapid;
+--enable_query_log

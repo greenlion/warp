@@ -1,0 +1,41 @@
+DuckDB in storage/rapid
+=======================
+
+The RAPID secondary engine runs its queries in DuckDB (MIT license,
+https://duckdb.org).  The sources of DuckDB are not in this tree: they are
+downloaded when the plugin is built.
+
+  1. When the build directory is configured, the release to use is decided:
+
+       -DRAPID_DUCKDB_VERSION=latest   (the default) the latest release, asked
+                                       from the GitHub API
+       -DRAPID_DUCKDB_VERSION=v2.0.0   that release
+
+     "latest" is resolved once for a build directory and kept in the CMake
+     cache (RAPID_DUCKDB_TAG), so that configuring again does not change the
+     release under a build.  To move to a newer release:
+
+       cmake -URAPID_DUCKDB_TAG .
+
+  2. "make rapid" downloads the source archive of the release
+     (https://github.com/duckdb/duckdb/archive/refs/tags/<tag>.tar.gz, or
+     -DRAPID_DUCKDB_URL=<url or file> for a mirror or a copy), and builds it
+     with DuckDB's own CMake files in <build>/storage/rapid/duckdb-<tag>:
+     static libraries, position independent, without jemalloc, the shell and
+     the tests.
+
+  3. All the static libraries of that build (the core, its third party
+     libraries, and the extensions that DuckDB links statically:
+     core_functions, parquet, json, icu) are put into one,
+     libduckdb_bundle.a (duckdb_bundle.cmake), which is linked into
+     ha_rapid.so.
+
+The engine only uses the C API of DuckDB (duckdb.h), which is stable across
+releases.  It was built and tested with v2.0.0.  Building needs a network
+connection the first time (or RAPID_DUCKDB_URL), about 110 MB of download and
+1.3 GB in the build directory.  -DWITHOUT_RAPID_SECONDARY_STORAGE_ENGINE=1
+builds the server without the engine.
+
+DuckDB does not publish the single file amalgamation (duckdb.cpp /
+duckdb.hpp) any more since 2.0, which is what this engine was built with
+before.

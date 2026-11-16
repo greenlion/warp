@@ -1,0 +1,11 @@
+#
+# Test RAPID with unsupported column types
+#
+# Test GEOMETRY (unsupported)
+CREATE TABLE t_geo (
+id INT PRIMARY KEY,
+location GEOMETRY
+) SECONDARY_ENGINE RAPID;
+ALTER TABLE t_geo SECONDARY_LOAD;
+ERROR HY000: Unsupported column type in RAPID secondary engine
+DROP TABLE t_geo;

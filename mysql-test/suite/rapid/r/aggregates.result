@@ -1,0 +1,38 @@
+#
+# Test RAPID with aggregate functions
+#
+CREATE TABLE t1 (
+id INT,
+category VARCHAR(50),
+amount DECIMAL(10,2)
+) SECONDARY_ENGINE RAPID;
+INSERT INTO t1 VALUES
+(1, 'A', 100.50),
+(2, 'B', 200.75),
+(3, 'A', 150.25),
+(4, 'B', 300.00),
+(5, 'A', 175.50);
+ALTER TABLE t1 SECONDARY_LOAD;
+SET SESSION secondary_engine_cost_threshold = 0;
+# Test COUNT
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+5
+# Test SUM
+SELECT SUM(amount) FROM t1;
+SUM(amount)
+927.00
+# Test AVG
+SELECT AVG(amount) FROM t1;
+AVG(amount)
+185.4
+# Test MIN/MAX
+SELECT MIN(amount), MAX(amount) FROM t1;
+MIN(amount)	MAX(amount)
+100.50	300.00
+# Test GROUP BY
+SELECT category, COUNT(*), SUM(amount) FROM t1 GROUP BY category ORDER BY category;
+category	COUNT(*)	SUM(amount)
+A	3	426.25
+B	2	500.75
+DROP TABLE t1;

@@ -1,0 +1,38 @@
+--disable_query_log
+eval INSTALL PLUGIN rapid SONAME 'ha_rapid.so';
+--enable_query_log
+
+--echo #
+--echo # Test RAPID system variables
+--echo #
+
+--echo # Show RAPID variables
+SHOW VARIABLES LIKE 'rapid%';
+
+--echo # Test rapid_binlog_enabled (dynamic)
+SET GLOBAL rapid_binlog_enabled = 0;
+SHOW VARIABLES LIKE 'rapid_binlog_enabled';
+SET GLOBAL rapid_binlog_enabled = 1;
+SHOW VARIABLES LIKE 'rapid_binlog_enabled';
+
+--echo # Test rapid_batch_size (dynamic)
+SET GLOBAL rapid_batch_size = 500;
+SHOW VARIABLES LIKE 'rapid_batch_size';
+SET GLOBAL rapid_batch_size = 1000;
+
+--echo # Test rapid_database_file (read-only)
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET GLOBAL rapid_database_file = '/tmp/test.db';
+
+SHOW VARIABLES LIKE 'rapid_database_file';
+
+--echo # Show status variables exist (values are dynamic)
+--disable_query_log
+--disable_result_log
+SHOW STATUS LIKE 'rapid%';
+--enable_result_log
+--enable_query_log
+
+--disable_query_log
+UNINSTALL PLUGIN rapid;
+--enable_query_log
