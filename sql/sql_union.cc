@@ -506,6 +506,17 @@ bool Query_expression::optimize(THD *thd, TABLE *materialize_destination,
   DBUG_TRACE;
   assert(is_prepared() && !is_optimized());
 
+  /* The statement is resolved and not optimized yet: a secondary engine
+     that runs it may read the query as it is now. */
+  if (this == thd->lex->unit && thd->lex->m_sql_cmd != nullptr &&
+      thd->lex->m_sql_cmd->using_secondary_storage_engine()) {
+    const handlerton *secondary = thd->lex->m_sql_cmd->secondary_engine();
+    if (secondary != nullptr &&
+        secondary->secondary_engine_resolved != nullptr &&
+        secondary->secondary_engine_resolved(thd, thd->lex))
+      return true;
+  }
+
   Change_current_query_block save_query_block(thd);
 
   ha_rows estimated_rowcount = 0;
