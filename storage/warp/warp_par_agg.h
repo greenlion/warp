@@ -556,6 +556,39 @@ static bool warp_pa_compile(Item *item, warp_pa_plan *plan, warp_pa_prog *prog, 
   }
   if(item->type() == Item::FUNC_ITEM) {
     Item_func *func = down_cast<Item_func *>(item);
+    /* x / c for a constant c that is not zero, when the quotients have no more
+       digits than the scale of the division: x * (10^n / c), which is exact
+       (see warp_gj_compiler::compile) */
+    if(dynamic_cast<Item_func_div *>(func) != nullptr) {
+      if(prog->real || func->argument_count() != 2 || func->result_type() != DECIMAL_RESULT) {
+        return warp_pa_no(__LINE__);
+      }
+      Item *divisor = func->arguments()[1];
+      if(divisor->type() != Item::INT_ITEM && divisor->type() != Item::DECIMAL_ITEM) {
+        return warp_pa_no(__LINE__);
+      }
+      int sa = 0, sb = 0;
+      if(!warp_pa_compile(func->arguments()[0], plan, prog, &sa) || !warp_pa_compile(divisor, plan, prog, &sb)) {
+        return false;
+      }
+      warp_pa_op &constant = prog->ops.back();
+      const int result_scale = (int)func->decimals;
+      const int digits = result_scale - sa + sb;
+      if(constant.kind != warp_pa_op::CONSTANT || constant.value == 0 || result_scale > 30 || digits < 0 ||
+         digits > 18) {
+        return warp_pa_no(__LINE__);
+      }
+      const warp_i128 power = warp_pa_pow10(digits);
+      if(power % constant.value != 0) {
+        return warp_pa_no(__LINE__);
+      }
+      constant.value = power / constant.value;
+      warp_pa_op op;
+      op.kind = warp_pa_op::MUL;
+      prog->ops.push_back(op);
+      *scale = result_scale;
+      return true;
+    }
     warp_pa_op::Kind kind;
     switch(func->functype()) {
       case Item_func::PLUS_FUNC:  kind = warp_pa_op::ADD; break;

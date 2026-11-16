@@ -1,0 +1,646 @@
+#
+# A division by a constant in the argument of an aggregate: the engine
+# aggregates it (alone and above its join) when every quotient is exact
+# in the scale of the division (/ 2, / 4, / 100, / 0.5, / 2.5, / -2), as
+# x * (10^n / c).  Any other division (/ 3, / 7.0, / 1.5, / a column) is
+# left to MySQL.  Every query is run against the WARP tables with the
+# aggregation on and off, and against InnoDB copies.  (TPC-DS query 4:
+# SUM(((a - b - c) + d) / 2) over customer x sales x date_dim.)
+#
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION warp_parallel_min_rows = 0;
+Warnings:
+Warning	1292	Truncated incorrect warp_parallel_min_rows value: '0'
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE f_w (id INT, k INT, g INT, p DECIMAL(7,2), q DECIMAL(7,2) NULL, n INT NULL, x DECIMAL(12,5)) ENGINE=WARP;
+CREATE TABLE d_w (k INT, t VARCHAR(10), r DECIMAL(6,3)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 6000)
+SELECT i, 1 + i % 600, i % 7, (i * 37) % 10007 / 100 - 30.01, IF(i % 5 = 0, NULL, (i * 13) % 9973 / 100),
+IF(i % 4 = 0, NULL, i % 9 - 3), (i * 7919) % 100003 / 100000 FROM s;
+INSERT INTO d_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 500)
+SELECT i, CONCAT('t', i % 5), (i % 997) / 7 FROM s;
+Warnings:
+Note	1265	Data truncated for column 'r' at row 1
+Note	1265	Data truncated for column 'r' at row 2
+Note	1265	Data truncated for column 'r' at row 3
+Note	1265	Data truncated for column 'r' at row 4
+Note	1265	Data truncated for column 'r' at row 5
+Note	1265	Data truncated for column 'r' at row 6
+Note	1265	Data truncated for column 'r' at row 8
+Note	1265	Data truncated for column 'r' at row 9
+Note	1265	Data truncated for column 'r' at row 10
+Note	1265	Data truncated for column 'r' at row 11
+Note	1265	Data truncated for column 'r' at row 12
+Note	1265	Data truncated for column 'r' at row 13
+Note	1265	Data truncated for column 'r' at row 15
+Note	1265	Data truncated for column 'r' at row 16
+Note	1265	Data truncated for column 'r' at row 17
+Note	1265	Data truncated for column 'r' at row 18
+Note	1265	Data truncated for column 'r' at row 19
+Note	1265	Data truncated for column 'r' at row 20
+Note	1265	Data truncated for column 'r' at row 22
+Note	1265	Data truncated for column 'r' at row 23
+Note	1265	Data truncated for column 'r' at row 24
+Note	1265	Data truncated for column 'r' at row 25
+Note	1265	Data truncated for column 'r' at row 26
+Note	1265	Data truncated for column 'r' at row 27
+Note	1265	Data truncated for column 'r' at row 29
+Note	1265	Data truncated for column 'r' at row 30
+Note	1265	Data truncated for column 'r' at row 31
+Note	1265	Data truncated for column 'r' at row 32
+Note	1265	Data truncated for column 'r' at row 33
+Note	1265	Data truncated for column 'r' at row 34
+Note	1265	Data truncated for column 'r' at row 36
+Note	1265	Data truncated for column 'r' at row 37
+Note	1265	Data truncated for column 'r' at row 38
+Note	1265	Data truncated for column 'r' at row 39
+Note	1265	Data truncated for column 'r' at row 40
+Note	1265	Data truncated for column 'r' at row 41
+Note	1265	Data truncated for column 'r' at row 43
+Note	1265	Data truncated for column 'r' at row 44
+Note	1265	Data truncated for column 'r' at row 45
+Note	1265	Data truncated for column 'r' at row 46
+Note	1265	Data truncated for column 'r' at row 47
+Note	1265	Data truncated for column 'r' at row 48
+Note	1265	Data truncated for column 'r' at row 50
+Note	1265	Data truncated for column 'r' at row 51
+Note	1265	Data truncated for column 'r' at row 52
+Note	1265	Data truncated for column 'r' at row 53
+Note	1265	Data truncated for column 'r' at row 54
+Note	1265	Data truncated for column 'r' at row 55
+Note	1265	Data truncated for column 'r' at row 57
+Note	1265	Data truncated for column 'r' at row 58
+Note	1265	Data truncated for column 'r' at row 59
+Note	1265	Data truncated for column 'r' at row 60
+Note	1265	Data truncated for column 'r' at row 61
+Note	1265	Data truncated for column 'r' at row 62
+Note	1265	Data truncated for column 'r' at row 64
+Note	1265	Data truncated for column 'r' at row 65
+Note	1265	Data truncated for column 'r' at row 66
+Note	1265	Data truncated for column 'r' at row 67
+Note	1265	Data truncated for column 'r' at row 68
+Note	1265	Data truncated for column 'r' at row 69
+Note	1265	Data truncated for column 'r' at row 71
+Note	1265	Data truncated for column 'r' at row 72
+Note	1265	Data truncated for column 'r' at row 73
+Note	1265	Data truncated for column 'r' at row 74
+Note	1265	Data truncated for column 'r' at row 75
+Note	1265	Data truncated for column 'r' at row 76
+Note	1265	Data truncated for column 'r' at row 78
+Note	1265	Data truncated for column 'r' at row 79
+Note	1265	Data truncated for column 'r' at row 80
+Note	1265	Data truncated for column 'r' at row 81
+Note	1265	Data truncated for column 'r' at row 82
+Note	1265	Data truncated for column 'r' at row 83
+Note	1265	Data truncated for column 'r' at row 85
+Note	1265	Data truncated for column 'r' at row 86
+Note	1265	Data truncated for column 'r' at row 87
+Note	1265	Data truncated for column 'r' at row 88
+Note	1265	Data truncated for column 'r' at row 89
+Note	1265	Data truncated for column 'r' at row 90
+Note	1265	Data truncated for column 'r' at row 92
+Note	1265	Data truncated for column 'r' at row 93
+Note	1265	Data truncated for column 'r' at row 94
+Note	1265	Data truncated for column 'r' at row 95
+Note	1265	Data truncated for column 'r' at row 96
+Note	1265	Data truncated for column 'r' at row 97
+Note	1265	Data truncated for column 'r' at row 99
+Note	1265	Data truncated for column 'r' at row 100
+Note	1265	Data truncated for column 'r' at row 101
+Note	1265	Data truncated for column 'r' at row 102
+Note	1265	Data truncated for column 'r' at row 103
+Note	1265	Data truncated for column 'r' at row 104
+Note	1265	Data truncated for column 'r' at row 106
+Note	1265	Data truncated for column 'r' at row 107
+Note	1265	Data truncated for column 'r' at row 108
+Note	1265	Data truncated for column 'r' at row 109
+Note	1265	Data truncated for column 'r' at row 110
+Note	1265	Data truncated for column 'r' at row 111
+Note	1265	Data truncated for column 'r' at row 113
+Note	1265	Data truncated for column 'r' at row 114
+Note	1265	Data truncated for column 'r' at row 115
+Note	1265	Data truncated for column 'r' at row 116
+Note	1265	Data truncated for column 'r' at row 117
+Note	1265	Data truncated for column 'r' at row 118
+Note	1265	Data truncated for column 'r' at row 120
+Note	1265	Data truncated for column 'r' at row 121
+Note	1265	Data truncated for column 'r' at row 122
+Note	1265	Data truncated for column 'r' at row 123
+Note	1265	Data truncated for column 'r' at row 124
+Note	1265	Data truncated for column 'r' at row 125
+Note	1265	Data truncated for column 'r' at row 127
+Note	1265	Data truncated for column 'r' at row 128
+Note	1265	Data truncated for column 'r' at row 129
+Note	1265	Data truncated for column 'r' at row 130
+Note	1265	Data truncated for column 'r' at row 131
+Note	1265	Data truncated for column 'r' at row 132
+Note	1265	Data truncated for column 'r' at row 134
+Note	1265	Data truncated for column 'r' at row 135
+Note	1265	Data truncated for column 'r' at row 136
+Note	1265	Data truncated for column 'r' at row 137
+Note	1265	Data truncated for column 'r' at row 138
+Note	1265	Data truncated for column 'r' at row 139
+Note	1265	Data truncated for column 'r' at row 141
+Note	1265	Data truncated for column 'r' at row 142
+Note	1265	Data truncated for column 'r' at row 143
+Note	1265	Data truncated for column 'r' at row 144
+Note	1265	Data truncated for column 'r' at row 145
+Note	1265	Data truncated for column 'r' at row 146
+Note	1265	Data truncated for column 'r' at row 148
+Note	1265	Data truncated for column 'r' at row 149
+Note	1265	Data truncated for column 'r' at row 150
+Note	1265	Data truncated for column 'r' at row 151
+Note	1265	Data truncated for column 'r' at row 152
+Note	1265	Data truncated for column 'r' at row 153
+Note	1265	Data truncated for column 'r' at row 155
+Note	1265	Data truncated for column 'r' at row 156
+Note	1265	Data truncated for column 'r' at row 157
+Note	1265	Data truncated for column 'r' at row 158
+Note	1265	Data truncated for column 'r' at row 159
+Note	1265	Data truncated for column 'r' at row 160
+Note	1265	Data truncated for column 'r' at row 162
+Note	1265	Data truncated for column 'r' at row 163
+Note	1265	Data truncated for column 'r' at row 164
+Note	1265	Data truncated for column 'r' at row 165
+Note	1265	Data truncated for column 'r' at row 166
+Note	1265	Data truncated for column 'r' at row 167
+Note	1265	Data truncated for column 'r' at row 169
+Note	1265	Data truncated for column 'r' at row 170
+Note	1265	Data truncated for column 'r' at row 171
+Note	1265	Data truncated for column 'r' at row 172
+Note	1265	Data truncated for column 'r' at row 173
+Note	1265	Data truncated for column 'r' at row 174
+Note	1265	Data truncated for column 'r' at row 176
+Note	1265	Data truncated for column 'r' at row 177
+Note	1265	Data truncated for column 'r' at row 178
+Note	1265	Data truncated for column 'r' at row 179
+Note	1265	Data truncated for column 'r' at row 180
+Note	1265	Data truncated for column 'r' at row 181
+Note	1265	Data truncated for column 'r' at row 183
+Note	1265	Data truncated for column 'r' at row 184
+Note	1265	Data truncated for column 'r' at row 185
+Note	1265	Data truncated for column 'r' at row 186
+Note	1265	Data truncated for column 'r' at row 187
+Note	1265	Data truncated for column 'r' at row 188
+Note	1265	Data truncated for column 'r' at row 190
+Note	1265	Data truncated for column 'r' at row 191
+Note	1265	Data truncated for column 'r' at row 192
+Note	1265	Data truncated for column 'r' at row 193
+Note	1265	Data truncated for column 'r' at row 194
+Note	1265	Data truncated for column 'r' at row 195
+Note	1265	Data truncated for column 'r' at row 197
+Note	1265	Data truncated for column 'r' at row 198
+Note	1265	Data truncated for column 'r' at row 199
+Note	1265	Data truncated for column 'r' at row 200
+Note	1265	Data truncated for column 'r' at row 201
+Note	1265	Data truncated for column 'r' at row 202
+Note	1265	Data truncated for column 'r' at row 204
+Note	1265	Data truncated for column 'r' at row 205
+Note	1265	Data truncated for column 'r' at row 206
+Note	1265	Data truncated for column 'r' at row 207
+Note	1265	Data truncated for column 'r' at row 208
+Note	1265	Data truncated for column 'r' at row 209
+Note	1265	Data truncated for column 'r' at row 211
+Note	1265	Data truncated for column 'r' at row 212
+Note	1265	Data truncated for column 'r' at row 213
+Note	1265	Data truncated for column 'r' at row 214
+Note	1265	Data truncated for column 'r' at row 215
+Note	1265	Data truncated for column 'r' at row 216
+Note	1265	Data truncated for column 'r' at row 218
+Note	1265	Data truncated for column 'r' at row 219
+Note	1265	Data truncated for column 'r' at row 220
+Note	1265	Data truncated for column 'r' at row 221
+Note	1265	Data truncated for column 'r' at row 222
+Note	1265	Data truncated for column 'r' at row 223
+Note	1265	Data truncated for column 'r' at row 225
+Note	1265	Data truncated for column 'r' at row 226
+Note	1265	Data truncated for column 'r' at row 227
+Note	1265	Data truncated for column 'r' at row 228
+Note	1265	Data truncated for column 'r' at row 229
+Note	1265	Data truncated for column 'r' at row 230
+Note	1265	Data truncated for column 'r' at row 232
+Note	1265	Data truncated for column 'r' at row 233
+Note	1265	Data truncated for column 'r' at row 234
+Note	1265	Data truncated for column 'r' at row 235
+Note	1265	Data truncated for column 'r' at row 236
+Note	1265	Data truncated for column 'r' at row 237
+Note	1265	Data truncated for column 'r' at row 239
+Note	1265	Data truncated for column 'r' at row 240
+Note	1265	Data truncated for column 'r' at row 241
+Note	1265	Data truncated for column 'r' at row 242
+Note	1265	Data truncated for column 'r' at row 243
+Note	1265	Data truncated for column 'r' at row 244
+Note	1265	Data truncated for column 'r' at row 246
+Note	1265	Data truncated for column 'r' at row 247
+Note	1265	Data truncated for column 'r' at row 248
+Note	1265	Data truncated for column 'r' at row 249
+Note	1265	Data truncated for column 'r' at row 250
+Note	1265	Data truncated for column 'r' at row 251
+Note	1265	Data truncated for column 'r' at row 253
+Note	1265	Data truncated for column 'r' at row 254
+Note	1265	Data truncated for column 'r' at row 255
+Note	1265	Data truncated for column 'r' at row 256
+Note	1265	Data truncated for column 'r' at row 257
+Note	1265	Data truncated for column 'r' at row 258
+Note	1265	Data truncated for column 'r' at row 260
+Note	1265	Data truncated for column 'r' at row 261
+Note	1265	Data truncated for column 'r' at row 262
+Note	1265	Data truncated for column 'r' at row 263
+Note	1265	Data truncated for column 'r' at row 264
+Note	1265	Data truncated for column 'r' at row 265
+Note	1265	Data truncated for column 'r' at row 267
+Note	1265	Data truncated for column 'r' at row 268
+Note	1265	Data truncated for column 'r' at row 269
+Note	1265	Data truncated for column 'r' at row 270
+Note	1265	Data truncated for column 'r' at row 271
+Note	1265	Data truncated for column 'r' at row 272
+Note	1265	Data truncated for column 'r' at row 274
+Note	1265	Data truncated for column 'r' at row 275
+Note	1265	Data truncated for column 'r' at row 276
+Note	1265	Data truncated for column 'r' at row 277
+Note	1265	Data truncated for column 'r' at row 278
+Note	1265	Data truncated for column 'r' at row 279
+Note	1265	Data truncated for column 'r' at row 281
+Note	1265	Data truncated for column 'r' at row 282
+Note	1265	Data truncated for column 'r' at row 283
+Note	1265	Data truncated for column 'r' at row 284
+Note	1265	Data truncated for column 'r' at row 285
+Note	1265	Data truncated for column 'r' at row 286
+Note	1265	Data truncated for column 'r' at row 288
+Note	1265	Data truncated for column 'r' at row 289
+Note	1265	Data truncated for column 'r' at row 290
+Note	1265	Data truncated for column 'r' at row 291
+Note	1265	Data truncated for column 'r' at row 292
+Note	1265	Data truncated for column 'r' at row 293
+Note	1265	Data truncated for column 'r' at row 295
+Note	1265	Data truncated for column 'r' at row 296
+Note	1265	Data truncated for column 'r' at row 297
+Note	1265	Data truncated for column 'r' at row 298
+Note	1265	Data truncated for column 'r' at row 299
+Note	1265	Data truncated for column 'r' at row 300
+Note	1265	Data truncated for column 'r' at row 302
+Note	1265	Data truncated for column 'r' at row 303
+Note	1265	Data truncated for column 'r' at row 304
+Note	1265	Data truncated for column 'r' at row 305
+Note	1265	Data truncated for column 'r' at row 306
+Note	1265	Data truncated for column 'r' at row 307
+Note	1265	Data truncated for column 'r' at row 309
+Note	1265	Data truncated for column 'r' at row 310
+Note	1265	Data truncated for column 'r' at row 311
+Note	1265	Data truncated for column 'r' at row 312
+Note	1265	Data truncated for column 'r' at row 313
+Note	1265	Data truncated for column 'r' at row 314
+Note	1265	Data truncated for column 'r' at row 316
+Note	1265	Data truncated for column 'r' at row 317
+Note	1265	Data truncated for column 'r' at row 318
+Note	1265	Data truncated for column 'r' at row 319
+Note	1265	Data truncated for column 'r' at row 320
+Note	1265	Data truncated for column 'r' at row 321
+Note	1265	Data truncated for column 'r' at row 323
+Note	1265	Data truncated for column 'r' at row 324
+Note	1265	Data truncated for column 'r' at row 325
+Note	1265	Data truncated for column 'r' at row 326
+Note	1265	Data truncated for column 'r' at row 327
+Note	1265	Data truncated for column 'r' at row 328
+Note	1265	Data truncated for column 'r' at row 330
+Note	1265	Data truncated for column 'r' at row 331
+Note	1265	Data truncated for column 'r' at row 332
+Note	1265	Data truncated for column 'r' at row 333
+Note	1265	Data truncated for column 'r' at row 334
+Note	1265	Data truncated for column 'r' at row 335
+Note	1265	Data truncated for column 'r' at row 337
+Note	1265	Data truncated for column 'r' at row 338
+Note	1265	Data truncated for column 'r' at row 339
+Note	1265	Data truncated for column 'r' at row 340
+Note	1265	Data truncated for column 'r' at row 341
+Note	1265	Data truncated for column 'r' at row 342
+Note	1265	Data truncated for column 'r' at row 344
+Note	1265	Data truncated for column 'r' at row 345
+Note	1265	Data truncated for column 'r' at row 346
+Note	1265	Data truncated for column 'r' at row 347
+Note	1265	Data truncated for column 'r' at row 348
+Note	1265	Data truncated for column 'r' at row 349
+Note	1265	Data truncated for column 'r' at row 351
+Note	1265	Data truncated for column 'r' at row 352
+Note	1265	Data truncated for column 'r' at row 353
+Note	1265	Data truncated for column 'r' at row 354
+Note	1265	Data truncated for column 'r' at row 355
+Note	1265	Data truncated for column 'r' at row 356
+Note	1265	Data truncated for column 'r' at row 358
+Note	1265	Data truncated for column 'r' at row 359
+Note	1265	Data truncated for column 'r' at row 360
+Note	1265	Data truncated for column 'r' at row 361
+Note	1265	Data truncated for column 'r' at row 362
+Note	1265	Data truncated for column 'r' at row 363
+Note	1265	Data truncated for column 'r' at row 365
+Note	1265	Data truncated for column 'r' at row 366
+Note	1265	Data truncated for column 'r' at row 367
+Note	1265	Data truncated for column 'r' at row 368
+Note	1265	Data truncated for column 'r' at row 369
+Note	1265	Data truncated for column 'r' at row 370
+Note	1265	Data truncated for column 'r' at row 372
+Note	1265	Data truncated for column 'r' at row 373
+Note	1265	Data truncated for column 'r' at row 374
+Note	1265	Data truncated for column 'r' at row 375
+Note	1265	Data truncated for column 'r' at row 376
+Note	1265	Data truncated for column 'r' at row 377
+Note	1265	Data truncated for column 'r' at row 379
+Note	1265	Data truncated for column 'r' at row 380
+Note	1265	Data truncated for column 'r' at row 381
+Note	1265	Data truncated for column 'r' at row 382
+Note	1265	Data truncated for column 'r' at row 383
+Note	1265	Data truncated for column 'r' at row 384
+Note	1265	Data truncated for column 'r' at row 386
+Note	1265	Data truncated for column 'r' at row 387
+Note	1265	Data truncated for column 'r' at row 388
+Note	1265	Data truncated for column 'r' at row 389
+Note	1265	Data truncated for column 'r' at row 390
+Note	1265	Data truncated for column 'r' at row 391
+Note	1265	Data truncated for column 'r' at row 393
+Note	1265	Data truncated for column 'r' at row 394
+Note	1265	Data truncated for column 'r' at row 395
+Note	1265	Data truncated for column 'r' at row 396
+Note	1265	Data truncated for column 'r' at row 397
+Note	1265	Data truncated for column 'r' at row 398
+Note	1265	Data truncated for column 'r' at row 400
+Note	1265	Data truncated for column 'r' at row 401
+Note	1265	Data truncated for column 'r' at row 402
+Note	1265	Data truncated for column 'r' at row 403
+Note	1265	Data truncated for column 'r' at row 404
+Note	1265	Data truncated for column 'r' at row 405
+Note	1265	Data truncated for column 'r' at row 407
+Note	1265	Data truncated for column 'r' at row 408
+Note	1265	Data truncated for column 'r' at row 409
+Note	1265	Data truncated for column 'r' at row 410
+Note	1265	Data truncated for column 'r' at row 411
+Note	1265	Data truncated for column 'r' at row 412
+Note	1265	Data truncated for column 'r' at row 414
+Note	1265	Data truncated for column 'r' at row 415
+Note	1265	Data truncated for column 'r' at row 416
+Note	1265	Data truncated for column 'r' at row 417
+Note	1265	Data truncated for column 'r' at row 418
+Note	1265	Data truncated for column 'r' at row 419
+Note	1265	Data truncated for column 'r' at row 421
+Note	1265	Data truncated for column 'r' at row 422
+Note	1265	Data truncated for column 'r' at row 423
+Note	1265	Data truncated for column 'r' at row 424
+Note	1265	Data truncated for column 'r' at row 425
+Note	1265	Data truncated for column 'r' at row 426
+Note	1265	Data truncated for column 'r' at row 428
+Note	1265	Data truncated for column 'r' at row 429
+Note	1265	Data truncated for column 'r' at row 430
+Note	1265	Data truncated for column 'r' at row 431
+Note	1265	Data truncated for column 'r' at row 432
+Note	1265	Data truncated for column 'r' at row 433
+Note	1265	Data truncated for column 'r' at row 435
+Note	1265	Data truncated for column 'r' at row 436
+Note	1265	Data truncated for column 'r' at row 437
+Note	1265	Data truncated for column 'r' at row 438
+Note	1265	Data truncated for column 'r' at row 439
+Note	1265	Data truncated for column 'r' at row 440
+Note	1265	Data truncated for column 'r' at row 442
+Note	1265	Data truncated for column 'r' at row 443
+Note	1265	Data truncated for column 'r' at row 444
+Note	1265	Data truncated for column 'r' at row 445
+Note	1265	Data truncated for column 'r' at row 446
+Note	1265	Data truncated for column 'r' at row 447
+Note	1265	Data truncated for column 'r' at row 449
+Note	1265	Data truncated for column 'r' at row 450
+Note	1265	Data truncated for column 'r' at row 451
+Note	1265	Data truncated for column 'r' at row 452
+Note	1265	Data truncated for column 'r' at row 453
+Note	1265	Data truncated for column 'r' at row 454
+Note	1265	Data truncated for column 'r' at row 456
+Note	1265	Data truncated for column 'r' at row 457
+Note	1265	Data truncated for column 'r' at row 458
+Note	1265	Data truncated for column 'r' at row 459
+Note	1265	Data truncated for column 'r' at row 460
+Note	1265	Data truncated for column 'r' at row 461
+Note	1265	Data truncated for column 'r' at row 463
+Note	1265	Data truncated for column 'r' at row 464
+Note	1265	Data truncated for column 'r' at row 465
+Note	1265	Data truncated for column 'r' at row 466
+Note	1265	Data truncated for column 'r' at row 467
+Note	1265	Data truncated for column 'r' at row 468
+Note	1265	Data truncated for column 'r' at row 470
+Note	1265	Data truncated for column 'r' at row 471
+Note	1265	Data truncated for column 'r' at row 472
+Note	1265	Data truncated for column 'r' at row 473
+Note	1265	Data truncated for column 'r' at row 474
+Note	1265	Data truncated for column 'r' at row 475
+Note	1265	Data truncated for column 'r' at row 477
+Note	1265	Data truncated for column 'r' at row 478
+Note	1265	Data truncated for column 'r' at row 479
+Note	1265	Data truncated for column 'r' at row 480
+Note	1265	Data truncated for column 'r' at row 481
+Note	1265	Data truncated for column 'r' at row 482
+Note	1265	Data truncated for column 'r' at row 484
+Note	1265	Data truncated for column 'r' at row 485
+Note	1265	Data truncated for column 'r' at row 486
+Note	1265	Data truncated for column 'r' at row 487
+Note	1265	Data truncated for column 'r' at row 488
+Note	1265	Data truncated for column 'r' at row 489
+Note	1265	Data truncated for column 'r' at row 491
+Note	1265	Data truncated for column 'r' at row 492
+Note	1265	Data truncated for column 'r' at row 493
+Note	1265	Data truncated for column 'r' at row 494
+Note	1265	Data truncated for column 'r' at row 495
+Note	1265	Data truncated for column 'r' at row 496
+Note	1265	Data truncated for column 'r' at row 498
+Note	1265	Data truncated for column 'r' at row 499
+Note	1265	Data truncated for column 'r' at row 500
+CREATE TABLE f_i LIKE f_w;
+CREATE TABLE d_i LIKE d_w;
+ALTER TABLE f_i ENGINE=InnoDB;
+ALTER TABLE d_i ENGINE=InnoDB;
+INSERT INTO f_i SELECT * FROM f_w;
+INSERT INTO d_i SELECT * FROM d_w;
+CREATE TABLE queries (i INT, used INT, q TEXT) ENGINE=InnoDB;
+INSERT INTO queries VALUES
+(1, 1, 'SELECT d.t, f.g, SUM(((f.p - f.q - d.r) + f.p) / 2) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t, f.g'),
+(2, 1, 'SELECT d.t, SUM(f.p / 4) a1, AVG(f.q / 100) a2, MIN(f.p / 0.5) a3, MAX(f.q / 2.5) a4, SUM(f.n / 2) a5, SUM(f.x / 8) a6 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+(3, 1, 'SELECT d.t, SUM(f.p / -2) a1, SUM(f.p / 2 * 3 - f.q / 4) a2, SUM(f.p / 2 / 2) a3, COUNT(f.q / 2) a4 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+(4, 1, 'SELECT f.g, SUM((f.p - f.q + f.p) / 2) a1, SUM(f.p / 4) a2, AVG(f.q / 100) a3, MIN(f.p / 0.5) a4, MAX(f.q / 2.5) a5, SUM(f.n / 2) a6, SUM(f.x / 8) a7 FROM f_# f GROUP BY f.g'),
+(5, 1, 'SELECT SUM(f.p / 2) a1, SUM(f.q / 1) a2 FROM f_# f'),
+(6, 0, 'SELECT d.t, SUM(f.p / 3) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+(7, 0, 'SELECT d.t, SUM(f.p / 7.0) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+(8, 0, 'SELECT d.t, SUM(f.p / 1.5) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+(9, 0, 'SELECT d.t, SUM(f.p / d.r) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+(10, 0, 'SELECT f.g, SUM(f.p / 3) a1, SUM(f.p / 32) a2 FROM f_# f GROUP BY f.g'),
+(11, 0, 'SELECT f.g, SUM(f.p / (f.id + 1)) a1 FROM f_# f GROUP BY f.g'),
+(12, 0, 'SELECT f.g, SUM(f.p / 2e0) a1 FROM f_# f GROUP BY f.g');
+# query 1
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 2
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 3
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 4
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 5
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 6
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 7
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 8
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 9
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 10
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 11
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# query 12
+engine_aggregates_as_expected
+1
+SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+(SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+same_rows_on	same_rows_off
+1	1
+SELECT COUNT(*) AS different_rows FROM
+((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+different_rows
+0
+DROP TABLE r_on, r_off, r_i;
+# the values of a division that the engine makes
+SET SESSION warp_parallel_aggregation = ON;
+SELECT d.t, SUM(((f.p - f.q - d.r) + f.p) / 2) a1, SUM(f.p / -2) a2, MIN(f.q / 2.5) a3 FROM f_w f JOIN d_w d ON f.k = d.k GROUP BY d.t ORDER BY d.t;
+t	a1	a2	a3
+t0	-22721.0050000	-9807.905000	0.020000
+t1	NULL	-9777.625000	NULL
+t2	-22370.4750000	-9853.325000	0.012000
+t3	-22537.1850000	-9838.185000	0.064000
+t4	-22604.1600000	-9823.045000	0.004000
+SELECT f.g, SUM((f.p - f.q + f.p) / 2) a1, AVG(f.n / 4) a2 FROM f_w f GROUP BY f.g ORDER BY f.g;
+g	a1	a2
+0	-3360.005000	0.25155521
+1	-3284.795000	0.25233281
+2	-3404.775000	0.24883359
+3	-3098.195000	0.24883359
+4	-3422.470000	0.24883178
+5	-3214.095000	0.24805599
+6	-3240.025000	0.24805599
+DROP TABLE f_w, d_w, f_i, d_i, queries;
