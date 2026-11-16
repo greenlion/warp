@@ -1,0 +1,130 @@
+#
+# A lookup through an index is a scan with the condition of the key.  A
+# statement that makes many lookups of whole keys reads the rows of the
+# table once and answers the lookups that follow from memory
+# (warp_lookup_cache_size, Warp_lookup_caches).
+#
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE d (id INT PRIMARY KEY, grp INT, d DATE, name VARCHAR(20), KEY (grp), KEY (d))
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO d WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000)
+SELECT x, x % 10, DATE_ADD('2020-01-01', INTERVAL x % 50 DAY), CONCAT('n', x) FROM seq;
+CREATE TABLE n (id INT, grp INT NULL, KEY (grp)) ENGINE=WARP;
+INSERT INTO n VALUES (1, 1), (2, NULL), (3, 1), (4, NULL), (5, 3);
+CREATE TABLE f (k INT, g INT, d DATE, v INT);
+INSERT INTO f WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 5000)
+SELECT (x * 7) % 1200, IF(x % 13 = 0, NULL, x % 12), DATE_ADD('2019-12-25', INTERVAL x % 60 DAY), x FROM seq;
+ANALYZE TABLE f;
+Table	Op	Msg_type	Msg_text
+test.f	analyze	status	OK
+# the primary key: one row for a key, none for the keys above 1000 and for 0
+EXPLAIN FORMAT=TREE SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.grp), MIN(d.name), MAX(d.name)
+FROM f JOIN d ON d.id = f.k;
+EXPLAIN
+-> Aggregate: count(0), sum(f.v), sum(d.grp), min(d.`name`), max(d.`name`)  (cost=# rows=#)
+    -> Nested loop inner join  (cost=# rows=#)
+        -> Filter: (f.k is not null)  (cost=# rows=#)
+            -> Table scan on f  (cost=# rows=#)
+        -> Single-row index lookup on d using PRIMARY (id = f.k)  (cost=# rows=#)
+
+Warnings:
+Note	1003	/* select#1 */ select /*+ JOIN_ORDER(@`select#1` `f`,`d`) NO_BNL(`d`@`select#1`) NO_HASH_JOIN(`d`@`select#1`) */ count(0) AS `COUNT(*)`,sum(`test`.`f`.`v`) AS `SUM(f.v)`,sum(`test`.`d`.`grp`) AS `SUM(d.grp)`,min(`test`.`d`.`name`) AS `MIN(d.name)`,max(`test`.`d`.`name`) AS `MAX(d.name)` from `test`.`f` join `test`.`d` where (`test`.`d`.`id` = `test`.`f`.`k`)
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.grp), MIN(d.name), MAX(d.name)
+FROM f JOIN d ON d.id = f.k;
+COUNT(*)	SUM(f.v)	SUM(d.grp)	MIN(d.name)	MAX(d.name)
+4171	10381547	18769	n1	n999
+# a key that is not unique: all the rows of the key
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.id), MIN(d.name), MAX(d.name)
+FROM f JOIN d FORCE INDEX (grp) ON d.grp = f.g;
+COUNT(*)	SUM(f.v)	SUM(d.id)	MIN(d.name)	MAX(d.name)
+384800	962461200	192591600	n1	n999
+# a key of dates, and the condition of the statement on the table
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.id)
+FROM f JOIN d FORCE INDEX (d) ON d.d = f.d WHERE d.grp IN (2, 3) AND f.v < 2000;
+COUNT(*)	SUM(f.v)	SUM(d.id)
+6660	6650260	3312340
+# an outer join: the rows without a key and with a key that is NULL
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), COUNT(d.id), SUM(d.id)
+FROM f LEFT JOIN d FORCE INDEX (grp) ON d.grp = f.g;
+COUNT(*)	COUNT(d.id)	SUM(d.id)
+385952	384800	192591600
+# NULL is equal to NULL for <=>: these lookups are not answered by the cache
+SELECT /*+ JOIN_ORDER(f, n) NO_BNL(n) NO_HASH_JOIN(n) */ COUNT(*), SUM(n.id)
+FROM f JOIN n FORCE INDEX (grp) ON n.grp <=> f.g;
+COUNT(*)	SUM(n.id)
+1923	5769
+# a subquery that is run for every row
+SELECT COUNT(*), SUM((SELECT d.grp FROM d WHERE d.id = f.k)) FROM f;
+COUNT(*)	SUM((SELECT d.grp FROM d WHERE d.id = f.k))
+5000	18769
+lookups_were_cached
+1
+# the same results without the cache
+SET SESSION warp_lookup_cache_size = 0;
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.grp), MIN(d.name), MAX(d.name)
+FROM f JOIN d ON d.id = f.k;
+COUNT(*)	SUM(f.v)	SUM(d.grp)	MIN(d.name)	MAX(d.name)
+4171	10381547	18769	n1	n999
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.id), MIN(d.name), MAX(d.name)
+FROM f JOIN d FORCE INDEX (grp) ON d.grp = f.g;
+COUNT(*)	SUM(f.v)	SUM(d.id)	MIN(d.name)	MAX(d.name)
+384800	962461200	192591600	n1	n999
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.id)
+FROM f JOIN d FORCE INDEX (d) ON d.d = f.d WHERE d.grp IN (2, 3) AND f.v < 2000;
+COUNT(*)	SUM(f.v)	SUM(d.id)
+6660	6650260	3312340
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), COUNT(d.id), SUM(d.id)
+FROM f LEFT JOIN d FORCE INDEX (grp) ON d.grp = f.g;
+COUNT(*)	COUNT(d.id)	SUM(d.id)
+385952	384800	192591600
+SELECT /*+ JOIN_ORDER(f, n) NO_BNL(n) NO_HASH_JOIN(n) */ COUNT(*), SUM(n.id)
+FROM f JOIN n FORCE INDEX (grp) ON n.grp <=> f.g;
+COUNT(*)	SUM(n.id)
+1923	5769
+SELECT COUNT(*), SUM((SELECT d.grp FROM d WHERE d.id = f.k)) FROM f;
+COUNT(*)	SUM((SELECT d.grp FROM d WHERE d.id = f.k))
+5000	18769
+caches_made_when_disabled
+0
+# rows that do not fit are not cached
+SET SESSION warp_lookup_cache_size = 1000;
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.grp), MIN(d.name), MAX(d.name)
+FROM f JOIN d ON d.id = f.k;
+COUNT(*)	SUM(f.v)	SUM(d.grp)	MIN(d.name)	MAX(d.name)
+4171	10381547	18769	n1	n999
+caches_made_when_too_small
+0
+SET SESSION warp_lookup_cache_size = DEFAULT;
+# the cache is of one statement: the next one sees the changes
+UPDATE d SET grp = grp + 100 WHERE id <= 500;
+DELETE FROM d WHERE id BETWEEN 501 AND 600;
+INSERT INTO d VALUES (1100, 5, '2020-01-05', 'new');
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.grp), MIN(d.name), MAX(d.name)
+FROM f JOIN d ON d.id = f.k;
+COUNT(*)	SUM(f.v)	SUM(d.grp)	MIN(d.name)	MAX(d.name)
+3761	9366648	226926	n1	new
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.id), MIN(d.name), MAX(d.name)
+FROM f JOIN d FORCE INDEX (grp) ON d.grp = f.g;
+COUNT(*)	SUM(f.v)	SUM(d.id)	MIN(d.name)	MAX(d.name)
+154305	385947941	123636140	n1000	new
+# in a transaction, with the rows that it wrote
+BEGIN;
+INSERT INTO d VALUES (1150, 7, '2020-01-07', 'trx');
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.grp), MIN(d.name), MAX(d.name)
+FROM f JOIN d ON d.id = f.k;
+COUNT(*)	SUM(f.v)	SUM(d.grp)	MIN(d.name)	MAX(d.name)
+3765	9377248	226954	n1	trx
+ROLLBACK;
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.grp), MIN(d.name), MAX(d.name)
+FROM f JOIN d ON d.id = f.k;
+COUNT(*)	SUM(f.v)	SUM(d.grp)	MIN(d.name)	MAX(d.name)
+3761	9366648	226926	n1	new
+# a statement that locks the rows that it reads makes the lookups
+BEGIN;
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*) FROM (SELECT k FROM f WHERE v <= 20) f JOIN d ON d.id = f.k FOR UPDATE;
+COUNT(*)
+20
+caches_made_for_update
+0
+COMMIT;
+DROP TABLE d, n, f;

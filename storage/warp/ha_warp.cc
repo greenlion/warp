@@ -266,6 +266,16 @@ static int show_warp_semi_key_scans(MYSQL_THD, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
+/* Warp_lookup_caches: the times that the rows of a table were read and kept
+   by key for the lookups of a statement (see ha_warp::lookup_cache_build) */
+static std::atomic<unsigned long long> warp_lookup_caches{0};
+static int show_warp_lookup_caches(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) = (longlong)warp_lookup_caches.load();
+  return 0;
+}
+
 /* Warp_join_semi_keys: the semis of the joins that the engine makes whose keys
    were read and applied (see warp_pj_find_semi) */
 static std::atomic<unsigned long long> warp_join_semi_keys{0};
@@ -288,6 +298,7 @@ static SHOW_VAR warp_status_variables[] = {
     {"Warp_active_transactions", (char *)&show_warp_active_transactions, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_semi_key_scans", (char *)&show_warp_semi_key_scans, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_join_semi_keys", (char *)&show_warp_join_semi_keys, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Warp_lookup_caches", (char *)&show_warp_lookup_caches, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}};
 
 mysql_declare_plugin(warp){
@@ -1393,6 +1404,7 @@ int ha_warp::close(void) {
     end_scan(true);
   }
   clear_lookup_parts();
+  lookup_cache.clear();
   discard_prefetched();
   if(writer) {
     writer->clearData();
@@ -5241,6 +5253,206 @@ int ha_warp::start_index_scan(const std::string &key_condition) {
   return rc;
 }
 
+/* ---------------------------------------------------------------------
+   The cache of the lookups of a statement (warp_lookup_cache)
+
+   A lookup is a scan of the table with the condition of the key: FastBit
+   parses the condition, opens the partitions that can have the key and
+   evaluates it.  A nested loop join makes one for every row of the other
+   tables.  When a statement has made enough lookups of whole keys in an
+   index to pay for a scan of the table, the rows that the statement can
+   see (the scan has the condition that was pushed down for the statement,
+   but not the one of a key) are read once and kept by key; the lookups
+   that follow are answered from memory.
+
+   The rows are the ones that the lookups would have returned: a statement
+   that only reads sees the same rows of a table in all its scans.  The
+   cache is not used by a statement that locks the rows that it reads or
+   that can write to the table, or with a condition that has values of
+   other tables (they change from one scan to the next).  The keys are
+   compared by their bytes, so only the indexes of integer and temporal
+   columns are cached.
+   --------------------------------------------------------------------- */
+
+static bool warp_lookup_cache_key_type(const Field *field) {
+  switch(field->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_YEAR:
+    case MYSQL_TYPE_NEWDATE:
+    case MYSQL_TYPE_TIME2:
+    case MYSQL_TYPE_DATETIME2:
+    case MYSQL_TYPE_TIMESTAMP2:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/* True if the lookup can be answered by the cache of the statement (the one
+   that exists or the one that would be built).  A cache that was made for
+   another index, condition or set of columns is dropped. */
+bool ha_warp::lookup_cache_usable(const uchar *key, key_part_map keypart_map,
+                                  enum ha_rkey_function find_flag) {
+  warp_lookup_cache &cache = lookup_cache;
+  if(find_flag != HA_READ_KEY_EXACT || key == nullptr || cache.disabled) {
+    return false;
+  }
+  THD *thd = table->in_use;
+  if(THDVAR(thd, lookup_cache_size) == 0) {
+    return false;
+  }
+  /* the rows of this statement must be the same for all its scans */
+  if(locks_rows_on_read() || (writer != NULL && writer->mRows() > 0) || is_partition_child ||
+     table->reginfo.lock_type >= TL_WRITE_ALLOW_WRITE ||
+     !outer_params.empty() || semi_in || !semi_candidates.empty()) {
+    return false;
+  }
+  auto trx = warp_get_trx(warp_hton, thd);
+  if(trx == NULL || trx->isolation_level == ISO_SERIALIZABLE || trx->lock_in_share_mode) {
+    return false;
+  }
+  const KEY *key_info = &table->key_info[active_index];
+  if(calculate_key_len(table, active_index, keypart_map) != key_info->key_length) {
+    return false;
+  }
+  if(cache.index != active_index || cache.base_where != index_base_where) {
+    cache.clear();
+    cache.index = active_index;
+    cache.base_where = index_base_where;
+  }
+  uint offset = 0;
+  for(uint p = 0; p < key_info->user_defined_key_parts; ++p) {
+    const KEY_PART_INFO &part = key_info->key_part[p];
+    if(!cache.built &&
+       (!warp_lookup_cache_key_type(part.field) || (part.key_part_flag & HA_PART_KEY_SEG))) {
+      cache.disabled = true;
+      return false;
+    }
+    /* NULL is not equal to a key: the condition of the key says what is */
+    if(part.null_bit && key[offset]) {
+      return false;
+    }
+    offset += part.store_length;
+  }
+  if(cache.built) {
+    /* the columns that are read now must be in the rows */
+    for(uint f = 0; f < table->s->fields; ++f) {
+      if(bitmap_is_set(table->read_set, f) && !cache.columns[f]) {
+        cache.clear();
+        cache.index = active_index;
+        cache.base_where = index_base_where;
+        break;
+      }
+    }
+  }
+  return true;
+}
+
+/* Reads the rows of the table into the cache.  False if they are not
+   cached (the lookups are then made as before): they need more than
+   warp_lookup_cache_size, a column is a BLOB, or the scan failed. */
+bool ha_warp::lookup_cache_build(uchar *buf) {
+  warp_lookup_cache &cache = lookup_cache;
+  THD *thd = table->in_use;
+  const KEY *key_info = &table->key_info[active_index];
+  const size_t reclength = table->s->reclength;
+  const size_t row_size = sizeof(uint64_t) + reclength;
+  const uint64_t limit = THDVAR(thd, lookup_cache_size);
+  /* a key, its place in the hash table and the place of its row */
+  const size_t key_size = key_info->key_length + 64;
+
+  cache.disabled = true;   // until the rows are all there
+  for(uint f = 0; f < table->s->fields; ++f) {
+    if(bitmap_is_set(table->read_set, f) && table->field[f]->is_flag_set(BLOB_FLAG)) {
+      /* the value of a BLOB is in the memory of the scan */
+      return false;
+    }
+  }
+  if(unadjusted_records > UINT32_MAX ||
+     (uint64_t)unadjusted_records * (row_size + key_size) > limit) {
+    return false;
+  }
+
+  prune_field = -1;
+  if(start_index_scan("") != 0) {
+    if(index_scan_open) end_scan(false);
+    return false;
+  }
+  std::vector<uchar> rows;
+  std::unordered_map<std::string, std::vector<uint32_t>> keys;
+  std::string key_buf(key_info->key_length, '\0');
+  uint32_t count = 0;
+  bool complete = false;
+  for(;;) {
+    const int rc = rnd_next(buf);
+    if(rc == HA_ERR_END_OF_FILE || rc == HA_ERR_KEY_NOT_FOUND) {
+      complete = true;
+      break;
+    }
+    if(rc != 0 || thd->killed || count == UINT32_MAX ||
+       (uint64_t)(count + 1) * (row_size + key_size) > limit) {
+      break;
+    }
+    key_copy((uchar *)&key_buf[0], buf, key_info, key_info->key_length);
+    bool null_key = false;
+    uint offset = 0;
+    for(uint p = 0; p < key_info->user_defined_key_parts; ++p) {
+      const KEY_PART_INFO &part = key_info->key_part[p];
+      if(part.null_bit && key_buf[offset]) {
+        null_key = true;
+        break;
+      }
+      offset += part.store_length;
+    }
+    if(null_key) {
+      continue;   // no lookup finds the row
+    }
+    const size_t at = rows.size();
+    rows.resize(at + row_size);
+    const uint64_t rowid = current_rowid;
+    memcpy(&rows[at], &rowid, sizeof(rowid));
+    memcpy(&rows[at + sizeof(rowid)], buf, reclength);
+    keys[key_buf].push_back(count);
+    ++count;
+  }
+  end_scan(false);
+  if(!complete) {
+    return false;
+  }
+  cache.columns.assign(table->s->fields, false);
+  for(uint f = 0; f < table->s->fields; ++f) {
+    cache.columns[f] = bitmap_is_set(table->read_set, f);
+  }
+  cache.row_size = row_size;
+  cache.rows.swap(rows);
+  cache.keys.swap(keys);
+  cache.hit = nullptr;
+  cache.hit_pos = 0;
+  cache.built = true;
+  cache.disabled = false;
+  ++warp_lookup_caches;
+  return true;
+}
+
+/* the next row of the key that was looked up */
+int ha_warp::lookup_cache_next(uchar *buf, int not_found) {
+  warp_lookup_cache &cache = lookup_cache;
+  if(cache.hit == nullptr || cache.hit_pos >= cache.hit->size()) {
+    cache.hit = nullptr;
+    return not_found;
+  }
+  const uchar *row = &cache.rows[(size_t)(*cache.hit)[cache.hit_pos++] * cache.row_size];
+  uint64_t rowid;
+  memcpy(&rowid, row, sizeof(rowid));
+  current_rowid = rowid;   // ::position
+  memcpy(buf, row + sizeof(rowid), table->s->reclength);
+  return 0;
+}
+
 int ha_warp::index_init(uint idxno, bool) {
   DBUG_ENTER("ha_warp::index_init");
   /* the condition that ECP pushed for the statement */
@@ -5248,6 +5460,7 @@ int ha_warp::index_init(uint idxno, bool) {
   if(index_scan_open) {
     end_scan(false);
   }
+  lookup_cache.hit = nullptr;
   active_index = idxno;
   DBUG_RETURN(0);
 }
@@ -5258,6 +5471,7 @@ int ha_warp::index_end() {
   if(index_scan_open || writer != NULL) {
     rc = end_scan(true);
   }
+  lookup_cache.hit = nullptr;
   /* the next index_init of the statement needs it again */
   push_where_clause = index_base_where;
   DBUG_RETURN(rc);
@@ -5273,6 +5487,31 @@ int ha_warp::index_read_map(uchar *buf, const uchar *key,
   if(find_flag != HA_READ_KEY_EXACT && find_flag != HA_READ_KEY_OR_NEXT &&
      find_flag != HA_READ_AFTER_KEY) {
     DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  }
+  lookup_cache.hit = nullptr;
+  if(lookup_cache_usable(key, keypart_map, find_flag)) {
+    warp_lookup_cache &cache = lookup_cache;
+    if(!cache.built) {
+      /* a lookup costs about as much as the scan of this many rows (the
+         condition is parsed and the partitions are opened for each one) */
+      ++cache.lookups;
+      if(cache.lookups >= 8 && cache.lookups * 64 >= unadjusted_records) {
+        lookup_cache_build(buf);
+      }
+    }
+    if(cache.built) {
+      if(index_scan_open) {
+        end_scan(false);
+      }
+      auto found = cache.keys.find(std::string(
+          (const char *)key, table->key_info[active_index].key_length));
+      if(found == cache.keys.end()) {
+        DBUG_RETURN(HA_ERR_KEY_NOT_FOUND);
+      }
+      cache.hit = &found->second;
+      cache.hit_pos = 0;
+      DBUG_RETURN(lookup_cache_next(buf, HA_ERR_KEY_NOT_FOUND));
+    }
   }
   if(!make_key_condition(&start, NULL, false, condition)) {
     DBUG_RETURN(HA_ERR_WRONG_COMMAND);
@@ -5309,6 +5548,9 @@ int ha_warp::index_read_idx_map(uchar *buf, uint idxno, const uchar *key,
 int ha_warp::index_next(uchar *buf) {
   DBUG_ENTER("ha_warp::index_next");
   ha_statistic_increment(&System_status_var::ha_read_next_count);
+  if(lookup_cache.hit != nullptr) {
+    DBUG_RETURN(lookup_cache_next(buf, HA_ERR_END_OF_FILE));
+  }
   if(!index_scan_open) {
     DBUG_RETURN(HA_ERR_END_OF_FILE);
   }
@@ -5323,6 +5565,7 @@ int ha_warp::index_next_same(uchar *buf, const uchar *, uint) {
 int ha_warp::index_first(uchar *buf) {
   DBUG_ENTER("ha_warp::index_first");
   ha_statistic_increment(&System_status_var::ha_read_first_count);
+  lookup_cache.hit = nullptr;
   int rc = start_index_scan("");
   if(rc != 0) {
     DBUG_RETURN(rc);
@@ -5340,6 +5583,7 @@ int ha_warp::read_range_first(const key_range *start_key,
     DBUG_RETURN(HA_ERR_WRONG_COMMAND);
   }
   ha_statistic_increment(&System_status_var::ha_read_key_count);
+  lookup_cache.hit = nullptr;
   int rc = start_index_scan(condition);
   if(rc != 0) {
     DBUG_RETURN(rc);
