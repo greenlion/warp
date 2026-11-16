@@ -1,0 +1,92 @@
+#
+# SYNCHRONOUS materialized views with TIMESTAMP columns.  A TIMESTAMP is a
+# point in time: the daemon must write the points that the base tables
+# have, whatever the time zones of the sessions that wrote them (the
+# binary log has the seconds since 1970 UTC, the daemon writes them as
+# FROM_UNIXTIME(seconds) in a session of the time zone of the server).
+#
+call mtr.add_suppression("WARP_MVIEW");
+SELECT @@global.time_zone;
+@@global.time_zone
+SYSTEM
+CREATE TABLE e (id INT PRIMARY KEY, ts TIMESTAMP(6) NULL, v INT) ENGINE=InnoDB;
+# the TIMESTAMP is the key that the daemon finds the rows by
+CREATE TABLE k (ts TIMESTAMP NOT NULL PRIMARY KEY, v INT) ENGINE=InnoDB;
+# no key: every column is part of the row key
+CREATE TABLE nk (ts TIMESTAMP(3) NULL, v INT) ENGINE=InnoDB;
+SET SESSION time_zone = '+00:00';
+INSERT INTO e VALUES (1, '2023-10-29 00:30:00.000001', 1), (2, '2023-10-29 01:30:00.000001', 2), (3, NULL, 3);
+INSERT INTO k VALUES ('2023-10-29 00:30:00', 10), ('2023-10-29 01:30:00', 20), ('2024-06-15 10:30:45', 30);
+INSERT INTO nk VALUES ('2023-10-29 00:30:00.123', 100), ('2023-10-29 01:30:00.123', 200), (NULL, 300);
+v_e: 3 rows, 0 missing, 0 extra
+v_k: 3 rows, 0 missing, 0 extra
+v_nk: 3 rows, 0 missing, 0 extra
+v_agg: 3 rows, 0 missing, 0 extra
+v_e_warp: 3 rows, 0 missing, 0 extra
+# written by sessions of other time zones
+SET SESSION time_zone = '-07:00';
+INSERT INTO e VALUES (4, '2025-12-25 23:59:59.5', 4);
+INSERT INTO k VALUES ('2025-12-25 23:59:59', 40);
+INSERT INTO nk VALUES ('2025-12-25 23:59:59.999', 400), ('2025-12-25 23:59:59.999', 400);
+SET SESSION time_zone = DEFAULT;
+INSERT INTO e VALUES (5, '2025-12-25 23:59:59.5', 5), (6, '2024-03-31 03:30:00', 6);
+INSERT INTO k VALUES ('2025-12-25 23:59:59', 50);
+INSERT INTO nk VALUES ('2025-12-25 23:59:59.999', 500);
+v_e: 6 rows, 0 missing, 0 extra
+v_k: 5 rows, 0 missing, 0 extra
+v_nk: 6 rows, 0 missing, 0 extra
+v_agg: 5 rows, 0 missing, 0 extra
+v_e_warp: 6 rows, 0 missing, 0 extra
+# changes and deletes of rows that are found by a TIMESTAMP
+SET SESSION time_zone = '+00:00';
+UPDATE k SET v = 21 WHERE ts = '2023-10-29 01:30:00';
+UPDATE nk SET v = 101 WHERE ts = '2023-10-29 00:30:00.123';
+UPDATE e SET ts = '2023-10-29 01:30:00.5' WHERE id = 1;
+v_e: 6 rows, 0 missing, 0 extra
+v_k: 5 rows, 0 missing, 0 extra
+v_nk: 6 rows, 0 missing, 0 extra
+v_agg: 5 rows, 0 missing, 0 extra
+v_e_warp: 6 rows, 0 missing, 0 extra
+SET SESSION time_zone = '-07:00';
+UPDATE k SET ts = '2023-10-28 18:45:00' WHERE ts = '2023-10-28 17:30:00';
+UPDATE nk SET ts = '2023-10-28 17:30:00.123' WHERE v = 200;
+v_e: 6 rows, 0 missing, 0 extra
+v_k: 5 rows, 0 missing, 0 extra
+v_nk: 6 rows, 0 missing, 0 extra
+v_agg: 4 rows, 0 missing, 0 extra
+v_e_warp: 6 rows, 0 missing, 0 extra
+SET SESSION time_zone = '+00:00';
+DELETE FROM k WHERE ts = '2023-10-29 01:30:00';
+DELETE FROM nk WHERE ts = '2023-10-29 00:30:00.123' AND v = 101;
+DELETE FROM e WHERE id = 2;
+v_e: 5 rows, 0 missing, 0 extra
+v_k: 4 rows, 0 missing, 0 extra
+v_nk: 5 rows, 0 missing, 0 extra
+v_agg: 4 rows, 0 missing, 0 extra
+v_e_warp: 5 rows, 0 missing, 0 extra
+SELECT ts, UNIX_TIMESTAMP(ts) AS seconds, v FROM v_k ORDER BY seconds;
+ts	seconds	v
+2023-10-29 01:45:00	1698543900	10
+2024-06-15 10:30:45	1718447445	30
+2025-12-25 20:59:59	1766696399	50
+2025-12-26 06:59:59	1766732399	40
+SELECT ts, UNIX_TIMESTAMP(ts) AS seconds, v FROM v_nk ORDER BY seconds, v;
+ts	seconds	v
+NULL	NULL	300
+2023-10-29 00:30:00.123	1698539400.123	200
+2025-12-25 20:59:59.999	1766696399.999	500
+2025-12-26 06:59:59.999	1766732399.999	400
+2025-12-26 06:59:59.999	1766732399.999	400
+SELECT id, ts, UNIX_TIMESTAMP(ts) AS seconds, v FROM v_e_warp ORDER BY id;
+id	ts	seconds	v
+1	2023-10-29 01:30:00.500000	1698543000.500000	1
+3	NULL	NULL	3
+4	2025-12-26 06:59:59.500000	1766732399.500000	4
+5	2025-12-25 20:59:59.500000	1766696399.500000	5
+6	2024-03-31 00:30:00.000000	1711845000.000000	6
+DROP MATERIALIZED VIEW v_e;
+DROP MATERIALIZED VIEW v_k;
+DROP MATERIALIZED VIEW v_nk;
+DROP MATERIALIZED VIEW v_agg;
+DROP MATERIALIZED VIEW v_e_warp;
+DROP TABLE e, k, nk;

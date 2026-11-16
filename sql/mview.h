@@ -193,6 +193,17 @@ struct Mview_def {
 
   bool is_aggregate{false};
 
+  /// The definition reads a TIMESTAMP column or has an expression of that
+  /// type.  A TIMESTAMP is a point in time, but it is compared, grouped
+  /// and converted as the date and time of the time zone of the session.
+  /// The statements that fill and maintain a view run in UTC (see
+  /// Internal_session in sql_mview.cc and the WARP_MVIEW daemon), where a
+  /// date and time is one point in time: such a view has the rows of its
+  /// query in a session of UTC, and is only used for the queries of
+  /// sessions of UTC.  Metadata without "time_zone_dependent" is of a view
+  /// that was made before this was recorded.
+  bool time_zone_dependent{false};
+
   /// Table instances in FROM-clause order.
   std::vector<Mview_table> tables;
   /// Index into tables of the root instance (join views).

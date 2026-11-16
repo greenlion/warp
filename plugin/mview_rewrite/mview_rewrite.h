@@ -305,6 +305,8 @@ struct View {
   uint64_t epoch{0};
   Mview_refresh_mode refresh_mode{Mview_refresh_mode::MANUAL};
   bool is_aggregate{false};
+  /// Mview_def::time_zone_dependent: the rows are the ones of UTC.
+  bool time_zone_dependent{false};
 
   /// The definition as a query block over the base tables.  The select
   /// list is: a join view: the columns of the view (user and key columns);
@@ -432,6 +434,8 @@ struct Options {
   /// committed: its SYNCHRONOUS views show the session its own changes.
   bool sync_current{true};
   bool use_manual{false};
+  /// The time zone of the session is UTC.
+  bool session_utc{true};
   bool use_foreign_keys{true};
   bool use_filter_tree{true};
   bool partial{true};

@@ -427,8 +427,9 @@ static bool field_literal(const Table_map_info &map, unsigned col,
         out->append("'0000-00-00 00:00:00'");
         return false;
       }
-      /* Independent of the time zone of the session.  A decimal argument
-         keeps the microseconds. */
+      /* The date and time of the time zone of the session, which is UTC
+         in the sessions of the daemon: every date and time is one point
+         in time there.  A decimal argument keeps the microseconds. */
       snprintf(buf, sizeof(buf), "FROM_UNIXTIME(%lld.%06lld)",
                static_cast<long long>(tv.m_tv_sec),
                static_cast<long long>(tv.m_tv_usec));
