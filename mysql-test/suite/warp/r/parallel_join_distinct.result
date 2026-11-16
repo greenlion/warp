@@ -1,0 +1,311 @@
+#
+# The join that the engine makes (warp_parallel_hash_join) is read for the
+# distinct values of columns of one of its tables only: the subquery of IN
+# that MySQL materializes without duplicates, the materialized subquery of
+# a semijoin, SELECT DISTINCT in a derived table.  The engine returns a row
+# of that table in one row of the join, not in every row that it is joined
+# to (TPC-DS query 14: 100 million rows of the join for 16 thousand items).
+# Every query is run against the WARP tables (suffix w) and against InnoDB
+# copies of them (suffix i) and the rows are compared.
+#
+call mtr.add_suppression("MY-015655");
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION warp_parallel_min_rows = 1;
+SET SESSION cte_max_recursion_depth = 10000;
+CREATE TABLE f_w (k INT, d INT) ENGINE=WARP;
+CREATE TABLE a_w (id INT, g INT) ENGINE=WARP;
+CREATE TABLE b_w (id INT, g INT, v INT) ENGINE=WARP;
+CREATE TABLE o_w (x INT, y INT) ENGINE=WARP;
+INSERT INTO a_w WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 200) SELECT n, n % 7 FROM s;
+INSERT INTO b_w WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 300) SELECT n, n % 10, IF(n % 13 = 0, NULL, n % 50) FROM s;
+INSERT INTO f_w WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 5000) SELECT n % 150, n % 5 FROM s;
+INSERT INTO o_w WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 400) SELECT n, n % 60 FROM s;
+INSERT INTO o_w VALUES (NULL, NULL), (1000, 1000);
+CREATE TABLE f_i ENGINE=InnoDB SELECT * FROM f_w;
+CREATE TABLE a_i ENGINE=InnoDB SELECT * FROM a_w;
+CREATE TABLE b_i ENGINE=InnoDB SELECT * FROM b_w;
+CREATE TABLE o_i ENGINE=InnoDB SELECT * FROM o_w;
+# optimizer_switch: semijoin=off,subquery_to_derived=off
+SET SESSION optimizer_switch = 'semijoin=off,subquery_to_derived=off';
+# case 1: the subquery of IN returns a column of the last table of the join
+210:31380
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Filter: <in_optimizer>(o_w.x,o_w.x in (select #2))
+        -> Table scan on o_w
+        -> Select #2 (subquery in condition; run only once)
+            -> Filter: ((o_w.x = `<materialized_subquery>`.id))
+                -> Limit: 1 row(s)
+                    -> Index lookup on <materialized_subquery> using <auto_distinct_key> (id = o_w.x)
+                        -> Materialize with deduplication
+                            -> Nested loop inner join
+                                -> Nested loop inner join
+                                    -> Table scan on f, with parallel hash join (distinct rows of b)
+                                    -> Table scan on a, joined by the parallel hash join
+                                -> Table scan on b, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` where <in_optimizer>(`test`.`o_w`.`x`,`test`.`o_w`.`x` in ( <materialize> (/* select#2 */ select `b`.`id` from `test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b` where ((`f`.`k` = `a`.`id`) and (`b`.`g` = `a`.`g`)) ), <primary_index_lookup>(`test`.`o_w`.`x` in <temporary table> on <auto_distinct_key> where ((`test`.`o_w`.`x` = `<materialized_subquery>`.`id`)))))
+# case 2: a nullable column, conditions on the tables
+238:47314
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE y IN (SELECT b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND f.d = 1);
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Filter: <in_optimizer>(o_w.y,o_w.y in (select #2))
+        -> Table scan on o_w
+        -> Select #2 (subquery in condition; run only once)
+            -> Filter: ((o_w.y = `<materialized_subquery>`.v))
+                -> Limit: 1 row(s)
+                    -> Index lookup on <materialized_subquery> using <auto_distinct_key> (v = o_w.y)
+                        -> Materialize with deduplication
+                            -> Nested loop inner join
+                                -> Nested loop inner join
+                                    -> Table scan on f, with parallel hash join (distinct rows of b)
+                                    -> Table scan on a, joined by the parallel hash join
+                                -> Table scan on b, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` where <in_optimizer>(`test`.`o_w`.`y`,`test`.`o_w`.`y` in ( <materialize> (/* select#2 */ select `b`.`v` from `test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b` where ((`f`.`k` = `a`.`id`) and (`b`.`g` = `a`.`g`) and (`f`.`d` = 1)) ), <primary_index_lookup>(`test`.`o_w`.`y` in <temporary table> on <auto_distinct_key> where ((`test`.`o_w`.`y` = `<materialized_subquery>`.`v`)))))
+# case 3: NOT IN, the subquery has a NULL
+0:NULL
+# case 4: NOT IN, no NULL
+317:65387
+# case 5: columns of two tables: every row of the join is returned
+30:3705
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE (x, y) IN (SELECT b.id, a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Filter: <in_optimizer>((o_w.x,o_w.y),(o_w.x,o_w.y) in (select #2))
+        -> Table scan on o_w
+        -> Select #2 (subquery in condition; run only once)
+            -> Filter: ((o_w.x = `<materialized_subquery>`.id) and (o_w.y = `<materialized_subquery>`.id))
+                -> Limit: 1 row(s)
+                    -> Index lookup on <materialized_subquery> using <auto_distinct_key> (id = o_w.x, id = o_w.y)
+                        -> Materialize with deduplication
+                            -> Nested loop inner join
+                                -> Nested loop inner join
+                                    -> Table scan on f, with parallel hash join
+                                    -> Table scan on a, joined by the parallel hash join
+                                -> Table scan on b, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` where <in_optimizer>((`test`.`o_w`.`x`,`test`.`o_w`.`y`),(`test`.`o_w`.`x`,`test`.`o_w`.`y`) in ( <materialize> (/* select#2 */ select `b`.`id`,`a`.`id` from `test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b` where ((`f`.`k` = `a`.`id`) and (`b`.`g` = `a`.`g`)) ), <primary_index_lookup>(`test`.`o_w`.`x` in <temporary table> on <auto_distinct_key> where ((`test`.`o_w`.`x` = `<materialized_subquery>`.`id`) and (`test`.`o_w`.`y` = `<materialized_subquery>`.`id`)))))
+# case 6: an expression of two tables: every row of the join is returned
+151:22952
+# case 7: SELECT DISTINCT in a derived table
+210:31380
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(id) FROM (SELECT DISTINCT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g) t;
+EXPLAIN
+-> Aggregate: count(0), sum(t.id)
+    -> Table scan on t
+        -> Materialize
+            -> Table scan on <temporary>
+                -> Temporary table with deduplication
+                    -> Nested loop inner join
+                        -> Nested loop inner join
+                            -> Table scan on f, with parallel hash join (distinct rows of b)
+                            -> Table scan on a, joined by the parallel hash join
+                        -> Table scan on b, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`t`.`id`) AS `SUM(id)` from (/* select#2 */ select distinct `b`.`id` AS `id` from `test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b` where ((`b`.`g` = `a`.`g`) and (`f`.`k` = `a`.`id`))) `t`
+# case 8: SELECT DISTINCT of two columns of one table
+210:31380
+# case 9: the join itself: every row is returned
+149010:22260450
+# case 10: a condition of two tables that MySQL evaluates: every row of the join is returned
+141:28020
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND b.id + f.d > 100);
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Filter: <in_optimizer>(o_w.x,o_w.x in (select #2))
+        -> Table scan on o_w
+        -> Select #2 (subquery in condition; run only once)
+            -> Filter: ((o_w.x = `<materialized_subquery>`.id))
+                -> Limit: 1 row(s)
+                    -> Index lookup on <materialized_subquery> using <auto_distinct_key> (id = o_w.x)
+                        -> Materialize with deduplication
+                            -> Filter: ((b.id + f.d) > 100)
+                                -> Nested loop inner join
+                                    -> Nested loop inner join
+                                        -> Table scan on f, with parallel hash join
+                                        -> Table scan on a, joined by the parallel hash join
+                                    -> Table scan on b, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` where <in_optimizer>(`test`.`o_w`.`x`,`test`.`o_w`.`x` in ( <materialize> (/* select#2 */ select `b`.`id` from `test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b` where (((`b`.`id` + `f`.`d`) > 100) and (`f`.`k` = `a`.`id`) and (`b`.`g` = `a`.`g`)) ), <primary_index_lookup>(`test`.`o_w`.`x` in <temporary table> on <auto_distinct_key> where ((`test`.`o_w`.`x` = `<materialized_subquery>`.`id`)))))
+# case 11: a condition that is not deterministic
+210:31380
+# case 12: a LEFT JOIN: every row of the join is returned
+120:17880
+# case 13: a column of the table in the middle of the join
+149:11175
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Filter: <in_optimizer>(o_w.x,o_w.x in (select #2))
+        -> Table scan on o_w
+        -> Select #2 (subquery in condition; run only once)
+            -> Filter: ((o_w.x = `<materialized_subquery>`.id))
+                -> Limit: 1 row(s)
+                    -> Index lookup on <materialized_subquery> using <auto_distinct_key> (id = o_w.x)
+                        -> Materialize with deduplication
+                            -> Nested loop inner join
+                                -> Nested loop inner join
+                                    -> Table scan on f, with parallel hash join (distinct rows of a)
+                                    -> Table scan on a, joined by the parallel hash join
+                                -> Table scan on b, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` where <in_optimizer>(`test`.`o_w`.`x`,`test`.`o_w`.`x` in ( <materialize> (/* select#2 */ select `a`.`id` from `test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b` where ((`f`.`k` = `a`.`id`) and (`b`.`g` = `a`.`g`)) ), <primary_index_lookup>(`test`.`o_w`.`x` in <temporary table> on <auto_distinct_key> where ((`test`.`o_w`.`x` = `<materialized_subquery>`.`id`)))))
+# case 14: a column of the probe table: every row of the join is returned
+149:11175
+# case 15: a grouped subquery
+0:NULL
+# case 16: a subquery that is executed for every row
+7:840
+# case 17: uncorrelated EXISTS in the subquery (TPC-DS query 14)
+210:31380
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND EXISTS (SELECT 1 FROM f_w f2, a_w a2 WHERE f2.k = a2.id AND a2.g = 3) AND EXISTS (SELECT 1 FROM b_w b3 WHERE b3.g = 4));
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Filter: <in_optimizer>(o_w.x,o_w.x in (select #2))
+        -> Table scan on o_w
+        -> Select #2 (subquery in condition; run only once)
+            -> Filter: ((o_w.x = `<materialized_subquery>`.id))
+                -> Limit: 1 row(s)
+                    -> Index lookup on <materialized_subquery> using <auto_distinct_key> (id = o_w.x)
+                        -> Materialize with deduplication
+                            -> Nested loop inner join
+                                -> Nested loop inner join
+                                    -> Table scan on f, with parallel hash join (distinct rows of b)
+                                    -> Table scan on a, joined by the parallel hash join
+                                -> Table scan on b, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` where <in_optimizer>(`test`.`o_w`.`x`,`test`.`o_w`.`x` in ( <materialize> (/* select#2 */ select `b`.`id` from `test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b` where ((`f`.`k` = `a`.`id`) and (`b`.`g` = `a`.`g`)) ), <primary_index_lookup>(`test`.`o_w`.`x` in <temporary table> on <auto_distinct_key> where ((`test`.`o_w`.`x` = `<materialized_subquery>`.`id`)))))
+# case 18: uncorrelated EXISTS that is false
+0:NULL
+# optimizer_switch: semijoin=on,subquery_to_derived=off
+SET SESSION optimizer_switch = 'semijoin=on,subquery_to_derived=off';
+# case 19: the subquery of IN returns a column of the last table of the join
+210:31380
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Remove duplicate o_w rows using temporary table (weedout)
+        -> Nested loop inner join
+            -> Nested loop inner join
+                -> Nested loop inner join
+                    -> Table scan on f, with parallel hash join
+                    -> Table scan on a, joined by the parallel hash join
+                -> Table scan on b, joined by the parallel hash join
+            -> Table scan on o_w, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` semi join (`test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b`) where ((`test`.`o_w`.`x` = `b`.`id`) and (`b`.`g` = `a`.`g`) and (`f`.`k` = `a`.`id`))
+# case 20: a nullable column, conditions on the tables
+238:47314
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE y IN (SELECT b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND f.d = 1);
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Remove duplicate o_w rows using temporary table (weedout)
+        -> Nested loop inner join
+            -> Nested loop inner join
+                -> Nested loop inner join
+                    -> Table scan on f, with parallel hash join
+                    -> Table scan on a, joined by the parallel hash join
+                -> Table scan on b, joined by the parallel hash join
+            -> Table scan on o_w, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` semi join (`test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b`) where ((`test`.`o_w`.`y` = `b`.`v`) and (`f`.`d` = 1) and (`b`.`g` = `a`.`g`) and (`f`.`k` = `a`.`id`))
+# case 21: NOT IN, the subquery has a NULL
+0:NULL
+# case 22: NOT IN, no NULL
+317:65387
+# case 23: columns of two tables: every row of the join is returned
+30:3705
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE (x, y) IN (SELECT b.id, a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Remove duplicate o_w rows using temporary table (weedout)
+        -> Nested loop inner join
+            -> Nested loop inner join
+                -> Nested loop inner join
+                    -> Table scan on f, with parallel hash join
+                    -> Table scan on a, joined by the parallel hash join
+                -> Table scan on o_w, joined by the parallel hash join
+            -> Table scan on b, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` semi join (`test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b`) where ((`test`.`o_w`.`x` = `b`.`id`) and (`b`.`g` = `a`.`g`) and (`test`.`o_w`.`y` = `a`.`id`) and (`f`.`k` = `a`.`id`))
+# case 24: an expression of two tables: every row of the join is returned
+151:22952
+# case 25: SELECT DISTINCT in a derived table
+210:31380
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(id) FROM (SELECT DISTINCT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g) t;
+EXPLAIN
+-> Aggregate: count(0), sum(t.id)
+    -> Table scan on t
+        -> Materialize
+            -> Table scan on <temporary>
+                -> Temporary table with deduplication
+                    -> Nested loop inner join
+                        -> Nested loop inner join
+                            -> Table scan on f, with parallel hash join (distinct rows of b)
+                            -> Table scan on a, joined by the parallel hash join
+                        -> Table scan on b, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`t`.`id`) AS `SUM(id)` from (/* select#2 */ select distinct `b`.`id` AS `id` from `test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b` where ((`b`.`g` = `a`.`g`) and (`f`.`k` = `a`.`id`))) `t`
+# case 26: SELECT DISTINCT of two columns of one table
+210:31380
+# case 27: the join itself: every row is returned
+149010:22260450
+# case 28: a condition of two tables that MySQL evaluates: every row of the join is returned
+141:28020
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND b.id + f.d > 100);
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Remove duplicate o_w rows using temporary table (weedout)
+        -> Filter: ((b.id + f.d) > 100)
+            -> Nested loop inner join
+                -> Nested loop inner join
+                    -> Nested loop inner join
+                        -> Table scan on f, with parallel hash join
+                        -> Table scan on a, joined by the parallel hash join
+                    -> Table scan on b, joined by the parallel hash join
+                -> Table scan on o_w, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` semi join (`test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b`) where ((`test`.`o_w`.`x` = `b`.`id`) and (`b`.`g` = `a`.`g`) and (`f`.`k` = `a`.`id`) and ((`b`.`id` + `f`.`d`) > 100))
+# case 29: a condition that is not deterministic
+210:31380
+# case 30: a LEFT JOIN: every row of the join is returned
+120:17880
+# case 31: a column of the table in the middle of the join
+149:11175
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+EXPLAIN
+-> Aggregate: count(0), sum(o_w.x)
+    -> Remove duplicate o_w rows using temporary table (weedout)
+        -> Nested loop inner join
+            -> Nested loop inner join
+                -> Nested loop inner join
+                    -> Table scan on f, with parallel hash join
+                    -> Table scan on a, joined by the parallel hash join
+                -> Table scan on b, joined by the parallel hash join
+            -> Table scan on o_w, joined by the parallel hash join
+
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)`,sum(`test`.`o_w`.`x`) AS `SUM(x)` from `test`.`o_w` semi join (`test`.`f_w` `f` join `test`.`a_w` `a` join `test`.`b_w` `b`) where ((`b`.`g` = `a`.`g`) and (`test`.`o_w`.`x` = `a`.`id`) and (`f`.`k` = `a`.`id`))
+# case 32: a column of the probe table: every row of the join is returned
+149:11175
+# case 33: a grouped subquery
+0:NULL
+# case 34: a subquery that is executed for every row
+7:840
+SET SESSION optimizer_switch = DEFAULT;
+DROP TABLE f_w, a_w, b_w, o_w, f_i, a_i, b_i, o_i;

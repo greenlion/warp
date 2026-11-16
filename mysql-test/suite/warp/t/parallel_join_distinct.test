@@ -1,0 +1,338 @@
+
+--echo #
+--echo # The join that the engine makes (warp_parallel_hash_join) is read for the
+--echo # distinct values of columns of one of its tables only: the subquery of IN
+--echo # that MySQL materializes without duplicates, the materialized subquery of
+--echo # a semijoin, SELECT DISTINCT in a derived table.  The engine returns a row
+--echo # of that table in one row of the join, not in every row that it is joined
+--echo # to (TPC-DS query 14: 100 million rows of the join for 16 thousand items).
+--echo # Every query is run against the WARP tables (suffix w) and against InnoDB
+--echo # copies of them (suffix i) and the rows are compared.
+--echo #
+
+call mtr.add_suppression("MY-015655");
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION warp_parallel_min_rows = 1;
+SET SESSION cte_max_recursion_depth = 10000;
+
+CREATE TABLE f_w (k INT, d INT) ENGINE=WARP;
+CREATE TABLE a_w (id INT, g INT) ENGINE=WARP;
+CREATE TABLE b_w (id INT, g INT, v INT) ENGINE=WARP;
+CREATE TABLE o_w (x INT, y INT) ENGINE=WARP;
+INSERT INTO a_w WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 200) SELECT n, n % 7 FROM s;
+INSERT INTO b_w WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 300) SELECT n, n % 10, IF(n % 13 = 0, NULL, n % 50) FROM s;
+INSERT INTO f_w WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 5000) SELECT n % 150, n % 5 FROM s;
+INSERT INTO o_w WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 400) SELECT n, n % 60 FROM s;
+INSERT INTO o_w VALUES (NULL, NULL), (1000, 1000);
+CREATE TABLE f_i ENGINE=InnoDB SELECT * FROM f_w;
+CREATE TABLE a_i ENGINE=InnoDB SELECT * FROM a_w;
+CREATE TABLE b_i ENGINE=InnoDB SELECT * FROM b_w;
+CREATE TABLE o_i ENGINE=InnoDB SELECT * FROM o_w;
+
+
+--echo # optimizer_switch: semijoin=off,subquery_to_derived=off
+SET SESSION optimizer_switch = 'semijoin=off,subquery_to_derived=off';
+--echo # case 1: the subquery of IN returns a column of the last table of the join
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 1: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+--echo # case 2: a nullable column, conditions on the tables
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE y IN (SELECT b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND f.d = 1)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE y IN (SELECT b.v FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND f.d = 1)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 2: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE y IN (SELECT b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND f.d = 1);
+--echo # case 3: NOT IN, the subquery has a NULL
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE y NOT IN (SELECT b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND f.d = 1 AND b.id < 40)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE y NOT IN (SELECT b.v FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND f.d = 1 AND b.id < 40)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 3: InnoDB has $i
+}
+--echo # case 4: NOT IN, no NULL
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE y NOT IN (SELECT b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND b.v IS NOT NULL AND b.id < 20)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE y NOT IN (SELECT b.v FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND b.v IS NOT NULL AND b.id < 20)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 4: InnoDB has $i
+}
+--echo # case 5: columns of two tables: every row of the join is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE (x, y) IN (SELECT b.id, a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE (x, y) IN (SELECT b.id, a.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 5: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE (x, y) IN (SELECT b.id, a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+--echo # case 6: an expression of two tables: every row of the join is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id + a.g FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id + a.g FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 6: InnoDB has $i
+}
+--echo # case 7: SELECT DISTINCT in a derived table
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(id) c2 FROM (SELECT DISTINCT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g) t) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(id) c2 FROM (SELECT DISTINCT b.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g) t) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 7: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(id) FROM (SELECT DISTINCT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g) t;
+--echo # case 8: SELECT DISTINCT of two columns of one table
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(id) c2 FROM (SELECT DISTINCT b.id, b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND f.d < 3) t) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(id) c2 FROM (SELECT DISTINCT b.id, b.v FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND f.d < 3) t) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 8: InnoDB has $i
+}
+--echo # case 9: the join itself: every row is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(b.id) c2 FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(b.id) c2 FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 9: InnoDB has $i
+}
+--echo # case 10: a condition of two tables that MySQL evaluates: every row of the join is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND b.id + f.d > 100)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND b.id + f.d > 100)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 10: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND b.id + f.d > 100);
+--echo # case 11: a condition that is not deterministic
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND RAND() >= 0)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND RAND() >= 0)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 11: InnoDB has $i
+}
+--echo # case 12: a LEFT JOIN: every row of the join is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id FROM f_w f JOIN a_w a ON f.k = a.id LEFT JOIN b_w b ON a.g = b.g + 3)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id FROM f_i f JOIN a_i a ON f.k = a.id LEFT JOIN b_i b ON a.g = b.g + 3)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 12: InnoDB has $i
+}
+--echo # case 13: a column of the table in the middle of the join
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT a.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 13: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+--echo # case 14: a column of the probe table: every row of the join is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT f.k FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT f.k FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 14: InnoDB has $i
+}
+--echo # case 15: a grouped subquery
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT COUNT(*) FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g GROUP BY b.id)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT COUNT(*) FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g GROUP BY b.id)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 15: InnoDB has $i
+}
+--echo # case 16: a subquery that is executed for every row
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(c) c2 FROM (SELECT x, (SELECT COUNT(*) FROM b_w b WHERE b.id IN (SELECT b2.id FROM f_w f, a_w a, b_w b2 WHERE f.k = a.id AND a.g = b2.g AND f.d = o.y)) c FROM o_w o WHERE x < 8) t) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(c) c2 FROM (SELECT x, (SELECT COUNT(*) FROM b_i b WHERE b.id IN (SELECT b2.id FROM f_i f, a_i a, b_i b2 WHERE f.k = a.id AND a.g = b2.g AND f.d = o.y)) c FROM o_i o WHERE x < 8) t) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 16: InnoDB has $i
+}
+--echo # case 17: uncorrelated EXISTS in the subquery (TPC-DS query 14)
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND EXISTS (SELECT 1 FROM f_w f2, a_w a2 WHERE f2.k = a2.id AND a2.g = 3) AND EXISTS (SELECT 1 FROM b_w b3 WHERE b3.g = 4))) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND EXISTS (SELECT 1 FROM f_i f2, a_i a2 WHERE f2.k = a2.id AND a2.g = 3) AND EXISTS (SELECT 1 FROM b_i b3 WHERE b3.g = 4))) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 17: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND EXISTS (SELECT 1 FROM f_w f2, a_w a2 WHERE f2.k = a2.id AND a2.g = 3) AND EXISTS (SELECT 1 FROM b_w b3 WHERE b3.g = 4));
+--echo # case 18: uncorrelated EXISTS that is false
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND EXISTS (SELECT 1 FROM f_w f2, a_w a2 WHERE f2.k = a2.id AND a2.g = 99))) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND EXISTS (SELECT 1 FROM f_i f2, a_i a2 WHERE f2.k = a2.id AND a2.g = 99))) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 18: InnoDB has $i
+}
+
+--echo # optimizer_switch: semijoin=on,subquery_to_derived=off
+SET SESSION optimizer_switch = 'semijoin=on,subquery_to_derived=off';
+--echo # case 19: the subquery of IN returns a column of the last table of the join
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 19: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+--echo # case 20: a nullable column, conditions on the tables
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE y IN (SELECT b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND f.d = 1)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE y IN (SELECT b.v FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND f.d = 1)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 20: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE y IN (SELECT b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND f.d = 1);
+--echo # case 21: NOT IN, the subquery has a NULL
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE y NOT IN (SELECT b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND f.d = 1 AND b.id < 40)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE y NOT IN (SELECT b.v FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND f.d = 1 AND b.id < 40)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 21: InnoDB has $i
+}
+--echo # case 22: NOT IN, no NULL
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE y NOT IN (SELECT b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND b.v IS NOT NULL AND b.id < 20)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE y NOT IN (SELECT b.v FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND b.v IS NOT NULL AND b.id < 20)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 22: InnoDB has $i
+}
+--echo # case 23: columns of two tables: every row of the join is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE (x, y) IN (SELECT b.id, a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE (x, y) IN (SELECT b.id, a.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 23: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE (x, y) IN (SELECT b.id, a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+--echo # case 24: an expression of two tables: every row of the join is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id + a.g FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id + a.g FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 24: InnoDB has $i
+}
+--echo # case 25: SELECT DISTINCT in a derived table
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(id) c2 FROM (SELECT DISTINCT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g) t) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(id) c2 FROM (SELECT DISTINCT b.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g) t) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 25: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(id) FROM (SELECT DISTINCT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g) t;
+--echo # case 26: SELECT DISTINCT of two columns of one table
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(id) c2 FROM (SELECT DISTINCT b.id, b.v FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND f.d < 3) t) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(id) c2 FROM (SELECT DISTINCT b.id, b.v FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND f.d < 3) t) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 26: InnoDB has $i
+}
+--echo # case 27: the join itself: every row is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(b.id) c2 FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(b.id) c2 FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 27: InnoDB has $i
+}
+--echo # case 28: a condition of two tables that MySQL evaluates: every row of the join is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND b.id + f.d > 100)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND b.id + f.d > 100)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 28: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND b.id + f.d > 100);
+--echo # case 29: a condition that is not deterministic
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g AND RAND() >= 0)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g AND RAND() >= 0)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 29: InnoDB has $i
+}
+--echo # case 30: a LEFT JOIN: every row of the join is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT b.id FROM f_w f JOIN a_w a ON f.k = a.id LEFT JOIN b_w b ON a.g = b.g + 3)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT b.id FROM f_i f JOIN a_i a ON f.k = a.id LEFT JOIN b_i b ON a.g = b.g + 3)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 30: InnoDB has $i
+}
+--echo # case 31: a column of the table in the middle of the join
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT a.id FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 31: InnoDB has $i
+}
+--replace_regex /  *\(cost=[^)]*\)//
+EXPLAIN FORMAT=TREE SELECT COUNT(*), SUM(x) FROM o_w WHERE x IN (SELECT a.id FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g);
+--echo # case 32: a column of the probe table: every row of the join is returned
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT f.k FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT f.k FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 32: InnoDB has $i
+}
+--echo # case 33: a grouped subquery
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_w WHERE x IN (SELECT COUNT(*) FROM f_w f, a_w a, b_w b WHERE f.k = a.id AND a.g = b.g GROUP BY b.id)) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(x) c2 FROM o_i WHERE x IN (SELECT COUNT(*) FROM f_i f, a_i a, b_i b WHERE f.k = a.id AND a.g = b.g GROUP BY b.id)) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 33: InnoDB has $i
+}
+--echo # case 34: a subquery that is executed for every row
+let $w = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(c) c2 FROM (SELECT x, (SELECT COUNT(*) FROM b_w b WHERE b.id IN (SELECT b2.id FROM f_w f, a_w a, b_w b2 WHERE f.k = a.id AND a.g = b2.g AND f.d = o.y)) c FROM o_w o WHERE x < 8) t) q`;
+let $i = `SELECT CONCAT_WS(':', q.c1, IFNULL(q.c2, 'NULL')) FROM (SELECT COUNT(*) c1, SUM(c) c2 FROM (SELECT x, (SELECT COUNT(*) FROM b_i b WHERE b.id IN (SELECT b2.id FROM f_i f, a_i a, b_i b2 WHERE f.k = a.id AND a.g = b2.g AND f.d = o.y)) c FROM o_i o WHERE x < 8) t) q`;
+--echo $w
+if ($w != $i)
+{
+  --echo MISMATCH in case 34: InnoDB has $i
+}
+
+SET SESSION optimizer_switch = DEFAULT;
+DROP TABLE f_w, a_w, b_w, o_w, f_i, a_i, b_i, o_i;

@@ -424,6 +424,13 @@ struct warp_pj_plan {
   std::vector<uint> where_fields;
   int nbuild = 0;                        // tables[1..nbuild] are joined to the probe table
   std::vector<warp_pj_semi> semis;
+  /* The rows of the join are read for the distinct values of columns of one
+     table only (the subquery of IN, a materialization that removes the
+     duplicates, see warp_pj_distinct_fields): a row of that table is returned
+     in one row of the join, not in every row that it is joined to.
+     distinct_seen has one flag for every row of that table. */
+  int distinct_level = 0;                // 0: every row of the join is returned
+  std::unique_ptr<std::atomic<uint8_t>[]> distinct_seen;
 
   /* the result */
   std::vector<warp_pj_result> results;
@@ -1665,6 +1672,7 @@ struct warp_pj_prober {
   void *local = nullptr;
   const void *extra = nullptr;      // the typed columns of the partition (std::vector<warp_gj_arr>)
   size_t index = 0;                 // the number of the row among the rows that pass the conditions
+  std::atomic<uint8_t> *distinct = nullptr;   // plan.distinct_seen, if only distinct rows are returned
 
   inline bool value(const warp_pj_ref &ref, int64_t *v) const {
     if(ref.level == 0) {
@@ -1685,6 +1693,13 @@ struct warp_pj_prober {
       if(sink != nullptr) {
         sink->add(local, *this);
         return true;
+      }
+      if(distinct != nullptr) {
+        /* the reader only wants the distinct rows of this table */
+        std::atomic<uint8_t> &seen = distinct[chosen[plan.distinct_level]];
+        if(seen.load(std::memory_order_relaxed) != 0 || seen.exchange(1, std::memory_order_relaxed) != 0) {
+          return true;
+        }
       }
       out->push_back(ordinal);
       for(int l = 1; l <= plan.nbuild; ++l) {
@@ -1921,6 +1936,7 @@ static bool warp_pj_partition(warp_pj_plan &plan, ibis::part *part, const warp_s
       prober.sink = scope.sink;
       prober.local = scope.local;
       prober.extra = &gj_arrays;
+      prober.distinct = plan.sink ? nullptr : plan.distinct_seen.get();
       for(size_t i = lo; i < hi; ++i) {
         /* a row can expand to many rows of the join: KILL is checked while
            the slice is probed, not only between partitions */
@@ -2205,6 +2221,11 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
     if(!built) {
       return false;
     }
+  }
+
+  plan.distinct_seen.reset();
+  if(plan.distinct_level >= 1 && plan.distinct_level <= plan.nbuild && !plan.sink && plan.exports.empty()) {
+    plan.distinct_seen.reset(new std::atomic<uint8_t>[plan.tables[plan.distinct_level].nrows + 1]());
   }
 
   /* a table that is joined to the probe table by one column and has few rows (it
@@ -2614,7 +2635,8 @@ int ha_warp::pj_follower_next(uchar *buf) {
 
 /* The access path `path` (a tree of joins) is replaced by a scan of the probe
    table, with a FILTER for the conditions that MySQL has to evaluate. */
-static bool warp_pj_replace(THD *thd, AccessPath *path, JOIN *join, const std::vector<warp_pj_semi> &semis) {
+static bool warp_pj_replace(THD *thd, AccessPath *path, JOIN *join, const std::vector<warp_pj_semi> &semis,
+                            const std::vector<Field *> *distinct_fields = nullptr) {
   std::vector<Item *> residual;
   std::shared_ptr<warp_pj_plan> plan = warp_pj_make_plan(thd, path, &residual);
   if(!plan) {
@@ -2691,6 +2713,24 @@ static bool warp_pj_replace(THD *thd, AccessPath *path, JOIN *join, const std::v
         return false;
       }
     }
+  }
+  /* The reader of the join only looks at the distinct values of columns of
+     one of the tables that are joined to the probe table: every row of that
+     table that is in the join is returned once.  MySQL must not have a
+     condition left to evaluate (the row that is returned could be one that it
+     drops), and no other scan reads the values of a column of the join. */
+  if(distinct_fields != nullptr && !distinct_fields->empty() && residual.empty() && plan->exports.empty()) {
+    int level = 0;
+    for(int l = 1; l <= plan->nbuild; ++l) {
+      if(plan->tables[l].table == (*distinct_fields)[0]->table) level = l;
+    }
+    for(const Field *field : *distinct_fields) {
+      if(level == 0 || field->table != plan->tables[level].table) level = 0;
+    }
+    for(int l = 1; l <= plan->nbuild; ++l) {
+      if(plan->tables[l].null_side) level = 0;
+    }
+    plan->distinct_level = level;
   }
   AccessPath *scan = NewTableScanAccessPath(thd, plan->probe, false);
   scan->set_num_output_rows(path->num_output_rows());
@@ -3027,6 +3067,86 @@ static bool warp_pj_replace_around_one_row(THD *thd, AccessPath *path, JOIN *joi
   return true;
 }
 
+/* Are the rows that `path` returns read for their distinct values only, and
+   are those values columns of tables?  The columns are returned in `fields`.
+
+   - `path` is the root of the block of the subquery of IN (it is not grouped,
+     has no window, no HAVING and no LIMIT, and is not a UNION): MySQL
+     materializes the distinct rows of the subquery, or looks for one row.
+   - `path` is what a materialization that removes the duplicates reads (the
+     materialized subquery of a semijoin, SELECT DISTINCT in a derived table),
+     alone or in a product with other row sources.
+
+   A join that feeds such a reader may return any subset of its rows that has
+   the same distinct values (TPC-DS query 14: the items of the brands, classes
+   and categories that were sold, 100 million rows of the join for 16 thousand
+   items). */
+static bool warp_pj_distinct_fields(AccessPath *root, AccessPath *path, JOIN *join,
+                                    const std::vector<AccessPath *> &dedup_materializes,
+                                    std::vector<Field *> *fields) {
+  fields->clear();
+  auto add = [&](Item *item) {
+    if(item == nullptr || item->real_item()->type() != Item::FIELD_ITEM) return false;
+    Field *field = down_cast<Item_field *>(item->real_item())->field;
+    if(field == nullptr || field->table == nullptr) return false;
+    fields->push_back(field);
+    return true;
+  };
+  if(path == root) {
+    if(join == nullptr || join->query_block == nullptr) return false;
+    Query_block *block = join->query_block;
+    Query_expression *unit = block->master_query_expression();
+    if(unit == nullptr || unit->item == nullptr || unit->item->subquery_type() != Item_subselect::IN_SUBQUERY ||
+       !unit->is_simple() || block->is_grouped() || block->is_implicitly_grouped() || block->has_windows() ||
+       block->having_cond() != nullptr || block->has_limit() || block->is_ordered() ||
+       block->olap != UNSPECIFIED_OLAP_TYPE) {
+      return false;
+    }
+    for(Item *item : block->visible_fields()) {
+      if(!add(item)) {
+        fields->clear();
+        return false;
+      }
+    }
+    return !fields->empty();
+  }
+  for(AccessPath *materialize : dedup_materializes) {
+    const MaterializePathParameters *param = materialize->materialize().param;
+    const MaterializePathParameters::Operand &operand = param->m_operands[0];
+    /* what the materialization reads is `path`, or the product of `path` and
+       other row sources (inner joins without a condition, the derived tables
+       of uncorrelated EXISTS): a product has the distinct values that `path`
+       has if it has a row at all */
+    bool feeds = false;
+    std::vector<AccessPath *> pending{operand.subquery_path};
+    while(!pending.empty() && !feeds) {
+      AccessPath *p = pending.back();
+      pending.pop_back();
+      if(p == nullptr) continue;
+      if(p == path) {
+        feeds = true;
+      } else if(p->type == AccessPath::HASH_JOIN && p->hash_join().join_predicate != nullptr &&
+                p->hash_join().join_predicate->expr != nullptr &&
+                p->hash_join().join_predicate->expr->type == RelationalExpression::INNER_JOIN &&
+                p->hash_join().join_predicate->expr->equijoin_conditions.empty() &&
+                p->hash_join().join_predicate->expr->join_conditions.empty()) {
+        pending.push_back(p->hash_join().outer);
+        pending.push_back(p->hash_join().inner);
+      }
+    }
+    if(!feeds) continue;
+    if(operand.temp_table_param == nullptr || operand.temp_table_param->items_to_copy == nullptr) return false;
+    for(const Func_ptr &entry : *operand.temp_table_param->items_to_copy) {
+      if(!add(entry.func())) {
+        fields->clear();
+        return false;
+      }
+    }
+    return !fields->empty();
+  }
+  return false;
+}
+
 static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
   if(!THDVAR(thd, parallel_hash_join) ||
      (thd->lex->sql_command != SQLCOM_SELECT && thd->lex->sql_command != SQLCOM_CREATE_TABLE &&
@@ -3070,6 +3190,21 @@ static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
     warp_pj_semi_materializes.push_back(semi.materialize);
     warp_pj_semi_tables.push_back(semi.inner->table);
   }
+  /* the materializations of the block that remove the duplicates of what they read */
+  std::vector<AccessPath *> dedup_materializes;
+  WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
+                  [&](AccessPath *path, const JOIN *) {
+                    if(path->type == AccessPath::MATERIALIZE && path->materialize().param != nullptr) {
+                      const MaterializePathParameters *param = path->materialize().param;
+                      if(param->m_operands.size() == 1 && param->table != nullptr &&
+                         param->limit_rows == HA_POS_ERROR && param->cte == nullptr &&
+                         !param->m_operands[0].is_recursive_reference &&
+                         MaterializeIsDoingDeduplication(param->table)) {
+                        dedup_materializes.push_back(path);
+                      }
+                    }
+                    return false;
+                  });
   WalkAccessPaths(root, join, WalkAccessPathPolicy::ENTIRE_QUERY_BLOCK,
                   [&](AccessPath *path, const JOIN *) {
                     /* the conditions on top of a join are conditions of the join too */
@@ -3080,7 +3215,9 @@ static void warp_try_parallel_join(THD *thd, AccessPath *root, JOIN *join) {
                       join_below = below->type == AccessPath::HASH_JOIN || below->type == AccessPath::NESTED_LOOP_JOIN;
                     }
                     if(join_below) {
-                      if(warp_pj_replace(thd, path, join, semis)) {
+                      std::vector<Field *> distinct_fields;
+                      warp_pj_distinct_fields(root, path, join, dedup_materializes, &distinct_fields);
+                      if(warp_pj_replace(thd, path, join, semis, &distinct_fields)) {
                         return true;  // everything below it is the engine's now
                       }
                       if(warp_pj_replace_below_sort(thd, path, join, semis)) {

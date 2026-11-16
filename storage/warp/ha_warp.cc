@@ -10492,6 +10492,9 @@ std::string ha_warp::explain_extra() const {
     extra += ", with parallel aggregation";
   } else if (par_join) {
     extra += ", with parallel hash join";
+    if (par_join->distinct_level >= 1 && par_join->distinct_level <= par_join->nbuild) {
+      extra += std::string(" (distinct rows of ") + par_join->tables[par_join->distinct_level].table->alias + ")";
+    }
   } else if (pj_follower) {
     extra += ", joined by the parallel hash join";
   }
