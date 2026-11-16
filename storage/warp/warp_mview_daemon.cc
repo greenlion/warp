@@ -4760,3 +4760,25 @@ SHOW_VAR warp_mview_status_variables[] = {
     {"Warp_mview_lag_seconds", (char *)&warp_mview::show_lag, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {nullptr, nullptr, SHOW_LONG, SHOW_SCOPE_GLOBAL}};
+
+/* The plugin is a library of its own, mview_refresh.so: it does not use the
+   WARP storage engine (the views that it maintains can be tables of any
+   engine), and a server can have it without ha_warp.so.  Its name, and with
+   it the names of its variables (warp_mview_*, Warp_mview_*), is what it
+   was when it was the second plugin of ha_warp.so. */
+mysql_declare_plugin(mview_refresh){
+    MYSQL_DAEMON_PLUGIN,
+    &warp_mview_daemon_descriptor,
+    "WARP_MVIEW",
+    "Justin Swanhart",
+    "Maintains table-backed materialized views from the binary log",
+    PLUGIN_LICENSE_GPL,
+    warp_mview_plugin_init,   /* Plugin Init */
+    nullptr,                  /* Plugin check uninstall */
+    warp_mview_plugin_deinit, /* Plugin Deinit */
+    0x0100,
+    warp_mview_status_variables, /* status variables */
+    warp_mview_system_variables, /* system variables */
+    nullptr,                     /* config options */
+    0,                           /* flags */
+} mysql_declare_plugin_end;

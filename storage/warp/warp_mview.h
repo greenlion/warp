@@ -27,8 +27,9 @@
   warp_mview_rows.cc    decodes the row images of row events into SQL
                         literals
 
-  This header is included by ha_warp.cc (for the plugin declaration) and by
-  the two files above; it must not pull in FastBit or the server internals.
+  The plugin is the library mview_refresh.so (it was the second plugin of
+  ha_warp.so): INSTALL PLUGIN warp_mview SONAME 'mview_refresh.so'.  It does
+  not use FastBit or the WARP storage engine.
 */
 
 #include <string>
@@ -38,7 +39,7 @@
 #include "mysql/plugin.h"
 #include "mysql/status_var.h"
 
-/* The second plugin of ha_warp.so, declared in ha_warp.cc */
+/* The plugin, declared in warp_mview_daemon.cc */
 extern struct st_mysql_daemon warp_mview_daemon_descriptor;
 extern SHOW_VAR warp_mview_status_variables[];
 extern SYS_VAR *warp_mview_system_variables[];

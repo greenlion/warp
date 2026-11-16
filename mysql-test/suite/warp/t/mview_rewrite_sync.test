@@ -71,8 +71,8 @@ ALTER MATERIALIZED VIEW sales_by_region REFRESH SYNCHRONOUS;
 --echo # without the daemon no SYNCHRONOUS view is known to be current
 UNINSTALL PLUGIN WARP_MVIEW;
 --source $q_check
---replace_result $WARP_PLUGIN WARP_PLUGIN
-eval INSTALL PLUGIN WARP_MVIEW SONAME '$WARP_PLUGIN';
+--replace_result $MVIEW_REFRESH MVIEW_REFRESH
+eval INSTALL PLUGIN WARP_MVIEW SONAME '$MVIEW_REFRESH';
 --source suite/warp/include/mview_rewrite_wait.inc
 --source $q_check
 

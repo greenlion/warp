@@ -67,7 +67,7 @@ SELECT `sales_by_region`.`mv$g1` AS `product`, (SUM(`sales_by_region`.`mv$s1`) /
 UNINSTALL PLUGIN WARP_MVIEW;
 SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
 # not rewritten
-INSTALL PLUGIN WARP_MVIEW SONAME 'WARP_PLUGIN';
+INSTALL PLUGIN WARP_MVIEW SONAME 'MVIEW_REFRESH';
 SELECT product, AVG(amount) FROM sales WHERE region IN ('north', 'south') GROUP BY product;
 # rewritten
 SELECT `sales_by_region`.`mv$g1` AS `product`, (SUM(`sales_by_region`.`mv$s1`) / NULLIF(SUM(`sales_by_region`.`mv$s0`),0)) AS `AVG(amount)` FROM `test`.`sales_by_region` `sales_by_region` WHERE ((`sales_by_region`.`mv$g0` in ('north','south'))) GROUP BY `sales_by_region`.`mv$g1`

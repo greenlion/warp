@@ -1,1 +1,1 @@
---plugin-load-add=WARP_MVIEW=$WARP_PLUGIN --warp-mview-pin-duty-percent=100
+--plugin-load-add=WARP_MVIEW=$MVIEW_REFRESH --warp-mview-pin-duty-percent=100
