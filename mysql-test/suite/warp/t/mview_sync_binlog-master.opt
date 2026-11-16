@@ -1,1 +1,1 @@
---plugin-load-add=WARP_MVIEW=$WARP_PLUGIN
+--plugin-load-add=WARP_MVIEW=$MVIEW_REFRESH

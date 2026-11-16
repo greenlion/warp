@@ -23,8 +23,8 @@ eval CREATE MATERIALIZED VIEW mv_a ENGINE=InnoDB AS $sel_a;
 INSERT INTO t VALUES (4, 2, 40);
 SELECT COUNT(*) FROM mv_j;
 
---replace_result $WARP_PLUGIN WARP_PLUGIN
-eval INSTALL PLUGIN WARP_MVIEW SONAME '$WARP_PLUGIN';
+--replace_result $MVIEW_REFRESH MVIEW_REFRESH
+eval INSTALL PLUGIN WARP_MVIEW SONAME '$MVIEW_REFRESH';
 --echo # a new connection works
 --connect (con1, localhost, root,,)
 SELECT PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME = 'WARP_MVIEW';
@@ -44,8 +44,8 @@ DELETE FROM t WHERE id = 2;
 
 UNINSTALL PLUGIN WARP_MVIEW;
 --echo # and again, after it was removed
---replace_result $WARP_PLUGIN WARP_PLUGIN
-eval INSTALL PLUGIN WARP_MVIEW SONAME '$WARP_PLUGIN';
+--replace_result $MVIEW_REFRESH MVIEW_REFRESH
+eval INSTALL PLUGIN WARP_MVIEW SONAME '$MVIEW_REFRESH';
 INSERT INTO t VALUES (6, 3, 60);
 --let $mview = mv_j
 --let $mview_select = $sel_j

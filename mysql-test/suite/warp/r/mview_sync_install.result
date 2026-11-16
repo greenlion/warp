@@ -20,7 +20,7 @@ INSERT INTO t VALUES (4, 2, 40);
 SELECT COUNT(*) FROM mv_j;
 COUNT(*)
 3
-INSTALL PLUGIN WARP_MVIEW SONAME 'WARP_PLUGIN';
+INSTALL PLUGIN WARP_MVIEW SONAME 'MVIEW_REFRESH';
 # a new connection works
 SELECT PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME = 'WARP_MVIEW';
 PLUGIN_STATUS
@@ -33,7 +33,7 @@ mv_j: 4 rows, 0 missing, 0 extra
 mv_a: 3 rows, 0 missing, 0 extra
 UNINSTALL PLUGIN WARP_MVIEW;
 # and again, after it was removed
-INSTALL PLUGIN WARP_MVIEW SONAME 'WARP_PLUGIN';
+INSTALL PLUGIN WARP_MVIEW SONAME 'MVIEW_REFRESH';
 INSERT INTO t VALUES (6, 3, 60);
 mv_j: 5 rows, 0 missing, 0 extra
 mv_a: 3 rows, 0 missing, 0 extra

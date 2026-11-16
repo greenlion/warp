@@ -1,1 +1,1 @@
---plugin-load-add=WARP_MVIEW=$WARP_PLUGIN --default-time-zone=MET
+--plugin-load-add=WARP_MVIEW=$MVIEW_REFRESH --default-time-zone=MET

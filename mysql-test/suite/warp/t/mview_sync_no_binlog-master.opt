@@ -1,1 +1,1 @@
---plugin-load-add=WARP_MVIEW=$WARP_PLUGIN --skip-log-bin
+--plugin-load-add=WARP_MVIEW=$MVIEW_REFRESH --skip-log-bin

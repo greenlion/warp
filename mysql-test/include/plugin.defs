@@ -59,6 +59,7 @@ rewrite_example    			plugin_output_directory  no REWRITE_EXAMPLE
 ddl_rewriter                            plugin_output_directory  no DDL_REWRITER
 rewriter           			plugin_output_directory  no REWRITER
 mview_rewrite                           plugin_output_directory  no MVIEW_REWRITE
+mview_refresh                           plugin_output_directory  no MVIEW_REFRESH
 mysql_no_login     			plugin_output_directory  no MYSQL_NO_LOGIN    mysql_no_login
 test_udf_services  			plugin_output_directory  no TESTUDFSERVICES
 test_udf_services  			plugin_output_directory  no TESTUDFREGISTRATION test_udf_registration
