@@ -2715,6 +2715,24 @@ using notify_materialized_view_usage_t = bool (*)(THD *thd,
 using secondary_engine_pre_prepare_hook_t = bool (*)(THD *thd);
 
 /**
+  Called for a statement that a secondary engine runs after the statement is
+  resolved and before it is optimized.
+
+  handlerton::prepare_secondary_engine is called when the tables are opened,
+  which is before the statement is resolved (EXPLAIN, CREATE TABLE ...
+  SELECT, and the first execution of a statement), and
+  handlerton::optimize_secondary_engine after the optimizer has changed the
+  conditions of the query in place.  An engine that reads the query as it
+  was resolved (to write a statement for an external executor from it) does
+  that here.
+
+  @param thd  the session
+  @param lex  the statement
+  @return true on error: the statement is not run by the secondary engine
+*/
+using secondary_engine_resolved_t = bool (*)(THD *thd, LEX *lex);
+
+/**
   Hook used to estimate the cardinality of table Node objects in the
   JoinHypergraph. For each Node, it attempts to estimate the cardinality,
   and if successful, stores it in the field `cardinality`.
@@ -3137,6 +3155,14 @@ struct handlerton {
 
   /** Page tracking interface */
   Page_track_t page_track;
+
+  /**
+    Called for a statement that is run by this secondary engine when the
+    statement has been resolved and before it is optimized (see
+    secondary_engine_resolved_t).  It is the last member: plugins that
+    were built before it existed do not set it.
+  */
+  secondary_engine_resolved_t secondary_engine_resolved;
 };
 
 /* Possible flags of a handlerton (there can be 32 of them) */
