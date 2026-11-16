@@ -2708,7 +2708,12 @@ static bool validate_secondary_engine_option(THD *thd,
   constexpr uint64_t supported_alter_operations = Alter_info::ALTER_OPTIONS;
 
   // The only table option that may be changed is SECONDARY_ENGINE.
-  constexpr uint64_t supported_table_options = HA_CREATE_USED_SECONDARY_ENGINE;
+  // (HA_CREATE_USED_EXPLICIT_SECONDARY_ENGINE is set with it by the parser for
+  // SECONDARY_ENGINE [=] name | NULL: without it here the secondary engine
+  // of a table could only be removed if that engine supports DDL.)
+  constexpr uint64_t supported_table_options =
+      HA_CREATE_USED_SECONDARY_ENGINE |
+      HA_CREATE_USED_EXPLICIT_SECONDARY_ENGINE;
 
   // Do not report an error if:
   //  (a) Current DDL is setting the secondary engine, OR
@@ -12486,8 +12491,10 @@ bool Sql_cmd_secondary_load_unload::mysql_secondary_load_or_unload(
   }
 
   handlerton *hton = table_list->table->s->db_type();
-  assert(hton->flags & HTON_SUPPORTS_ATOMIC_DDL &&
-         hton->flags & HTON_SUPPORTS_SECONDARY_ENGINE &&
+  /* The change of the secondary_load flag is a transaction of the data
+     dictionary.  The engine of the table does not have to support atomic
+     DDL for it (WARP does not), it only has to have post_ddl. */
+  assert(hton->flags & HTON_SUPPORTS_SECONDARY_ENGINE &&
          hton->post_ddl != nullptr);
 
   // cache table name locally for future use
