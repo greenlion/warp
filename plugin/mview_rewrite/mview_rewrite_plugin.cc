@@ -64,6 +64,7 @@
 #include "sql/replication.h"
 #include "sql/sql_base.h"
 #include "sql/sql_class.h"
+#include "sql/tztime.h"  // Time_zone
 #include "sql/sql_error.h"
 #include "sql/sql_lex.h"
 #include "sql/system_variables.h"
@@ -180,6 +181,7 @@ bool analyse_view(THD *thd, const Mview_def &def,
   view->epoch = def.epoch;
   view->refresh_mode = def.refresh_mode;
   view->is_aggregate = def.is_aggregate;
+  view->time_zone_dependent = def.time_zone_dependent;
   for (const Mview_table &t : def.tables) {
     if (t.null_supplying) {
       *why = "outer joins";
@@ -590,6 +592,15 @@ int notify(MYSQL_THD thd, mysql_event_class_t event_class,
   options.sync_current = session_is_applied(thd, &position);
   if (trace && !position.empty()) push_note(thd, "positions: " + position);
   options.use_manual = THDVAR(thd, use_manual_views);
+  {
+    /* UTC, or an offset of zero.  A named time zone of the time zone
+       tables is not taken for UTC, whatever its name is. */
+    const Time_zone *tz = thd->time_zone();
+    options.session_utc =
+        tz == my_tz_UTC || tz->get_timezone_type() == Time_zone::TZ_UTC ||
+        (tz->get_timezone_type() == Time_zone::TZ_OFFSET &&
+         tz->get_timezone_offset() == 0);
+  }
   options.use_foreign_keys = THDVAR(thd, use_foreign_keys);
   options.use_filter_tree = THDVAR(thd, use_filter_tree);
   options.partial = THDVAR(thd, partial);

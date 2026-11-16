@@ -1464,6 +1464,11 @@ bool rewrite_statement(THD *thd, const Registry &registry,
       st.note(view, "REFRESH MANUAL (see mview_rewrite_use_manual_views)");
       continue;
     }
+    if (view.time_zone_dependent && !options.session_utc) {
+      st.note(view, "it has TIMESTAMP values, which are computed in UTC, and "
+                    "the time zone of the session is not UTC");
+      continue;
+    }
     if (view.is_aggregate && !q.aggregated() && !q.distinct) {
       st.note(view, "an aggregate view for a query without aggregation");
       continue;

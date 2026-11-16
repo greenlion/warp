@@ -1,0 +1,58 @@
+--echo #
+--echo # MVIEW_REWRITE and the time zone of the session.  The rows of a
+--echo # materialized view are computed in UTC.  A view that reads a TIMESTAMP
+--echo # column (which is compared, grouped and converted as the date and time
+--echo # of the time zone of the session) is only used for the queries of
+--echo # sessions of UTC; a view without one is used by every session.
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+call mtr.add_suppression("WARP_MVIEW");
+
+--let $q_check = suite/warp/include/mview_rewrite_check.inc
+CREATE TABLE ev (id INT PRIMARY KEY, kind INT NOT NULL, ts TIMESTAMP NOT NULL,
+  d DATETIME NOT NULL, amount INT NOT NULL) ENGINE=InnoDB;
+SET SESSION time_zone = '+00:00';
+INSERT INTO ev VALUES (1, 1, '2025-12-25 20:00:00', '2025-12-25 20:00:00', 10),
+  (2, 1, '2025-12-25 23:30:00', '2025-12-25 23:30:00', 20),
+  (3, 2, '2025-12-26 01:00:00', '2025-12-26 01:00:00', 30),
+  (4, 2, '2025-12-26 05:00:00', '2025-12-26 05:00:00', 40);
+SET SESSION time_zone = '-07:00';
+CREATE MATERIALIZED VIEW by_hour AS
+  SELECT kind, HOUR(ts) AS h, COUNT(*) AS n, SUM(amount) AS total FROM ev GROUP BY kind, HOUR(ts);
+CREATE MATERIALIZED VIEW by_kind AS
+  SELECT kind, HOUR(d) AS h, COUNT(*) AS n, SUM(amount) AS total FROM ev GROUP BY kind, HOUR(d);
+
+--echo # a session of UTC: both views are used
+SET SESSION time_zone = '+00:00';
+--let $mvr_query = SELECT kind, HOUR(d), SUM(amount) FROM ev GROUP BY kind, HOUR(d)
+--source suite/warp/include/mview_rewrite_wait.inc
+--source $q_check
+--let $mvr_query = SELECT kind, HOUR(ts), SUM(amount) FROM ev GROUP BY kind, HOUR(ts)
+--source suite/warp/include/mview_rewrite_wait.inc
+--source $q_check
+
+--echo # a session of another time zone: the hours of the TIMESTAMP are other
+--echo # hours, the view with them is not used
+SET SESSION time_zone = '-07:00';
+--let $mvr_query = SELECT kind, HOUR(ts), SUM(amount) FROM ev GROUP BY kind, HOUR(ts)
+--source $q_check
+SET SESSION mview_rewrite_trace = ON;
+--disable_result_log
+SELECT kind, HOUR(ts), SUM(amount) FROM ev GROUP BY kind, HOUR(ts);
+--enable_result_log
+--replace_regex /positions: .*/positions: (binary log positions)/
+SHOW WARNINGS;
+SET SESSION mview_rewrite_trace = OFF;
+--echo # the view without a TIMESTAMP is
+--let $mvr_query = SELECT kind, HOUR(d), SUM(amount) FROM ev GROUP BY kind, HOUR(d)
+--source $q_check
+SET SESSION time_zone = DEFAULT;
+--let $mvr_query = SELECT kind, HOUR(ts), SUM(amount) FROM ev GROUP BY kind, HOUR(ts)
+--source $q_check
+--let $mvr_query = SELECT kind, HOUR(d), SUM(amount) FROM ev GROUP BY kind, HOUR(d)
+--source $q_check
+
+DROP MATERIALIZED VIEW by_hour;
+DROP MATERIALIZED VIEW by_kind;
+DROP TABLE ev;

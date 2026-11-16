@@ -247,6 +247,8 @@ std::string mview_def_to_json(const Mview_def &def,
   put(&w, "where", def.where_sql);
   w.Key("aggregate");
   w.Bool(def.is_aggregate);
+  w.Key("time_zone_dependent");
+  w.Bool(def.time_zone_dependent);
   if (!def.is_aggregate) {
     put(&w, "detail_columns", def.detail_columns);
     put(&w, "detail_select", def.detail_select);
@@ -325,6 +327,9 @@ bool mview_def_from_dd(const char *db, const dd::Abstract_table &table,
   }
   def->epoch = epoch->value.GetUint64();
   def->root = root->value.GetUint();
+  /* not in the metadata of the views of earlier versions */
+  def->time_zone_dependent = false;
+  (void)get(doc, "time_zone_dependent", &def->time_zone_dependent);
   def->refresh_mode = refresh == "SYNCHRONOUS" ? Mview_refresh_mode::SYNCHRONOUS
                                                : Mview_refresh_mode::MANUAL;
   for (const auto &t : tables->value.GetArray()) {

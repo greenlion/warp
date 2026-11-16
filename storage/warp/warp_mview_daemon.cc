@@ -1229,6 +1229,12 @@ void Daemon::setup_session() {
       /* each server maintains its own views from its own binary log */
       {"SET SESSION sql_log_bin = 0", true},
       {"SET SESSION sql_mode = ''", true},
+      /* The rows of the views are computed in UTC, as the statement that
+         fills a view computes them (Internal_session in sql_mview.cc).  A
+         TIMESTAMP of the binary log is written as FROM_UNIXTIME(seconds),
+         the date and time of the time zone of the session: in a time zone
+         with daylight saving time two points in time have the same one. */
+      {"SET SESSION time_zone = '+00:00'", true},
       {"SET SESSION transaction_isolation = 'READ-COMMITTED'", true},
       {"SET SESSION autocommit = 0", true},
       {"SET SESSION lock_wait_timeout = " + timeout, true},

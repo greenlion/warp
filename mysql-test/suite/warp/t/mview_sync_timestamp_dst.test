@@ -1,0 +1,94 @@
+--echo #
+--echo # SYNCHRONOUS materialized views with TIMESTAMP columns.  A TIMESTAMP is a
+--echo # point in time: the daemon must write the points that the base tables
+--echo # have, whatever the time zones of the sessions that wrote them, and of
+--echo # the server (MET here, which has daylight saving time: 2023-10-29 02:30
+--echo # is two points in time, 00:30 and 01:30 UTC).
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+call mtr.add_suppression("WARP_MVIEW");
+SELECT @@global.time_zone;
+
+CREATE TABLE e (id INT PRIMARY KEY, ts TIMESTAMP(6) NULL, v INT) ENGINE=InnoDB;
+--echo # the TIMESTAMP is the key that the daemon finds the rows by
+CREATE TABLE k (ts TIMESTAMP NOT NULL PRIMARY KEY, v INT) ENGINE=InnoDB;
+--echo # no key: every column is part of the row key
+CREATE TABLE nk (ts TIMESTAMP(3) NULL, v INT) ENGINE=InnoDB;
+
+SET SESSION time_zone = '+00:00';
+INSERT INTO e VALUES (1, '2023-10-29 00:30:00.000001', 1), (2, '2023-10-29 01:30:00.000001', 2), (3, NULL, 3);
+INSERT INTO k VALUES ('2023-10-29 00:30:00', 10), ('2023-10-29 01:30:00', 20), ('2024-06-15 10:30:45', 30);
+INSERT INTO nk VALUES ('2023-10-29 00:30:00.123', 100), ('2023-10-29 01:30:00.123', 200), (NULL, 300);
+
+--let $sel_e = SELECT id, ts, v FROM e
+--let $sel_k = SELECT ts, v FROM k
+--let $sel_nk = SELECT ts, v FROM nk
+--let $sel_join = SELECT e.id, e.ts AS ets, k.ts AS kts, k.v FROM e JOIN k ON k.ts = CAST(e.ts AS DATETIME(0))
+--let $sel_agg = SELECT ts, COUNT(*) AS n, SUM(v) AS s FROM nk GROUP BY ts
+
+--disable_query_log
+eval CREATE MATERIALIZED VIEW v_e ENGINE=InnoDB AS $sel_e;
+eval CREATE MATERIALIZED VIEW v_k ENGINE=InnoDB AS $sel_k;
+eval CREATE MATERIALIZED VIEW v_nk ENGINE=InnoDB AS $sel_nk;
+eval CREATE MATERIALIZED VIEW v_agg ENGINE=InnoDB AS $sel_agg;
+eval CREATE MATERIALIZED VIEW v_e_warp ENGINE=WARP AS $sel_e;
+--enable_query_log
+
+--let $check = suite/warp/include/mview_sync_timestamp_check.inc
+--source $check
+
+--echo # written by sessions of other time zones
+SET SESSION time_zone = '-07:00';
+INSERT INTO e VALUES (4, '2025-12-25 23:59:59.5', 4);
+INSERT INTO k VALUES ('2025-12-25 23:59:59', 40);
+INSERT INTO nk VALUES ('2025-12-25 23:59:59.999', 400), ('2025-12-25 23:59:59.999', 400);
+SET SESSION time_zone = DEFAULT;
+INSERT INTO e VALUES (5, '2025-12-25 23:59:59.5', 5), (6, '2024-03-31 03:30:00', 6);
+INSERT INTO k VALUES ('2025-12-25 23:59:59', 50);
+INSERT INTO nk VALUES ('2025-12-25 23:59:59.999', 500);
+--source $check
+
+--echo # the two points in time that are 02:30 in the time zone of the server:
+--echo # a change of one of them is a change of that one
+SET SESSION time_zone = '+00:00';
+UPDATE k SET v = 21 WHERE ts = '2023-10-29 01:30:00';
+UPDATE nk SET v = 101 WHERE ts = '2023-10-29 00:30:00.123';
+UPDATE e SET ts = '2023-10-29 01:30:00.5' WHERE id = 1;
+--source $check
+UPDATE k SET ts = '2023-10-29 01:45:00' WHERE ts = '2023-10-29 00:30:00';
+UPDATE nk SET ts = '2023-10-29 00:30:00.123' WHERE v = 200;
+--source $check
+DELETE FROM k WHERE ts = '2023-10-29 01:30:00';
+DELETE FROM nk WHERE ts = '2023-10-29 00:30:00.123' AND v = 101;
+DELETE FROM e WHERE id = 2;
+--source $check
+
+--echo # an expression that depends on the time zone has the value of UTC, when
+--echo # the view is filled and when it is maintained, whatever the time zone
+--echo # of the session that creates the view or writes the rows
+SET SESSION time_zone = '-07:00';
+--let $sel_hour = SELECT id, HOUR(ts) AS h, CAST(ts AS DATETIME(6)) AS d, ts >= '2025-12-26 00:00:00' AS later FROM e
+--disable_query_log
+eval CREATE MATERIALIZED VIEW v_hour ENGINE=InnoDB AS $sel_hour;
+--enable_query_log
+INSERT INTO e VALUES (7, '2025-12-25 20:00:00', 7);
+SET SESSION time_zone = '+00:00';
+--let $mview = v_hour
+--let $mview_select = $sel_hour
+--source suite/warp/include/mview_sync_check.inc
+SELECT * FROM v_hour ORDER BY id;
+REFRESH MATERIALIZED VIEW v_hour;
+--source suite/warp/include/mview_sync_check.inc
+DROP MATERIALIZED VIEW v_hour;
+
+SELECT ts, UNIX_TIMESTAMP(ts) AS seconds, v FROM v_k ORDER BY seconds;
+SELECT ts, UNIX_TIMESTAMP(ts) AS seconds, v FROM v_nk ORDER BY seconds, v;
+SELECT id, ts, UNIX_TIMESTAMP(ts) AS seconds, v FROM v_e_warp ORDER BY id;
+
+DROP MATERIALIZED VIEW v_e;
+DROP MATERIALIZED VIEW v_k;
+DROP MATERIALIZED VIEW v_nk;
+DROP MATERIALIZED VIEW v_agg;
+DROP MATERIALIZED VIEW v_e_warp;
+DROP TABLE e, k, nk;

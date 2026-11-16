@@ -1,0 +1,54 @@
+#
+# MVIEW_REWRITE and the time zone of the session.  The rows of a
+# materialized view are computed in UTC.  A view that reads a TIMESTAMP
+# column (which is compared, grouped and converted as the date and time
+# of the time zone of the session) is only used for the queries of
+# sessions of UTC; a view without one is used by every session.
+#
+call mtr.add_suppression("WARP_MVIEW");
+CREATE TABLE ev (id INT PRIMARY KEY, kind INT NOT NULL, ts TIMESTAMP NOT NULL,
+d DATETIME NOT NULL, amount INT NOT NULL) ENGINE=InnoDB;
+SET SESSION time_zone = '+00:00';
+INSERT INTO ev VALUES (1, 1, '2025-12-25 20:00:00', '2025-12-25 20:00:00', 10),
+(2, 1, '2025-12-25 23:30:00', '2025-12-25 23:30:00', 20),
+(3, 2, '2025-12-26 01:00:00', '2025-12-26 01:00:00', 30),
+(4, 2, '2025-12-26 05:00:00', '2025-12-26 05:00:00', 40);
+SET SESSION time_zone = '-07:00';
+CREATE MATERIALIZED VIEW by_hour AS
+SELECT kind, HOUR(ts) AS h, COUNT(*) AS n, SUM(amount) AS total FROM ev GROUP BY kind, HOUR(ts);
+CREATE MATERIALIZED VIEW by_kind AS
+SELECT kind, HOUR(d) AS h, COUNT(*) AS n, SUM(amount) AS total FROM ev GROUP BY kind, HOUR(d);
+# a session of UTC: both views are used
+SET SESSION time_zone = '+00:00';
+SELECT kind, HOUR(d), SUM(amount) FROM ev GROUP BY kind, HOUR(d);
+# rewritten
+SELECT `by_kind`.`mv$g0` AS `kind`, `by_kind`.`mv$g1` AS `HOUR(d)`, `by_kind`.`mv$s1` AS `SUM(amount)` FROM `test`.`by_kind` `by_kind`
+SELECT kind, HOUR(ts), SUM(amount) FROM ev GROUP BY kind, HOUR(ts);
+# rewritten
+SELECT `by_hour`.`mv$g0` AS `kind`, `by_hour`.`mv$g1` AS `HOUR(ts)`, `by_hour`.`mv$s1` AS `SUM(amount)` FROM `test`.`by_hour` `by_hour`
+# a session of another time zone: the hours of the TIMESTAMP are other
+# hours, the view with them is not used
+SET SESSION time_zone = '-07:00';
+SELECT kind, HOUR(ts), SUM(amount) FROM ev GROUP BY kind, HOUR(ts);
+# not rewritten
+SET SESSION mview_rewrite_trace = ON;
+SELECT kind, HOUR(ts), SUM(amount) FROM ev GROUP BY kind, HOUR(ts);
+SHOW WARNINGS;
+Level	Code	Message
+Note	1105	mview_rewrite: positions: (binary log positions)
+Note	1105	mview_rewrite: view `test`.`by_hour`: it has TIMESTAMP values, which are computed in UTC, and the time zone of the session is not UTC
+Note	1105	mview_rewrite: view `test`.`by_kind`: a GROUP BY expression of the query is not computed from the groups of the view
+SET SESSION mview_rewrite_trace = OFF;
+# the view without a TIMESTAMP is
+SELECT kind, HOUR(d), SUM(amount) FROM ev GROUP BY kind, HOUR(d);
+# rewritten
+SELECT `by_kind`.`mv$g0` AS `kind`, `by_kind`.`mv$g1` AS `HOUR(d)`, `by_kind`.`mv$s1` AS `SUM(amount)` FROM `test`.`by_kind` `by_kind`
+SET SESSION time_zone = DEFAULT;
+SELECT kind, HOUR(ts), SUM(amount) FROM ev GROUP BY kind, HOUR(ts);
+# not rewritten
+SELECT kind, HOUR(d), SUM(amount) FROM ev GROUP BY kind, HOUR(d);
+# rewritten
+SELECT `by_kind`.`mv$g0` AS `kind`, `by_kind`.`mv$g1` AS `HOUR(d)`, `by_kind`.`mv$s1` AS `SUM(amount)` FROM `test`.`by_kind` `by_kind`
+DROP MATERIALIZED VIEW by_hour;
+DROP MATERIALIZED VIEW by_kind;
+DROP TABLE ev;

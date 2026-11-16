@@ -49,6 +49,7 @@
 #include "sql/auth/auth_common.h"
 #include "sql/auth/sql_security_ctx.h"
 #include "sql/binlog.h"
+#include "sql/tztime.h"  // my_tz_UTC
 #include "sql/binlog_index.h"
 #include "sql/dd/cache/dictionary_client.h"
 #include "sql/dd/dd_schema.h"
@@ -223,6 +224,7 @@ class Internal_session {
         m_require_pk(thd->variables.sql_require_primary_key),
         m_generate_pk(thd->variables.sql_generate_invisible_primary_key),
         m_select_limit(thd->variables.select_limit),
+        m_time_zone(thd->variables.time_zone),
         m_commit_in_middle(thd->is_commit_in_middle_of_statement),
         m_owned_gtid(thd->owned_gtid),
         m_owned_tsid(thd->owned_tsid),
@@ -240,6 +242,15 @@ class Internal_session {
     thd->variables.sql_require_primary_key = false;
     thd->variables.sql_generate_invisible_primary_key = false;
     thd->variables.select_limit = HA_POS_ERROR;
+    /*
+      The rows of a view are computed in UTC, by the statement that fills
+      it and by the WARP_MVIEW daemon that maintains it: a TIMESTAMP is
+      compared, grouped and converted as the date and time of the time zone
+      of the session, and only in a time zone without daylight saving time
+      is every date and time one point in time (in MET, 2023-10-29 02:30
+      is two).  See Mview_def::time_zone_dependent.
+    */
+    thd->variables.time_zone = my_tz_UTC;
     thd->is_commit_in_middle_of_statement = true;
     /*
       The GTID of the statement (the one a replica applies it with) is not
@@ -257,6 +268,7 @@ class Internal_session {
     m_thd->variables.gtid_next = m_gtid_next;
     m_thd->is_commit_in_middle_of_statement = m_commit_in_middle;
     m_thd->variables.select_limit = m_select_limit;
+    m_thd->variables.time_zone = m_time_zone;
     m_thd->variables.sql_generate_invisible_primary_key = m_generate_pk;
     m_thd->variables.sql_require_primary_key = m_require_pk;
     m_thd->variables.character_set_client = m_cs_client;
@@ -360,6 +372,7 @@ class Internal_session {
   bool m_require_pk;
   bool m_generate_pk;
   ha_rows m_select_limit;
+  Time_zone *m_time_zone;
   bool m_commit_in_middle;
   Gtid m_owned_gtid;
   mysql::gtid::Tsid m_owned_tsid;
@@ -481,6 +494,8 @@ bool unsupported_table(const Table_ref *tr, const char *why) {
 struct Mview_analysis {
   bool has_aggregates{false};
   bool is_aggregate{false};
+  /// A TIMESTAMP column or expression: see Mview_def::time_zone_dependent.
+  bool time_zone_dependent{false};
   /// The expressions the view is grouped by: GROUP BY, or the select list
   /// of SELECT DISTINCT.
   std::vector<Item *> group_items;
@@ -610,6 +625,9 @@ bool check_expression(Item *root, Mview_analysis *analysis) {
   if (root == nullptr) return false;
   std::string what;
   WalkItem(root, enum_walk::PREFIX, [&](Item *item) -> bool {
+    if (item->data_type() == MYSQL_TYPE_TIMESTAMP ||
+        item->data_type() == MYSQL_TYPE_TIMESTAMP2)
+      analysis->time_zone_dependent = true;
     switch (item->type()) {
       case Item::SUBQUERY_ITEM:
         what = "subqueries";
@@ -1661,6 +1679,8 @@ THD *make_populate_session(const void *stack_base, ulong lock_wait_timeout) {
   thd->real_id = my_thread_self();
   thd->set_time();
   thd->variables.lock_wait_timeout = lock_wait_timeout;
+  /* as the session of the statement, see Internal_session */
+  thd->variables.time_zone = my_tz_UTC;
   Global_THD_manager::get_instance()->add_thd(thd);
   return thd;
 }
@@ -1906,6 +1926,7 @@ bool analyse_definition(THD *thd, Table_ref *view, bool warp, Mview_def *def,
   {
     Mview_analysis analysis;
     if (check_resolved_query(qb, &analysis)) goto end;
+    def->time_zone_dependent = analysis.time_zone_dependent;
     /* Print the way the internal statements are parsed: sql_mode=''. */
     const sql_mode_t saved_sql_mode = thd->variables.sql_mode;
     thd->variables.sql_mode = 0;
