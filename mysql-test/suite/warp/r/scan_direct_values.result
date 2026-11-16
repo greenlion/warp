@@ -1,0 +1,313 @@
+SET time_zone = '+00:00';
+DROP TABLE IF EXISTS t_w, t_i;
+CREATE TABLE t_i (
+id INT NOT NULL PRIMARY KEY,
+c_tiny TINYINT, c_utiny TINYINT UNSIGNED, c_small SMALLINT, c_med MEDIUMINT,
+c_int INT, c_uint INT UNSIGNED, c_big BIGINT, c_ubig BIGINT UNSIGNED,
+c_dec DECIMAL(7,2), c_dec_nn DECIMAL(7,2) NOT NULL, c_bigdec DECIMAL(38,10),
+c_dec0 DECIMAL(10,0), c_udec DECIMAL(12,4) UNSIGNED,
+c_float FLOAT, c_double DOUBLE,
+c_char CHAR(10), c_varchar VARCHAR(100), c_varchar_nn VARCHAR(20) NOT NULL,
+c_utf8 VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_cs,
+c_bin BINARY(4), c_varbin VARBINARY(20), c_text TEXT, c_blob BLOB,
+c_enum ENUM('a','b','c'), c_set SET('x','y','z'),
+c_date DATE, c_time TIME, c_datetime DATETIME(3), c_ts TIMESTAMP NULL, c_year YEAR,
+c_bit BIT(12), c_json JSON
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+Warnings:
+Warning	1681	UNSIGNED for decimal and floating point data types is deprecated and support for it will be removed in a future release.
+INSERT INTO t_i VALUES
+(1, -128, 255, -32768, -8388608, -2147483648, 4294967295, -9223372036854775807, 18446744073709551615,
+-99999.99, 0.00, -1234567890123456789012345678.0123456789, -9999999999, 99999999.9999,
+1.5, -2.25, 'abc', 'hello world', '', 'żółw ß 日本',
+x'00010203', x'00ff00ff', 'text value', x'000102ff',
+'a', 'x,z', '2001-08-04', '-12:34:56', '2001-08-04 01:02:03.456', '2001-08-04 01:02:03', 2001,
+b'101010101010', '{"a": [1, 2, {"b": null}]}'),
+(2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+NULL, 12345.67, NULL, NULL, NULL,
+NULL, NULL, NULL, NULL, 'not null', NULL,
+NULL, NULL, NULL, NULL,
+NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+NULL, NULL),
+(3, 127, 0, 32767, 8388607, 2147483647, 0, 9223372036854775807, 0,
+99999.99, -0.01, 1234567890123456789012345678.9999999999, 9999999999, 0.0001,
+0, 0, '', '', 'x', '',
+x'61620000', x'', '', x'',
+'c', '', '1000-01-01', '838:59:59', '9999-12-31 23:59:59.999', '2038-01-19 03:14:07', 1901,
+b'0', '[]'),
+(4, 0, 1, 0, 0, 0, 1, 0, 1,
+0.00, 0.10, 0.0000000001, 0, 0,
+3.25, 1e100, 'trail  ', ' lead and trail ', '0.50', 'a''b"c\\d',
+x'20202020', x'2c27225c', 'a,b\n"c"', x'2c0a0d00',
+'b', 'x,y,z', '2024-02-29', '00:00:00', '1970-01-01 00:00:01.000', '1970-01-01 00:00:01', 2155,
+b'111111111111', '"string"'),
+(5, 5, 5, 5, 5, 5, 5, 5, 5,
+5.50, 5.05, 5.5, 5, 5.5,
+5.5, 5.5, NULL, 'five', 'five', NULL,
+NULL, x'05', NULL, x'05',
+NULL, 'y', NULL, '05:05:05', NULL, '2005-05-05 05:05:05', NULL,
+NULL, '{"five": 5}');
+CREATE TABLE t_w LIKE t_i;
+Warnings:
+Warning	1681	UNSIGNED for decimal and floating point data types is deprecated and support for it will be removed in a future release.
+ALTER TABLE t_w ENGINE=WARP;
+INSERT INTO t_w SELECT * FROM t_i;
+# table scan
+SELECT id, c_tiny, c_utiny, c_small, c_med, c_int, c_uint, c_big, c_ubig, c_dec, c_dec_nn, c_bigdec, c_dec0, c_udec, c_float, c_double, c_char, c_varchar, c_varchar_nn, c_utf8, HEX(c_bin), HEX(c_varbin), c_text, HEX(c_blob), c_enum, c_set, c_date, c_time, c_datetime, c_ts, c_year, HEX(c_bit), c_json FROM t_w ORDER BY id;
+id	1
+c_tiny	-128
+c_utiny	255
+c_small	-32768
+c_med	-8388608
+c_int	-2147483648
+c_uint	4294967295
+c_big	-9223372036854775807
+c_ubig	18446744073709551615
+c_dec	-99999.99
+c_dec_nn	0.00
+c_bigdec	-1234567890123456789012345678.0123456789
+c_dec0	-9999999999
+c_udec	99999999.9999
+c_float	1.5
+c_double	-2.25
+c_char	abc
+c_varchar	hello world
+c_varchar_nn	
+c_utf8	żółw ß 日本
+HEX(c_bin)	00010203
+HEX(c_varbin)	00FF00FF
+c_text	text value
+HEX(c_blob)	000102FF
+c_enum	a
+c_set	x,z
+c_date	2001-08-04
+c_time	-12:34:56
+c_datetime	2001-08-04 01:02:03.456
+c_ts	2001-08-04 01:02:03
+c_year	2001
+HEX(c_bit)	AAA
+c_json	{"a": [1, 2, {"b": null}]}
+id	2
+c_tiny	NULL
+c_utiny	NULL
+c_small	NULL
+c_med	NULL
+c_int	NULL
+c_uint	NULL
+c_big	NULL
+c_ubig	NULL
+c_dec	NULL
+c_dec_nn	12345.67
+c_bigdec	NULL
+c_dec0	NULL
+c_udec	NULL
+c_float	NULL
+c_double	NULL
+c_char	NULL
+c_varchar	NULL
+c_varchar_nn	not null
+c_utf8	NULL
+HEX(c_bin)	NULL
+HEX(c_varbin)	NULL
+c_text	NULL
+HEX(c_blob)	NULL
+c_enum	NULL
+c_set	NULL
+c_date	NULL
+c_time	NULL
+c_datetime	NULL
+c_ts	NULL
+c_year	NULL
+HEX(c_bit)	NULL
+c_json	NULL
+id	3
+c_tiny	127
+c_utiny	0
+c_small	32767
+c_med	8388607
+c_int	2147483647
+c_uint	0
+c_big	9223372036854775807
+c_ubig	0
+c_dec	99999.99
+c_dec_nn	-0.01
+c_bigdec	1234567890123456789012345678.9999999999
+c_dec0	9999999999
+c_udec	0.0001
+c_float	0
+c_double	0
+c_char	
+c_varchar	
+c_varchar_nn	x
+c_utf8	
+HEX(c_bin)	61620000
+HEX(c_varbin)	
+c_text	
+HEX(c_blob)	
+c_enum	c
+c_set	
+c_date	1000-01-01
+c_time	838:59:59
+c_datetime	9999-12-31 23:59:59.999
+c_ts	2038-01-19 03:14:07
+c_year	1901
+HEX(c_bit)	0
+c_json	[]
+id	4
+c_tiny	0
+c_utiny	1
+c_small	0
+c_med	0
+c_int	0
+c_uint	1
+c_big	0
+c_ubig	1
+c_dec	0.00
+c_dec_nn	0.10
+c_bigdec	0.0000000001
+c_dec0	0
+c_udec	0.0000
+c_float	3.25
+c_double	1e100
+c_char	trail
+c_varchar	 lead and trail 
+c_varchar_nn	0.50
+c_utf8	a'b"c\d
+HEX(c_bin)	20202020
+HEX(c_varbin)	2C27225C
+c_text	a,b
+"c"
+HEX(c_blob)	2C0A0D00
+c_enum	b
+c_set	x,y,z
+c_date	2024-02-29
+c_time	00:00:00
+c_datetime	1970-01-01 00:00:01.000
+c_ts	1970-01-01 00:00:01
+c_year	2155
+HEX(c_bit)	FFF
+c_json	"string"
+id	5
+c_tiny	5
+c_utiny	5
+c_small	5
+c_med	5
+c_int	5
+c_uint	5
+c_big	5
+c_ubig	5
+c_dec	5.50
+c_dec_nn	5.05
+c_bigdec	5.5000000000
+c_dec0	5
+c_udec	5.5000
+c_float	5.5
+c_double	5.5
+c_char	NULL
+c_varchar	five
+c_varchar_nn	five
+c_utf8	NULL
+HEX(c_bin)	NULL
+HEX(c_varbin)	05
+c_text	NULL
+HEX(c_blob)	05
+c_enum	NULL
+c_set	y
+c_date	NULL
+c_time	05:05:05
+c_datetime	NULL
+c_ts	2005-05-05 05:05:05
+c_year	NULL
+HEX(c_bit)	NULL
+c_json	{"five": 5}
+# the rows are the rows of InnoDB (no rows expected)
+SELECT 'only in WARP', x.* FROM (SELECT id, c_tiny, c_utiny, c_small, c_med, c_int, c_uint, c_big, c_ubig, c_dec, c_dec_nn, c_bigdec, c_dec0, c_udec, c_float, c_double, c_char, c_varchar, c_varchar_nn, c_utf8, HEX(c_bin), HEX(c_varbin), c_text, HEX(c_blob), c_enum, c_set, c_date, c_time, c_datetime, c_ts, c_year, HEX(c_bit), c_json FROM t_w EXCEPT SELECT id, c_tiny, c_utiny, c_small, c_med, c_int, c_uint, c_big, c_ubig, c_dec, c_dec_nn, c_bigdec, c_dec0, c_udec, c_float, c_double, c_char, c_varchar, c_varchar_nn, c_utf8, HEX(c_bin), HEX(c_varbin), c_text, HEX(c_blob), c_enum, c_set, c_date, c_time, c_datetime, c_ts, c_year, HEX(c_bit), c_json FROM t_i) x;
+only in WARP	id	c_tiny	c_utiny	c_small	c_med	c_int	c_uint	c_big	c_ubig	c_dec	c_dec_nn	c_bigdec	c_dec0	c_udec	c_float	c_double	c_char	c_varchar	c_varchar_nn	c_utf8	HEX(c_bin)	HEX(c_varbin)	c_text	HEX(c_blob)	c_enum	c_set	c_date	c_time	c_datetime	c_ts	c_year	HEX(c_bit)	c_json
+SELECT 'only in InnoDB', x.* FROM (SELECT id, c_tiny, c_utiny, c_small, c_med, c_int, c_uint, c_big, c_ubig, c_dec, c_dec_nn, c_bigdec, c_dec0, c_udec, c_float, c_double, c_char, c_varchar, c_varchar_nn, c_utf8, HEX(c_bin), HEX(c_varbin), c_text, HEX(c_blob), c_enum, c_set, c_date, c_time, c_datetime, c_ts, c_year, HEX(c_bit), c_json FROM t_i EXCEPT SELECT id, c_tiny, c_utiny, c_small, c_med, c_int, c_uint, c_big, c_ubig, c_dec, c_dec_nn, c_bigdec, c_dec0, c_udec, c_float, c_double, c_char, c_varchar, c_varchar_nn, c_utf8, HEX(c_bin), HEX(c_varbin), c_text, HEX(c_blob), c_enum, c_set, c_date, c_time, c_datetime, c_ts, c_year, HEX(c_bit), c_json FROM t_w) x;
+only in InnoDB	id	c_tiny	c_utiny	c_small	c_med	c_int	c_uint	c_big	c_ubig	c_dec	c_dec_nn	c_bigdec	c_dec0	c_udec	c_float	c_double	c_char	c_varchar	c_varchar_nn	c_utf8	HEX(c_bin)	HEX(c_varbin)	c_text	HEX(c_blob)	c_enum	c_set	c_date	c_time	c_datetime	c_ts	c_year	HEX(c_bit)	c_json
+# a scan with a condition, a lookup through the primary key, single columns
+SELECT id, c_dec, c_dec_nn, c_varchar FROM t_w WHERE c_int >= 0 ORDER BY id;
+id	c_dec	c_dec_nn	c_varchar
+3	99999.99	-0.01	
+4	0.00	0.10	 lead and trail 
+5	5.50	5.05	five
+SELECT id, c_bigdec, c_enum, c_set FROM t_w WHERE id = 1;
+id	c_bigdec	c_enum	c_set
+1	-1234567890123456789012345678.0123456789	a	x,z
+SELECT id, c_dec FROM t_w WHERE id IN (2, 4) ORDER BY id;
+id	c_dec
+2	NULL
+4	0.00
+SELECT c_dec FROM t_w ORDER BY id;
+c_dec
+-99999.99
+NULL
+99999.99
+0.00
+5.50
+SELECT c_varchar_nn FROM t_w ORDER BY id;
+c_varchar_nn
+
+not null
+x
+0.50
+five
+SELECT SUM(c_dec), SUM(c_dec_nn), SUM(c_bigdec), COUNT(c_dec), COUNT(c_varchar), COUNT(*) FROM t_w;
+SUM(c_dec)	SUM(c_dec_nn)	SUM(c_bigdec)	COUNT(c_dec)	COUNT(c_varchar)	COUNT(*)
+5.50	12350.81	6.4876543211	4	4	5
+# a join with a lookup for every row
+SELECT a.id, b.c_dec, b.c_varchar FROM t_i a JOIN t_w b ON b.id = a.id ORDER BY a.id;
+id	c_dec	c_varchar
+1	-99999.99	hello world
+2	NULL	NULL
+3	99999.99	
+4	0.00	 lead and trail 
+5	5.50	five
+# a derived table that is materialized
+SELECT d.id, d.amount FROM (SELECT id, c_dec AS amount FROM t_w UNION ALL
+SELECT id, c_dec_nn FROM t_w) d ORDER BY d.id, d.amount;
+id	amount
+1	-99999.99
+1	0.00
+2	NULL
+2	12345.67
+3	-0.01
+3	99999.99
+4	0.00
+4	0.10
+5	5.05
+5	5.50
+# rows that are updated and deleted are read by the scan
+UPDATE t_w SET c_dec = c_dec + 1, c_varchar = CONCAT(c_varchar, '!') WHERE id IN (1, 4);
+UPDATE t_w SET c_dec = NULL, c_varchar_nn = 'was five' WHERE id = 5;
+UPDATE t_w SET c_dec = 1.23 WHERE id = 2;
+DELETE FROM t_w WHERE id = 3;
+SELECT id, c_dec, c_dec_nn, c_varchar, c_varchar_nn FROM t_w ORDER BY id;
+id	c_dec	c_dec_nn	c_varchar	c_varchar_nn
+1	-99998.99	0.00	hello world!	
+2	1.23	12345.67	NULL	not null
+4	1.00	0.10	 lead and trail !	0.50
+5	NULL	5.05	five	was five
+# more rows than one partition of the tail, with NULLs
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE t_n (id INT NOT NULL, d DECIMAL(7,2), s VARCHAR(20), dnn DECIMAL(15,3) NOT NULL) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t_n
+WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 50000)
+SELECT n, IF(n % 7 = 0, NULL, (n % 1000) - 500 + (n % 100) / 100),
+IF(n % 5 = 0, NULL, CONCAT('s', n % 13)), n / 8 - 3000 FROM seq;
+SELECT COUNT(*), COUNT(d), SUM(d), MIN(d), MAX(d), COUNT(s), COUNT(DISTINCT s), MIN(s), MAX(s),
+SUM(dnn), MIN(dnn), MAX(dnn) FROM t_n;
+COUNT(*)	COUNT(d)	SUM(d)	MIN(d)	MAX(d)	COUNT(s)	COUNT(DISTINCT s)	MIN(s)	MAX(s)	SUM(dnn)	MIN(dnn)	MAX(dnn)
+50000	42858	-356.71	-500.00	499.99	40000	13	s0	s9	6253125.000	-2999.875	3250.000
+SELECT COUNT(*), SUM(x.d), SUM(x.dnn), COUNT(x.s) FROM (SELECT id, d, s, dnn FROM t_n UNION ALL SELECT id, d, s, dnn FROM t_n) x
+WHERE x.id % 3 = 0;
+COUNT(*)	SUM(x.d)	SUM(x.dnn)	COUNT(x.s)
+33332	428.86	4168583.250	26666
+SELECT id, d, s, dnn FROM t_n WHERE id IN (7, 8, 10, 49999, 50000) ORDER BY id;
+id	d	s	dnn
+7	NULL	s7	-2999.125
+8	-491.92	s8	-2999.000
+10	-489.90	NULL	-2998.750
+49999	499.99	s1	3249.875
+50000	-500.00	NULL	3250.000
+DROP TABLE t_w, t_i, t_n;

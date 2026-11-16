@@ -1212,6 +1212,15 @@ class ha_warp : public handler {
   ibis::table::cursor *pos_cursor = nullptr;   // the cursor that pos_c and pos_n are the positions of
   std::vector<int> pos_c, pos_n;               // by field index: position of c<i>, n<i> (-1: none)
   int pos_r = -1, pos_t = -1;                  // positions of the row id r and the transaction id t
+  /* The arrays of the values of the registered cursor (the columns of an
+     in-memory ibis::bord), by field index; nullptr: read through the cursor.
+     Reading a string through the cursor constructs a std::ostringstream,
+     looks the column up by its name and copies the value, for every value
+     (a DECIMAL is stored as a string). */
+  std::vector<const std::vector<std::string> *> dir_str;       // c<i> of a column of strings (ibis::TEXT)
+  std::vector<const ibis::array_t<unsigned char> *> dir_null;  // n<i>
+  const ibis::array_t<uint64_t> *dir_r = nullptr, *dir_t = nullptr;
+  uint64_t dir_rows = 0;                       // the rows of the table of the cursor
   /* An index lookup of one integer value of the first column of the key:
      the partitions whose values of the column do not contain it are not
      opened (see warp_partition_may_contain) */

@@ -1,0 +1,108 @@
+# The scan reads strings (and DECIMAL, ENUM, SET, which are stored as
+# strings), the NULL markers and the row ids from the arrays of the selected
+# columns instead of through the cursor: every type, NULL and not NULL,
+# must be returned as InnoDB returns it.
+# the smallest TIMESTAMP below is one of UTC
+SET time_zone = '+00:00';
+--disable_warnings
+DROP TABLE IF EXISTS t_w, t_i;
+--enable_warnings
+
+CREATE TABLE t_i (
+  id INT NOT NULL PRIMARY KEY,
+  c_tiny TINYINT, c_utiny TINYINT UNSIGNED, c_small SMALLINT, c_med MEDIUMINT,
+  c_int INT, c_uint INT UNSIGNED, c_big BIGINT, c_ubig BIGINT UNSIGNED,
+  c_dec DECIMAL(7,2), c_dec_nn DECIMAL(7,2) NOT NULL, c_bigdec DECIMAL(38,10),
+  c_dec0 DECIMAL(10,0), c_udec DECIMAL(12,4) UNSIGNED,
+  c_float FLOAT, c_double DOUBLE,
+  c_char CHAR(10), c_varchar VARCHAR(100), c_varchar_nn VARCHAR(20) NOT NULL,
+  c_utf8 VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_cs,
+  c_bin BINARY(4), c_varbin VARBINARY(20), c_text TEXT, c_blob BLOB,
+  c_enum ENUM('a','b','c'), c_set SET('x','y','z'),
+  c_date DATE, c_time TIME, c_datetime DATETIME(3), c_ts TIMESTAMP NULL, c_year YEAR,
+  c_bit BIT(12), c_json JSON
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+INSERT INTO t_i VALUES
+(1, -128, 255, -32768, -8388608, -2147483648, 4294967295, -9223372036854775807, 18446744073709551615,
+ -99999.99, 0.00, -1234567890123456789012345678.0123456789, -9999999999, 99999999.9999,
+ 1.5, -2.25, 'abc', 'hello world', '', 'żółw ß 日本',
+ x'00010203', x'00ff00ff', 'text value', x'000102ff',
+ 'a', 'x,z', '2001-08-04', '-12:34:56', '2001-08-04 01:02:03.456', '2001-08-04 01:02:03', 2001,
+ b'101010101010', '{"a": [1, 2, {"b": null}]}'),
+(2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+ NULL, 12345.67, NULL, NULL, NULL,
+ NULL, NULL, NULL, NULL, 'not null', NULL,
+ NULL, NULL, NULL, NULL,
+ NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+ NULL, NULL),
+(3, 127, 0, 32767, 8388607, 2147483647, 0, 9223372036854775807, 0,
+ 99999.99, -0.01, 1234567890123456789012345678.9999999999, 9999999999, 0.0001,
+ 0, 0, '', '', 'x', '',
+ x'61620000', x'', '', x'',
+ 'c', '', '1000-01-01', '838:59:59', '9999-12-31 23:59:59.999', '2038-01-19 03:14:07', 1901,
+ b'0', '[]'),
+(4, 0, 1, 0, 0, 0, 1, 0, 1,
+ 0.00, 0.10, 0.0000000001, 0, 0,
+ 3.25, 1e100, 'trail  ', ' lead and trail ', '0.50', 'a''b"c\\d',
+ x'20202020', x'2c27225c', 'a,b\n"c"', x'2c0a0d00',
+ 'b', 'x,y,z', '2024-02-29', '00:00:00', '1970-01-01 00:00:01.000', '1970-01-01 00:00:01', 2155,
+ b'111111111111', '"string"'),
+(5, 5, 5, 5, 5, 5, 5, 5, 5,
+ 5.50, 5.05, 5.5, 5, 5.5,
+ 5.5, 5.5, NULL, 'five', 'five', NULL,
+ NULL, x'05', NULL, x'05',
+ NULL, 'y', NULL, '05:05:05', NULL, '2005-05-05 05:05:05', NULL,
+ NULL, '{"five": 5}');
+
+CREATE TABLE t_w LIKE t_i;
+ALTER TABLE t_w ENGINE=WARP;
+INSERT INTO t_w SELECT * FROM t_i;
+
+let $cols= id, c_tiny, c_utiny, c_small, c_med, c_int, c_uint, c_big, c_ubig, c_dec, c_dec_nn, c_bigdec, c_dec0, c_udec, c_float, c_double, c_char, c_varchar, c_varchar_nn, c_utf8, HEX(c_bin), HEX(c_varbin), c_text, HEX(c_blob), c_enum, c_set, c_date, c_time, c_datetime, c_ts, c_year, HEX(c_bit), c_json;
+
+--echo # table scan
+--vertical_results
+eval SELECT $cols FROM t_w ORDER BY id;
+--horizontal_results
+
+--echo # the rows are the rows of InnoDB (no rows expected)
+eval SELECT 'only in WARP', x.* FROM (SELECT $cols FROM t_w EXCEPT SELECT $cols FROM t_i) x;
+eval SELECT 'only in InnoDB', x.* FROM (SELECT $cols FROM t_i EXCEPT SELECT $cols FROM t_w) x;
+
+--echo # a scan with a condition, a lookup through the primary key, single columns
+SELECT id, c_dec, c_dec_nn, c_varchar FROM t_w WHERE c_int >= 0 ORDER BY id;
+SELECT id, c_bigdec, c_enum, c_set FROM t_w WHERE id = 1;
+SELECT id, c_dec FROM t_w WHERE id IN (2, 4) ORDER BY id;
+SELECT c_dec FROM t_w ORDER BY id;
+SELECT c_varchar_nn FROM t_w ORDER BY id;
+SELECT SUM(c_dec), SUM(c_dec_nn), SUM(c_bigdec), COUNT(c_dec), COUNT(c_varchar), COUNT(*) FROM t_w;
+
+--echo # a join with a lookup for every row
+SELECT a.id, b.c_dec, b.c_varchar FROM t_i a JOIN t_w b ON b.id = a.id ORDER BY a.id;
+
+--echo # a derived table that is materialized
+SELECT d.id, d.amount FROM (SELECT id, c_dec AS amount FROM t_w UNION ALL
+                            SELECT id, c_dec_nn FROM t_w) d ORDER BY d.id, d.amount;
+
+--echo # rows that are updated and deleted are read by the scan
+UPDATE t_w SET c_dec = c_dec + 1, c_varchar = CONCAT(c_varchar, '!') WHERE id IN (1, 4);
+UPDATE t_w SET c_dec = NULL, c_varchar_nn = 'was five' WHERE id = 5;
+UPDATE t_w SET c_dec = 1.23 WHERE id = 2;
+DELETE FROM t_w WHERE id = 3;
+SELECT id, c_dec, c_dec_nn, c_varchar, c_varchar_nn FROM t_w ORDER BY id;
+
+--echo # more rows than one partition of the tail, with NULLs
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE t_n (id INT NOT NULL, d DECIMAL(7,2), s VARCHAR(20), dnn DECIMAL(15,3) NOT NULL) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO t_n
+WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 50000)
+SELECT n, IF(n % 7 = 0, NULL, (n % 1000) - 500 + (n % 100) / 100),
+       IF(n % 5 = 0, NULL, CONCAT('s', n % 13)), n / 8 - 3000 FROM seq;
+SELECT COUNT(*), COUNT(d), SUM(d), MIN(d), MAX(d), COUNT(s), COUNT(DISTINCT s), MIN(s), MAX(s),
+       SUM(dnn), MIN(dnn), MAX(dnn) FROM t_n;
+SELECT COUNT(*), SUM(x.d), SUM(x.dnn), COUNT(x.s) FROM (SELECT id, d, s, dnn FROM t_n UNION ALL SELECT id, d, s, dnn FROM t_n) x
+ WHERE x.id % 3 = 0;
+SELECT id, d, s, dnn FROM t_n WHERE id IN (7, 8, 10, 49999, 50000) ORDER BY id;
+
+DROP TABLE t_w, t_i, t_n;

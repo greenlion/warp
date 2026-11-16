@@ -935,12 +935,18 @@ void ha_warp::register_cursor(ibis::table::cursor *cursor, ibis::table *rows) {
   pos_c.clear();
   pos_n.clear();
   pos_r = pos_t = -1;
+  dir_str.clear();
+  dir_null.clear();
+  dir_r = dir_t = nullptr;
+  dir_rows = 0;
   if(cursor == nullptr || rows == nullptr) {
     return;
   }
   const ibis::table::stringArray names = rows->columnNames();
   pos_c.assign(table->s->fields, -1);
   pos_n.assign(table->s->fields, -1);
+  dir_str.assign(table->s->fields, nullptr);
+  dir_null.assign(table->s->fields, nullptr);
   for(size_t i = 0; i < names.size(); ++i) {
     const char *name = names[i];
     if((name[0] == 'r' || name[0] == 't') && name[1] == 0) {
@@ -958,11 +964,65 @@ void ha_warp::register_cursor(ibis::table::cursor *cursor, ibis::table *rows) {
     (name[0] == 'c' ? pos_c : pos_n)[idx] = (int)i;
   }
   pos_cursor = cursor;
+
+  /* The table of a selection is an in-memory table (ibis::bord) whose
+     columns are arrays: the strings, the NULL markers and the row and
+     transaction ids are read from the arrays, at the row of the cursor.
+     The cursor of a bord reads the same arrays (bord::cursor::cursor), but
+     its getColumnAsString() constructs a std::ostringstream, looks a TEXT
+     column up by its name and copies the string for every value.  A column
+     that is not what is expected here is read through the cursor. */
+  const ibis::bord *mem = dynamic_cast<const ibis::bord *>(rows);
+  if(mem == nullptr || dynamic_cast<const ibis::bord::cursor *>(cursor) == nullptr ||
+     mem->nColumns() != names.size()) {
+    return;
+  }
+  dir_rows = mem->nRows();
+  auto column_at = [&](int pos) -> const ibis::bord::column * {
+    if(pos < 0 || (size_t)pos >= names.size()) return nullptr;
+    const ibis::bord::column *col =
+        dynamic_cast<const ibis::bord::column *>(mem->getColumn((uint32_t)pos));
+    if(col == nullptr || col->name() == nullptr || col->getArray() == nullptr ||
+       strcasecmp(col->name(), names[pos]) != 0) {
+      return nullptr;
+    }
+    return col;
+  };
+  for(size_t idx = 0; idx < pos_c.size(); ++idx) {
+    const ibis::bord::column *col = column_at(pos_c[idx]);
+    if(col != nullptr && col->type() == ibis::TEXT) {
+      const std::vector<std::string> *values =
+          static_cast<const std::vector<std::string> *>(col->getArray());
+      if(values->size() >= dir_rows) dir_str[idx] = values;
+    }
+    col = column_at(pos_n[idx]);
+    if(col != nullptr && (col->type() == ibis::UBYTE || col->type() == ibis::BYTE)) {
+      const ibis::array_t<unsigned char> *values =
+          static_cast<const ibis::array_t<unsigned char> *>(col->getArray());
+      if(values->size() >= dir_rows) dir_null[idx] = values;
+    }
+  }
+  for(int which = 0; which < 2; ++which) {
+    const ibis::bord::column *col = column_at(which == 0 ? pos_r : pos_t);
+    if(col != nullptr && col->type() == ibis::ULONG) {
+      const ibis::array_t<uint64_t> *values =
+          static_cast<const ibis::array_t<uint64_t> *>(col->getArray());
+      if(values->size() >= dir_rows) (which == 0 ? dir_r : dir_t) = values;
+    }
+  }
 }
 
 /* the row id and the transaction id of the row of the cursor, by position
    when the cursor is registered */
 void ha_warp::read_row_ids(ibis::table::cursor *cursor, uint64_t &rowid, uint64_t &trx_id) {
+  if(cursor == pos_cursor && dir_r != nullptr && dir_t != nullptr) {
+    const uint64_t row = cursor->getCurrentRowNumber();
+    if(row < dir_rows) {
+      rowid = (*dir_r)[row];
+      trx_id = (*dir_t)[row];
+      return;
+    }
+  }
   if(cursor == pos_cursor && pos_r >= 0) {
     cursor->getColumnAsULong((uint32_t)pos_r, rowid);
   } else {
@@ -1000,6 +1060,12 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
   /* Read all columns when a table is opened for update */
   
 
+  /* the row of the cursor in the arrays of its table (see register_cursor);
+     a row outside of them is read (and refused) through the cursor */
+  const bool registered = cursor == pos_cursor;
+  const uint64_t direct_row = registered && dir_rows > 0 ? cursor->getCurrentRowNumber() : 0;
+  const bool direct = registered && direct_row < dir_rows;
+
   for (Field **field = table->field; *field; field++) {
     buffer.length(0);
     if(decode_only != nullptr ? bitmap_is_set(decode_only, (*field)->field_index()) :
@@ -1010,7 +1076,10 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
          register_cursor), looking a column up by its name costs more than
          the rest of the row */
       const uint32_t idx = (*field)->field_index();
-      const bool by_position = cursor == pos_cursor && idx < pos_c.size() && pos_c[idx] >= 0;
+      const bool by_position = registered && idx < pos_c.size() && pos_c[idx] >= 0;
+      /* the strings of the column, when they are read from their array */
+      const std::vector<std::string> *direct_strings =
+          (direct && idx < dir_str.size()) ? dir_str[idx] : nullptr;
       std::string cname, nname;
       if(!by_position) {
         cname = "c" + std::to_string(idx);
@@ -1020,8 +1089,12 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
       if((*field)->is_nullable()) {
         unsigned char is_null = 0;
 
-        rc = (by_position && pos_n[idx] >= 0) ? cursor->getColumnAsUByte((uint32_t)pos_n[idx], is_null)
-                                              : cursor->getColumnAsUByte(((nname.empty() ? (nname = "n" + std::to_string(idx)) : nname)).c_str(), is_null);
+        if(direct && idx < dir_null.size() && dir_null[idx] != nullptr) {
+          is_null = (*dir_null[idx])[direct_row];
+        } else {
+          rc = (by_position && pos_n[idx] >= 0) ? cursor->getColumnAsUByte((uint32_t)pos_n[idx], is_null)
+                                                : cursor->getColumnAsUByte(((nname.empty() ? (nname = "n" + std::to_string(idx)) : nname)).c_str(), is_null);
+        }
 
         /* This column value is NULL */
         if(is_null != 0) {
@@ -1090,13 +1163,20 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
         case MYSQL_TYPE_LONG_BLOB:
         case MYSQL_TYPE_JSON: {
           std::string tmp;
-          rc = WARP_GET(getColumnAsString, tmp);
-          if(warp_is_binary_string(*field)) {
-            std::string encoded;
-            encoded.swap(tmp);
-            warp_decode_binary(encoded, tmp);
+          const std::string *value = &tmp;
+          if(direct_strings != nullptr) {
+            value = &(*direct_strings)[direct_row];
+            rc = 0;
+          } else {
+            rc = WARP_GET(getColumnAsString, tmp);
           }
-          if((*field)->store(tmp.c_str(), tmp.length(), (*field)->charset(),
+          if(warp_is_binary_string(*field)) {
+            std::string decoded;
+            warp_decode_binary(*value, decoded);
+            tmp.swap(decoded);
+            value = &tmp;
+          }
+          if((*field)->store(value->c_str(), value->length(), (*field)->charset(),
                               CHECK_FIELD_WARN)) {
             rc = HA_ERR_CRASHED_ON_USAGE;
             goto err;
@@ -1191,8 +1271,14 @@ int ha_warp::find_current_row_impl(uchar *buf, ibis::table::cursor *cursor) {
         case MYSQL_TYPE_SET:
         case MYSQL_TYPE_GEOMETRY: {
           std::string tmp;
-          rc = WARP_GET(getColumnAsString, tmp);
-          if((*field)->store(tmp.c_str(), tmp.length(), (*field)->charset(),
+          const std::string *value = &tmp;
+          if(direct_strings != nullptr) {
+            value = &(*direct_strings)[direct_row];
+            rc = 0;
+          } else {
+            rc = WARP_GET(getColumnAsString, tmp);
+          }
+          if((*field)->store(value->c_str(), value->length(), (*field)->charset(),
                               CHECK_FIELD_WARN)) {
             rc = HA_ERR_CRASHED_ON_USAGE;
             goto err;
@@ -3317,6 +3403,10 @@ int ha_warp::rnd_init(bool) {
     filtered_table = pushdown_info->filtered_table;
     if(filtered_table != NULL && pushdown_info->cursor != NULL) {
       cursor = pushdown_info->cursor;
+      /* the cursor was made by another scan: its columns are registered
+         for this one (a cursor that is not registered must not be taken
+         for a registered one that was deleted at the same address) */
+      register_cursor(cursor, filtered_table);
     } else {
       if(filtered_table != NULL) {
         cursor = filtered_table->createCursor();
