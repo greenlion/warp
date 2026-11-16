@@ -1,0 +1,69 @@
+--disable_query_log
+eval INSTALL PLUGIN rapid SONAME 'ha_rapid.so';
+--enable_query_log
+
+--echo #
+--echo # A WARP table with the secondary engine RAPID: SECONDARY_ENGINE at CREATE
+--echo # and with ALTER TABLE (which does not copy the table), SECONDARY_LOAD,
+--echo # queries in the secondary engine, changes through the binary log,
+--echo # SECONDARY_UNLOAD.
+--echo #
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE w (id INT PRIMARY KEY, grp INT, name VARCHAR(20), amount DECIMAL(10,2), d DATE)
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO w WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 5000)
+  SELECT x, x % 10, CONCAT('n', x), x / 4, DATE_ADD('2024-01-01', INTERVAL x % 300 DAY) FROM seq;
+
+--echo # the attribute is a change of the data dictionary only
+ALTER TABLE w SECONDARY_ENGINE = RAPID, ALGORITHM = INSTANT;
+SHOW CREATE TABLE w;
+ALTER TABLE w SECONDARY_LOAD;
+
+let $q1 = SELECT grp, COUNT(*) AS n, SUM(amount) AS s, MIN(d) AS first_d, MAX(name) AS last_name FROM w GROUP BY grp ORDER BY grp;
+let $q2 = SELECT COUNT(*), SUM(id), SUM(amount) FROM w WHERE d >= '2024-06-01' AND grp IN (1, 3, 5);
+--echo # in the secondary engine
+SET SESSION use_secondary_engine = FORCED;
+--replace_column 10 # 11 #
+eval EXPLAIN $q1;
+eval $q1;
+eval $q2;
+--echo # the same from the WARP table
+SET SESSION use_secondary_engine = OFF;
+eval $q1;
+eval $q2;
+
+--echo # changes of the WARP table come through the binary log
+INSERT INTO w VALUES (6001, 1, 'new', 1000.50, '2025-01-01'), (6002, 3, 'new2', 0.25, '2025-01-02');
+UPDATE w SET amount = amount + 1 WHERE grp = 5;
+DELETE FROM w WHERE id BETWEEN 10 AND 19;
+BEGIN;
+INSERT INTO w VALUES (7001, 1, 'rolled back', 1, '2025-01-01');
+ROLLBACK;
+--sleep 3
+SET SESSION use_secondary_engine = FORCED;
+eval $q1;
+eval $q2;
+SET SESSION use_secondary_engine = OFF;
+eval $q1;
+eval $q2;
+
+--echo # a table that is created with the attribute
+CREATE TABLE w2 (a INT, b VARCHAR(10)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+  SECONDARY_ENGINE = RAPID;
+INSERT INTO w2 VALUES (1, 'x'), (2, 'y'), (NULL, NULL);
+ALTER TABLE w2 SECONDARY_LOAD;
+SET SESSION use_secondary_engine = FORCED;
+SELECT w2.a, w2.b, w.name FROM w2 LEFT JOIN w ON w.id = w2.a ORDER BY w2.a;
+SET SESSION use_secondary_engine = OFF;
+
+--echo # unload, and remove the attribute
+ALTER TABLE w SECONDARY_UNLOAD;
+ALTER TABLE w2 SECONDARY_UNLOAD;
+ALTER TABLE w SECONDARY_ENGINE = NULL;
+SHOW CREATE TABLE w;
+SELECT COUNT(*) FROM w;
+DROP TABLE w, w2;
+
+--disable_query_log
+UNINSTALL PLUGIN rapid;
+--enable_query_log
