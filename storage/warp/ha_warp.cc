@@ -254,7 +254,7 @@ static int show_warp_active_transactions(MYSQL_THD, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
-thread_local bool warp_pj_suspended = false;
+thread_local std::vector<const warp_pj_plan *> warp_pj_running;
 
 /* Warp_semi_key_scans: the scans that were limited to the keys of another
    table (see ha_warp::semi_key_condition) */
@@ -3210,6 +3210,7 @@ static bool warp_partition_may_contain(const std::string &dir, const std::string
 
 int ha_warp::rnd_init(bool) {
   DBUG_ENTER("ha_warp::rnd_init");
+  const bool warp_pj_suspended = pj_suspended();
   if(star_agg && !warp_pj_suspended) {
     /* the query is aggregated by the engine, the rows are the groups */
     DBUG_RETURN(star_agg_run() ? HA_ERR_INTERNAL_ERROR : 0);
@@ -3704,6 +3705,7 @@ void ha_warp::wait_for_join_threads() {
    escape into the server, which would terminate it. */
 int ha_warp::rnd_next(uchar *buf) {
   DBUG_ENTER("ha_warp::rnd_next");
+  const bool warp_pj_suspended = !warp_pj_running.empty() && pj_suspended();
   if(par_agg && !warp_pj_suspended) {
     DBUG_RETURN(pa_next(buf));
   }
@@ -6907,8 +6909,11 @@ bool ha_warp::semi_keys_of(const std::shared_ptr<warp_semi_in> &candidate, std::
   }
   /* the rows of the join of the engine are being read (the subquery of a semi
      of that join is read): the rows of the table are not limited to the keys
-     of a join that is not made (the subquery reads the rows of the table) */
-  if(warp_pj_suspended) {
+     of a join that is not made (the subquery reads the rows of the table).
+     The keys of a join of the subquery itself are known when that join is
+     made, as they are outside a subquery. */
+  if(!warp_pj_running.empty() &&
+     (warp_pj_table_is_running(table) || warp_pj_table_is_running(candidate->outer_table))) {
     return false;
   }
   /* the other table is the probe table of a join that the engine makes: the
