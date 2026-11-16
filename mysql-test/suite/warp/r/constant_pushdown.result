@@ -62,12 +62,12 @@ INSERT INTO preds VALUES
 # the conditions with a constant that is an expression are not left to MySQL
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE d BETWEEN 0.06 - 0.01 AND 0.06 + 0.01 AND i < 12 * 2;
 EXPLAIN
--> Aggregate: count(0)  (cost=44.6 rows=1)
-    -> Table scan on t_w  (cost=41.2 rows=14.9)
+-> Aggregate: count(0)  (cost=44.4 rows=1)
+    -> Table scan on t_w  (cost=41 rows=14.8)
 
 EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM t_w WHERE i IN (5, -5);
 EXPLAIN
--> Aggregate: count(0)  (cost=59.7 rows=1)
-    -> Table scan on t_w  (cost=41.2 rows=80.4)
+-> Aggregate: count(0)  (cost=59.4 rows=1)
+    -> Table scan on t_w  (cost=41 rows=80)
 
 DROP TABLE t_w, t_i, preds;

@@ -406,8 +406,10 @@ static MYSQL_THDVAR_STR(partition_filter, PLUGIN_VAR_RQCMDARG|PLUGIN_VAR_MEMALLO
                           nullptr, nullptr, "");
 
 static MYSQL_THDVAR_BOOL(adjust_table_stats_for_joins, PLUGIN_VAR_NOCMDARG,
-                          "Sets the largest table in a query to have a row count of 2.  Can cause problems with some MySQL subquery optimizations.",
-                          nullptr, nullptr, true);
+                          "Gives the optimizer the number of rows of the smallest table of the query plus 2 as the "
+                          "number of rows of the largest one, so that it is read first.  The estimates of the joins "
+                          "are then wrong, which gives bad plans for queries with subqueries and derived tables.",
+                          nullptr, nullptr, false);
 
 static MYSQL_THDVAR_BOOL(star_aggregation, PLUGIN_VAR_NOCMDARG,
                           "Evaluate star schema queries that join one fact table to dimension tables and "
