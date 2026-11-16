@@ -1,0 +1,98 @@
+--echo #
+--echo # A lookup through an index is a scan with the condition of the key.  A
+--echo # statement that makes many lookups of whole keys reads the rows of the
+--echo # table once and answers the lookups that follow from memory
+--echo # (warp_lookup_cache_size, Warp_lookup_caches).
+--echo #
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE d (id INT PRIMARY KEY, grp INT, d DATE, name VARCHAR(20), KEY (grp), KEY (d))
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO d WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000)
+  SELECT x, x % 10, DATE_ADD('2020-01-01', INTERVAL x % 50 DAY), CONCAT('n', x) FROM seq;
+CREATE TABLE n (id INT, grp INT NULL, KEY (grp)) ENGINE=WARP;
+INSERT INTO n VALUES (1, 1), (2, NULL), (3, 1), (4, NULL), (5, 3);
+CREATE TABLE f (k INT, g INT, d DATE, v INT);
+INSERT INTO f WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 5000)
+  SELECT (x * 7) % 1200, IF(x % 13 = 0, NULL, x % 12), DATE_ADD('2019-12-25', INTERVAL x % 60 DAY), x FROM seq;
+ANALYZE TABLE f;
+
+let $caches = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_lookup_caches', Value, 1);
+
+--echo # the primary key: one row for a key, none for the keys above 1000 and for 0
+let $q1 = SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.grp), MIN(d.name), MAX(d.name)
+  FROM f JOIN d ON d.id = f.k;
+--replace_regex /cost=[0-9.e+-]+ rows=[0-9.e+-]+/cost=# rows=#/
+--eval EXPLAIN FORMAT=TREE $q1
+--eval $q1
+--echo # a key that is not unique: all the rows of the key
+let $q2 = SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.id), MIN(d.name), MAX(d.name)
+  FROM f JOIN d FORCE INDEX (grp) ON d.grp = f.g;
+--eval $q2
+--echo # a key of dates, and the condition of the statement on the table
+let $q3 = SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.id)
+  FROM f JOIN d FORCE INDEX (d) ON d.d = f.d WHERE d.grp IN (2, 3) AND f.v < 2000;
+--eval $q3
+--echo # an outer join: the rows without a key and with a key that is NULL
+let $q4 = SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), COUNT(d.id), SUM(d.id)
+  FROM f LEFT JOIN d FORCE INDEX (grp) ON d.grp = f.g;
+--eval $q4
+--echo # NULL is equal to NULL for <=>: these lookups are not answered by the cache
+let $q5 = SELECT /*+ JOIN_ORDER(f, n) NO_BNL(n) NO_HASH_JOIN(n) */ COUNT(*), SUM(n.id)
+  FROM f JOIN n FORCE INDEX (grp) ON n.grp <=> f.g;
+--eval $q5
+--echo # a subquery that is run for every row
+let $q6 = SELECT COUNT(*), SUM((SELECT d.grp FROM d WHERE d.id = f.k)) FROM f;
+--eval $q6
+
+let $caches2 = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_lookup_caches', Value, 1);
+--disable_query_log
+--eval SELECT $caches2 - $caches >= 4 AS lookups_were_cached
+--enable_query_log
+
+--echo # the same results without the cache
+SET SESSION warp_lookup_cache_size = 0;
+--eval $q1
+--eval $q2
+--eval $q3
+--eval $q4
+--eval $q5
+--eval $q6
+let $caches3 = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_lookup_caches', Value, 1);
+--disable_query_log
+--eval SELECT $caches3 - $caches2 AS caches_made_when_disabled
+--enable_query_log
+
+--echo # rows that do not fit are not cached
+SET SESSION warp_lookup_cache_size = 1000;
+--eval $q1
+let $caches4 = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_lookup_caches', Value, 1);
+--disable_query_log
+--eval SELECT $caches4 - $caches3 AS caches_made_when_too_small
+--enable_query_log
+SET SESSION warp_lookup_cache_size = DEFAULT;
+
+--echo # the cache is of one statement: the next one sees the changes
+UPDATE d SET grp = grp + 100 WHERE id <= 500;
+DELETE FROM d WHERE id BETWEEN 501 AND 600;
+INSERT INTO d VALUES (1100, 5, '2020-01-05', 'new');
+--eval $q1
+--eval $q2
+--echo # in a transaction, with the rows that it wrote
+BEGIN;
+INSERT INTO d VALUES (1150, 7, '2020-01-07', 'trx');
+--eval $q1
+ROLLBACK;
+--eval $q1
+
+--echo # a statement that locks the rows that it reads makes the lookups
+BEGIN;
+let $caches5 = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_lookup_caches', Value, 1);
+SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*) FROM (SELECT k FROM f WHERE v <= 20) f JOIN d ON d.id = f.k FOR UPDATE;
+let $caches6 = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_lookup_caches', Value, 1);
+--disable_query_log
+--eval SELECT $caches6 - $caches5 AS caches_made_for_update
+--enable_query_log
+COMMIT;
+
+DROP TABLE d, n, f;

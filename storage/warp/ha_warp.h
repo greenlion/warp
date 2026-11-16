@@ -441,6 +441,13 @@ static MYSQL_THDVAR_ULONG(index_cost_factor, PLUGIN_VAR_RQCMDARG,
                           "a hash join would be faster.",
                           nullptr, nullptr, 2, 1, 1000000, 0);
 
+static MYSQL_THDVAR_ULONGLONG(lookup_cache_size, PLUGIN_VAR_RQCMDARG,
+                          "A lookup through an index of WARP is a scan with a condition made from the key.  A "
+                          "statement that makes many lookups of single keys in a table (a join with a lookup "
+                          "for every row of another table) reads the rows of the table once and keeps them in "
+                          "memory, by key, when they fit in this many bytes.  0 disables it.",
+                          nullptr, nullptr, 268435456ULL, 0, ULLONG_MAX, 0);
+
 static MYSQL_THDVAR_BOOL(parallel_aggregation, PLUGIN_VAR_NOCMDARG,
                           "Aggregate the rows of one WARP table (SUM, AVG, COUNT, MIN, MAX, COUNT(DISTINCT) with a "
                           "GROUP BY) inside the engine, in parallel by partition",
@@ -510,6 +517,7 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(semi_key_pushdown),
   MYSQL_SYSVAR(scan_rows_per_cost),
   MYSQL_SYSVAR(index_cost_factor),
+  MYSQL_SYSVAR(lookup_cache_size),
   MYSQL_SYSVAR(parallel_join_min_rows),
   MYSQL_SYSVAR(max_degree_of_parallelism),
   MYSQL_SYSVAR(parallel_min_rows),
@@ -1237,6 +1245,43 @@ class ha_warp : public handler {
   bool index_scan_mode = false;
   void maintain_indexes(const char* datadir);
 
+  /* The rows of the table by key, for the lookups of a statement that makes
+     many of them: every lookup is a scan of its own otherwise.  The rows are
+     the ones of a scan with the condition of the statement, read once (see
+     lookup_cache_build).  The cache is of one statement, one index and one
+     set of columns. */
+  struct warp_lookup_cache {
+    bool built = false;
+    bool disabled = false;        // the rows do not fit, or the scan failed
+    uint index = MAX_KEY;
+    std::string base_where;
+    uint64_t lookups = 0;         // lookups of the statement that could have used it
+    std::vector<bool> columns;    // the columns that the rows have
+    size_t row_size = 0;          // the row id and the record
+    std::vector<uchar> rows;
+    std::unordered_map<std::string, std::vector<uint32_t>> keys;
+    const std::vector<uint32_t> *hit = nullptr;   // the rows of the last lookup
+    size_t hit_pos = 0;
+    void clear() {
+      built = false;
+      disabled = false;
+      index = MAX_KEY;
+      base_where.clear();
+      lookups = 0;
+      columns.clear();
+      row_size = 0;
+      std::vector<uchar>().swap(rows);
+      std::unordered_map<std::string, std::vector<uint32_t>>().swap(keys);
+      hit = nullptr;
+      hit_pos = 0;
+    }
+  };
+  warp_lookup_cache lookup_cache;
+  bool lookup_cache_usable(const uchar *key, key_part_map keypart_map,
+                           enum ha_rkey_function find_flag);
+  bool lookup_cache_build(uchar *buf);
+  int lookup_cache_next(uchar *buf, int not_found);
+
   /* Look ahead: while the connection thread returns the rows of one
      partition, the next partitions are opened and selected (read and
      decompressed) by threads of the statement's thread budget.  Nothing
@@ -1657,6 +1702,7 @@ class ha_warp : public handler {
     pj_follower.reset();
     pj_follower_pending = false;
     clear_lookup_parts();
+    lookup_cache.clear();
     return 0;
   }
   int delete_all_rows(void);
