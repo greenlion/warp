@@ -40,7 +40,7 @@ EXPLAIN
         -> Table scan on f
 
 Warnings:
-Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,`test`.`d2`.`g2` AS `g2`,sum(0) AS `SUM(a)`,sum(0) AS `SUM(c - a)` from `test`.`f` join `test`.`d1` join `test`.`d2` where ((`test`.`f`.`k1` = `test`.`d1`.`k`) and (`test`.`d2`.`k` = `test`.`f`.`k2`) and (`test`.`d1`.`n1` < 3)) group by `test`.`d1`.`g1`,`test`.`d2`.`g2`
+Note	1003	/* select#1 */ select `test`.`d1`.`g1` AS `g1`,`test`.`d2`.`g2` AS `g2`,sum(0) AS `SUM(a)`,sum(0) AS `SUM(c - a)` from `test`.`f` join `test`.`d1` join `test`.`d2` where ((`test`.`f`.`k1` = `test`.`d1`.`k`) and (`test`.`f`.`k2` = `test`.`d2`.`k`) and (`test`.`d1`.`n1` < 3)) group by `test`.`d1`.`g1`,`test`.`d2`.`g2`
 one dimension, one group column: 6 rows
 no group by, conditions on both tables: 1 rows
 two dimensions, two groups, two sums, constants: 33 rows
