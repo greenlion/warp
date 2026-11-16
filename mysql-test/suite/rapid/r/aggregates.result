@@ -25,7 +25,7 @@ SUM(amount)
 # Test AVG
 SELECT AVG(amount) FROM t1;
 AVG(amount)
-185.4
+185.400000
 # Test MIN/MAX
 SELECT MIN(amount), MAX(amount) FROM t1;
 MIN(amount)	MAX(amount)

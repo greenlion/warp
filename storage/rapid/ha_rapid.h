@@ -120,58 +120,6 @@ class ha_rapid : public handler {
 */
 LEX_CSTRING lex_to_sql_string(LEX *lex);
 
-/**
-  Reconstruct SQL from LEX AST with DuckDB-compatible table name transformation.
-  
-  @param lex The LEX object containing the parsed AST
-  @return The reconstructed SQL query as a std::string, or empty string if invalid
-*/
-std::string lex_to_duckdb_sql(LEX *lex);
-
-/**
-  Transform table references from SCHEMA.TABLE to SCHEMA_TABLE format.
-  
-  @param sql The original SQL string
-  @return The transformed SQL string with DuckDB-compatible table names
-*/
-std::string transform_table_references(const std::string& sql);
-
-/**
-  Transform table references from SCHEMA.TABLE to SCHEMA_TABLE format and add implicit aliases.
-  
-  @param sql The original SQL string
-  @param table_aliases Map from full table names to their aliases
-  @return The transformed SQL string with DuckDB-compatible table names and implicit aliases
-*/
-std::string transform_table_references_with_aliases(const std::string& sql, 
-                                                  const std::map<std::string, std::string>& table_aliases);
-
-/**
-  Collect table aliases from the LEX AST.
-  
-  @param lex The LEX object containing the parsed AST
-  @return A map from full table names to their aliases
-*/
-std::map<std::string, std::string> collect_table_aliases(LEX *lex);
-
-/**
-  Replace full table names with aliases in SELECT clauses.
-  
-  @param sql The SQL string
-  @param table_aliases Map from full table names to aliases
-  @return The SQL string with table names replaced by aliases in SELECT clauses
-*/
-std::string replace_table_names_with_aliases(const std::string& sql, 
-                                           const std::map<std::string, std::string>& table_aliases);
-
-/**
-  Strip backticks from SELECT clauses for DuckDB compatibility.
-  
-  @param sql The SQL string
-  @return The SQL string with backticks removed from SELECT clauses
-*/
-std::string strip_backticks_from_select(const std::string& sql);
-
 }  // namespace rapid
 
 #endif  // PLUGIN_SECONDARY_ENGINE_RAPID_HA_RAPID_H_

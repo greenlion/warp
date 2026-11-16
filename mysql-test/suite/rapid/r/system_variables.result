@@ -7,6 +7,7 @@ Variable_name	Value
 rapid_batch_size	1000
 rapid_binlog_enabled	ON
 rapid_database_file	:memory:
+rapid_trace_sql	OFF
 # Test rapid_binlog_enabled (dynamic)
 SET GLOBAL rapid_binlog_enabled = 0;
 SHOW VARIABLES LIKE 'rapid_binlog_enabled';

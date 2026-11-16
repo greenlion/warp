@@ -1,0 +1,102 @@
+--disable_query_log
+eval INSTALL PLUGIN rapid SONAME 'ha_rapid.so';
+--enable_query_log
+
+--echo #
+--echo # The statement that RAPID gives DuckDB is written from the resolved
+--echo # query (storage/rapid/rapid_sql.cc).  Every query gives the rows that
+--echo # the tables give.
+--echo #
+CREATE TABLE c (id INT PRIMARY KEY, name VARCHAR(20), region INT, since DATE) SECONDARY_ENGINE RAPID;
+CREATE TABLE o (id INT PRIMARY KEY, c_id INT, amount DECIMAL(10,2), qty INT, p_id INT, d DATE) SECONDARY_ENGINE RAPID;
+CREATE TABLE p (id INT PRIMARY KEY, label VARCHAR(20), price DECIMAL(7,2)) SECONDARY_ENGINE RAPID;
+INSERT INTO c VALUES (1, 'ann', 1, '2020-01-15'), (2, 'bob', 1, '2021-06-30'), (3, 'cy', 2, '2022-12-31'),
+  (4, 'dee', NULL, NULL), (5, 'eve', 2, '2020-02-29');
+INSERT INTO o VALUES (10, 1, 15.50, 1, 100, '2024-01-10'), (11, 1, 250.00, 3, 101, '2024-02-20'),
+  (12, 2, 99.99, 2, NULL, '2024-02-21'), (13, NULL, 5.00, 7, 100, '2024-03-01'), (14, 9, 7.25, 1, 102, NULL),
+  (15, 3, 40.00, 4, 101, '2024-03-15'), (16, 3, 60.00, 6, 100, '2024-01-31'), (17, 5, 0.00, 0, 103, '2024-04-01');
+INSERT INTO p VALUES (100, 'nut', 0.10), (101, 'bolt', 0.25), (103, 'gear', 12.00);
+ALTER TABLE c SECONDARY_LOAD;
+ALTER TABLE o SECONDARY_LOAD;
+ALTER TABLE p SECONDARY_LOAD;
+
+CREATE TABLE queries (i INT PRIMARY KEY, q TEXT);
+INSERT INTO queries VALUES
+ (1, 'SELECT c.id FROM c WHERE c.id IN (SELECT o.c_id FROM o WHERE o.amount > 50)'),
+ (2, 'SELECT c.id FROM c WHERE c.id NOT IN (SELECT p.id - 99 FROM p)'),
+ (3, 'SELECT c.id FROM c WHERE EXISTS (SELECT 1 FROM o WHERE o.c_id = c.id AND o.qty > 2)'),
+ (4, 'SELECT c.id FROM c WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.c_id = c.id)'),
+ (5, 'SELECT c.id FROM c WHERE c.id IN (SELECT o.c_id FROM o JOIN p ON p.id = o.p_id WHERE p.price < 1) AND EXISTS (SELECT 1 FROM p WHERE p.price > 10)'),
+ (6, 'SELECT o.id, (SELECT c.name FROM c WHERE c.id = o.c_id) AS who FROM o'),
+ (7, 'SELECT c.id, c.name FROM c WHERE (SELECT SUM(o.amount) FROM o WHERE o.c_id = c.id) > 50'),
+ (8, 'SELECT o.c_id, SUM(o.amount) AS total FROM o GROUP BY o.c_id HAVING SUM(o.amount) > (SELECT AVG(amount) FROM o)'),
+ (9, 'WITH t AS (SELECT c_id, SUM(amount) AS total, COUNT(*) AS n FROM o GROUP BY c_id) SELECT a.c_id, a.total, b.n FROM t a JOIN t b ON b.c_id = a.c_id WHERE a.total > 20'),
+ (10, 'SELECT id, name FROM c WHERE region = 1 UNION SELECT id, label FROM p UNION ALL SELECT id, name FROM c WHERE id < 3'),
+ (11, 'SELECT id FROM c INTERSECT SELECT c_id FROM o'),
+ (12, 'SELECT id FROM c EXCEPT SELECT c_id FROM o'),
+ (13, 'SELECT c.region, o.p_id, SUM(o.amount) AS s, COUNT(*) AS n, GROUPING(c.region) AS g FROM c JOIN o ON o.c_id = c.id GROUP BY c.region, o.p_id WITH ROLLUP'),
+ (14, 'SELECT o.id, RANK() OVER (PARTITION BY o.c_id ORDER BY o.amount DESC) AS r, SUM(o.amount) OVER (PARTITION BY o.c_id) AS t, ROW_NUMBER() OVER (ORDER BY o.id) AS rn FROM o'),
+ (15, 'SELECT c_id, SUM(amount) AS s, RANK() OVER (ORDER BY SUM(amount) DESC) AS r FROM o GROUP BY c_id'),
+ (16, 'SELECT o.id, CASE WHEN o.amount > 100 THEN ''big'' WHEN o.amount > 10 THEN ''mid'' ELSE ''small'' END AS size, CASE o.qty WHEN 1 THEN ''one'' ELSE ''many'' END AS q FROM o'),
+ (17, 'SELECT id, COALESCE(c_id, -1) AS c, IFNULL(p_id, 0) AS p, IF(qty > 2, amount, 0) AS a, NULLIF(qty, 1) AS n FROM o'),
+ (18, 'SELECT id, amount / qty AS unit, amount * 2 AS twice, qty % 3 AS m, -qty AS neg, ROUND(amount / 3, 1) AS r FROM o WHERE qty > 0'),
+ (19, 'SELECT AVG(amount) AS a, AVG(qty) AS q, MIN(d) AS first_d, MAX(d) AS last_d, COUNT(DISTINCT c_id) AS customers, SUM(DISTINCT qty) AS sq FROM o'),
+ (20, 'SELECT id FROM o WHERE d BETWEEN ''2024-02-01'' AND DATE_ADD(''2024-02-01'', INTERVAL 30 DAY)'),
+ (21, 'SELECT id, YEAR(d) AS y, MONTH(d) AS m, d + INTERVAL 1 MONTH AS next_month, CAST(amount AS SIGNED) AS whole FROM o WHERE d IS NOT NULL'),
+ (22, 'SELECT id FROM c WHERE name LIKE ''%e'' OR name IN (''ann'', ''bob'') AND region <> 2'),
+ (23, 'SELECT id FROM o WHERE c_id NOT BETWEEN 2 AND 5 OR c_id IS NULL'),
+ (24, 'SELECT name, UPPER(name) AS u, CONCAT(name, ''-'', region) AS tag, SUBSTR(name, 1, 2) AS pre, CHAR_LENGTH(name) AS len FROM c'),
+ (25, 'SELECT x.region, x.n FROM (SELECT region, COUNT(*) AS n FROM c GROUP BY region) x WHERE x.n > 1'),
+ (26, 'SELECT DISTINCT c.region FROM c JOIN o ON o.c_id = c.id'),
+ (27, 'SELECT c.id, (SELECT COUNT(*) FROM o WHERE o.c_id = c.id) AS orders, (SELECT MAX(o.amount) FROM o WHERE o.c_id = c.id) AS biggest FROM c'),
+ (28, 'SELECT SUBSTR(name, 1, 1) AS initial, COUNT(*) AS n FROM c GROUP BY SUBSTR(name, 1, 1)'),
+ (29, 'SELECT id FROM o WHERE (c_id, p_id) IN (SELECT c_id, p_id FROM o WHERE amount > 20)'),
+ (30, 'SELECT id FROM o WHERE qty = ''3'' OR amount < ''10'''),
+ (31, 'SELECT o.c_id, SUM(o.amount) AS s FROM o WHERE o.c_id IN (SELECT id FROM c WHERE region IN (SELECT region FROM c WHERE id = 1)) GROUP BY o.c_id');
+
+--let $i = 1
+while ($i <= 31)
+{
+  --let $q = `SELECT q FROM queries WHERE i = $i`
+  --echo # query $i: $q
+  --disable_query_log
+  --disable_warnings
+  SET SESSION use_secondary_engine = OFF;
+  eval CREATE TABLE r_primary AS $q;
+  SET SESSION use_secondary_engine = FORCED;
+  eval CREATE TABLE r_secondary AS $q;
+  SET SESSION use_secondary_engine = OFF;
+  --enable_warnings
+  --enable_query_log
+  SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+         (SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+                                (SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+  DROP TABLE r_primary, r_secondary;
+  --inc $i
+}
+
+--echo # NULL is the smallest value of ORDER BY, as in MySQL
+SET SESSION use_secondary_engine = FORCED;
+SELECT id, region FROM c ORDER BY region, id;
+SELECT id, region FROM c ORDER BY region DESC, id LIMIT 3;
+SELECT c_id, SUM(amount) FROM o GROUP BY c_id ORDER BY c_id LIMIT 2 OFFSET 1;
+SELECT id FROM c WHERE region = 1 UNION ALL SELECT id FROM p ORDER BY id DESC LIMIT 4;
+
+--echo # the statement of DuckDB
+SET SESSION rapid_trace_sql = ON;
+SELECT name FROM c WHERE id IN (SELECT c_id FROM o WHERE amount > 200) ORDER BY name;
+SET SESSION rapid_trace_sql = OFF;
+
+--echo # what DuckDB can not be given is an error of the secondary engine
+--error ER_SECONDARY_ENGINE_PLUGIN
+SELECT SOUNDEX(name) FROM c;
+SET SESSION use_secondary_engine = DEFAULT;
+
+ALTER TABLE c SECONDARY_UNLOAD;
+ALTER TABLE o SECONDARY_UNLOAD;
+ALTER TABLE p SECONDARY_UNLOAD;
+DROP TABLE queries, c, o, p;
+
+--disable_query_log
+UNINSTALL PLUGIN rapid;
+--enable_query_log
