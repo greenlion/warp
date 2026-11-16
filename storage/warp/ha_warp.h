@@ -1689,7 +1689,10 @@ class ha_warp : public handler {
   void position(const uchar *record);
   int info(uint);
   int extra(enum ha_extra_function operation);
+  int flush_statement_rows();
   int reset() override {
+    /* end of the statement: the rows it wrote that are still buffered */
+    const int flush_rc = flush_statement_rows();
     dup_row_is_read = false;
     /* end of the statement: what was pushed down for it is not valid for the
        next one */
@@ -1705,7 +1708,7 @@ class ha_warp : public handler {
     pj_follower_pending = false;
     clear_lookup_parts();
     lookup_cache.clear();
-    return 0;
+    return flush_rc;
   }
   int delete_all_rows(void);
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
@@ -1720,6 +1723,8 @@ class ha_warp : public handler {
   warp_trx* create_trx(THD* thd);
   int external_lock(THD *thd, int lock_type);
   int start_stmt(THD *thd, thr_lock_type lock_type);
+  warp_trx* begin_statement(THD* thd, bool write_lock);
+  warp_trx* trx_for_write();
   int register_trx_with_mysql(THD* thd, warp_trx* trx);
   bool is_trx_visible_to_read(uint64_t row_trx_id);
   bool is_row_visible_to_read(uint64_t rowid);

@@ -1,0 +1,533 @@
+#
+# Statements that change a WARP table under LOCK TABLES.
+#
+# Under LOCK TABLES the server calls handler::external_lock for the LOCK
+# TABLES and the UNLOCK TABLES statements only, and handler::start_stmt
+# for every statement in between.  ha_warp::start_stmt did not create
+# the transaction of the connection, did not register it with the
+# server and did not mark it as one that changes data, so
+# (1) the rows that were written under LOCK TABLES were never committed:
+#     they were visible until UNLOCK TABLES and gone after it, and
+# (2) after an implicit commit under LOCK TABLES (ALTER TABLE ... DISABLE
+#     KEYS, as written by mysqldump) there was no transaction at all and
+#     the next INSERT crashed the server in ha_warp::encode_quote.
+# The rows of a statement whose command was not known to change data
+# (REPLACE ... SELECT, a stored function called by a SELECT) were lost
+# in the same way, with and without LOCK TABLES.
+# The rows of a statement that runs in prelocked mode (an INSERT into a
+# table with a trigger, the statements of the trigger or of a stored
+# function) stayed in the write buffer of the handler when the statement
+# ended: the next statement did not read them and they were lost when
+# the table was closed.
+#
+call mtr.add_suppression("MY-015655");
+CREATE TABLE t1 (id INT NOT NULL, v VARCHAR(10)) ENGINE=WARP COLLATE utf8mb4_bin;
+CREATE TABLE t2 (id INT NOT NULL, v VARCHAR(10), PRIMARY KEY (id)) ENGINE=WARP COLLATE utf8mb4_bin;
+CREATE TABLE t3 (id INT NOT NULL, n INT) ENGINE=WARP;
+#
+# 1. the row that is inserted under LOCK TABLES stays after UNLOCK TABLES
+#
+LOCK TABLES t3 WRITE;
+INSERT INTO t3 VALUES (1,1);
+SELECT COUNT(*) FROM t3;
+COUNT(*)
+1
+UNLOCK TABLES;
+# an empty table before, 1 row now
+SELECT COUNT(*) FROM t3;
+COUNT(*)
+1
+DELETE FROM t3;
+INSERT INTO t1 VALUES (1,'x');
+LOCK TABLES t1 WRITE;
+INSERT INTO t1 VALUES (2,'x');
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+2
+UNLOCK TABLES;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+2
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	x
+2	x
+#
+# 2. what mysqldump writes: no crash, the rows are there
+#
+LOCK TABLES `t1` WRITE;
+/*!40000 ALTER TABLE `t1` DISABLE KEYS */;
+Warnings:
+Note	1031	Table storage engine for 't1' doesn't have this option
+INSERT INTO `t1` VALUES (3,'y'),(4,'y');
+INSERT INTO `t1` VALUES (5,'y');
+/*!40000 ALTER TABLE `t1` ENABLE KEYS */;
+Warnings:
+Note	1031	Table storage engine for 't1' doesn't have this option
+UNLOCK TABLES;
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	x
+2	x
+3	y
+4	y
+5	y
+# a read after the implicit commit of the ALTER
+LOCK TABLES t1 WRITE;
+ALTER TABLE t1 DISABLE KEYS;
+Warnings:
+Note	1031	Table storage engine for 't1' doesn't have this option
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+5
+SELECT * FROM t1 WHERE id = 3;
+id	v
+3	y
+ALTER TABLE t1 ENABLE KEYS;
+Warnings:
+Note	1031	Table storage engine for 't1' doesn't have this option
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+5
+UNLOCK TABLES;
+#
+# 3. INSERT, UPDATE, DELETE, REPLACE, INSERT ... SELECT, REPLACE ... SELECT
+#    and LOAD DATA, several tables locked at once
+#
+LOCK TABLES t1 WRITE, t2 WRITE, t3 READ;
+INSERT INTO t2 VALUES (1,'a'),(2,'b'),(3,'c');
+INSERT INTO t2 SELECT id + 10, v FROM t1;
+UPDATE t2 SET v = 'upd' WHERE id IN (2, 13);
+DELETE FROM t2 WHERE id = 3;
+REPLACE INTO t2 VALUES (1,'repl'),(6,'repl');
+REPLACE INTO t2 SELECT id, 'rs' FROM t1 WHERE id <= 2;
+UPDATE t1 SET v = 'z' WHERE id = 1;
+DELETE FROM t1 WHERE id = 5;
+LOAD DATA INFILE 'MYSQLTEST_VARDIR/tmp/warp_lock_tables_dml.txt' INTO TABLE t1 FIELDS TERMINATED BY ',';
+SELECT COUNT(*) FROM t3;
+COUNT(*)
+0
+INSERT INTO t3 VALUES (9,9);
+ERROR HY000: Table 't3' was locked with a READ lock and can't be updated
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	z
+2	x
+3	y
+4	y
+20	load
+21	load
+22	load
+SELECT * FROM t2 ORDER BY id;
+id	v
+1	rs
+2	rs
+6	repl
+11	x
+12	x
+13	upd
+14	y
+15	y
+UNLOCK TABLES;
+SELECT * FROM t1 ORDER BY id;
+id	v
+1	z
+2	x
+3	y
+4	y
+20	load
+21	load
+22	load
+SELECT * FROM t2 ORDER BY id;
+id	v
+1	rs
+2	rs
+6	repl
+11	x
+12	x
+13	upd
+14	y
+15	y
+#
+# 4. READ locks
+#
+LOCK TABLES t1 READ, t2 READ;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+7
+SELECT COUNT(*) FROM t2;
+COUNT(*)
+8
+SELECT t1.id, t2.v FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id;
+id	v
+1	rs
+2	rs
+INSERT INTO t1 VALUES (100,'no');
+ERROR HY000: Table 't1' was locked with a READ lock and can't be updated
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+7
+UNLOCK TABLES;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+7
+#
+# 5. a statement that fails is rolled back alone
+#
+# autocommit: every statement is a transaction
+LOCK TABLES t2 WRITE;
+INSERT INTO t2 VALUES (30,'ok');
+INSERT INTO t2 VALUES (31,'no'),(32,'no'),(1,'dup');
+ERROR 23000: Duplicate entry '1' for key 't2.PRIMARY'
+INSERT INTO t2 VALUES (33,'ok');
+UPDATE t2 SET id = 30 WHERE id = 33;
+ERROR 23000: Duplicate entry '30' for key 't2.PRIMARY'
+SELECT * FROM t2 WHERE id >= 30 ORDER BY id;
+id	v
+30	ok
+33	ok
+UNLOCK TABLES;
+SELECT * FROM t2 WHERE id >= 30 ORDER BY id;
+id	v
+30	ok
+33	ok
+# no autocommit: the statements before it are kept
+SET autocommit = 0;
+LOCK TABLES t2 WRITE;
+INSERT INTO t2 VALUES (40,'ok');
+INSERT INTO t2 VALUES (41,'no'),(42,'no'),(1,'dup');
+ERROR 23000: Duplicate entry '1' for key 't2.PRIMARY'
+INSERT INTO t2 VALUES (43,'ok');
+SELECT * FROM t2 WHERE id >= 40 ORDER BY id;
+id	v
+40	ok
+43	ok
+COMMIT;
+UNLOCK TABLES;
+SET autocommit = 1;
+SELECT * FROM t2 WHERE id >= 40 ORDER BY id;
+id	v
+40	ok
+43	ok
+#
+# 6. COMMIT and ROLLBACK under LOCK TABLES
+#
+# autocommit: ROLLBACK has nothing to roll back
+LOCK TABLES t1 WRITE;
+INSERT INTO t1 VALUES (50,'ac');
+ROLLBACK;
+SELECT * FROM t1 WHERE id >= 50 ORDER BY id;
+id	v
+50	ac
+UNLOCK TABLES;
+SELECT * FROM t1 WHERE id >= 50 ORDER BY id;
+id	v
+50	ac
+SET autocommit = 0;
+LOCK TABLES t1 WRITE, t2 WRITE;
+INSERT INTO t1 VALUES (51,'rb');
+INSERT INTO t2 VALUES (51,'rb');
+UPDATE t1 SET v = 'rb' WHERE id = 50;
+DELETE FROM t2 WHERE id = 40;
+SELECT * FROM t1 WHERE id >= 50 ORDER BY id;
+id	v
+50	rb
+51	rb
+ROLLBACK;
+SELECT * FROM t1 WHERE id >= 50 ORDER BY id;
+id	v
+50	ac
+SELECT * FROM t2 WHERE id IN (40, 51) ORDER BY id;
+id	v
+40	ok
+INSERT INTO t1 VALUES (52,'co');
+INSERT INTO t2 VALUES (52,'co');
+COMMIT;
+INSERT INTO t1 VALUES (53,'rb');
+ROLLBACK;
+INSERT INTO t1 VALUES (54,'unl');
+# UNLOCK TABLES commits
+UNLOCK TABLES;
+ROLLBACK;
+SELECT * FROM t1 WHERE id >= 50 ORDER BY id;
+id	v
+50	ac
+52	co
+54	unl
+SELECT * FROM t2 WHERE id >= 50 ORDER BY id;
+id	v
+52	co
+COMMIT;
+SET autocommit = 1;
+# START TRANSACTION releases the table locks, the transaction goes on
+LOCK TABLES t1 WRITE;
+INSERT INTO t1 VALUES (55,'lk');
+START TRANSACTION;
+INSERT INTO t1 VALUES (56,'rb');
+INSERT INTO t3 VALUES (56,56);
+ROLLBACK;
+START TRANSACTION;
+INSERT INTO t1 VALUES (57,'co');
+COMMIT;
+SELECT * FROM t1 WHERE id >= 55 ORDER BY id;
+id	v
+55	lk
+57	co
+SELECT COUNT(*) FROM t3;
+COUNT(*)
+0
+#
+# 7. another connection sees the rows that are committed only
+#
+SET autocommit = 0;
+LOCK TABLES t3 WRITE;
+INSERT INTO t3 VALUES (60,60);
+COMMIT;
+INSERT INTO t3 VALUES (61,61);
+SELECT * FROM t3 ORDER BY id, n;
+id	n
+60	60
+61	61
+# the table is locked
+SET SESSION lock_wait_timeout = 1;
+SELECT * FROM t3 ORDER BY id, n;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+SET SESSION lock_wait_timeout = DEFAULT;
+# the connection goes away with its locks: row 61 is rolled back
+SELECT * FROM t3 ORDER BY id, n;
+id	n
+60	60
+LOCK TABLES t3 WRITE;
+INSERT INTO t3 VALUES (62,62);
+UPDATE t3 SET n = 0 WHERE id = 60;
+SELECT * FROM t3 ORDER BY id;
+INSERT INTO t3 VALUES (63,63);
+UNLOCK TABLES;
+id	n
+60	0
+62	62
+63	63
+DELETE FROM t3;
+#
+# 8. DDL under LOCK TABLES, and the statements after it
+#
+LOCK TABLES t3 WRITE;
+INSERT INTO t3 VALUES (70,1);
+ALTER TABLE t3 ADD COLUMN c INT;
+INSERT INTO t3 VALUES (71,1,1);
+UPDATE t3 SET c = 7 WHERE id = 70;
+TRUNCATE TABLE t3;
+INSERT INTO t3 VALUES (72,2,2);
+SELECT * FROM t3 ORDER BY id, n;
+id	n	c
+72	2	2
+UNLOCK TABLES;
+SELECT * FROM t3 ORDER BY id, n;
+id	n	c
+72	2	2
+ALTER TABLE t3 DROP COLUMN c;
+DELETE FROM t3;
+#
+# 9. statements that change a table but are not data change commands,
+#    with and without LOCK TABLES
+#
+CREATE FUNCTION f1(x INT) RETURNS INT DETERMINISTIC MODIFIES SQL DATA
+BEGIN
+INSERT INTO t3 VALUES (x, x);
+RETURN x;
+END|
+CREATE PROCEDURE p1(x INT)
+BEGIN
+INSERT INTO t3 VALUES (x, x);
+UPDATE t3 SET n = n + 1 WHERE id = x;
+END|
+CREATE TRIGGER tr1 AFTER INSERT ON t1 FOR EACH ROW INSERT INTO t3 VALUES (NEW.id, -1);
+SELECT f1(80);
+f1(80)
+80
+DO f1(81);
+SET @x = f1(82);
+CALL p1(83);
+INSERT INTO t1 VALUES (84,'trg');
+# the row of the table with the trigger is read by the next statement
+SELECT * FROM t1 WHERE id = 84;
+id	v
+84	trg
+REPLACE INTO t3 SELECT id + 5, 0 FROM t1 WHERE id = 84;
+INSERT INTO t1 VALUES (85,'trg'),(86,'trg');
+INSERT INTO t1 SELECT id + 3, 'trg2' FROM t1 WHERE id IN (85, 86);
+SELECT COUNT(*) FROM t1 WHERE id >= 84;
+COUNT(*)
+5
+SELECT COUNT(*) FROM t3;
+COUNT(*)
+10
+# a statement that fails, and a transaction that is rolled back
+INSERT INTO t2 VALUES (f1(87), 'f'), (1, 'dup');
+ERROR 23000: Duplicate entry '1' for key 't2.PRIMARY'
+START TRANSACTION;
+SELECT f1(87);
+f1(87)
+87
+INSERT INTO t1 VALUES (87,'trg');
+ROLLBACK;
+START TRANSACTION;
+SELECT f1(88);
+f1(88)
+88
+COMMIT;
+# the tables are closed: nothing was left in a buffer
+FLUSH TABLES;
+SELECT * FROM t1 WHERE id >= 84 ORDER BY id;
+id	v
+84	trg
+85	trg
+86	trg
+88	trg2
+89	trg2
+SELECT * FROM t3 ORDER BY id, n;
+id	n
+80	80
+81	81
+82	82
+83	84
+84	-1
+85	-1
+86	-1
+88	-1
+88	88
+89	-1
+89	0
+LOCK TABLES t1 WRITE, t3 WRITE;
+SELECT f1(90);
+f1(90)
+90
+DO f1(91);
+CALL p1(93);
+INSERT INTO t1 VALUES (94,'trg');
+INSERT INTO t1 VALUES (95,'trg'),(96,'trg');
+SELECT * FROM t1 WHERE id >= 94 ORDER BY id;
+id	v
+94	trg
+95	trg
+96	trg
+SELECT * FROM t3 WHERE id >= 90 ORDER BY id, n;
+id	n
+90	90
+91	91
+93	94
+94	-1
+95	-1
+96	-1
+UNLOCK TABLES;
+FLUSH TABLES;
+SELECT * FROM t1 WHERE id >= 84 ORDER BY id;
+id	v
+84	trg
+85	trg
+86	trg
+88	trg2
+89	trg2
+94	trg
+95	trg
+96	trg
+SELECT * FROM t3 ORDER BY id, n;
+id	n
+80	80
+81	81
+82	82
+83	84
+84	-1
+85	-1
+86	-1
+88	-1
+88	88
+89	-1
+89	0
+90	90
+91	91
+93	94
+94	-1
+95	-1
+96	-1
+DROP TRIGGER tr1;
+DROP FUNCTION f1;
+DROP PROCEDURE p1;
+#
+# 10. a dump made by mysqldump with its default options is restored
+#     into another schema
+#
+CREATE DATABASE warp_dump_src;
+CREATE DATABASE warp_dump_dst;
+CREATE TABLE warp_dump_src.d1 (id INT NOT NULL, v VARCHAR(10)) ENGINE=WARP COLLATE utf8mb4_bin;
+CREATE TABLE warp_dump_src.d2 (id INT NOT NULL, v VARCHAR(10), d DATE, PRIMARY KEY (id)) ENGINE=WARP COLLATE utf8mb4_bin;
+CREATE TABLE warp_dump_src.d3 (id INT NOT NULL, n DECIMAL(10,2)) ENGINE=WARP;
+CREATE TABLE warp_dump_src.d4 (id BIGINT, s VARCHAR(40)) ENGINE=WARP COLLATE utf8mb4_bin;
+INSERT INTO warp_dump_src.d1 SELECT id, v FROM t1;
+INSERT INTO warp_dump_src.d2 SELECT id, v, DATE'2020-01-01' + INTERVAL id DAY FROM t2;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO warp_dump_src.d4
+WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 30000)
+SELECT n, CONCAT('row ', n, ' ', REPEAT('x', n % 20)) FROM seq;
+SET SESSION cte_max_recursion_depth = DEFAULT;
+SELECT 'd1' t, (SELECT COUNT(*) FROM warp_dump_src.d1) src, (SELECT COUNT(*) FROM warp_dump_dst.d1) dst
+UNION ALL SELECT 'd2', (SELECT COUNT(*) FROM warp_dump_src.d2), (SELECT COUNT(*) FROM warp_dump_dst.d2)
+UNION ALL SELECT 'd3', (SELECT COUNT(*) FROM warp_dump_src.d3), (SELECT COUNT(*) FROM warp_dump_dst.d3)
+UNION ALL SELECT 'd4', (SELECT COUNT(*) FROM warp_dump_src.d4), (SELECT COUNT(*) FROM warp_dump_dst.d4);
+t	src	dst
+d1	20	20
+d2	13	13
+d3	0	0
+d4	30000	30000
+SELECT * FROM warp_dump_dst.d1 ORDER BY id;
+id	v
+1	z
+2	x
+3	y
+4	y
+20	load
+21	load
+22	load
+50	ac
+52	co
+54	unl
+55	lk
+57	co
+84	trg
+85	trg
+86	trg
+88	trg2
+89	trg2
+94	trg
+95	trg
+96	trg
+SELECT * FROM warp_dump_dst.d2 ORDER BY id;
+id	v	d
+1	rs	2020-01-02
+2	rs	2020-01-03
+6	repl	2020-01-07
+11	x	2020-01-12
+12	x	2020-01-13
+13	upd	2020-01-14
+14	y	2020-01-15
+15	y	2020-01-16
+30	ok	2020-01-31
+33	ok	2020-02-03
+40	ok	2020-02-10
+43	ok	2020-02-13
+52	co	2020-02-22
+SELECT (SELECT SUM(CRC32(CONCAT(id, ':', s))) FROM warp_dump_src.d4) =
+(SELECT SUM(CRC32(CONCAT(id, ':', s))) FROM warp_dump_dst.d4) AS d4_same_rows;
+d4_same_rows
+1
+# the restored tables can be changed
+INSERT INTO warp_dump_dst.d3 VALUES (1, 1.50);
+INSERT INTO warp_dump_dst.d2 VALUES (1, 'dup', NULL);
+ERROR 23000: Duplicate entry '1' for key 'd2.PRIMARY'
+SELECT COUNT(*) FROM warp_dump_dst.d3;
+COUNT(*)
+1
+DROP DATABASE warp_dump_src;
+DROP DATABASE warp_dump_dst;
+DROP TABLE t1, t2, t3;
+# end
