@@ -74,8 +74,25 @@ extern struct st_mysql_show_var *rapid_binlog_get_status_vars();
 #include "sql/sql_lex.h"
 #include "sql/sql_optimizer.h"
 #include "sql/table.h"
+#include "sql/mysqld.h"  // global_system_variables
+#include "sql/system_variables.h"
+#include "sql/tztime.h"  // Time_zone
 #include "template_utils.h"
 #include "thr_lock.h"
+
+/* A TIMESTAMP column of MySQL is a point in time, which a session sees in its
+   time zone.  The column of DuckDB is a TIMESTAMP without a time zone: it
+   holds the date and time of the point in the time zone of the server
+   (@@global.time_zone).  The rows that are loaded, the rows that come through
+   the binary log and the values that a query returns are all converted with
+   it, so a session gets the right point in time whatever its own time zone
+   is.  The text of a query is given to DuckDB as it is: a date and time
+   constant that is compared with a TIMESTAMP column is taken in the time zone
+   of the server, which is the one of the session unless the session changed
+   its time zone. */
+static inline Time_zone *rapid_server_time_zone() {
+  return global_system_variables.time_zone;
+}
 
 /* storage/rapid/duckdb/generated_extension_loader_package_build.cpp */
 extern "C" int32_t duckdb_register_static_extensions(void);
@@ -587,6 +604,28 @@ int ha_rapid::load_table(const TABLE &table_arg,
           // GEOMETRY not supported
           duckdb_append_null(appender);
           break;
+
+        case MYSQL_TYPE_TIMESTAMP:
+        case MYSQL_TYPE_TIMESTAMP2: {
+          /* the date and time of the time zone of the server, not of the
+             session that loads the table: see rapid_server_time_zone */
+          my_timeval tv;
+          int warnings = 0;
+          MYSQL_TIME lt;
+          if ((*field)->get_timestamp(&tv, &warnings)) {
+            duckdb_append_null(appender);
+            break;
+          }
+          rapid_server_time_zone()->gmt_sec_to_TIME(&lt, tv);
+          char buf[40];
+          const int len = snprintf(buf, sizeof(buf),
+                                   "%04u-%02u-%02u %02u:%02u:%02u.%06lu",
+                                   lt.year, lt.month, lt.day, lt.hour,
+                                   lt.minute, lt.second,
+                                   static_cast<unsigned long>(tv.m_tv_usec));
+          duckdb_append_varchar_length(appender, buf, len);
+          break;
+        }
         
         default: {
           // For unsupported types, convert to string
@@ -1354,7 +1393,19 @@ static bool ConvertDuckDBValueToField(duckdb_result *result, idx_t col, idx_t ro
       mysql_time.second = ts_struct.time.sec;
       mysql_time.second_part = ts_struct.time.micros;
       mysql_time.time_type = MYSQL_TIMESTAMP_DATETIME;
-      field->store_time(&mysql_time);
+      if (field->type() == MYSQL_TYPE_TIMESTAMP) {
+        /* a point in time: the date and time of the time zone of the server
+           (see rapid_server_time_zone), which the field shows in the time
+           zone of the session */
+        bool in_dst_time_gap = false;
+        my_timeval tv;
+        tv.m_tv_sec = rapid_server_time_zone()->TIME_to_gmt_sec(
+            &mysql_time, &in_dst_time_gap);
+        tv.m_tv_usec = ts_struct.time.micros;
+        field->store_timestamp(&tv);
+      } else {
+        field->store_time(&mysql_time);
+      }
       break;
     }
     default: {

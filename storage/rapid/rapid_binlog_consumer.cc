@@ -65,6 +65,9 @@
 #include "sql/sql_base.h"       // open_table_def, open_table_from_share
 #include "sql/sql_class.h"
 #include "sql/table.h"
+#include "sql/mysqld.h"         // global_system_variables
+#include "sql/system_variables.h"
+#include "sql/tztime.h"         // Time_zone
 #include "sql/log.h"  // sql_print_error, sql_print_warning
 #include "decimal.h"  // bin2decimal, decimal2string
 #include "my_time.h"  // my_time_packed_from_binary, my_datetime_packed_from_binary
@@ -797,10 +800,25 @@ std::string parse_field_value(const uchar *&ptr, uint8_t type, uint16_t meta, bo
         }
       }
       
-      // Convert Unix timestamp to datetime (UTC)
-      time_t ts = timestamp;
+      /* A TIMESTAMP is a point in time (seconds since 1970 UTC), the column
+         of DuckDB is a date and time without a time zone.  It gets the date
+         and time of the time zone of the server (@@global.time_zone), as
+         ALTER TABLE ... SECONDARY_LOAD stores it (ha_rapid::load_table) and
+         as the result of a query is read back (see rapid_server_time_zone
+         in ha_rapid.cc).  It was the UTC date and time: rows that came
+         through the binary log differed from the rows that were loaded by
+         the offset of the time zone. */
+      MYSQL_TIME local_time;
+      global_system_variables.time_zone->gmt_sec_to_TIME(
+          &local_time, static_cast<my_time_t>(timestamp));
       struct tm tm_val;
-      gmtime_r(&ts, &tm_val);
+      memset(&tm_val, 0, sizeof(tm_val));
+      tm_val.tm_year = static_cast<int>(local_time.year) - 1900;
+      tm_val.tm_mon = static_cast<int>(local_time.month) - 1;
+      tm_val.tm_mday = static_cast<int>(local_time.day);
+      tm_val.tm_hour = static_cast<int>(local_time.hour);
+      tm_val.tm_min = static_cast<int>(local_time.minute);
+      tm_val.tm_sec = static_cast<int>(local_time.second);
       
       // Format to string
       char buf[64];
