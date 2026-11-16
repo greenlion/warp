@@ -1,0 +1,31 @@
+#
+# Test RAPID system variables
+#
+# Show RAPID variables
+SHOW VARIABLES LIKE 'rapid%';
+Variable_name	Value
+rapid_batch_size	1000
+rapid_binlog_enabled	ON
+rapid_database_file	:memory:
+# Test rapid_binlog_enabled (dynamic)
+SET GLOBAL rapid_binlog_enabled = 0;
+SHOW VARIABLES LIKE 'rapid_binlog_enabled';
+Variable_name	Value
+rapid_binlog_enabled	OFF
+SET GLOBAL rapid_binlog_enabled = 1;
+SHOW VARIABLES LIKE 'rapid_binlog_enabled';
+Variable_name	Value
+rapid_binlog_enabled	ON
+# Test rapid_batch_size (dynamic)
+SET GLOBAL rapid_batch_size = 500;
+SHOW VARIABLES LIKE 'rapid_batch_size';
+Variable_name	Value
+rapid_batch_size	500
+SET GLOBAL rapid_batch_size = 1000;
+# Test rapid_database_file (read-only)
+SET GLOBAL rapid_database_file = '/tmp/test.db';
+ERROR HY000: Variable 'rapid_database_file' is a read only variable
+SHOW VARIABLES LIKE 'rapid_database_file';
+Variable_name	Value
+rapid_database_file	:memory:
+# Show status variables exist (values are dynamic)

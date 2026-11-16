@@ -1,0 +1,45 @@
+RAPID Secondary Engine Test Suite
+==================================
+
+This test suite validates the RAPID secondary storage engine functionality.
+
+Test Files:
+-----------
+- basic.test: Basic table creation, loading, and querying
+- binlog_replication.test: Tests binlog-based incremental replication
+- system_variables.test: Tests RAPID configuration variables
+- aggregates.test: Tests aggregate functions (COUNT, SUM, AVG, etc.)
+- decimal.test: Tests DECIMAL type support with various precisions and scales
+- unsupported_types.test: Verifies GEOMETRY and other unsupported types are rejected
+- binary_blob.test: Tests binary BLOB/TEXT data handling with hex encoding
+
+Running Tests:
+--------------
+# Run all RAPID tests:
+./mtr suite/rapid
+
+# Run a specific test:
+./mtr suite/rapid/basic
+
+# Run with verbose output:
+./mtr --verbose suite/rapid
+
+Configuration:
+--------------
+The suite.opt file configures:
+- Binary logging enabled (required for incremental replication)
+- ROW binlog format (required for proper row-level replication)
+
+Prerequisites:
+--------------
+- RAPID plugin must be loaded via LD_PRELOAD
+- Binary logging must be enabled
+- DuckDB library must be available
+
+Expected Behavior:
+------------------
+- Tables created with SECONDARY_ENGINE=RAPID offload queries to DuckDB
+- ALTER TABLE SECONDARY_LOAD copies data from InnoDB to DuckDB
+- INSERT/UPDATE/DELETE operations are replicated via binlog consumer
+- Aggregate queries execute in DuckDB and return correct results
+

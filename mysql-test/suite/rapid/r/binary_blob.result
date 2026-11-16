@@ -1,0 +1,28 @@
+#
+# Test RAPID binary BLOB support
+#
+CREATE TABLE t_blob (
+id INT PRIMARY KEY,
+text_data TEXT,
+binary_data BLOB,
+tiny_blob TINYBLOB,
+medium_blob MEDIUMBLOB
+) SECONDARY_ENGINE RAPID;
+# Insert text data
+INSERT INTO t_blob (id, text_data) VALUES (1, 'This is text data');
+# Insert binary data with null bytes
+INSERT INTO t_blob (id, binary_data) VALUES (2, X'00010203040506070809');
+# Insert mixed data
+INSERT INTO t_blob (id, text_data, binary_data) VALUES (3, 'Text', X'DEADBEEF');
+# Insert tiny blob
+INSERT INTO t_blob (id, tiny_blob) VALUES (4, X'FF');
+# Insert medium blob with various bytes
+INSERT INTO t_blob (id, medium_blob) VALUES (5, X'48656C6C6F20576F726C6400');
+ALTER TABLE t_blob SECONDARY_LOAD;
+SET SESSION secondary_engine_cost_threshold = 0;
+# Count records (HEX function not supported by DuckDB, so we just count)
+SELECT COUNT(*) FROM t_blob;
+COUNT(*)
+5
+ALTER TABLE t_blob SECONDARY_UNLOAD;
+DROP TABLE t_blob;

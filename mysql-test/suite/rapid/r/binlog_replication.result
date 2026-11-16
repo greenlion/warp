@@ -1,0 +1,36 @@
+#
+# Test RAPID binlog-based incremental replication
+#
+# Create and load a table
+CREATE TABLE t1 (a INT, b VARCHAR(100)) SECONDARY_ENGINE RAPID;
+INSERT INTO t1 VALUES (1, 'foo'), (2, 'bar');
+ALTER TABLE t1 SECONDARY_LOAD;
+SET SESSION secondary_engine_cost_threshold = 0;
+# Initial query
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+2
+# Insert more rows (should be replicated via binlog)
+INSERT INTO t1 VALUES (3, 'baz'), (4, 'qux');
+# Give binlog consumer time to process
+# Query again - should see new rows
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+4
+SELECT * FROM t1 ORDER BY a;
+a	b
+1	foo
+2	bar
+3	baz
+4	qux
+# Update a row
+UPDATE t1 SET b = 'updated' WHERE a = 2;
+SELECT * FROM t1 WHERE a = 2;
+a	b
+2	updated
+# Delete a row
+DELETE FROM t1 WHERE a = 1;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+3
+DROP TABLE t1;

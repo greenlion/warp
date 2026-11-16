@@ -1,0 +1,6 @@
+$RAPID_PLUGIN_OPT
+--log-bin=master-bin
+--binlog-format=ROW
+# Set the cost threshold to zero to maximize the use of secondary
+# engines in this test suite.
+--secondary-engine-cost-threshold=0

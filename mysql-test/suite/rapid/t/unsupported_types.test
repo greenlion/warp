@@ -1,0 +1,23 @@
+--disable_query_log
+eval INSTALL PLUGIN rapid SONAME 'ha_rapid.so';
+--enable_query_log
+
+--echo #
+--echo # Test RAPID with unsupported column types
+--echo #
+
+--echo # Test GEOMETRY (unsupported)
+CREATE TABLE t_geo (
+  id INT PRIMARY KEY,
+  location GEOMETRY
+) SECONDARY_ENGINE RAPID;
+
+--error ER_SECONDARY_ENGINE_PLUGIN
+ALTER TABLE t_geo SECONDARY_LOAD;
+
+DROP TABLE t_geo;
+
+--disable_query_log
+UNINSTALL PLUGIN rapid;
+--enable_query_log
+
