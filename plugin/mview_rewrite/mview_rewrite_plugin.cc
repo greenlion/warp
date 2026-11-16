@@ -257,7 +257,7 @@ THD *make_session(const void *stack_base) {
   THD *thd = new (std::nothrow) THD;
   if (thd == nullptr) return nullptr;
   thd->set_new_thread_id();
-  thd->capture_stack_base(stack_base);
+  thd->thread_stack = static_cast<const char *>(stack_base);
   thd->store_globals();
   thd->set_command(COM_DAEMON);
   thd->system_thread = SYSTEM_THREAD_BACKGROUND;

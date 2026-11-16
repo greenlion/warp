@@ -27,8 +27,6 @@ EXPLAIN
             -> Table scan on f  (cost=# rows=#)
         -> Single-row index lookup on d using PRIMARY (id = f.k)  (cost=# rows=#)
 
-Warnings:
-Note	1003	/* select#1 */ select /*+ JOIN_ORDER(@`select#1` `f`,`d`) NO_BNL(`d`@`select#1`) NO_HASH_JOIN(`d`@`select#1`) */ count(0) AS `COUNT(*)`,sum(`test`.`f`.`v`) AS `SUM(f.v)`,sum(`test`.`d`.`grp`) AS `SUM(d.grp)`,min(`test`.`d`.`name`) AS `MIN(d.name)`,max(`test`.`d`.`name`) AS `MAX(d.name)` from `test`.`f` join `test`.`d` where (`test`.`d`.`id` = `test`.`f`.`k`)
 SELECT /*+ JOIN_ORDER(f, d) NO_BNL(d) NO_HASH_JOIN(d) */ COUNT(*), SUM(f.v), SUM(d.grp), MIN(d.name), MAX(d.name)
 FROM f JOIN d ON d.id = f.k;
 COUNT(*)	SUM(f.v)	SUM(d.grp)	MIN(d.name)	MAX(d.name)

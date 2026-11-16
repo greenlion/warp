@@ -1219,8 +1219,6 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
-Warnings:
-Note	1003	/* select#1 */ select sum(0) AS `SUM(v)`,`test`.`f_w`.`g1` AS `g1`,`test`.`f_w`.`g3` AS `g3` from `test`.`f_w` where (`test`.`f_w`.`g3` = 'b2') group by `test`.`f_w`.`g1`
 # a column that is not in the GROUP BY (ONLY_FULL_GROUP_BY off): one row a group
 SET @saved_sql_mode = @@sql_mode;
 SET SESSION sql_mode = '';
@@ -1231,8 +1229,6 @@ EXPLAIN
     -> Aggregate using temporary table
         -> Table scan on f_w, with parallel aggregation
 
-Warnings:
-Note	1003	/* select#1 */ select `test`.`f_w`.`id` AS `id`,`test`.`f_w`.`s` AS `s`,`test`.`f_w`.`d1` AS `d1`,sum(0) AS `SUM(v)` from `test`.`f_w` group by `test`.`f_w`.`id`
 SET SESSION sql_mode = @saved_sql_mode;
 # the engine aggregates: the table is scanned once and the groups are the rows
 EXPLAIN FORMAT=TREE SELECT g1, SUM(d1), COUNT(*) FROM f_w GROUP BY g1;

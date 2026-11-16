@@ -43,6 +43,7 @@
 #include "sql/item_func.h"
 #include "sql/item_sum.h"
 #include "sql/opt_explain_format.h"
+#include "sql/opt_explain_traditional.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
 #include "sql/system_variables.h"
@@ -1376,7 +1377,8 @@ std::string explain_prefix(LEX *lex) {
   if (lex->is_explain_analyze) p += "ANALYZE ";
   if (lex->explain_format->is_hierarchical())
     p += "FORMAT=JSON ";
-  else if (lex->explain_format->is_tree())
+  else if (dynamic_cast<const Explain_format_tree *>(lex->explain_format) !=
+           nullptr)
     p += "FORMAT=TREE ";
   else
     p += "FORMAT=TRADITIONAL ";

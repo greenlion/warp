@@ -273,7 +273,6 @@ EXPLAIN
 
 Warnings:
 Note	1105	Query 'EXPLAIN FORMAT=TREE SELECT o_custkey, COUNT(*) FROM orders WHERE o_custkey = 1 GROUP BY o_custkey' rewritten to 'EXPLAIN FORMAT=TREE SELECT `v5`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`v5`.`mv$count`),0) AS SIGNED) AS `COUNT(*)` FROM `test`.`v5` `v5` WHERE (`v5`.`mv$g0` = 1) GROUP BY `v5`.`mv$g0`' by a query rewrite plugin
-Note	1003	/* select#1 */ select `test`.`v5`.`mv$g0` AS `o_custkey`,cast(coalesce(sum(`test`.`v5`.`mv$count`),0) as signed) AS `COUNT(*)` from `test`.`v5` where (`test`.`v5`.`mv$g0` = 1) group by `test`.`v5`.`mv$g0`
 # A SYNCHRONOUS view is used only while the WARP_MVIEW daemon keeps it
 # current (the daemon is not loaded here)
 CREATE MATERIALIZED VIEW v6 AS
