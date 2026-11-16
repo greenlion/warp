@@ -1,0 +1,68 @@
+--disable_query_log
+eval INSTALL PLUGIN rapid SONAME 'ha_rapid.so';
+--enable_query_log
+
+--echo #
+--echo # Outer joins in the secondary engine: every query gives the rows that
+--echo # the tables give.
+--echo #
+CREATE TABLE c (id INT PRIMARY KEY, name VARCHAR(20), region INT) SECONDARY_ENGINE RAPID;
+CREATE TABLE o (id INT PRIMARY KEY, c_id INT, amount INT, p_id INT) SECONDARY_ENGINE RAPID;
+CREATE TABLE p (id INT PRIMARY KEY, label VARCHAR(20)) SECONDARY_ENGINE RAPID;
+INSERT INTO c VALUES (1, 'ann', 1), (2, 'bob', 1), (3, 'cy', 2), (4, 'dee', NULL);
+INSERT INTO o VALUES (10, 1, 15, 100), (11, 1, 250, 101), (12, 2, 99, NULL), (13, NULL, 5, 100), (14, 9, 7, 102);
+INSERT INTO p VALUES (100, 'nut'), (101, 'bolt'), (103, 'gear');
+ALTER TABLE c SECONDARY_LOAD;
+ALTER TABLE o SECONDARY_LOAD;
+ALTER TABLE p SECONDARY_LOAD;
+
+CREATE TABLE queries (i INT PRIMARY KEY, q TEXT);
+INSERT INTO queries VALUES
+ (1, 'SELECT c.id, c.name, o.id AS oid, o.amount FROM c LEFT JOIN o ON o.c_id = c.id'),
+ (2, 'SELECT c.id, o.id AS oid FROM c LEFT JOIN o ON o.c_id = c.id AND o.amount > 50'),
+ (3, 'SELECT c.id, o.id AS oid FROM c LEFT JOIN o ON o.c_id = c.id WHERE o.id IS NULL'),
+ (4, 'SELECT c.name, o.amount FROM o RIGHT JOIN c ON o.c_id = c.id'),
+ (5, 'SELECT c.id, o.id AS oid, p.label FROM c LEFT JOIN o ON o.c_id = c.id LEFT JOIN p ON p.id = o.p_id'),
+ (6, 'SELECT c.id, o.id AS oid, p.label FROM c JOIN o ON o.c_id = c.id LEFT JOIN p ON p.id = o.p_id'),
+ (7, 'SELECT c.id, o.id AS oid, p.label FROM c LEFT JOIN o ON o.c_id = c.id JOIN p ON p.id = o.p_id'),
+ (8, 'SELECT c.id, o.id AS oid, p.label FROM c LEFT JOIN (o JOIN p ON p.id = o.p_id) ON o.c_id = c.id'),
+ (9, 'SELECT c.id, x.id AS oid, p.label FROM c, p LEFT JOIN o AS x ON x.p_id = p.id WHERE c.region = 1'),
+ (10, 'SELECT c.region, COUNT(*) AS n, COUNT(o.id) AS orders, SUM(o.amount) AS total FROM c LEFT JOIN o ON o.c_id = c.id GROUP BY c.region'),
+ (11, 'SELECT a.id, b.id AS bid FROM c a LEFT JOIN c b ON b.region = a.region AND b.id > a.id'),
+ (12, 'SELECT o.id, c.name, p.label FROM o LEFT JOIN c ON c.id = o.c_id LEFT JOIN p ON p.id = o.p_id WHERE o.amount < 100 OR c.name IS NULL'),
+ (13, 'SELECT c.id, o.id AS oid FROM c JOIN o ON o.c_id = c.id'),
+ (14, 'SELECT c.id, o.id AS oid, p.id AS pid FROM c JOIN o JOIN p WHERE o.c_id = c.id AND p.id = o.p_id');
+
+--let $i = 1
+while ($i <= 14)
+{
+  --let $q = `SELECT q FROM queries WHERE i = $i`
+  --echo # query $i: $q
+  --disable_query_log
+  SET SESSION use_secondary_engine = OFF;
+  eval CREATE TABLE r_primary AS $q;
+  SET SESSION use_secondary_engine = FORCED;
+  eval CREATE TABLE r_secondary AS $q;
+  SET SESSION use_secondary_engine = OFF;
+  --enable_query_log
+  SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+         (SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+                                (SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+  DROP TABLE r_primary, r_secondary;
+  --inc $i
+}
+
+SET SESSION use_secondary_engine = FORCED;
+SELECT c.id, c.name, o.id AS oid, o.amount FROM c LEFT JOIN o ON o.c_id = c.id ORDER BY c.id, o.id;
+--replace_column 10 # 11 #
+EXPLAIN SELECT c.id, c.name, o.id AS oid, o.amount FROM c LEFT JOIN o ON o.c_id = c.id;
+SET SESSION use_secondary_engine = DEFAULT;
+
+ALTER TABLE c SECONDARY_UNLOAD;
+ALTER TABLE o SECONDARY_UNLOAD;
+ALTER TABLE p SECONDARY_UNLOAD;
+DROP TABLE queries, c, o, p;
+
+--disable_query_log
+UNINSTALL PLUGIN rapid;
+--enable_query_log

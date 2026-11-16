@@ -147,7 +147,8 @@ SET_TARGET_PROPERTIES(rapid_duckdb PROPERTIES
   INTERFACE_LINK_LIBRARIES "${CMAKE_DL_LIBS};pthread")
 ADD_DEPENDENCIES(rapid_duckdb rapid_duckdb_build)
 
-SET(RAPID_SOURCES ha_rapid.cc ha_rapid.h rapid_binlog_consumer.cc)
+SET(RAPID_SOURCES ha_rapid.cc ha_rapid.h rapid_binlog_consumer.cc
+  rapid_sql.cc rapid_sql.h)
 
 IF(WITH_RAPID_SECONDARY_STORAGE_ENGINE AND
     NOT WITHOUT_RAPID_SECONDARY_STORAGE_ENGINE)

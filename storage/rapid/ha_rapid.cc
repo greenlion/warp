@@ -22,9 +22,11 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 #include "ha_rapid.h"
+#include "storage/rapid/rapid_sql.h"
 #include "duckdb.h"
 #include "sql/protocol.h"
 
+#include <chrono>
 #include <thread>
 #include <queue>
 #include <mutex>
@@ -74,6 +76,10 @@ extern struct st_mysql_show_var *rapid_binlog_get_status_vars();
 #include "sql/sql_lex.h"
 #include "sql/sql_optimizer.h"
 #include "sql/table.h"
+#include "sql/sql_executor.h"
+#include "sql/sql_select.h"     // count_field_types
+#include "sql/sql_tmp_table.h"  // create_tmp_table
+#include "sql/temp_table_param.h"
 #include "sql/mysqld.h"  // global_system_variables
 #include "sql/system_variables.h"
 #include "sql/tztime.h"  // Time_zone
@@ -116,8 +122,14 @@ static MYSQL_SYSVAR_STR(
     ":memory:"  // default value
 );
 
+static MYSQL_THDVAR_BOOL(
+    trace_sql, PLUGIN_VAR_OPCMDARG,
+    "Give the statement that RAPID runs in DuckDB as a note (SHOW WARNINGS).",
+    nullptr, nullptr, false);
+
 static SYS_VAR *rapid_system_variables[] = {
     MYSQL_SYSVAR(database_file),
+    MYSQL_SYSVAR(trace_sql),
     nullptr
 };
 
@@ -741,427 +753,6 @@ LEX_CSTRING lex_to_sql_string(LEX *lex) {
   return lex->thd->query();
 }
 
-/**
-  Reconstruct SQL from LEX AST with DuckDB-compatible table name transformation.
-  
-  This function traverses the LEX AST and reconstructs the SQL query, transforming
-  schema.table references to schema_table format for DuckDB compatibility.
-  It also uses table aliases in SELECT clauses instead of full table names.
-  
-  @param lex The LEX object containing the parsed AST
-  @return The reconstructed SQL query as a std::string, or empty string if invalid
-  
-  @note This function handles SELECT, INSERT, UPDATE, DELETE statements and
-        transforms table references from SCHEMA.TABLE to SCHEMA_TABLE format.
-        It also replaces full table names with aliases in SELECT clauses.
-        
-  @example
-    LEX *lex = thd->lex;
-    std::string reconstructed_sql = lex_to_duckdb_sql(lex);
-*/
-std::string lex_to_duckdb_sql(LEX *lex) {
-  if (lex == nullptr || lex->thd == nullptr) {
-    return "";
-  }
-  
-  String sql_buffer;
-  THD *thd = lex->thd;
-  
-  // Use MySQL's built-in print functionality to reconstruct the SQL
-  // This handles all the complex cases like subqueries, joins, etc.
-  if (lex->unit != nullptr) {
-    lex->unit->print(thd, &sql_buffer, QT_ORDINARY);
-  } else if (lex->query_block != nullptr) {
-    lex->query_block->print(thd, &sql_buffer, QT_ORDINARY);
-  } else {
-    return "";
-  }
-  
-  std::string result = std::string(sql_buffer.ptr(), sql_buffer.length());
-  
-  // First, collect table aliases from the LEX
-  std::map<std::string, std::string> table_aliases = collect_table_aliases(lex);
-  
-  // Replace full table names with aliases everywhere
-  std::string sql_with_aliases = replace_table_names_with_aliases(result, table_aliases);
-  
-  // Transform schema.table references to schema_table format in FROM/JOIN clauses only
-  std::string transformed_sql = transform_table_references_with_aliases(sql_with_aliases, table_aliases);
-  
-  // Strip backticks for DuckDB compatibility (DuckDB uses double quotes, not backticks)
-  std::string duckdb_compatible_sql = transformed_sql;
-  
-  // Remove all backticks from the query
-  size_t pos = 0;
-  while ((pos = duckdb_compatible_sql.find('`', pos)) != std::string::npos) {
-    duckdb_compatible_sql.erase(pos, 1);
-  }
-  
-  // Quote aliases that need quoting (contain special chars like *, (), etc.)
-  // Pattern: " AS identifier" where identifier contains special characters
-  std::string upper_sql = duckdb_compatible_sql;
-  std::transform(upper_sql.begin(), upper_sql.end(), upper_sql.begin(), ::toupper);
-  
-  pos = 0;
-  while ((pos = upper_sql.find(" AS ", pos)) != std::string::npos) {
-    size_t alias_start = pos + 4; // Skip " AS "
-    
-    // Skip whitespace after AS
-    while (alias_start < duckdb_compatible_sql.length() && 
-           std::isspace(duckdb_compatible_sql[alias_start])) {
-      alias_start++;
-    }
-    
-    // Find the end of the alias (until comma, whitespace, FROM, WHERE, GROUP, ORDER, or end)
-    size_t alias_end = alias_start;
-    bool needs_quoting = false;
-    
-    while (alias_end < duckdb_compatible_sql.length()) {
-      char ch = duckdb_compatible_sql[alias_end];
-      if (ch == ',' || ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
-        break;
-      }
-      // Check if character needs quoting (special chars like *, (), etc.)
-      if (!std::isalnum(ch) && ch != '_') {
-        needs_quoting = true;
-      }
-      alias_end++;
-    }
-    
-    // If alias needs quoting and isn't already quoted, add double quotes
-    if (needs_quoting && alias_start < alias_end) {
-      std::string alias = duckdb_compatible_sql.substr(alias_start, alias_end - alias_start);
-      
-      // Check if already quoted
-      if (!(alias.front() == '"' && alias.back() == '"')) {
-        std::string quoted_alias = "\"" + alias + "\"";
-        duckdb_compatible_sql.replace(alias_start, alias_end - alias_start, quoted_alias);
-        
-        // Update upper_sql for next iteration
-        upper_sql = duckdb_compatible_sql;
-        std::transform(upper_sql.begin(), upper_sql.end(), upper_sql.begin(), ::toupper);
-        
-        pos = alias_start + quoted_alias.length();
-      } else {
-        pos = alias_end;
-      }
-    } else {
-      pos = alias_end;
-    }
-  }
-  
-  // Fix implicit joins: Convert JOIN without ON clause to comma-separated table list
-  // "from table1 t1 join table2 t2 join table3 t3 where ..." 
-  // becomes "from table1 t1, table2 t2, table3 t3 where ..."
-  std::string fixed_sql = duckdb_compatible_sql;
-  std::string upper_fixed = fixed_sql;
-  std::transform(upper_fixed.begin(), upper_fixed.end(), upper_fixed.begin(), ::toupper);
-  
-  // Find the FROM clause
-  size_t from_pos = upper_fixed.find(" FROM ");
-  if (from_pos != std::string::npos) {
-    // Find the end of the FROM clause (WHERE, GROUP BY, ORDER BY, LIMIT, or end of string)
-    size_t from_end = from_pos + 6; // Skip " FROM "
-    std::vector<std::string> end_keywords = {"WHERE", "GROUP", "ORDER", "LIMIT", "HAVING"};
-    size_t clause_end = fixed_sql.length();
-    
-    for (const auto& keyword : end_keywords) {
-      size_t kw_pos = upper_fixed.find(" " + keyword + " ", from_end);
-      if (kw_pos != std::string::npos && kw_pos < clause_end) {
-        clause_end = kw_pos;
-      }
-    }
-    
-    // Extract the FROM clause content
-    std::string from_clause = fixed_sql.substr(from_end, clause_end - from_end);
-    std::string upper_from = from_clause;
-    std::transform(upper_from.begin(), upper_from.end(), upper_from.begin(), ::toupper);
-    
-    // Replace " join " with ", " if not followed by "ON"
-    std::string modified_from = from_clause;
-    pos = 0;
-    while ((pos = upper_from.find(" JOIN ", pos)) != std::string::npos) {
-      // Check if followed by ON clause
-      size_t after_join = pos + 6;
-      // Skip whitespace and table name/alias to see what comes next
-      size_t check_pos = after_join;
-      int word_count = 0;
-      while (check_pos < upper_from.length() && word_count < 2) {
-        // Skip whitespace
-        while (check_pos < upper_from.length() && std::isspace(upper_from[check_pos])) {
-          check_pos++;
-        }
-        // Skip word (table name or alias)
-        while (check_pos < upper_from.length() && 
-               (std::isalnum(upper_from[check_pos]) || upper_from[check_pos] == '_')) {
-          check_pos++;
-        }
-        word_count++;
-      }
-      
-      // Check if "ON" follows
-      while (check_pos < upper_from.length() && std::isspace(upper_from[check_pos])) {
-        check_pos++;
-      }
-      
-      bool has_on_clause = (check_pos + 2 <= upper_from.length() && 
-                           upper_from.substr(check_pos, 2) == "ON");
-      
-      if (!has_on_clause) {
-        // Replace " join " with ", "
-        modified_from.replace(pos, 6, ", ");
-        upper_from = modified_from;
-        std::transform(upper_from.begin(), upper_from.end(), upper_from.begin(), ::toupper);
-        pos += 2;  // Skip ", "
-      } else {
-        pos += 6;  // Skip " JOIN "
-      }
-    }
-    
-    // Replace the FROM clause in the original SQL
-    fixed_sql.replace(from_end, clause_end - from_end, modified_from);
-  }
-  
-  return fixed_sql;
-}
-
-/**
-  No transformation needed - keep schema.table format as is.
-
-  Previously this function transformed SCHEMA.TABLE to SCHEMA_TABLE format,
-  but now we use DuckDB schemas directly, so no transformation is needed.
-
-  @param sql The original SQL string
-  @return The SQL string unchanged
-*/
-std::string transform_table_references(const std::string& sql) {
-  // No transformation needed - DuckDB supports schema.table format directly
-  return sql;
-}
-
-/**
-  Add implicit aliases to table references that don't have explicit aliases.
-
-  This function ensures tables in FROM clauses, JOIN clauses, etc. have proper aliases
-  while preserving the schema.table format (no transformation to underscore format).
-
-  @param sql The original SQL string
-  @param table_aliases Map from full table names (schema.table) to their aliases
-  @return The SQL string with implicit aliases added where needed
-*/
-std::string transform_table_references_with_aliases(const std::string& sql,
-                                                  const std::map<std::string, std::string>& table_aliases) {
-  // With schema.table format, we don't need to transform anything
-  // MySQL's query rewriter already handles the schema.table references correctly
-  // and DuckDB will understand them directly
-  return sql;
-}
-
-/**
-  Collect table aliases from the LEX AST.
-  
-  @param lex The LEX object containing the parsed AST
-  @return A map from full table names to their aliases
-*/
-std::map<std::string, std::string> collect_table_aliases(LEX *lex) {
-  std::map<std::string, std::string> aliases;
-  
-  if (lex == nullptr || lex->query_block == nullptr) {
-    return aliases;
-  }
-  
-  // Traverse all table references in the query block
-  for (Table_ref *table = lex->query_block->get_table_list(); table != nullptr;
-       table = table->next_local) {
-
-    // Build the full table name (schema.table format)
-    std::string full_table_name;
-    if (table->db != nullptr && table->table_name != nullptr) {
-      full_table_name = std::string(table->db) + "." + std::string(table->table_name);
-    } else if (table->table_name != nullptr) {
-      full_table_name = std::string(table->table_name);
-    }
-
-    if (!full_table_name.empty()) {
-      std::string alias;
-
-      if (table->alias != nullptr) {
-        // Use explicit alias if provided
-        alias = std::string(table->alias);
-      } else if (table->table_name != nullptr) {
-        // Use table name as implicit alias when no explicit alias is provided
-        alias = std::string(table->table_name);
-      }
-
-      if (!alias.empty()) {
-        aliases[full_table_name] = alias;
-      }
-    }
-  }
-  
-  return aliases;
-}
-
-/**
-  Replace full table names with aliases throughout the SQL query.
-  
-  This handles column references in all clauses (SELECT, WHERE, JOIN, ORDER BY, etc.)
-  by replacing patterns like `db`.`table`.`column` with `alias`.`column`.
-  
-  @param sql The SQL string
-  @param table_aliases Map from full table names (db_table) to aliases
-  @return The SQL string with table names replaced by aliases
-*/
-std::string replace_table_names_with_aliases(const std::string& sql, 
-                                           const std::map<std::string, std::string>& table_aliases) {
-  std::string result = sql;
-  
-  // Handle the original format (db.table.column) that MySQL's print() generates
-  // We need to replace these patterns globally, not just in SELECT clauses
-  for (const auto& alias_pair : table_aliases) {
-    const std::string& full_name = alias_pair.first;  // e.g., "test.dim_date"
-    const std::string& alias = alias_pair.second;      // e.g., "dim_date"
-
-    size_t dot_pos = full_name.find('.');
-    if (dot_pos != std::string::npos) {
-      std::string db_name = full_name.substr(0, dot_pos);           // e.g., "test"
-      std::string table_name = full_name.substr(dot_pos + 1);       // e.g., "dim_date"
-
-      // Pattern 1: `db`.`table`.`column` -> `alias`.`column`
-      std::string pattern1 = "`" + db_name + "`.`" + table_name + "`.";
-      std::string replacement1 = "`" + alias + "`.";
-
-      size_t pos = 0;
-      while ((pos = result.find(pattern1, pos)) != std::string::npos) {
-        result.replace(pos, pattern1.length(), replacement1);
-        pos += replacement1.length();
-      }
-
-      // Pattern 2: db.table.column (without backticks) -> alias.column
-      // This handles cases where MySQL prints without quotes
-      std::string pattern2 = db_name + "." + table_name + ".";
-      std::string replacement2 = alias + ".";
-
-      pos = 0;
-      while ((pos = result.find(pattern2, pos)) != std::string::npos) {
-        // Make sure we're not matching something like "mydb.table.field" inside a string literal
-        // Simple check: if preceded by quote, skip it
-        if (pos > 0 && (result[pos-1] == '\'' || result[pos-1] == '"')) {
-          pos++;
-          continue;
-        }
-        result.replace(pos, pattern2.length(), replacement2);
-        pos += replacement2.length();
-      }
-    }
-  }
-  
-  return result;
-}
-
-/**
-  Strip backticks from SELECT clauses for DuckDB compatibility.
-  
-  DuckDB doesn't support backtick-quoted identifiers, so we need to remove them
-  from the SELECT clause while preserving them in other parts of the query.
-  
-  @param sql The SQL string
-  @return The SQL string with backticks removed from SELECT clauses
-*/
-std::string strip_backticks_from_select(const std::string& sql) {
-  std::string result = sql;
-  
-  // Case-insensitive scan for SELECT ... FROM ranges
-  std::string upper_result = result;
-  std::transform(upper_result.begin(), upper_result.end(), upper_result.begin(), ::toupper);
-  size_t scan_pos = 0;
-  while (true) {
-    size_t select_pos = upper_result.find("SELECT", scan_pos);
-    if (select_pos == std::string::npos) break;
-    if (select_pos > 0 && std::isalnum(static_cast<unsigned char>(upper_result[select_pos - 1]))) {
-      scan_pos = select_pos + 1;
-      continue;
-    }
-    size_t from_pos_upper = upper_result.find(" FROM ", select_pos);
-    if (from_pos_upper == std::string::npos) break;
-
-    size_t select_start_content = select_pos + 6;
-    std::string select_clause = result.substr(select_start_content, from_pos_upper - select_start_content);
-
-    std::string modified_select = select_clause;
-    
-    // First, strip backticks
-    size_t pos = 0;
-    while ((pos = modified_select.find('`', pos)) != std::string::npos) {
-      modified_select.erase(pos, 1);
-    }
-    
-    // Second, quote aliases that need quoting (contain special chars like *, (), etc.)
-    // Pattern: " AS identifier" where identifier contains special characters
-    std::string upper_modified = modified_select;
-    std::transform(upper_modified.begin(), upper_modified.end(), upper_modified.begin(), ::toupper);
-    
-    pos = 0;
-    while ((pos = upper_modified.find(" AS ", pos)) != std::string::npos) {
-      size_t alias_start = pos + 4; // Skip " AS "
-      
-      // Skip whitespace after AS
-      while (alias_start < modified_select.length() && std::isspace(modified_select[alias_start])) {
-        alias_start++;
-      }
-      
-      // Find the end of the alias (until comma, whitespace after non-identifier char, or end)
-      size_t alias_end = alias_start;
-      bool needs_quoting = false;
-      bool in_identifier = true;
-      
-      while (alias_end < modified_select.length() && in_identifier) {
-        char ch = modified_select[alias_end];
-        if (ch == ',' || ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
-          break;
-        }
-        // Check if character needs quoting (special chars like *, (), etc.)
-        if (!std::isalnum(ch) && ch != '_') {
-          needs_quoting = true;
-        }
-        alias_end++;
-      }
-      
-      // If alias needs quoting and isn't already quoted, add double quotes
-      if (needs_quoting && alias_start < alias_end) {
-        std::string alias = modified_select.substr(alias_start, alias_end - alias_start);
-        
-        // Check if already quoted
-        if (!(alias.front() == '"' && alias.back() == '"')) {
-          std::string quoted_alias = "\"" + alias + "\"";
-          modified_select.replace(alias_start, alias_end - alias_start, quoted_alias);
-          
-          // Update upper_modified for next iteration
-          upper_modified = modified_select;
-          std::transform(upper_modified.begin(), upper_modified.end(), upper_modified.begin(), ::toupper);
-          
-          pos = alias_start + quoted_alias.length();
-        } else {
-          pos = alias_end;
-        }
-      } else {
-        pos = alias_end;
-      }
-    }
-
-    if (modified_select != select_clause) {
-      result.replace(select_start_content, from_pos_upper - select_start_content, modified_select);
-      upper_result = result;
-      std::transform(upper_result.begin(), upper_result.end(), upper_result.begin(), ::toupper);
-      scan_pos = select_start_content + modified_select.length();
-    } else {
-      scan_pos = from_pos_upper + 6;
-    }
-  }
-  
-  return result;
-}
-
 }  // namespace rapid
 
 namespace {
@@ -1280,7 +871,8 @@ static void AssertSupportedPath(const AccessPath *path) {
   @return true on error, false on success
 */
 static bool ConvertDuckDBValueToField(duckdb_result *result, idx_t col, idx_t row,
-                                      Field *field) {
+                                      Field *field,
+                                      bool timestamp_column = false) {
   // Check if value is NULL
   if (duckdb_value_is_null(result, col, row)) {
     field->set_null();
@@ -1377,7 +969,14 @@ static bool ConvertDuckDBValueToField(duckdb_result *result, idx_t col, idx_t ro
       mysql_time.second = time_struct.sec;
       mysql_time.second_part = time_struct.micros;
       mysql_time.time_type = MYSQL_TIMESTAMP_TIME;
-      field->store_time(&mysql_time);
+      /* as text, with the fraction: the field keeps as many digits as it
+         has */
+      char time_text[32];
+      const int time_length =
+          snprintf(time_text, sizeof(time_text), "%02u:%02u:%02u.%06lu",
+                   mysql_time.hour, mysql_time.minute, mysql_time.second,
+                   static_cast<unsigned long>(mysql_time.second_part));
+      field->store(time_text, time_length, &my_charset_utf8mb4_bin);
       break;
     }
     case DUCKDB_TYPE_TIMESTAMP: {
@@ -1393,18 +992,27 @@ static bool ConvertDuckDBValueToField(duckdb_result *result, idx_t col, idx_t ro
       mysql_time.second = ts_struct.time.sec;
       mysql_time.second_part = ts_struct.time.micros;
       mysql_time.time_type = MYSQL_TIMESTAMP_DATETIME;
-      if (field->type() == MYSQL_TYPE_TIMESTAMP) {
+      if (field->type() == MYSQL_TYPE_TIMESTAMP || timestamp_column) {
         /* a point in time: the date and time of the time zone of the server
-           (see rapid_server_time_zone), which the field shows in the time
-           zone of the session */
+           (see rapid_server_time_zone), which a session sees in its own
+           time zone */
         bool in_dst_time_gap = false;
         my_timeval tv;
         tv.m_tv_sec = rapid_server_time_zone()->TIME_to_gmt_sec(
             &mysql_time, &in_dst_time_gap);
         tv.m_tv_usec = ts_struct.time.micros;
-        field->store_timestamp(&tv);
+        if (field->type() == MYSQL_TYPE_TIMESTAMP) {
+          field->store_timestamp(&tv);
+        } else {
+          /* the field of the result is not a TIMESTAMP: the date and time
+             of the time zone of the session */
+          MYSQL_TIME local_time;
+          current_thd->time_zone()->gmt_sec_to_TIME(&local_time, tv);
+          local_time.second_part = ts_struct.time.micros;
+          field->store_time(&local_time, 6);
+        }
       } else {
-        field->store_time(&mysql_time);
+        field->store_time(&mysql_time, 6);
       }
       break;
     }
@@ -1432,6 +1040,14 @@ static bool ConvertDuckDBValueToField(duckdb_result *result, idx_t col, idx_t ro
 static bool ExecuteDuckDBQuery(JOIN *join, Query_result *query_result) {
   THD *thd = join->thd;
   LEX *lex = thd->lex;
+
+  /* The server calls this for every query block of the statement (the
+     blocks of a UNION): the statement of DuckDB is the whole statement, it
+     is run for the first one. */
+  if (join->query_block !=
+      join->query_block->master_query_expression()->first_query_block()) {
+    return false;
+  }
   
   // Get the DuckDB query from the execution context
   auto *context = down_cast<Rapid_execution_context *>(
@@ -1452,174 +1068,154 @@ static bool ExecuteDuckDBQuery(JOIN *join, Query_result *query_result) {
     return true;
   }
   
-  // Execute the query
+  /* Execute the query.  duckdb_query() only returns when the query has
+     ended: a thread watches the session meanwhile and interrupts the query
+     in DuckDB when the statement is killed (KILL, max_execution_time, the
+     end of the server). */
   duckdb_result result;
-  if (duckdb_query(con, duckdb_sql.c_str(), &result) == DuckDBError) {
-    const char *error = duckdb_result_error(&result);
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             error ? error : "DuckDB query execution failed");
-    duckdb_destroy_result(&result);
-    duckdb_disconnect(&con);
-    return true;
-  }
-  
-  // Get the result set metadata
-  idx_t row_count = duckdb_row_count(&result);
-  idx_t column_count = duckdb_column_count(&result);
-  
-  // Get the field list from the JOIN
-  mem_root_deque<Item *> *fields = join->fields;
-  if (fields == nullptr) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "Could not get field list from JOIN");
-    duckdb_destroy_result(&result);
-    duckdb_disconnect(&con);
-    return true;
-  }
-  
-  // For queries with aggregates or expressions without fields, we need to set up result fields
-  // Check if we have tmp_table_param with items_to_copy
-  if (join->tmp_table_param.items_to_copy != nullptr) {
-    // Map output items to their corresponding items in items_to_copy which have fields
-    idx_t col = 0;
-    auto &items_to_copy = *join->tmp_table_param.items_to_copy;
-    
-    for (Item *item : *fields) {
-      if (col < items_to_copy.size()) {
-        // Get the source item from items_to_copy
-        Item *src_item = items_to_copy[col].func();
-        if (src_item) {
-          // If the source has a tmp_table_field, use it for our output item
-          Field *src_field = src_item->get_tmp_table_field();
-          if (src_field && item->get_tmp_table_field() == nullptr) {
-            // Set this field as the result field for the output item
-            item->set_result_field(src_field);
-          }
+  memset(&result, 0, sizeof(result));
+  {
+    std::atomic<bool> finished{false};
+    std::atomic<bool> interrupted{false};
+    std::thread watcher([&finished, &interrupted, thd, con]() {
+      while (!finished.load()) {
+        if (thd->killed != THD::NOT_KILLED) {
+          interrupted.store(true);
+          duckdb_interrupt(con);
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
       }
-      col++;
-    }
-  }
-  
-  // If no items_to_copy (direct execution without temp table), we need to handle differently
-  // For items without fields, we'll store values in a protocol-compatible way
-  bool has_items_without_fields = false;
-  for (Item *item : *fields) {
-    if (item->get_tmp_table_field() == nullptr && item->get_result_field() == nullptr) {
-      has_items_without_fields = true;
-      break;
-    }
-  }
-  
-  // If we have items without fields, the query should have used a temp table but didn't
-  // This happens when MySQL optimizes the query differently
-  // We need to send results directly through the protocol
-  if (has_items_without_fields) {
-    // Get the protocol object to send results directly
-    Protocol *protocol = thd->get_protocol();
-    
-    // Send each row
-    for (idx_t row = 0; row < row_count; ++row) {
-      protocol->start_row();
-      
-      for (idx_t col = 0; col < column_count && col < fields->size(); ++col) {
-        if (duckdb_value_is_null(&result, col, row)) {
-          protocol->store_null();
-        } else {
-          // Get type and send appropriate value
-          duckdb_type col_type = duckdb_column_type(&result, col);
-          switch (col_type) {
-            case DUCKDB_TYPE_BIGINT:
-            case DUCKDB_TYPE_INTEGER:
-            case DUCKDB_TYPE_SMALLINT:
-            case DUCKDB_TYPE_TINYINT:
-            case DUCKDB_TYPE_HUGEINT:
-            case DUCKDB_TYPE_UBIGINT:
-            case DUCKDB_TYPE_UINTEGER:
-            case DUCKDB_TYPE_USMALLINT:
-            case DUCKDB_TYPE_UTINYINT: {
-              int64_t val = duckdb_value_int64(&result, col, row);
-              protocol->store_longlong(val, false);
-              break;
-            }
-            case DUCKDB_TYPE_DOUBLE:
-            case DUCKDB_TYPE_FLOAT: {
-              double val = duckdb_value_double(&result, col, row);
-              protocol->store_double(val, DECIMAL_NOT_SPECIFIED, 0);
-              break;
-            }
-            default: {
-              char *val = duckdb_value_varchar(&result, col, row);
-              if (val) {
-                protocol->store_string(val, strlen(val), &my_charset_utf8mb4_0900_ai_ci);
-                duckdb_free(val);
-              } else {
-                protocol->store_null();
-              }
-              break;
-            }
-          }
-        }
+    });
+    const duckdb_state state = duckdb_query(con, duckdb_sql.c_str(), &result);
+    finished.store(true);
+    watcher.join();
+    if (state == DuckDBError) {
+      if (interrupted.load() && thd->killed != THD::NOT_KILLED) {
+        thd->send_kill_message();
+      } else {
+        const char *error = duckdb_result_error(&result);
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 error ? error : "DuckDB query execution failed");
       }
-      
-      if (protocol->end_row()) {
-        duckdb_destroy_result(&result);
-        duckdb_disconnect(&con);
-        return true;
-      }
-      
-      thd->inc_sent_row_count(1);
-      join->send_records++;
-    }
-    
-    duckdb_destroy_result(&result);
-    duckdb_disconnect(&con);
-    return false;
-  }
-  
-  // Stream each row to MySQL
-  for (idx_t row = 0; row < row_count; ++row) {
-    // Convert DuckDB row to MySQL fields
-    idx_t col = 0;
-    for (Item *item : *fields) {
-      if (col >= column_count) break;
-      
-      // Try multiple ways to get a Field object
-      Field *field = item->get_tmp_table_field();
-      if (field == nullptr) {
-        field = item->get_result_field();
-      }
-      if (field == nullptr && item->type() == Item::FIELD_ITEM) {
-        field = down_cast<Item_field *>(item)->field;
-      }
-      
-      if (field != nullptr) {
-        if (ConvertDuckDBValueToField(&result, col, row, field)) {
-          duckdb_destroy_result(&result);
-          duckdb_disconnect(&con);
-          return true;
-        }
-      }
-      
-      ++col;
-    }
-    
-    // Send the row to the client
-    if (query_result->send_data(thd, *fields)) {
       duckdb_destroy_result(&result);
       duckdb_disconnect(&con);
       return true;
     }
-    
-    // Update row count
+  }
+
+  // Get the result set metadata
+  idx_t row_count = duckdb_row_count(&result);
+  idx_t column_count = duckdb_column_count(&result);
+
+  /* The rows are returned through a table that has the columns of the result
+     of the statement, with the types that MySQL gave them: a value of
+     DuckDB is stored in its field (which converts and formats it as MySQL
+     would) and the row of fields is given to the receiver of the result
+     (the client, or the table of INSERT ... SELECT and CREATE TABLE ...
+     SELECT).  The table is only its row buffer, it is never opened. */
+  Query_expression *unit = join->query_block->master_query_expression();
+  mem_root_deque<Item *> holders(thd->mem_root);
+  std::vector<bool> timestamp_columns;
+  for (Item *item : VisibleFields(*unit->get_unit_column_types())) {
+    timestamp_columns.push_back(item->data_type() == MYSQL_TYPE_TIMESTAMP ||
+                                item->data_type() == MYSQL_TYPE_TIMESTAMP2);
+    Item_type_holder *holder = new (thd->mem_root) Item_type_holder(thd, item);
+    /* as for the columns of a UNION: the type of the column is the type of
+       its (one) expression, with its precision */
+    if (holder == nullptr || holder->unify_types(item)) {
+      duckdb_destroy_result(&result);
+      duckdb_disconnect(&con);
+      return true;
+    }
+    holders.push_back(holder);
+  }
+  if (holders.size() != column_count) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "The result of DuckDB does not have the columns of the statement");
+    duckdb_destroy_result(&result);
+    duckdb_disconnect(&con);
+    return true;
+  }
+  Temp_table_param tmp_table_param;
+  count_field_types(join->query_block, &tmp_table_param, holders, false, true);
+  tmp_table_param.skip_create_table = true;
+  TABLE *row_table =
+      create_tmp_table(thd, &tmp_table_param, holders, nullptr, false, true,
+                       TMP_TABLE_ALL_COLUMNS, HA_POS_ERROR, "rapid_result");
+  if (row_table == nullptr) {
+    duckdb_destroy_result(&result);
+    duckdb_disconnect(&con);
+    return true;
+  }
+  mem_root_deque<Item *> row_items(thd->mem_root);
+  bool error = false;
+  for (uint i = 0; i < row_table->s->fields && !error; i++) {
+    Item *item = new (thd->mem_root) Item_field(row_table->field[i]);
+    error = item == nullptr;
+    if (!error) row_items.push_back(item);
+  }
+  error = error || row_items.size() != column_count;
+
+  for (idx_t row = 0; row < row_count && !error; ++row) {
+    for (idx_t col = 0; col < column_count && !error; ++col) {
+      Field *field = row_table->field[col];
+      if (duckdb_value_is_null(&result, col, row)) {
+        /* a column that MySQL takes for NOT NULL has its zero value */
+        if (field->is_nullable())
+          field->set_null();
+        else
+          field->reset();
+        continue;
+      }
+      error = ConvertDuckDBValueToField(&result, col, row, field,
+                                        timestamp_columns[col]);
+    }
+    if (error || thd->killed) {
+      error = true;
+      break;
+    }
+    if (query_result->send_data(thd, row_items)) {
+      error = true;
+      break;
+    }
     thd->inc_sent_row_count(1);
     join->send_records++;
   }
-  
-  // Cleanup
+
+  close_tmp_table(row_table);
+  free_tmp_table(row_table);
   duckdb_destroy_result(&result);
   duckdb_disconnect(&con);
-  
+
+  return error;
+}
+
+/* handlerton::secondary_engine_resolved: the statement for DuckDB is written
+   from the query as it was resolved, before the optimizer changes its
+   conditions in place. */
+static bool SecondaryEngineResolved(THD *thd, LEX *lex) {
+  auto *context = down_cast<Rapid_execution_context *>(
+      lex->secondary_engine_execution_context());
+  if (context == nullptr) return false;
+  {
+    std::string duckdb_sql, why;
+    if (rapid::generate_duckdb_sql(thd, lex, &duckdb_sql, &why)) {
+      const std::string message =
+          "The statement can not be run by RAPID: it has " + why;
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), message.c_str());
+      return true;
+    }
+    context->SetDuckDBQuery(duckdb_sql);
+    if (THDVAR(thd, trace_sql)) {
+      /* a note holds about 500 bytes: the statement in parts */
+      const size_t part = 400;
+      for (size_t at = 0, n = 1; at < duckdb_sql.length(); at += part, n++) {
+        push_warning_printf(thd, Sql_condition::SL_NOTE,
+                            ER_SECONDARY_ENGINE_PLUGIN, "RAPID %zu: %s", n,
+                            duckdb_sql.substr(at, part).c_str());
+      }
+    }
+  }
   return false;
 }
 
@@ -1627,14 +1223,10 @@ static bool OptimizeSecondaryEngine(THD *thd [[maybe_unused]], LEX *lex) {
   // The context should have been set by PrepareSecondaryEngine.
   assert(lex->secondary_engine_execution_context() != nullptr);
 
-  // Reconstruct SQL with DuckDB-compatible table names
-  std::string duckdb_sql = rapid::lex_to_duckdb_sql(lex);
-  if (!duckdb_sql.empty()) {
-    // Store the DuckDB query in the execution context for later execution
-    auto *context = down_cast<Rapid_execution_context *>(
-        lex->secondary_engine_execution_context());
-    context->SetDuckDBQuery(duckdb_sql);
-    
+  /* the statement for DuckDB was written by PrepareSecondaryEngine */
+  auto *context = down_cast<Rapid_execution_context *>(
+      lex->secondary_engine_execution_context());
+  if (!context->GetDuckDBQuery().empty()) {
     // Set the external executor on all query blocks' JOIN objects
     for (Query_block *select = lex->unit->first_query_block(); select != nullptr;
          select = select->next_query_block()) {
@@ -1729,6 +1321,7 @@ static int Init(MYSQL_PLUGIN p) {
   hton->prepare_secondary_engine = PrepareSecondaryEngine;
   hton->secondary_engine_pre_prepare_hook = SecondaryEnginePrePrepareHook;
   hton->optimize_secondary_engine = OptimizeSecondaryEngine;
+  hton->secondary_engine_resolved = SecondaryEngineResolved;
   hton->compare_secondary_engine_cost = CompareJoinCost;
   hton->secondary_engine_flags =
       MakeSecondaryEngineFlags(SecondaryEngineFlag::SUPPORTS_HASH_JOIN,

@@ -1,0 +1,146 @@
+#
+# Outer joins in the secondary engine: every query gives the rows that
+# the tables give.
+#
+CREATE TABLE c (id INT PRIMARY KEY, name VARCHAR(20), region INT) SECONDARY_ENGINE RAPID;
+CREATE TABLE o (id INT PRIMARY KEY, c_id INT, amount INT, p_id INT) SECONDARY_ENGINE RAPID;
+CREATE TABLE p (id INT PRIMARY KEY, label VARCHAR(20)) SECONDARY_ENGINE RAPID;
+INSERT INTO c VALUES (1, 'ann', 1), (2, 'bob', 1), (3, 'cy', 2), (4, 'dee', NULL);
+INSERT INTO o VALUES (10, 1, 15, 100), (11, 1, 250, 101), (12, 2, 99, NULL), (13, NULL, 5, 100), (14, 9, 7, 102);
+INSERT INTO p VALUES (100, 'nut'), (101, 'bolt'), (103, 'gear');
+ALTER TABLE c SECONDARY_LOAD;
+ALTER TABLE o SECONDARY_LOAD;
+ALTER TABLE p SECONDARY_LOAD;
+CREATE TABLE queries (i INT PRIMARY KEY, q TEXT);
+INSERT INTO queries VALUES
+(1, 'SELECT c.id, c.name, o.id AS oid, o.amount FROM c LEFT JOIN o ON o.c_id = c.id'),
+(2, 'SELECT c.id, o.id AS oid FROM c LEFT JOIN o ON o.c_id = c.id AND o.amount > 50'),
+(3, 'SELECT c.id, o.id AS oid FROM c LEFT JOIN o ON o.c_id = c.id WHERE o.id IS NULL'),
+(4, 'SELECT c.name, o.amount FROM o RIGHT JOIN c ON o.c_id = c.id'),
+(5, 'SELECT c.id, o.id AS oid, p.label FROM c LEFT JOIN o ON o.c_id = c.id LEFT JOIN p ON p.id = o.p_id'),
+(6, 'SELECT c.id, o.id AS oid, p.label FROM c JOIN o ON o.c_id = c.id LEFT JOIN p ON p.id = o.p_id'),
+(7, 'SELECT c.id, o.id AS oid, p.label FROM c LEFT JOIN o ON o.c_id = c.id JOIN p ON p.id = o.p_id'),
+(8, 'SELECT c.id, o.id AS oid, p.label FROM c LEFT JOIN (o JOIN p ON p.id = o.p_id) ON o.c_id = c.id'),
+(9, 'SELECT c.id, x.id AS oid, p.label FROM c, p LEFT JOIN o AS x ON x.p_id = p.id WHERE c.region = 1'),
+(10, 'SELECT c.region, COUNT(*) AS n, COUNT(o.id) AS orders, SUM(o.amount) AS total FROM c LEFT JOIN o ON o.c_id = c.id GROUP BY c.region'),
+(11, 'SELECT a.id, b.id AS bid FROM c a LEFT JOIN c b ON b.region = a.region AND b.id > a.id'),
+(12, 'SELECT o.id, c.name, p.label FROM o LEFT JOIN c ON c.id = o.c_id LEFT JOIN p ON p.id = o.p_id WHERE o.amount < 100 OR c.name IS NULL'),
+(13, 'SELECT c.id, o.id AS oid FROM c JOIN o ON o.c_id = c.id'),
+(14, 'SELECT c.id, o.id AS oid, p.id AS pid FROM c JOIN o JOIN p WHERE o.c_id = c.id AND p.id = o.p_id');
+# query 1: SELECT c.id, c.name, o.id AS oid, o.amount FROM c LEFT JOIN o ON o.c_id = c.id
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+5	5	0
+DROP TABLE r_primary, r_secondary;
+# query 2: SELECT c.id, o.id AS oid FROM c LEFT JOIN o ON o.c_id = c.id AND o.amount > 50
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+4	4	0
+DROP TABLE r_primary, r_secondary;
+# query 3: SELECT c.id, o.id AS oid FROM c LEFT JOIN o ON o.c_id = c.id WHERE o.id IS NULL
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+2	2	0
+DROP TABLE r_primary, r_secondary;
+# query 4: SELECT c.name, o.amount FROM o RIGHT JOIN c ON o.c_id = c.id
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+5	5	0
+DROP TABLE r_primary, r_secondary;
+# query 5: SELECT c.id, o.id AS oid, p.label FROM c LEFT JOIN o ON o.c_id = c.id LEFT JOIN p ON p.id = o.p_id
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+5	5	0
+DROP TABLE r_primary, r_secondary;
+# query 6: SELECT c.id, o.id AS oid, p.label FROM c JOIN o ON o.c_id = c.id LEFT JOIN p ON p.id = o.p_id
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+3	3	0
+DROP TABLE r_primary, r_secondary;
+# query 7: SELECT c.id, o.id AS oid, p.label FROM c LEFT JOIN o ON o.c_id = c.id JOIN p ON p.id = o.p_id
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+2	2	0
+DROP TABLE r_primary, r_secondary;
+# query 8: SELECT c.id, o.id AS oid, p.label FROM c LEFT JOIN (o JOIN p ON p.id = o.p_id) ON o.c_id = c.id
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+5	5	0
+DROP TABLE r_primary, r_secondary;
+# query 9: SELECT c.id, x.id AS oid, p.label FROM c, p LEFT JOIN o AS x ON x.p_id = p.id WHERE c.region = 1
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+8	8	0
+DROP TABLE r_primary, r_secondary;
+# query 10: SELECT c.region, COUNT(*) AS n, COUNT(o.id) AS orders, SUM(o.amount) AS total FROM c LEFT JOIN o ON o.c_id = c.id GROUP BY c.region
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+3	3	0
+DROP TABLE r_primary, r_secondary;
+# query 11: SELECT a.id, b.id AS bid FROM c a LEFT JOIN c b ON b.region = a.region AND b.id > a.id
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+4	4	0
+DROP TABLE r_primary, r_secondary;
+# query 12: SELECT o.id, c.name, p.label FROM o LEFT JOIN c ON c.id = o.c_id LEFT JOIN p ON p.id = o.p_id WHERE o.amount < 100 OR c.name IS NULL
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+4	4	0
+DROP TABLE r_primary, r_secondary;
+# query 13: SELECT c.id, o.id AS oid FROM c JOIN o ON o.c_id = c.id
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+3	3	0
+DROP TABLE r_primary, r_secondary;
+# query 14: SELECT c.id, o.id AS oid, p.id AS pid FROM c JOIN o JOIN p WHERE o.c_id = c.id AND p.id = o.p_id
+SELECT (SELECT COUNT(*) FROM r_primary) AS rows_of_the_tables, (SELECT COUNT(*) FROM r_secondary) AS rows_of_rapid,
+(SELECT COUNT(*) FROM ((SELECT * FROM r_primary EXCEPT ALL SELECT * FROM r_secondary) UNION ALL
+(SELECT * FROM r_secondary EXCEPT ALL SELECT * FROM r_primary)) d) AS different_rows;
+rows_of_the_tables	rows_of_rapid	different_rows
+2	2	0
+DROP TABLE r_primary, r_secondary;
+SET SESSION use_secondary_engine = FORCED;
+SELECT c.id, c.name, o.id AS oid, o.amount FROM c LEFT JOIN o ON o.c_id = c.id ORDER BY c.id, o.id;
+id	name	oid	amount
+1	ann	10	15
+1	ann	11	250
+2	bob	12	99
+3	cy	NULL	NULL
+4	dee	NULL	NULL
+EXPLAIN SELECT c.id, c.name, o.id AS oid, o.amount FROM c LEFT JOIN o ON o.c_id = c.id;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	c	NULL	ALL	NULL	NULL	NULL	NULL	#	#	Using secondary engine RAPID
+1	SIMPLE	o	NULL	ALL	NULL	NULL	NULL	NULL	#	#	Using where; Using join buffer (hash join); Using secondary engine RAPID
+Warnings:
+Note	1003	/* select#1 */ select `test`.`c`.`id` AS `id`,`test`.`c`.`name` AS `name`,`test`.`o`.`id` AS `oid`,`test`.`o`.`amount` AS `amount` from `test`.`c` left join `test`.`o` on((`test`.`o`.`c_id` = `test`.`c`.`id`)) where true
+SET SESSION use_secondary_engine = DEFAULT;
+ALTER TABLE c SECONDARY_UNLOAD;
+ALTER TABLE o SECONDARY_UNLOAD;
+ALTER TABLE p SECONDARY_UNLOAD;
+DROP TABLE queries, c, o, p;
