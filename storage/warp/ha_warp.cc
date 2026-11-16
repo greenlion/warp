@@ -91,6 +91,12 @@ mysql_mutex_t warp_mutex;
 static std::unique_ptr<collation_unordered_multimap<std::string, WARP_SHARE *>>
     warp_open_tables;
 
+/* Called by the server after a statement that changed the data dictionary
+   for a table of the engine (ALTER TABLE ... SECONDARY_LOAD / SECONDARY_UNLOAD
+   call it without asking whether the engine has one).  WARP keeps nothing
+   that has to be finished or undone then. */
+static void warp_post_ddl(THD *) {}
+
 static handler *warp_create_handler(handlerton *hton, TABLE_SHARE *table,
                                     bool partitioned, MEM_ROOT *mem_root);
 
@@ -534,7 +540,12 @@ static int warp_init_func(void *p) {
   warp_hton->state = SHOW_OPTION_YES;
   warp_hton->db_type = DB_TYPE_UNKNOWN;
   warp_hton->create = warp_create_handler;
-  warp_hton->flags = HTON_CAN_RECREATE;
+  /* A WARP table can have a secondary engine (ALTER TABLE ...
+     SECONDARY_ENGINE = RAPID, SECONDARY_LOAD): the secondary engine reads
+     the rows with a scan of the table and follows the binary log. */
+  warp_hton->flags = HTON_CAN_RECREATE | HTON_SUPPORTS_SECONDARY_ENGINE;
+  /* ALTER TABLE ... SECONDARY_LOAD calls it when it has ended */
+  warp_hton->post_ddl = warp_post_ddl;
   warp_hton->partition_flags = warp_partition_flags;
   warp_hton->file_extensions = ha_warp_exts;
   warp_hton->rm_tmp_tables = default_rm_tmp_tables;
@@ -3165,6 +3176,21 @@ enum_alter_inplace_result ha_warp::check_if_supported_inplace_alter(
       Alter_inplace_info::DROP_UNIQUE_INDEX | Alter_inplace_info::DROP_PK_INDEX |
       Alter_inplace_info::RENAME_INDEX | Alter_inplace_info::ALTER_INDEX_COMMENT;
   const Alter_inplace_info::HA_ALTER_FLAGS flags = ha_alter_info->handler_flags;
+
+  /* SECONDARY_ENGINE [=] name and SECONDARY_ENGINE_ATTRIBUTE are kept by the
+     data dictionary, nothing of the table changes: the table is not copied
+     (as InnoDB does not rebuild its table for them) */
+  if(flags == Alter_inplace_info::CHANGE_CREATE_OPTION &&
+     ha_alter_info->create_info->used_fields != 0 &&
+     (ha_alter_info->create_info->used_fields &
+      ~(HA_CREATE_USED_SECONDARY_ENGINE | HA_CREATE_USED_SECONDARY_ENGINE_ATTRIBUTE |
+        HA_CREATE_USED_EXPLICIT_SECONDARY_ENGINE)) == 0) {
+    if(ha_alter_info->alter_info->requested_algorithm ==
+       Alter_info::ALTER_TABLE_ALGORITHM_INPLACE) {
+      DBUG_RETURN(HA_ALTER_INPLACE_NO_LOCK);
+    }
+    DBUG_RETURN(HA_ALTER_INPLACE_INSTANT);
+  }
 
   /* only index changes, and at least one */
   if((flags & ~index_changes) != 0 || (flags & index_changes) == 0) {
