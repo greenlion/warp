@@ -130,8 +130,16 @@ static const char *ha_warp_exts[] = {
 /* The rows of the materialized subquery of a semi are read before the join is
    made (warp_par_join.h).  The subquery can read a table of the join: the scans
    of the tables of the plan are the scans of the table then, not the scans of
-   the join (a scan of the join would read the subquery again, without end). */
-extern thread_local bool warp_pj_suspended;
+   the join (a scan of the join would read the subquery again, without end).
+   Only the tables of the joins that are being made are read that way
+   (warp_pj_table_is_running): the subquery has joins and aggregations of its
+   own, the engine makes them as it does anywhere else.  A plan of MySQL whose
+   join or aggregation the engine replaced is not a plan that MySQL can run
+   (the tables of a join are scans in a nested loop, the aggregates of an
+   aggregation read what the engine computes). */
+struct warp_pj_plan;
+extern thread_local std::vector<const warp_pj_plan *> warp_pj_running;
+bool warp_pj_table_is_running(const TABLE *table);
 
 /* engine variables */
 static unsigned long long my_partition_max_rows, my_cache_size, my_write_cache_size;//, my_lock_wait_timeout;
@@ -1662,6 +1670,9 @@ class ha_warp : public handler {
   bool pj_follower_pending = false;
   int pj_follower_next(uchar *buf);
   bool pj_following() const;
+  /* the table is a table of a join that the engine is making now: its scans
+     are the scans of the table (see warp_pj_running) */
+  bool pj_suspended() const { return !warp_pj_running.empty() && warp_pj_table_is_running(table); }
   /* aggregation of the rows of the table inside the engine, see warp_par_agg.h */
   std::shared_ptr<warp_pa_plan> par_agg;
   int pa_run();

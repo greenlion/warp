@@ -1,0 +1,97 @@
+--echo #
+--echo # The subquery of a semi of a join that the engine makes
+--echo # (warp_parallel_hash_join) has joins and aggregations of its own.  Only
+--echo # the tables of the join that is being made are read by the scans of the
+--echo # tables while the subquery is read: the join and the aggregation of the
+--echo # subquery are made by the engine too.  They were not: the nested loop that
+--echo # stands for a join of the engine scanned its inner table for every row
+--echo # (TPC-DS query 23 with subquery_to_derived=on did not end), and the
+--echo # aggregation that the engine had replaced returned no group (the same
+--echo # query without the switch lost the rows of its subquery).
+--echo # Every query is run with the join and the aggregation of the engine on
+--echo # and off, with subquery_to_derived on and off, and against InnoDB copies.
+--echo #
+SET @save_rows = @@global.warp_partition_max_rows;
+SET GLOBAL warp_partition_max_rows = 64000;
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION warp_parallel_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 400000;
+
+CREATE TABLE f_w (id INT, k INT NULL, cid INT NULL, v INT, flag INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE d_w (id INT, flag INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE c_w (cid INT, w INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 199999)
+  SELECT i, IF(i % 1000 = 0, NULL, i % 20000), IF(i % 500 = 0, NULL, i % 3000), i % 97, i % 3 FROM s;
+INSERT INTO d_w VALUES (0, 1), (1, 0), (2, 1);
+INSERT INTO c_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 2999)
+  SELECT i, i % 2 FROM s;
+CREATE TABLE f_i LIKE f_w;
+CREATE TABLE d_i LIKE d_w;
+CREATE TABLE c_i LIKE c_w;
+ALTER TABLE f_i ENGINE=InnoDB;
+ALTER TABLE d_i ENGINE=InnoDB;
+ALTER TABLE c_i ENGINE=InnoDB;
+INSERT INTO f_i SELECT * FROM f_w;
+INSERT INTO d_i SELECT * FROM d_w;
+INSERT INTO c_i SELECT * FROM c_w;
+
+CREATE TABLE queries (i INT, q TEXT) ENGINE=InnoDB;
+INSERT INTO queries VALUES
+ (1, 'WITH best AS (SELECT c.cid, SUM(f2.v) s FROM f_# f2, c_# c WHERE f2.cid = c.cid GROUP BY c.cid HAVING SUM(f2.v) > 3300) SELECT COUNT(*) cnt, SUM(f.v) s FROM f_# f, d_# d WHERE f.flag = d.id AND d.flag = 1 AND f.cid IN (SELECT /*+ SEMIJOIN(MATERIALIZATION) */ cid FROM best)'),
+ (2, 'WITH best AS (SELECT c.cid, f2.v FROM f_# f2, c_# c WHERE f2.cid = c.cid AND c.w = 1 AND f2.v = 5) SELECT COUNT(*) cnt, SUM(f.v) s FROM f_# f, d_# d WHERE f.flag = d.id AND d.flag = 1 AND f.cid IN (SELECT /*+ SEMIJOIN(MATERIALIZATION) */ cid FROM best)'),
+ (3, 'WITH best AS (SELECT c.cid, SUM(f2.v) s FROM f_# f2, c_# c WHERE f2.cid = c.cid GROUP BY c.cid HAVING SUM(f2.v) > 0.98 * (SELECT MAX(s) FROM (SELECT SUM(f3.v) s FROM f_# f3, c_# c3 WHERE f3.cid = c3.cid AND c3.w = 1 GROUP BY c3.cid) m)) SELECT COUNT(*) cnt, SUM(f.v) s FROM f_# f, d_# d WHERE f.flag = d.id AND d.flag = 1 AND f.cid IN (SELECT /*+ SEMIJOIN(MATERIALIZATION) */ cid FROM best)'),
+ (4, 'WITH best AS (SELECT f2.cid, COUNT(*) n FROM f_# f2 GROUP BY f2.cid HAVING COUNT(*) > 66) SELECT COUNT(*) cnt, SUM(f.v) s FROM f_# f, d_# d WHERE f.flag = d.id AND d.flag = 1 AND f.cid IN (SELECT /*+ SEMIJOIN(MATERIALIZATION) */ cid FROM best)');
+
+--let $s = 0
+while ($s <= 1)
+{
+  --disable_query_log
+  if ($s == 0)
+  {
+    SET SESSION optimizer_switch = 'subquery_to_derived=off';
+  }
+  if ($s == 1)
+  {
+    SET SESSION optimizer_switch = 'subquery_to_derived=on';
+  }
+  --enable_query_log
+  --echo # subquery_to_derived: $s
+  --let $i = 1
+  while ($i <= 4)
+  {
+    --let $w = `SELECT REPLACE(q, '#', 'w') FROM queries WHERE i = $i`
+    --let $n = `SELECT REPLACE(q, '#', 'i') FROM queries WHERE i = $i`
+    --echo # query $i
+    --disable_query_log
+    SET SESSION warp_parallel_hash_join = ON;
+    SET SESSION warp_parallel_aggregation = ON;
+    --let $before = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_join_semi_keys', Value, 1)
+    eval CREATE TABLE r_on ENGINE=InnoDB AS $w;
+    --let $after = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_join_semi_keys', Value, 1)
+    SET SESSION warp_parallel_hash_join = OFF;
+    SET SESSION warp_parallel_aggregation = OFF;
+    eval CREATE TABLE r_off ENGINE=InnoDB AS $w;
+    SET SESSION warp_parallel_hash_join = ON;
+    SET SESSION warp_parallel_aggregation = ON;
+    eval CREATE TABLE r_i ENGINE=InnoDB AS $n;
+    --enable_query_log
+    --let $used = `SELECT $after > $before`
+    --echo # the keys of the subquery limited the rows of the join of the engine: $used
+    SELECT * FROM r_i;
+    SELECT COUNT(*) AS different_rows FROM
+      ((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+       UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+    DROP TABLE r_on, r_off, r_i;
+    --inc $i
+  }
+  --inc $s
+}
+
+SET SESSION optimizer_switch = DEFAULT;
+SET SESSION warp_parallel_hash_join = DEFAULT;
+SET SESSION warp_parallel_aggregation = DEFAULT;
+SET SESSION warp_parallel_join_min_rows = DEFAULT;
+SET SESSION warp_parallel_min_rows = DEFAULT;
+SET GLOBAL warp_partition_max_rows = @save_rows;
+DROP TABLE queries, f_w, d_w, c_w, f_i, d_i, c_i;
+--echo # end

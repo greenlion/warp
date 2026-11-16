@@ -2016,13 +2016,10 @@ static bool warp_pj_read_semi(THD *thd, warp_pj_semi &semi, std::string *error) 
   semi.keys.clear();
   TABLE *derived = semi.inner->table;
   /* the subquery can read a table of the join: while its rows are read, the
-     tables are read by the scans of the table, not by the scan of the join
-     (the scan of the join reads the subquery again) */
-  struct suspended_scope {
-    bool saved = warp_pj_suspended;
-    suspended_scope() { warp_pj_suspended = true; }
-    ~suspended_scope() { warp_pj_suspended = saved; }
-  } suspended;
+     tables of the join are read by the scans of the table, not by the scan of
+     the join (the scan of the join reads the subquery again): the plan is one
+     of warp_pj_running, see warp_pj_execute.  The joins and the aggregations
+     of the subquery itself are made by the engine. */
   unique_ptr_destroy_only<RowIterator> iterator =
       CreateIteratorFromAccessPath(thd, semi.materialize, semi.join, false);
   if(!iterator || iterator->Init()) {
@@ -2054,6 +2051,22 @@ static bool warp_pj_read_semi(THD *thd, warp_pj_semi &semi, std::string *error) 
    table must not make the join again. */
 static thread_local warp_pj_plan *warp_pj_executing = nullptr;
 
+/* Is the table a table of a join that the thread is making (the join whose
+   semis are read, and the joins that are made around it)? */
+bool warp_pj_table_is_running(const TABLE *table) {
+  for(const warp_pj_plan *plan : warp_pj_running) {
+    if(plan->probe == table) {
+      return true;
+    }
+    for(int l = 1; l <= plan->nbuild; ++l) {
+      if(plan->tables[l].table == table) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
   THD *thd = plan.thd;
   if(warp_pj_executing == &plan) {
@@ -2062,18 +2075,19 @@ static bool warp_pj_execute(warp_pj_plan &plan, std::string *error) {
   }
   struct executing_scope {
     warp_pj_plan *saved;
-    bool suspended = warp_pj_suspended;
     executing_scope(warp_pj_plan *plan) : saved(warp_pj_executing) {
       warp_pj_executing = plan;
       /* the tables of the plan are read by the scans of the tables while the
          rows of the join are made: the subqueries of the semis and the tables
          that the join builds are read by the engine itself, and a scan that
-         would make the join again would never end */
-      warp_pj_suspended = true;
+         would make the join again would never end.  The tables of other
+         plans (a join or an aggregation of the subquery of a semi) are not
+         tables of this join: the engine makes those plans. */
+      warp_pj_running.push_back(plan);
     }
     ~executing_scope() {
       warp_pj_executing = saved;
-      warp_pj_suspended = suspended;
+      warp_pj_running.pop_back();
     }
   } executing(&plan);
   for(warp_pj_export &e : plan.exports) {
