@@ -734,11 +734,12 @@ int ha_warp::encode_quote(uchar *) {
   /* the RID column is at the end of every table */
   buffer.append(std::to_string(current_rowid).c_str());
     
-  /* add the transaction identifier */
+  /* add the transaction identifier (write_row_impl has checked that there is
+     a transaction) */
   auto current_trx=warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
   buffer.append(",");
-  buffer.append(std::to_string(current_trx->trx_id).c_str());
+  buffer.append(std::to_string(current_trx != NULL ? current_trx->trx_id : 0).c_str());
   return (buffer.length());
 }
 
@@ -1619,6 +1620,28 @@ int ha_warp::write_buffered_rows_to_disk() {
   return rc;
 }
 
+/* Writes the rows that the statement has buffered, if there are any.  Called
+   when a scan ends (the rows of an UPDATE), and when the statement ends
+   (ha_warp::reset): the server ends the bulk insert of an INSERT, which
+   writes the rows (end_bulk_insert), but it starts none for a statement that
+   runs in prelocked mode (a table with a trigger, a statement of a stored
+   function or of a trigger).  The rows of such a statement stayed in the
+   buffer of the handler: they were not read by the next statement, and they
+   were lost when the handler was closed. */
+int ha_warp::flush_statement_rows() {
+  int rc = 0;
+  if(writer != NULL && writer->mRows() > 0) {
+    rc = write_buffered_rows_to_disk();
+    /* write_buffered_rows_to_disk flushed the partition that was written.
+       The files of the other partitions did not change, flushing them
+       too makes the next query read and decompress them again (and
+       fails for the files that other queries use). */
+    ibis::fileManager::instance().flushFile(
+        (std::string(share->data_dir_name) + "/-part.txt").c_str());
+  }
+  return rc;
+}
+
 /*
   This is an INSERT.  The row data is converted to CSV (just like the CSV
   engine) and this is passed to the storage layer for processing.  It would be
@@ -1650,6 +1673,11 @@ int ha_warp::write_row(uchar *buf) {
 int ha_warp::write_row_impl(uchar *buf) {
   DBUG_ENTER("ha_warp::write_row_impl");
   ha_statistic_increment(&System_status_var::ha_write_count);
+
+  /* the row has the id of its transaction, and it is committed with it */
+  if(trx_for_write() == NULL) {
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  }
   
   /* The row ids of this handler are consecutive.  If they came one at a time
      from a counter shared by all the connections that write to the table,
@@ -1743,8 +1771,10 @@ int ha_warp::write_row_impl(uchar *buf) {
 // newer transactions and will be visible to older transactions.
 int ha_warp::update_row(const uchar *old_data, uchar *new_data) {
   DBUG_ENTER("ha_warp::update_row");
-  auto current_trx = warp_get_trx(warp_hton, table->in_use);
-  assert(current_trx != NULL);
+  auto current_trx = trx_for_write();
+  if(current_trx == NULL) {
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  }
   
   /*delete cursor;
   delete filtered_table;
@@ -1810,8 +1840,10 @@ int ha_warp::update_row(const uchar *old_data, uchar *new_data) {
 int ha_warp::delete_row(const uchar *buf) {
   DBUG_ENTER("ha_warp::delete_row");
   
-  auto current_trx = warp_get_trx(warp_hton, table->in_use);
-  assert(current_trx != NULL);
+  auto current_trx = trx_for_write();
+  if(current_trx == NULL) {
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  }
   int lock_taken = warp_state->create_lock(current_rowid, current_trx, LOCK_EX);
   /* if deadlock or lock timeout return the error*/
   if(lock_taken != LOCK_EX) {
@@ -4186,6 +4218,10 @@ fetch_again:
   // Lock rows during a read if requested
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   int lock_taken = 0;
+  if(current_trx == NULL && (lock_in_share_mode || lock_for_update)) {
+    /* a row lock belongs to a transaction */
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  }
   if( lock_in_share_mode ) {
     lock_taken = warp_state->create_lock(current_rowid, current_trx, LOCK_SH);
     // row is exclusive locked so it has been deleted but this row should 
@@ -4384,15 +4420,7 @@ int ha_warp::end_scan(bool finish) {
   if(finish) {
     /* Only a statement that wrote rows changes the files on disk.  A scan
        that only read must leave the files it cached for the next query. */
-    if(writer != NULL && writer->mRows() > 0) {
-      write_rc = write_buffered_rows_to_disk();
-      /* write_buffered_rows_to_disk flushed the partition that was written.
-         The files of the other partitions did not change, flushing them
-         too makes the next query read and decompress them again (and
-         fails for the files that other queries use). */
-      ibis::fileManager::instance().flushFile(
-          (std::string(share->data_dir_name) + "/-part.txt").c_str());
-    }
+    write_rc = flush_statement_rows();
   }
   index_scan_open = false;
   release_scan_lease();
@@ -4894,7 +4922,7 @@ static int warp_key_lock_error(int lock_taken) {
 
 int ha_warp::lock_unique_keys(const uchar *record) {
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
-  assert(current_trx != NULL);
+  if(current_trx == NULL) return HA_ERR_INTERNAL_ERROR;
   for(uint k = 0; k < table->s->keys; ++k) {
     if(!(table->key_info[k].flags & HA_NOSAME) ||
        unique_key_is_null(k, record)) {
@@ -4913,15 +4941,16 @@ int ha_warp::lock_unique_keys(const uchar *record) {
    transaction that inserted it is this one or it has ended. */
 bool ha_warp::unique_row_exists(uint64_t rowid, uint64_t trx_id) {
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
-  assert(current_trx != NULL);
+  /* without a transaction: only the rows that are committed exist */
+  const uint64_t my_trx_id = current_trx != NULL ? current_trx->trx_id : 0;
   /* the row that an update replaces */
   if(rowid == unique_exclude_rowid) return false;
   /* committed deletes, and the inserts of rolled back statements */
   if(warp_state->delete_bitmap->is_set(rowid)) return false;
   /* deleted by this transaction */
-  if(warp_state->get_history_lock(rowid) == current_trx->trx_id) return false;
+  if(my_trx_id != 0 && warp_state->get_history_lock(rowid) == my_trx_id) return false;
   /* the rows of rolled back transactions do not exist */
-  return trx_id == current_trx->trx_id ||
+  return (my_trx_id != 0 && trx_id == my_trx_id) ||
          (trx_id != 0 && warp_state->is_trx_committed(trx_id));
 }
 
@@ -4999,6 +5028,7 @@ bool ha_warp::build_unique_cache() {
 /* The rows that are written are added to the cache, buffered or not */
 void ha_warp::remember_unique_keys(const uchar *record) {
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
+  if(current_trx == NULL) return; /* no row is written without a transaction */
   std::string image;
   std::lock_guard<std::mutex> guard(share->unique_mtx);
   if(!share->unique_cache_built) {
@@ -7960,25 +7990,118 @@ int ha_warp::bitmap_merge_join() {
   return 0;
 }
 
-//FIXME: maybe this is supposed to do something?
-//everything seems to work with it just returning zero
-//but some unexpected bugs around transactions might be
-//lurking.  Need to double check storage engine 
-//interface documentation.  Note: Those docs are outdated and
-//I think this function is no longer used...
-//external_lock seems to handle it?
-int ha_warp::start_stmt(THD *thd, thr_lock_type) {
-  /* a statement under LOCK TABLES, see external_lock */
+/* The data modification commands: their transaction is marked dirty when the
+   statement starts (see begin_statement). */
+static bool warp_is_write_command(enum_sql_command sql_command) {
+  return sql_command == SQLCOM_UPDATE || sql_command == SQLCOM_UPDATE_MULTI ||
+         sql_command == SQLCOM_INSERT ||
+         sql_command == SQLCOM_REPLACE ||
+         sql_command == SQLCOM_DELETE || sql_command == SQLCOM_DELETE_MULTI ||
+         sql_command == SQLCOM_INSERT_SELECT ||
+         sql_command == SQLCOM_REPLACE_SELECT ||
+         sql_command == SQLCOM_LOAD ||
+         sql_command == SQLCOM_ALTER_TABLE ||
+         sql_command == SQLCOM_CREATE_TABLE;
+}
+
+/* The first change of a transaction marks it dirty: it is on the list of the
+   open transactions until it ends, and its commit sets its bit in the commit
+   bitmap (a transaction that is not dirty commits nothing, its rows would
+   never be visible).  Registering the open transaction prevents a
+   transaction from seeing inserts that are not visible to it and to still
+   find duplicate keys in transactions doing concurrent inserts.
+
+   A statement of a transaction that is not autocommit can be rolled back
+   alone (see warp_trx::rollback): it writes one savepoint, for all its
+   tables, before it changes anything. */
+static void warp_mark_trx_dirty(THD *thd, warp_trx *trx) {
+  if(!trx->dirty) {
+    warp_state->register_open_trx(trx->trx_id);
+    trx->open_registered = true;
+    trx->dirty = true;
+  }
+  if(!trx->autocommit &&
+     trx->savepoint_query_id != (uint64_t)thd->query_id) {
+    trx->write_savepoint(thd->query_id);
+  }
+}
+
+/* A statement starts to use the table.  The server tells the engine with
+   external_lock, or with start_stmt when the table is already locked: the
+   statements under LOCK TABLES, and those of stored functions and triggers
+   (prelocking).  In both cases the transaction of the connection is created
+   if there is none (the one before it may have been committed by the
+   statement before, or by the implicit commit of LOCK TABLES or of a DDL
+   statement), it is registered with the server, which calls warp_commit or
+   warp_rollback only for the engines that are registered for the statement,
+   and it is marked dirty if the statement changes data. */
+warp_trx* ha_warp::begin_statement(THD *thd, bool write_lock) {
   auto current_trx = warp_get_trx(warp_hton, thd);
-  if(current_trx != NULL && current_trx->dirty && !current_trx->autocommit &&
-     current_trx->savepoint_query_id != (uint64_t)thd->query_id) {
-    current_trx->write_savepoint(thd->query_id);
+  if(current_trx == NULL) current_trx = create_trx(thd);
+  if(current_trx == NULL) return NULL;
+
+  register_trx_with_mysql(thd, current_trx);
+
+  current_trx->for_update = write_lock;
+
+  /* serializable isolation level takes shared locks on all visible rows traveresed
+    and so does LOCK IN SHARE MODE
+  */
+  if (current_trx->isolation_level == ISO_SERIALIZABLE) {
+    current_trx->lock_in_share_mode=true;
+  }
+
+  enum_sql_command sql_command = (enum_sql_command)thd_sql_command(thd);
+  /* Row events applied by a replica or by a BINLOG statement have no data
+     modification command, but they do take a write lock. */
+  const bool applying_row_events =
+    write_lock &&
+    (thd->slave_thread || sql_command == SQLCOM_BINLOG_BASE64_EVENT);
+  if(applying_row_events || warp_is_write_command(sql_command)) {
+    warp_mark_trx_dirty(thd, current_trx);
+  }
+  return current_trx;
+}
+
+/* The transaction of a statement that is about to change a row.  The
+   statement has started the transaction (begin_statement); it is marked
+   dirty here if the command of the statement is not one of those that
+   begin_statement knows to change data (a stored function or a trigger that
+   writes, called by a SELECT for example), otherwise the rows that are
+   written would never be committed.  NULL: there is no transaction, the
+   caller returns an error. */
+warp_trx* ha_warp::trx_for_write() {
+  THD *thd = table->in_use;
+  auto current_trx = warp_get_trx(warp_hton, thd);
+  if(current_trx == NULL) {
+    sql_print_error("WARP: a row of %s is changed without a transaction",
+                    share != NULL ? share->data_dir_name : "a table");
+    return NULL;
+  }
+  if(!current_trx->dirty ||
+     (!current_trx->autocommit &&
+      current_trx->savepoint_query_id != (uint64_t)thd->query_id)) {
+    warp_mark_trx_dirty(thd, current_trx);
+  }
+  return current_trx;
+}
+
+/* A statement that uses a table which is already locked: under LOCK TABLES
+   the server calls external_lock for LOCK TABLES and for UNLOCK TABLES only,
+   and start_stmt for every statement in between. */
+int ha_warp::start_stmt(THD *thd, thr_lock_type lock_type) {
+  if(begin_statement(thd, lock_type >= TL_WRITE_ALLOW_WRITE) == NULL) {
+    return HA_ERR_OUT_OF_MEM;
   }
   return 0;
 }
 
+/* A transaction of several statements is registered with the server once
+   (it ends with COMMIT or ROLLBACK, or with an implicit commit), every
+   statement is registered.  A statement under LOCK TABLES is like any other:
+   with autocommit it is a transaction of its own, as it is for InnoDB. */
 int ha_warp::register_trx_with_mysql(THD* thd, warp_trx* trx) {
-  long long all_trx = thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_TABLE_LOCK);
+  long long all_trx = thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
   if(all_trx && !trx->registered) {
     trx->registered = true;
     trans_register_ha(thd, true, warp_hton, const_cast<ulonglong*>(&(trx->trx_id)));
@@ -7990,58 +8113,9 @@ int ha_warp::register_trx_with_mysql(THD* thd, warp_trx* trx) {
 int ha_warp::external_lock(THD *thd, int lock_type){ 
     
   if (lock_type != F_UNLCK)  {
-    auto current_trx = warp_get_trx(warp_hton, table->in_use);
-    if(current_trx == NULL) current_trx = create_trx(table->in_use);
-    assert(current_trx != NULL);
-  
-    register_trx_with_mysql(thd, current_trx);
+    auto current_trx = begin_statement(thd, lock_type == F_WRLCK);
+    if(current_trx == NULL) return HA_ERR_OUT_OF_MEM;
     current_trx->lock_count++;
-
-    if(lock_type == F_WRLCK) {
-      current_trx->for_update = true;
-    } else {
-      current_trx->for_update = false;
-    }
-
-    /* serializable isolation level takes shared locks on all visible rows traveresed
-      and so does LOCK IN SHARE MODE
-    */
-    if (current_trx->isolation_level == ISO_SERIALIZABLE) {
-      current_trx->lock_in_share_mode=true;
-    }
-
-    enum_sql_command sql_command = (enum_sql_command)thd_sql_command(thd);
-    /* Row events applied by a replica or by a BINLOG statement have no data
-       modification command, but they do take a write lock. */
-    const bool applying_row_events =
-      lock_type == F_WRLCK &&
-      (thd->slave_thread || sql_command == SQLCOM_BINLOG_BASE64_EVENT);
-    if(applying_row_events ||
-      sql_command == SQLCOM_UPDATE || sql_command == SQLCOM_UPDATE_MULTI ||
-      sql_command == SQLCOM_INSERT ||
-      sql_command == SQLCOM_REPLACE ||
-      sql_command == SQLCOM_DELETE || sql_command == SQLCOM_DELETE_MULTI ||
-      sql_command == SQLCOM_INSERT_SELECT ||
-      sql_command == SQLCOM_LOAD ||
-      sql_command == SQLCOM_ALTER_TABLE ||
-      sql_command == SQLCOM_CREATE_TABLE)  {  
-      // the first time a data modification statement is encountered
-      // the transaction is marked dirty.  Registering the open
-      // transaction prevents a transaction from seeing inserts
-      // that are not visible to it and to still find duplicate
-      // keys in transactions doing concurrent inserts
-      if(!current_trx->dirty) {
-        warp_state->register_open_trx(current_trx->trx_id);
-        current_trx->open_registered = true;
-        current_trx->dirty = true;
-      }
-      /* the statement can be rolled back alone (see warp_trx::rollback),
-         one savepoint for all the tables of the statement */
-      if(!current_trx->autocommit &&
-         current_trx->savepoint_query_id != (uint64_t)thd->query_id) {
-        current_trx->write_savepoint(thd->query_id);
-      }
-    } 
   } else {
     // unlock the table
     cleanup_pushdown_info();
@@ -8060,7 +8134,7 @@ warp_trx* ha_warp::create_trx(THD* thd) {
   trx->active_registered = true;
   /* the log is opened by the first change of the transaction (see
      open_log), a transaction that only reads has none */
-  trx->autocommit = !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_TABLE_LOCK);
+  trx->autocommit = !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
   trx_mutex.unlock();
   return trx;
 }
@@ -8740,6 +8814,8 @@ warp_trx* warp_get_trx(handlerton* hton, THD* thd) {
 */
 int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
   auto current_trx = warp_get_trx(hton, thd);
+  /* nothing to commit: the transaction has ended already */
+  if(current_trx == NULL) return 0;
   
   if(commit_trx || current_trx->autocommit) {
     if(current_trx->dirty) {
@@ -8776,6 +8852,7 @@ int warp_commit(handlerton* hton, THD *thd, bool commit_trx) {
 */
 int warp_rollback(handlerton* hton, THD *thd, bool rollback_trx) {
   warp_trx* current_trx = warp_get_trx(hton, thd);
+  if(current_trx == NULL) return 0;
   //if a statement failed, we need to rollback the insertions
   //
   if(rollback_trx) {
@@ -8822,6 +8899,10 @@ bool ha_warp::is_row_visible_to_read(uint64_t rowid) {
   
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
+  if(current_trx == NULL) {
+    /* a read without a transaction sees what is committed */
+    return !is_deleted(current_rowid);
+  }
   
   if(history_trx_id == 0 
     || history_trx_id < current_trx->trx_id 
@@ -8851,6 +8932,11 @@ bool ha_warp::is_trx_visible_to_read(uint64_t row_trx_id) {
 
   auto current_trx = warp_get_trx(warp_hton, table->in_use);
   assert(current_trx != NULL);
+  if(current_trx == NULL) {
+    /* a read without a transaction sees what is committed */
+    is_trx_visible = row_trx_id != 0 && warp_state->is_trx_committed(row_trx_id);
+    return is_trx_visible;
+  }
   
   //dbug("trx_id:" << current_trx->trx_id << " row_trx_id: " << row_trx_id);
 
