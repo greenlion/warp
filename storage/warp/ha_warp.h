@@ -1389,6 +1389,12 @@ class ha_warp : public handler {
     uint outer_col = 0;             // its column
     TABLE *inner_table = nullptr;   // the table that is limited to the keys
     uint inner_col = 0;             // the column of this table that is materialized
+    /* the other table is a derived table that MySQL materializes once (the
+       path that materializes it): its keys are read from its rows when the
+       scan of this table starts (derived_keys_of) */
+    AccessPath *derived_path = nullptr;
+    std::shared_ptr<std::vector<int64_t>> derived_keys;   // ascending and unique, once read
+    bool derived_failed = false;
   };
   /* the keys that the scan may be limited to: the one with the fewest keys is
      the one that is used (semi_in, semi_pick_keys), see semi_pick */
@@ -1397,6 +1403,7 @@ class ha_warp : public handler {
   std::shared_ptr<std::vector<int64_t>> semi_pick_keys;
   void semi_pick();
   bool semi_keys_of(const std::shared_ptr<warp_semi_in> &candidate, std::vector<int64_t> *keys, uint64_t max_keys);
+  bool derived_keys_of(const std::shared_ptr<warp_semi_in> &candidate, std::vector<int64_t> *keys, uint64_t max_keys);
   /* more keys than a condition of the scan can list: each partition lists the
      keys that are in the range of its values (see where_for_partition) */
   std::shared_ptr<std::vector<int64_t>> semi_keys;

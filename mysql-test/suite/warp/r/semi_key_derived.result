@@ -46,7 +46,7 @@ different_rows
 0
 DROP TABLE r_on, r_off, r_i;
 # query 2
-# the aggregation was limited to the keys of the other table: 0
+# the aggregation was limited to the keys of the other table: 1
 SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
 (SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
 same_rows_on	same_rows_off
@@ -58,7 +58,7 @@ different_rows
 0
 DROP TABLE r_on, r_off, r_i;
 # query 3
-# the aggregation was limited to the keys of the other table: 0
+# the aggregation was limited to the keys of the other table: 1
 SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
 (SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
 same_rows_on	same_rows_off

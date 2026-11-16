@@ -256,6 +256,16 @@ static int show_warp_active_transactions(MYSQL_THD, SHOW_VAR *var, char *buff) {
 
 thread_local std::vector<const warp_pj_plan *> warp_pj_running;
 
+/* Warp_invalid_pushed_conditions: the conditions that were not pushed down
+   because FastBit could not parse the text that was made of them (a bug of
+   the pushdown, the condition is evaluated by MySQL) */
+static std::atomic<unsigned long long> warp_invalid_pushed_conditions{0};
+static int show_warp_invalid_pushed_conditions(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *reinterpret_cast<longlong *>(buff) = (longlong)warp_invalid_pushed_conditions.load();
+  return 0;
+}
 /* Warp_semi_key_scans: the scans that were limited to the keys of another
    table (see ha_warp::semi_key_condition) */
 static std::atomic<unsigned long long> warp_semi_key_scans{0};
@@ -297,6 +307,7 @@ static SHOW_VAR warp_status_variables[] = {
     {"Warp_history_locks", (char *)&show_warp_history_locks, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_active_transactions", (char *)&show_warp_active_transactions, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_semi_key_scans", (char *)&show_warp_semi_key_scans, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Warp_invalid_pushed_conditions", (char *)&show_warp_invalid_pushed_conditions, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_join_semi_keys", (char *)&show_warp_join_semi_keys, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_lookup_caches", (char *)&show_warp_lookup_caches, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}};
@@ -5937,6 +5948,245 @@ static void warp_add_semi_candidate(ha_warp *inner_handler, Field *inner_field, 
   warp_semi_registry.push_back(semi);
 }
 
+/* A scan of a table that is limited to the keys of a column of a derived
+   table (a CTE) that MySQL materializes once: scan_field is a column of the
+   table that the scan reads, derived_field a column of the derived table, and
+   they are equal in every row of the (inner) join that the scan is read for.
+   The derived table is materialized when the scan starts, if it is not yet
+   (MySQL would do it for the first row of the join), and its keys are read
+   (ha_warp::derived_keys_of). */
+static void warp_add_derived_candidate(TABLE *scan_table, Field *scan_field, AccessPath *materialize,
+                                       Field *derived_field) {
+  auto integer = [](Field *f) {
+    switch(f->real_type()) {
+      case MYSQL_TYPE_TINY:
+      case MYSQL_TYPE_SHORT:
+      case MYSQL_TYPE_INT24:
+      case MYSQL_TYPE_LONG:
+        return true;
+      case MYSQL_TYPE_LONGLONG:
+        return !f->is_flag_set(UNSIGNED_FLAG);
+      default:
+        return false;
+    }
+  };
+  ha_warp *scan_handler = scan_table == nullptr ? nullptr : dynamic_cast<ha_warp *>(scan_table->file);
+  if(scan_handler == nullptr || scan_field == nullptr || derived_field == nullptr || materialize == nullptr ||
+     scan_field->table != scan_table || !integer(scan_field) || !integer(derived_field)) {
+    return;
+  }
+  TABLE *derived = derived_field->table;
+  for(const auto &known : scan_handler->semi_candidates) {
+    if(known->outer_table == derived && known->outer_col == derived_field->field_index() &&
+       known->inner_col == scan_field->field_index()) {
+      return;
+    }
+  }
+  auto semi = std::make_shared<ha_warp::warp_semi_in>();
+  semi->outer_table = derived;
+  semi->outer_col = derived_field->field_index();
+  semi->inner_table = scan_table;
+  semi->inner_col = scan_field->field_index();
+  semi->derived_path = materialize;
+  scan_handler->semi_candidates.push_back(semi);
+  warp_semi_registry.push_back(semi);
+}
+
+/* The derived table of a path, if the path is a derived table that MySQL
+   materializes once for the statement (the rows that it has do not depend on
+   the rows of other tables, and there is no limit of their number). */
+static TABLE *warp_materialized_once(AccessPath *path) {
+  if(path == nullptr || path->type != AccessPath::MATERIALIZE) {
+    return nullptr;
+  }
+  const MaterializePathParameters *param = path->materialize().param;
+  if(param == nullptr || param->rematerialize || param->table == nullptr ||
+     (param->invalidators != nullptr && !param->invalidators->empty()) ||
+     param->reject_multiple_rows || param->table->pos_in_table_list == nullptr ||
+     !param->table->pos_in_table_list->is_view_or_derived()) {
+    return nullptr;
+  }
+  return param->table;
+}
+
+/* The scans of WARP tables below a path whose rows are all rows of an inner
+   join with the path (a row that the scan leaves out is a row that the path
+   does not return either), and that are started once: a scan on the inner
+   side of a nested loop is started again for every row of the outer side. */
+static void warp_inner_joined_scans(AccessPath *path, std::vector<TABLE *> *scans) {
+  while(path != nullptr && path->type == AccessPath::FILTER) {
+    path = path->filter().child;
+  }
+  if(path == nullptr) {
+    return;
+  }
+  switch(path->type) {
+    case AccessPath::TABLE_SCAN:
+      if(dynamic_cast<ha_warp *>(path->table_scan().table->file) != nullptr) {
+        scans->push_back(path->table_scan().table);
+      }
+      break;
+    case AccessPath::NESTED_LOOP_JOIN:
+      if(path->nested_loop_join().join_type == JoinType::INNER) {
+        warp_inner_joined_scans(path->nested_loop_join().outer, scans);
+      }
+      break;
+    case AccessPath::HASH_JOIN: {
+      const JoinPredicate *predicate = path->hash_join().join_predicate;
+      if(predicate != nullptr && predicate->expr != nullptr &&
+         predicate->expr->type == RelationalExpression::INNER_JOIN) {
+        warp_inner_joined_scans(path->hash_join().outer, scans);
+        warp_inner_joined_scans(path->hash_join().inner, scans);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+/* The derived tables below a path that are materialized once and whose rows
+   are joined to the rows of the path with inner joins. */
+static void warp_inner_joined_derived(AccessPath *path, std::vector<AccessPath *> *derived) {
+  while(path != nullptr && path->type == AccessPath::FILTER) {
+    path = path->filter().child;
+  }
+  if(path == nullptr) {
+    return;
+  }
+  switch(path->type) {
+    case AccessPath::MATERIALIZE:
+      if(warp_materialized_once(path) != nullptr) {
+        derived->push_back(path);
+      }
+      break;
+    case AccessPath::NESTED_LOOP_JOIN:
+      if(path->nested_loop_join().join_type == JoinType::INNER) {
+        warp_inner_joined_derived(path->nested_loop_join().outer, derived);
+        warp_inner_joined_derived(path->nested_loop_join().inner, derived);
+      }
+      break;
+    case AccessPath::HASH_JOIN: {
+      const JoinPredicate *predicate = path->hash_join().join_predicate;
+      if(predicate != nullptr && predicate->expr != nullptr &&
+         predicate->expr->type == RelationalExpression::INNER_JOIN) {
+        warp_inner_joined_derived(path->hash_join().outer, derived);
+        warp_inner_joined_derived(path->hash_join().inner, derived);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+/* A hash join (inner) whose equality compares a column of a WARP table that
+   is scanned on one side with a column of a derived table of the other side:
+   the scan is limited to the keys of the derived table.  The side of the
+   derived table is read before the scan starts (the hash table is built
+   first) or after it has started (the derived table is then materialized
+   when the scan starts). */
+static void warp_derived_keys_of_hash_join(AccessPath *path) {
+  const RelationalExpression *expr = path->hash_join().join_predicate->expr;
+  if(expr->type != RelationalExpression::INNER_JOIN) {
+    return;
+  }
+  for(int side = 0; side < 2; ++side) {
+    AccessPath *scan_side = side == 0 ? path->hash_join().outer : path->hash_join().inner;
+    AccessPath *derived_side = side == 0 ? path->hash_join().inner : path->hash_join().outer;
+    std::vector<TABLE *> scans;
+    std::vector<AccessPath *> derived;
+    warp_inner_joined_scans(scan_side, &scans);
+    warp_inner_joined_derived(derived_side, &derived);
+    if(scans.empty() || derived.empty()) {
+      continue;
+    }
+    for(Item_eq_base *eq : expr->equijoin_conditions) {
+      /* a = b: a row with NULL has no row of the join (a <=> b has) */
+      if(eq->functype() != Item_func::EQ_FUNC || eq->argument_count() != 2 ||
+         eq->arguments()[0]->real_item()->type() != Item::FIELD_ITEM ||
+         eq->arguments()[1]->real_item()->type() != Item::FIELD_ITEM) {
+        continue;
+      }
+      Field *f0 = down_cast<Item_field *>(eq->arguments()[0]->real_item())->field;
+      Field *f1 = down_cast<Item_field *>(eq->arguments()[1]->real_item())->field;
+      if(f0 == nullptr || f1 == nullptr) continue;
+      for(TABLE *scan_table : scans) {
+        Field *scan_field = f0->table == scan_table ? f0 : (f1->table == scan_table ? f1 : nullptr);
+        if(scan_field == nullptr) continue;
+        Field *other = scan_field == f0 ? f1 : f0;
+        for(AccessPath *materialize : derived) {
+          if(other->table == materialize->materialize().param->table) {
+            warp_add_derived_candidate(scan_table, scan_field, materialize, other);
+          }
+        }
+      }
+    }
+  }
+}
+
+/* A nested loop (inner join) that reads a derived table by a key whose value
+   is a column of a WARP table that is scanned on the outer side: the scan is
+   limited to the keys of the derived table. */
+static void warp_derived_keys_of_nested_loop(AccessPath *path) {
+  AccessPath *inner = path->nested_loop_join().inner;
+  while(inner != nullptr && inner->type == AccessPath::FILTER) {
+    inner = inner->filter().child;
+  }
+  TABLE *derived = warp_materialized_once(inner);
+  if(derived == nullptr) {
+    return;
+  }
+  AccessPath *table_path = inner->materialize().table_path;
+  if(table_path == nullptr || (table_path->type != AccessPath::REF && table_path->type != AccessPath::EQ_REF)) {
+    return;
+  }
+  const bool is_ref = table_path->type == AccessPath::REF;
+  Index_lookup *ref = is_ref ? table_path->ref().ref : table_path->eq_ref().ref;
+  if((is_ref ? table_path->ref().table : table_path->eq_ref().table) != derived || ref == nullptr) {
+    return;
+  }
+  std::vector<TABLE *> scans;
+  warp_inner_joined_scans(path->nested_loop_join().outer, &scans);
+  for(uint k = 0; k < ref->key_parts; ++k) {
+    Item *value = ref->items[k]->real_item();
+    if(value->type() != Item::FIELD_ITEM) continue;
+    Field *scan_field = down_cast<Item_field *>(value)->field;
+    if(scan_field == nullptr) continue;
+    /* a key that is NULL finds no row, unless the key is compared with <=>
+       (the lookup is then not marked as one that rejects NULL): a column
+       that has no NULL is the same for both */
+    if(scan_field->is_nullable() && (ref->null_rejecting & ((key_part_map)1 << k)) == 0) {
+      continue;
+    }
+    for(TABLE *scan_table : scans) {
+      if(scan_field->table == scan_table) {
+        warp_add_derived_candidate(scan_table, scan_field, inner, derived->key_info[ref->key].key_part[k].field);
+      }
+    }
+  }
+}
+
+/* The operands of a derived table that is a UNION can be limited to the keys
+   that the derived table is read by like the scan of a derived table of one
+   query block: the rows of an operand with other keys are rows of the derived
+   table with other keys, which are not read.  Not if the number of rows of
+   the UNION is limited, if it is recursive, or if the CTE is read by another
+   reference too (which shares the rows and reads other keys). */
+static bool warp_union_operands_can_be_limited(const MaterializePathParameters *param) {
+  if(param->unit == nullptr || param->unit->is_recursive() || param->unit->query_term() == nullptr ||
+     param->unit->query_term()->term_type() != QT_UNION || param->limit_rows != HA_POS_ERROR ||
+     param->reject_multiple_rows || (param->cte != nullptr && param->cte->references.size() > 1)) {
+    return false;
+  }
+  for(const MaterializePathParameters::Operand &operand : param->m_operands) {
+    if(operand.is_recursive_reference) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /* The column of a table that a column of a derived table is made of, if the
    derived table is made of a scan of one WARP table with conditions, or of an
    aggregation of such a scan and the column is one of the columns that the
@@ -6065,6 +6315,7 @@ static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
          expr->type != RelationalExpression::ANTIJOIN) {
         return false;
       }
+      warp_derived_keys_of_hash_join(path);
       AccessPath *build = path->hash_join().inner;
       while(build != nullptr && build->type == AccessPath::FILTER) {
         build = build->filter().child;
@@ -6089,6 +6340,7 @@ static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
     if(path->type != AccessPath::NESTED_LOOP_JOIN || path->nested_loop_join().join_type != JoinType::INNER) {
       return false;
     }
+    warp_derived_keys_of_nested_loop(path);
     /* the conditions on top of the derived table: derived.column = column of another table */
     AccessPath *inner = path->nested_loop_join().inner;
     std::vector<Item *> conditions;
@@ -6097,7 +6349,9 @@ static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
       inner = inner->filter().child;
     }
     if(inner->type != AccessPath::MATERIALIZE || inner->materialize().param == nullptr ||
-       inner->materialize().param->rematerialize || inner->materialize().param->m_operands.size() != 1) {
+       inner->materialize().param->rematerialize || inner->materialize().param->m_operands.empty() ||
+       (inner->materialize().param->m_operands.size() != 1 &&
+        !warp_union_operands_can_be_limited(inner->materialize().param))) {
       return false;
     }
     AccessPath *table_path = inner->materialize().table_path;
@@ -6138,13 +6392,14 @@ static void warp_try_semi_keys(THD *thd, AccessPath *root, JOIN *join) {
       }
     };
     for(Item *condition : conditions) collect(condition);
-    const MaterializePathParameters::Operand &operand = inner->materialize().param->m_operands[0];
-    for(const auto &pair : pairs) {
-      Field *source_field = nullptr;
-      ha_warp *source_handler = nullptr;
-      const bool resolved = warp_derived_source(operand, pair.first, &source_field, &source_handler);
-      if(resolved) {
-        warp_add_semi_candidate(source_handler, source_field, pair.second);
+    for(const MaterializePathParameters::Operand &operand : inner->materialize().param->m_operands) {
+      for(const auto &pair : pairs) {
+        Field *source_field = nullptr;
+        ha_warp *source_handler = nullptr;
+        const bool resolved = warp_derived_source(operand, pair.first, &source_field, &source_handler);
+        if(resolved) {
+          warp_add_semi_candidate(source_handler, source_field, pair.second);
+        }
       }
     }
     return false;
@@ -6276,6 +6531,19 @@ const Item *ha_warp::cond_push(const Item *cond) {
   
   // only push a where clause if there were condtiions that were actually pushed
   if(depth == 0 && (unpushed_condition_count != condition_count)){
+    /* A condition that FastBit can not parse is not a condition of the scan
+       (the scan would return every row of the table): MySQL evaluates it */
+    bool valid = false;
+    try {
+      ibis::whereClause parsed(where_clause.c_str());
+      valid = !parsed.empty();
+    } catch(...) {
+      valid = false;
+    }
+    if(!valid) {
+      ++warp_invalid_pushed_conditions;
+      return cond;
+    }
     push_where_clause += where_clause;
   }
   
@@ -6902,7 +7170,88 @@ std::string ha_warp::where_for_partition(const std::string &dir) {
    the statement are included, the keys are only used to leave rows out).  The
    condition that limits the scan of this table, or none if the keys are not
    known or are too many to help. */
+/* The values of a column of a derived table that MySQL materializes once (see
+   warp_add_derived_candidate).  The table is materialized now if it is not
+   yet: by the iterator that MySQL reads it with, which finds it materialized
+   when the join reads it.  No row of the derived table is being read when the
+   scan of this table starts: the table was not read yet, or it was read to
+   the end for the hash table of the join. */
+bool ha_warp::derived_keys_of(const std::shared_ptr<warp_semi_in> &candidate, std::vector<int64_t> *keys_out, uint64_t max_keys) {
+  if(candidate->derived_keys) {
+    if(candidate->derived_keys->size() > max_keys) {
+      return false;
+    }
+    *keys_out = *candidate->derived_keys;
+    return true;
+  }
+  if(candidate->derived_failed || !warp_pj_running.empty() || par_join || pj_follower || pj_plain_scan) {
+    return false;
+  }
+  AccessPath *materialize = candidate->derived_path;
+  TABLE *derived = candidate->outer_table;
+  THD *thd = table->in_use;
+  if(materialize->iterator == nullptr || thd == nullptr || thd->is_error() || thd->killed) {
+    return false;
+  }
+  candidate->derived_failed = true;   // not tried again if it fails
+  if(!derived->materialized && materialize->iterator->Init()) {
+    return false;
+  }
+  if(!derived->materialized || !derived->is_created() || derived->file == nullptr ||
+     candidate->outer_col >= derived->s->fields) {
+    return false;
+  }
+  handler *file = derived->file;
+  const auto was_inited = file->inited;
+  const uint was_index = file->active_index;
+  file->ha_index_or_rnd_end();
+  auto restore = [&]() {
+    if(was_inited == handler::INDEX && file->inited == handler::NONE) {
+      file->ha_index_init(was_index, false);
+    }
+  };
+  if(file->ha_rnd_init(true) != 0) {
+    restore();
+    return false;
+  }
+  Field *key = derived->field[candidate->outer_col];
+  std::vector<int64_t> keys;
+  bool too_many = false;
+  int rc;
+  while((rc = file->ha_rnd_next(derived->record[0])) == 0) {
+    if(key->is_null()) {
+      continue;
+    }
+    keys.push_back(key->val_int());
+    if(keys.size() > 4 * max_keys + 65536) {
+      std::sort(keys.begin(), keys.end());
+      keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+      if(keys.size() > max_keys) {
+        too_many = true;
+        break;
+      }
+    }
+  }
+  file->ha_rnd_end();
+  restore();
+  if(too_many || rc != HA_ERR_END_OF_FILE) {
+    return false;
+  }
+  std::sort(keys.begin(), keys.end());
+  keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+  candidate->derived_keys = std::make_shared<std::vector<int64_t>>(std::move(keys));
+  candidate->derived_failed = false;
+  if(candidate->derived_keys->size() > max_keys) {
+    return false;
+  }
+  *keys_out = *candidate->derived_keys;
+  return true;
+}
+
 bool ha_warp::semi_keys_of(const std::shared_ptr<warp_semi_in> &candidate, std::vector<int64_t> *keys_out, uint64_t max_keys) {
+  if(candidate->derived_path != nullptr) {
+    return derived_keys_of(candidate, keys_out, max_keys);
+  }
   ha_warp *outer = dynamic_cast<ha_warp *>(candidate->outer_table->file);
   if(outer == nullptr) {
     return false;
@@ -7412,6 +7761,28 @@ int ha_warp::append_column_filter(const Item *cond,
       return 2;
     }
     
+    /* The condition is written as "column OP value": the column is a column
+       of this table and the values are constants.  A value that is a column
+       (a BETWEEN b AND c, a IN (b, 5), a bound that is a column of another
+       table: t.a BETWEEN x.lo AND x.hi) is not a condition that FastBit
+       evaluates, MySQL evaluates it.  Such a condition was written as text
+       that FastBit could not parse ("c2 BETWEEN  AND c0 AND  AND c1"), which
+       made the whole condition of the scan invalid: the scan returned every
+       row of the table, also the rows that the other conditions of the scan
+       exclude, and MySQL does not evaluate those again. */
+    for(uint i = 0; i < tmp->arg_count; ++i) {
+      if(arg[i]->type() != Item::Type::FIELD_ITEM) continue;
+      const Field *column = down_cast<Item_field *>(arg[i])->field;
+      if(column == nullptr || column->table != table) {
+        return 0;
+      }
+      /* "5 < column" is written as "column > 5" below */
+      if(i > 0 && (is_between || is_in || tmp->arg_count != 2 ||
+                   arg[0]->type() == Item::Type::FIELD_ITEM)) {
+        return 0;
+      }
+    }
+
     /* NOT IN and NOT BETWEEN are left to MySQL */
     if((is_between || is_in) &&
        down_cast<Item_func_opt_neg *>(tmp)->negated) {
