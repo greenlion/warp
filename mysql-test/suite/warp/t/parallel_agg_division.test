@@ -1,0 +1,75 @@
+--echo #
+--echo # A division by a constant in the argument of an aggregate: the engine
+--echo # aggregates it (alone and above its join) when every quotient is exact
+--echo # in the scale of the division (/ 2, / 4, / 100, / 0.5, / 2.5, / -2), as
+--echo # x * (10^n / c).  Any other division (/ 3, / 7.0, / 1.5, / a column) is
+--echo # left to MySQL.  Every query is run against the WARP tables with the
+--echo # aggregation on and off, and against InnoDB copies.  (TPC-DS query 4:
+--echo # SUM(((a - b - c) + d) / 2) over customer x sales x date_dim.)
+--echo #
+
+SET SESSION warp_parallel_join_min_rows = 0;
+SET SESSION warp_parallel_min_rows = 0;
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE TABLE f_w (id INT, k INT, g INT, p DECIMAL(7,2), q DECIMAL(7,2) NULL, n INT NULL, x DECIMAL(12,5)) ENGINE=WARP;
+CREATE TABLE d_w (k INT, t VARCHAR(10), r DECIMAL(6,3)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 6000)
+  SELECT i, 1 + i % 600, i % 7, (i * 37) % 10007 / 100 - 30.01, IF(i % 5 = 0, NULL, (i * 13) % 9973 / 100),
+         IF(i % 4 = 0, NULL, i % 9 - 3), (i * 7919) % 100003 / 100000 FROM s;
+INSERT INTO d_w WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 500)
+  SELECT i, CONCAT('t', i % 5), (i % 997) / 7 FROM s;
+CREATE TABLE f_i LIKE f_w;
+CREATE TABLE d_i LIKE d_w;
+ALTER TABLE f_i ENGINE=InnoDB;
+ALTER TABLE d_i ENGINE=InnoDB;
+INSERT INTO f_i SELECT * FROM f_w;
+INSERT INTO d_i SELECT * FROM d_w;
+
+CREATE TABLE queries (i INT, used INT, q TEXT) ENGINE=InnoDB;
+INSERT INTO queries VALUES
+ (1, 1, 'SELECT d.t, f.g, SUM(((f.p - f.q - d.r) + f.p) / 2) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t, f.g'),
+ (2, 1, 'SELECT d.t, SUM(f.p / 4) a1, AVG(f.q / 100) a2, MIN(f.p / 0.5) a3, MAX(f.q / 2.5) a4, SUM(f.n / 2) a5, SUM(f.x / 8) a6 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+ (3, 1, 'SELECT d.t, SUM(f.p / -2) a1, SUM(f.p / 2 * 3 - f.q / 4) a2, SUM(f.p / 2 / 2) a3, COUNT(f.q / 2) a4 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+ (4, 1, 'SELECT f.g, SUM((f.p - f.q + f.p) / 2) a1, SUM(f.p / 4) a2, AVG(f.q / 100) a3, MIN(f.p / 0.5) a4, MAX(f.q / 2.5) a5, SUM(f.n / 2) a6, SUM(f.x / 8) a7 FROM f_# f GROUP BY f.g'),
+ (5, 1, 'SELECT SUM(f.p / 2) a1, SUM(f.q / 1) a2 FROM f_# f'),
+ (6, 0, 'SELECT d.t, SUM(f.p / 3) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+ (7, 0, 'SELECT d.t, SUM(f.p / 7.0) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+ (8, 0, 'SELECT d.t, SUM(f.p / 1.5) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+ (9, 0, 'SELECT d.t, SUM(f.p / d.r) a1 FROM f_# f JOIN d_# d ON f.k = d.k GROUP BY d.t'),
+ (10, 0, 'SELECT f.g, SUM(f.p / 3) a1, SUM(f.p / 32) a2 FROM f_# f GROUP BY f.g'),
+ (11, 0, 'SELECT f.g, SUM(f.p / (f.id + 1)) a1 FROM f_# f GROUP BY f.g'),
+ (12, 0, 'SELECT f.g, SUM(f.p / 2e0) a1 FROM f_# f GROUP BY f.g');
+
+--let $i = 1
+while ($i <= 12)
+{
+  --let $w = `SELECT REPLACE(q, '#', 'w') FROM queries WHERE i = $i`
+  --let $n = `SELECT REPLACE(q, '#', 'i') FROM queries WHERE i = $i`
+  --echo # query $i
+  --disable_query_log
+  --disable_warnings
+  SET SESSION warp_parallel_aggregation = ON;
+  --let $plan = `EXPLAIN FORMAT=TREE $w`
+  eval SELECT (LOCATE('with parallel aggregation', "$plan") > 0) = (SELECT used FROM queries WHERE i = $i) AS engine_aggregates_as_expected;
+  eval CREATE TABLE r_on ENGINE=InnoDB AS $w;
+  SET SESSION warp_parallel_aggregation = OFF;
+  eval CREATE TABLE r_off ENGINE=InnoDB AS $w;
+  eval CREATE TABLE r_i ENGINE=InnoDB AS $n;
+  --enable_warnings
+  --enable_query_log
+  SELECT (SELECT COUNT(*) FROM r_on) = (SELECT COUNT(*) FROM r_i) AS same_rows_on,
+         (SELECT COUNT(*) FROM r_off) = (SELECT COUNT(*) FROM r_i) AS same_rows_off;
+  SELECT COUNT(*) AS different_rows FROM
+    ((SELECT * FROM r_on EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_on)
+     UNION ALL (SELECT * FROM r_off EXCEPT SELECT * FROM r_i) UNION ALL (SELECT * FROM r_i EXCEPT SELECT * FROM r_off)) d;
+  DROP TABLE r_on, r_off, r_i;
+  --inc $i
+}
+
+--echo # the values of a division that the engine makes
+SET SESSION warp_parallel_aggregation = ON;
+SELECT d.t, SUM(((f.p - f.q - d.r) + f.p) / 2) a1, SUM(f.p / -2) a2, MIN(f.q / 2.5) a3 FROM f_w f JOIN d_w d ON f.k = d.k GROUP BY d.t ORDER BY d.t;
+SELECT f.g, SUM((f.p - f.q + f.p) / 2) a1, AVG(f.n / 4) a2 FROM f_w f GROUP BY f.g ORDER BY f.g;
+
+DROP TABLE f_w, d_w, f_i, d_i, queries;

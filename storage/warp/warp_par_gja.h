@@ -728,6 +728,46 @@ struct warp_gj_compiler {
       n.slen = len < 0 ? -1 : (int)std::min<longlong>(len, INT_MAX);
       return add(n);
     }
+    /* x / c, a decimal divided by a constant that is not zero, when every
+       quotient has no more digits than the scale of the division (/ 2, / 4,
+       / 100, / 0.5, ...: c divides a power of ten that fits in the digits that
+       the division adds): the quotient is then exactly x * (10^n / c), with
+       no rounding, whatever way MySQL would compute and add it.  Any other
+       division is left to MySQL, which truncates the quotients and rounds
+       their sums depending on how it aggregates.  (TPC-DS query 4:
+       SUM(((a - b - c) + d) / 2).) */
+    if(dynamic_cast<Item_func_div *>(func) != nullptr) {
+      if(func->arg_count != 2 || func->result_type() != DECIMAL_RESULT) return -1;
+      Item *divisor = func->arguments()[1];
+      if(!divisor->const_item() || divisor->real_item()->type() == Item::FIELD_ITEM) return -1;
+      const int a = compile(func->arguments()[0]);
+      if(a < 0 || (nodes[a].kind != WARP_GJ_INT && nodes[a].kind != WARP_GJ_DEC) || nodes[a].temporal) return -1;
+      const int b = compile(divisor);
+      if(b < 0 || nodes[b].op != GJN_CONST || nodes[b].c.null ||
+         (nodes[b].kind != WARP_GJ_INT && nodes[b].kind != WARP_GJ_DEC) || nodes[b].c.i == 0) {
+        return -1;
+      }
+      const int result_scale = (int)func->decimals;
+      const int digits = result_scale - nodes[a].scale + nodes[b].scale;
+      if(result_scale > 18 || func->max_length > 36 || digits < 0 || digits > 18) return -1;
+      __int128 power = 1;
+      for(int k = 0; k < digits; ++k) power *= 10;
+      const __int128 c = nodes[b].c.i;
+      if(power % c != 0) return -1;
+      warp_gj_node factor;
+      factor.op = GJN_CONST;
+      factor.kind = WARP_GJ_INT;
+      factor.c.kind = WARP_GJ_INT;
+      factor.c.null = false;
+      factor.c.i = power / c;
+      const int f = add(factor);
+      warp_gj_node n;
+      n.op = GJN_MUL;
+      n.kind = WARP_GJ_DEC;
+      n.scale = result_scale;
+      n.kids = {a, f};
+      return add(n);
+    }
     /* + - * and unary - */
     Item_func_plus *plus = dynamic_cast<Item_func_plus *>(func);
     Item_func_minus *minus = dynamic_cast<Item_func_minus *>(func);
