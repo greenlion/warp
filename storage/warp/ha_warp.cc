@@ -2057,6 +2057,18 @@ static void warp_set_records_per_key(TABLE *table, const char *datadir) {
   }
 }
 
+/* the table is read for a subquery that MySQL made a semijoin or an antijoin
+   of (IN, EXISTS, NOT EXISTS): it is in the nest of the subquery */
+static bool warp_in_semijoin_nest(const TABLE *t) {
+  for(const Table_ref *ref = t->pos_in_table_list; ref != nullptr;
+      ref = ref->embedding) {
+    if(ref->is_sj_or_aj_nest()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /*
   ::info() is used to return information to the optimizer.
   Currently this table handler doesn't implement most of the fields
@@ -2111,7 +2123,36 @@ int ha_warp::info(uint flag) {
   // time, a count that was lowered for one statement (as the fact table, or
   // with warp_adjust_table_stats_for_joins = ON) is not kept for the next.
   stats.records = unadjusted_records;
-  if(is_fact_table && !is_partition_child &&
+  /* The fact table may be in a query block more than once (a self join, a
+     CTE of it that is used in an IN).  When one instance is a table of the
+     join itself and another is read for an IN / EXISTS (the tables of a
+     semijoin or antijoin nest: the subquery, and the derived tables and
+     CTEs merged into it), only the first one is the table that the joins of
+     the star are made to and gets the small count.  With the small count
+     for the others the optimizer takes the subquery for a few rows and
+     reads it again, with table scans, for every row of the join before the
+     selective dimensions are joined (FirstMatch: TPC-DS query 95, a self
+     join of web_sales in two IN subqueries).  A fact table
+     that is only in the subqueries of the block keeps the small count (the
+     EXISTS of TPC-DS query 35). */
+  bool subquery_instance = false;
+  if(is_fact_table && warp_in_semijoin_nest(table)) {
+    const Table_ref *own_ref = table->pos_in_table_list;
+    for(TABLE *cur_table = table->in_use->open_tables; cur_table != NULL;
+        cur_table = cur_table->next) {
+      ha_warp *other = dynamic_cast<ha_warp *>(cur_table->file);
+      if(cur_table == table || other == NULL || other->share != share ||
+         cur_table->pos_in_table_list == nullptr ||
+         cur_table->pos_in_table_list->query_block != own_ref->query_block) {
+        continue;
+      }
+      if(!warp_in_semijoin_nest(cur_table)) {
+        subquery_instance = true;
+        break;
+      }
+    }
+  }
+  if(is_fact_table && !is_partition_child && !subquery_instance &&
      THDVAR(table->in_use, adjust_table_stats_for_joins)) {
     stats.records = least_row_count+2;
   }
