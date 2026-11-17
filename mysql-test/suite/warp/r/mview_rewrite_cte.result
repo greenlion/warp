@@ -1,0 +1,198 @@
+#
+# MVIEW_REWRITE and common table expressions: the query expression of
+# a common table expression is rewritten as if it were a statement of
+# its own, in the text of the statement; the rest of the statement is
+# as it was.  Every statement is run with and without the plugin and
+# must give the same rows.
+#
+CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_name VARCHAR(25) NOT NULL,
+c_nation INT NOT NULL);
+CREATE TABLE orders (o_orderkey INT PRIMARY KEY, o_custkey INT NOT NULL,
+o_status CHAR(1) NOT NULL, o_price DECIMAL(12,2) NOT NULL,
+o_date DATE NOT NULL,
+FOREIGN KEY (o_custkey) REFERENCES customer (c_custkey));
+CREATE TABLE returned (r_orderkey INT NOT NULL, r_amount DECIMAL(12,2));
+INSERT INTO customer
+WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 30)
+SELECT k, CONCAT('Customer#', k), k % 5 FROM s;
+INSERT INTO orders
+WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 200)
+SELECT k, (k * 7 % 30) + 1, ELT(k % 3 + 1, 'F', 'O', 'P'),
+(k * 13 % 500) + 0.25, DATE'2025-01-01' + INTERVAL (k * 3 % 365) DAY
+FROM s;
+INSERT INTO returned SELECT o_orderkey, o_price / 2 FROM orders
+WHERE o_orderkey % 4 = 0;
+Warnings:
+Note	1265	Data truncated for column 'r_amount' at row 1
+Note	1265	Data truncated for column 'r_amount' at row 2
+Note	1265	Data truncated for column 'r_amount' at row 3
+Note	1265	Data truncated for column 'r_amount' at row 4
+Note	1265	Data truncated for column 'r_amount' at row 5
+Note	1265	Data truncated for column 'r_amount' at row 6
+Note	1265	Data truncated for column 'r_amount' at row 7
+Note	1265	Data truncated for column 'r_amount' at row 8
+Note	1265	Data truncated for column 'r_amount' at row 9
+Note	1265	Data truncated for column 'r_amount' at row 10
+Note	1265	Data truncated for column 'r_amount' at row 11
+Note	1265	Data truncated for column 'r_amount' at row 12
+Note	1265	Data truncated for column 'r_amount' at row 13
+Note	1265	Data truncated for column 'r_amount' at row 14
+Note	1265	Data truncated for column 'r_amount' at row 15
+Note	1265	Data truncated for column 'r_amount' at row 16
+Note	1265	Data truncated for column 'r_amount' at row 17
+Note	1265	Data truncated for column 'r_amount' at row 18
+Note	1265	Data truncated for column 'r_amount' at row 19
+Note	1265	Data truncated for column 'r_amount' at row 20
+Note	1265	Data truncated for column 'r_amount' at row 21
+Note	1265	Data truncated for column 'r_amount' at row 22
+Note	1265	Data truncated for column 'r_amount' at row 23
+Note	1265	Data truncated for column 'r_amount' at row 24
+Note	1265	Data truncated for column 'r_amount' at row 25
+Note	1265	Data truncated for column 'r_amount' at row 26
+Note	1265	Data truncated for column 'r_amount' at row 27
+Note	1265	Data truncated for column 'r_amount' at row 28
+Note	1265	Data truncated for column 'r_amount' at row 29
+Note	1265	Data truncated for column 'r_amount' at row 30
+Note	1265	Data truncated for column 'r_amount' at row 31
+Note	1265	Data truncated for column 'r_amount' at row 32
+Note	1265	Data truncated for column 'r_amount' at row 33
+Note	1265	Data truncated for column 'r_amount' at row 34
+Note	1265	Data truncated for column 'r_amount' at row 35
+Note	1265	Data truncated for column 'r_amount' at row 36
+Note	1265	Data truncated for column 'r_amount' at row 37
+Note	1265	Data truncated for column 'r_amount' at row 38
+Note	1265	Data truncated for column 'r_amount' at row 39
+Note	1265	Data truncated for column 'r_amount' at row 40
+Note	1265	Data truncated for column 'r_amount' at row 41
+Note	1265	Data truncated for column 'r_amount' at row 42
+Note	1265	Data truncated for column 'r_amount' at row 43
+Note	1265	Data truncated for column 'r_amount' at row 44
+Note	1265	Data truncated for column 'r_amount' at row 45
+Note	1265	Data truncated for column 'r_amount' at row 46
+Note	1265	Data truncated for column 'r_amount' at row 47
+Note	1265	Data truncated for column 'r_amount' at row 48
+Note	1265	Data truncated for column 'r_amount' at row 49
+Note	1265	Data truncated for column 'r_amount' at row 50
+SET SESSION mview_rewrite_use_manual_views = ON;
+CREATE MATERIALIZED VIEW by_cust REFRESH MANUAL AS
+SELECT o_custkey, o_status, COUNT(*) AS n, SUM(o_price) AS total
+FROM orders GROUP BY o_custkey, o_status;
+CREATE MATERIALIZED VIEW by_nation REFRESH MANUAL AS
+SELECT c_nation, YEAR(o_date) AS y, COUNT(*) AS n, SUM(o_price) AS total
+FROM orders, customer WHERE o_custkey = c_custkey
+GROUP BY c_nation, YEAR(o_date);
+#
+# One common table expression, read twice (as in TPC-DS query 1)
+#
+WITH t AS (SELECT o_custkey AS k, o_status AS s, SUM(o_price) AS total FROM orders GROUP BY o_custkey, o_status) SELECT t1.k, t1.s, t1.total FROM t t1 WHERE t1.total > (SELECT AVG(t2.total) * 1.2 FROM t t2 WHERE t2.s = t1.s) ORDER BY 1, 2;
+# rewritten
+WITH t AS (SELECT `by_cust`.`mv$g0` AS `k`, `by_cust`.`mv$g1` AS `s`, `by_cust`.`mv$s1` AS `total` FROM `test`.`by_cust` `by_cust`) SELECT t1.k, t1.s, t1.total FROM t t1 WHERE t1.total > (SELECT AVG(t2.total) * 1.2 FROM t t2 WHERE t2.s = t1.s) ORDER BY 1, 2
+# with a join to a table in the statement, and coarser groups
+WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT c_name, n FROM t, customer WHERE o_custkey = c_custkey AND n > 6 ORDER BY c_name;
+# rewritten
+WITH t AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`) SELECT c_name, n FROM t, customer WHERE o_custkey = c_custkey AND n > 6 ORDER BY c_name
+# a list of column names
+WITH t (k, cnt, amount) AS (SELECT o_custkey, COUNT(*), SUM(o_price) FROM orders WHERE o_status = 'F' GROUP BY o_custkey) SELECT k, cnt, amount FROM t WHERE cnt > 2;
+# rewritten
+WITH t (k, cnt, amount) AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `COUNT(*)`, SUM(`by_cust`.`mv$s1`) AS `SUM(o_price)` FROM `test`.`by_cust` `by_cust` WHERE (`by_cust`.`mv$g1` = 'F') GROUP BY `by_cust`.`mv$g0`) SELECT k, cnt, amount FROM t WHERE cnt > 2
+#
+# Several common table expressions: each one on its own
+#
+# two that are rewritten, to two views
+WITH a AS (SELECT o_custkey, SUM(o_price) AS total FROM orders GROUP BY o_custkey), b AS (SELECT c_nation, SUM(o_price) AS total FROM orders, customer WHERE o_custkey = c_custkey AND YEAR(o_date) = 2025 GROUP BY c_nation) SELECT c_name, a.total, b.total FROM a, b, customer WHERE a.o_custkey = c_custkey AND b.c_nation = customer.c_nation AND c_custkey < 6;
+# rewritten
+WITH a AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, SUM(`by_cust`.`mv$s1`) AS `total` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`), b AS (SELECT `by_nation`.`mv$g0` AS `c_nation`, SUM(`by_nation`.`mv$s1`) AS `total` FROM `test`.`by_nation` `by_nation` WHERE ((`by_nation`.`mv$g1` = 2025)) GROUP BY `by_nation`.`mv$g0`) SELECT c_name, a.total, b.total FROM a, b, customer WHERE a.o_custkey = c_custkey AND b.c_nation = customer.c_nation AND c_custkey < 6
+# one that is rewritten and one that is not (no view of returned)
+WITH a AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey), r AS (SELECT o_custkey, SUM(r_amount) AS back FROM returned, orders WHERE r_orderkey = o_orderkey GROUP BY o_custkey) SELECT a.o_custkey, n, back FROM a LEFT JOIN r ON a.o_custkey = r.o_custkey WHERE n > 7;
+# rewritten
+WITH a AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`), r AS (SELECT o_custkey, SUM(r_amount) AS back FROM returned, orders WHERE r_orderkey = o_orderkey GROUP BY o_custkey) SELECT a.o_custkey, n, back FROM a LEFT JOIN r ON a.o_custkey = r.o_custkey WHERE n > 7
+# one that reads another: the other is rewritten
+WITH a AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey), b AS (SELECT MAX(n) AS most FROM a) SELECT o_custkey, n FROM a, b WHERE n = most;
+# rewritten
+WITH a AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`), b AS (SELECT MAX(n) AS most FROM a) SELECT o_custkey, n FROM a, b WHERE n = most
+# one that is not read stays as it is (the parser leaves it out)
+WITH a AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey), b AS (SELECT o_status, COUNT(*) AS n FROM orders GROUP BY o_status) SELECT * FROM b;
+# rewritten
+WITH a AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey), b AS (SELECT `by_cust`.`mv$g1` AS `o_status`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g1`) SELECT * FROM b
+#
+# The name of a base table that a view has is the name of a common
+# table expression: it is not the base table
+#
+WITH orders AS (SELECT c_custkey AS o_custkey, 'F' AS o_status, 1.00 AS o_price FROM customer WHERE c_custkey < 4), t AS (SELECT o_custkey, COUNT(*) AS n, SUM(o_price) AS total FROM orders GROUP BY o_custkey) SELECT * FROM t;
+# not rewritten
+# with the schema it is the base table
+WITH orders AS (SELECT c_custkey AS o_custkey FROM customer WHERE c_custkey < 4), t AS (SELECT o_custkey, COUNT(*) AS n, SUM(o_price) AS total FROM test.orders GROUP BY o_custkey) SELECT t.* FROM t, orders WHERE t.o_custkey = orders.o_custkey;
+# rewritten
+WITH orders AS (SELECT c_custkey AS o_custkey FROM customer WHERE c_custkey < 4), t AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n`, SUM(`by_cust`.`mv$s1`) AS `total` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`) SELECT t.* FROM t, orders WHERE t.o_custkey = orders.o_custkey
+#
+# The rest of the statement is kept: subqueries, set operations,
+# outer joins, window functions, comments, EXPLAIN
+#
+WITH t AS (SELECT o_custkey, o_status, COUNT(*) AS n FROM orders GROUP BY o_custkey, o_status) SELECT c_name FROM customer WHERE c_custkey IN (SELECT o_custkey FROM t WHERE n > 4) UNION ALL SELECT CONCAT('status ', o_status) FROM t GROUP BY o_status HAVING SUM(n) > 60;
+# rewritten
+WITH t AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, `by_cust`.`mv$g1` AS `o_status`, `by_cust`.`mv$count` AS `n` FROM `test`.`by_cust` `by_cust`) SELECT c_name FROM customer WHERE c_custkey IN (SELECT o_custkey FROM t WHERE n > 4) UNION ALL SELECT CONCAT('status ', o_status) FROM t GROUP BY o_status HAVING SUM(n) > 60
+WITH t AS (SELECT o_custkey, SUM(o_price) AS total FROM orders GROUP BY o_custkey) SELECT o_custkey, total, RANK() OVER (ORDER BY total DESC) AS r FROM t ORDER BY r LIMIT 5;
+# rewritten
+WITH t AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, SUM(`by_cust`.`mv$s1`) AS `total` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`) SELECT o_custkey, total, RANK() OVER (ORDER BY total DESC) AS r FROM t ORDER BY r LIMIT 5
+/* a (comment) */ WITH /* t ( */ t AS /* ) */ ( /* in */ SELECT o_custkey, COUNT(*) AS `n ()` FROM orders /* ) ( */ WHERE o_status <> ')' GROUP BY o_custkey ) /* after ) */ SELECT 'ü (', t.* FROM t WHERE `n ()` > 7;
+# rewritten
+/* a (comment) */ WITH /* t ( */ t AS /* ) */ (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n ()` FROM `test`.`by_cust` `by_cust` WHERE ((`by_cust`.`mv$g1` <> ')')) GROUP BY `by_cust`.`mv$g0`) /* after ) */ SELECT 'ü (', t.* FROM t WHERE `n ()` > 7
+WITH t AS ((SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey ORDER BY n DESC, o_custkey LIMIT 3)) SELECT * FROM t;
+# rewritten
+WITH t AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0` ORDER BY CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) DESC, `by_cust`.`mv$g0` LIMIT 3) SELECT * FROM t
+EXPLAIN FORMAT=TREE WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT * FROM t WHERE n > 7;
+EXPLAIN
+-> Table scan on t  (cost=# rows=#)
+    -> Materialize CTE t  (cost=# rows=#)
+        -> Filter: (cast(coalesce(sum(by_cust.mv$count),0) as signed) > 7)  (cost=# rows=#)
+            -> Group aggregate: sum(by_cust.mv$count)  (cost=# rows=#)
+                -> Index scan on by_cust using mv$ix_group  (cost=# rows=#)
+
+Warnings:
+Note	1105	Query 'EXPLAIN FORMAT=TREE WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT * FROM t WHERE n > 7' rewritten to 'EXPLAIN FORMAT=TREE WITH t AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`) SELECT * FROM t WHERE n > 7' by a query rewrite plugin
+Note	1003	with `t` as (/* select#2 */ select `test`.`by_cust`.`mv$g0` AS `o_custkey`,cast(coalesce(sum(`test`.`by_cust`.`mv$count`),0) as signed) AS `n` from `test`.`by_cust` group by `test`.`by_cust`.`mv$g0` having (cast(coalesce(sum(`test`.`by_cust`.`mv$count`),0) as signed) > 7)) /* select#1 */ select `t`.`o_custkey` AS `o_custkey`,`t`.`n` AS `n` from `t`
+#
+# Not rewritten: set operations in the common table expression, a
+# recursive one, one with subqueries, a WITH clause that is not the
+# one of the statement
+#
+WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey UNION ALL SELECT o_custkey, COUNT(*) FROM orders GROUP BY o_custkey) SELECT COUNT(*), SUM(n) FROM t;
+# not rewritten
+WITH RECURSIVE t (k, n) AS (SELECT o_custkey, COUNT(*) FROM orders GROUP BY o_custkey UNION ALL SELECT k + 100, n FROM t WHERE k < 100) SELECT COUNT(*), SUM(n) FROM t;
+# not rewritten
+WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders WHERE o_custkey IN (SELECT c_custkey FROM customer WHERE c_nation = 1) GROUP BY o_custkey) SELECT COUNT(*), SUM(n) FROM t;
+# not rewritten
+SELECT * FROM (WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT COUNT(*), SUM(n) FROM t) d;
+# not rewritten
+# in a recursive WITH clause the ones that are not recursive are
+WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 3), t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT k, n FROM s, t WHERE k = o_custkey;
+# rewritten
+WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 3), t AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`) SELECT k, n FROM s, t WHERE k = o_custkey
+#
+# The notes of the trace name the common table expression
+#
+SET SESSION mview_rewrite_trace = ON;
+WITH a AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey),
+r AS (SELECT r_orderkey, r_amount FROM returned UNION SELECT 1, 1)
+SELECT * FROM a, r WHERE r_orderkey = o_custkey;
+SHOW WARNINGS;
+Level	Code	Message
+Note	1105	mview_rewrite: common table expression `a`: view `test`.`by_cust`: matches: SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`
+Note	1105	mview_rewrite: common table expression `a`: view `test`.`by_nation`: a GROUP BY expression of the query is not computed from the groups of the view
+Note	1105	mview_rewrite: common table expression `r`: the query is not used: set operations
+Note	1105	Query 'WITH a AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey),
+r AS (SELECT r_orderkey, r_amount FROM returned UNION SELECT 1, 1)
+SELECT * FROM a, r WHERE r_orderkey = o_custkey' rewritten to 'WITH a AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`),
+r AS (SELECT r_orderkey, r_amount FROM returned UNION SELECT 1, 1)
+SELECT * FROM a, r WHERE r_orderkey = o_custkey' by a que
+SET SESSION mview_rewrite_trace = OFF;
+# INSERT ... SELECT is not rewritten, with or without WITH
+CREATE TABLE copy (k INT, n INT);
+INSERT INTO copy WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT * FROM t;
+SELECT COUNT(*), SUM(n) FROM copy;
+COUNT(*)	SUM(n)
+30	200
+DROP TABLE copy;
+DROP MATERIALIZED VIEW by_cust;
+DROP MATERIALIZED VIEW by_nation;
+DROP TABLE returned, orders, customer;

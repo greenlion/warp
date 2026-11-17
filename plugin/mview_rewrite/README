@@ -67,12 +67,38 @@ Which views answer a statement
   and on the view.
 
 
+Common table expressions
+------------------------
+
+In a statement with a WITH clause, the query expression of every common
+table expression that is one query block is rewritten as if it were a
+statement of its own (the rules above), and replaces the original in the
+text of the statement.  The rest of the statement is not changed and may be
+anything: joins of the common table expressions, subqueries, set
+operations, outer joins, window functions, ROLLUP.
+
+  WITH t AS (SELECT k, SUM(v) AS s FROM f GROUP BY k)
+  SELECT ... FROM t t1 WHERE t1.s > (SELECT AVG(s) FROM t t2 ...)
+->
+  WITH t AS (SELECT `mv`.`mv$g0` AS `k`, `mv`.`mv$s1` AS `s` FROM `d`.`mv` `mv`)
+  SELECT ... FROM t t1 WHERE t1.s > (SELECT AVG(s) FROM t t2 ...)
+
+Only the WITH clause of the statement itself is looked at (not one in a
+subquery or derived table), and only common table expressions that the
+statement reads.  A recursive one, one with set operations or with a WITH
+clause of its own is left as it is; so is a query block that reads another
+common table expression (a name that is a common table expression is not
+the base table of that name).  With mview_rewrite_trace the notes name the
+common table expression.
+
+
 Statements that are not rewritten
 ---------------------------------
 
 Prepared statements and statements of stored programs; subqueries,
-derived tables, CTEs, set operations, outer joins, NATURAL and USING joins,
-window functions, ROLLUP; locking reads, SELECT ... INTO, optimizer hints,
+derived tables, set operations, outer joins, NATURAL and USING joins,
+window functions, ROLLUP (all of these outside of a common table
+expression that is rewritten); locking reads, SELECT ... INTO, optimizer hints,
 SQL_CALC_FOUND_ROWS; tables with partition selection or TABLESAMPLE,
 temporary tables; statements in a transaction that has changed data, under
 LOCK TABLES, of replication threads, of users with SKIP_QUERY_REWRITE;
@@ -113,4 +139,5 @@ Files
   mv_match.cc                view matching, the rewritten statement
   mv_filter.cc               lattice index and filter tree
 
-Tests: mysql-test/suite/warp/t/mview_rewrite.test, mview_rewrite_sync.test.
+Tests: mysql-test/suite/warp/t/mview_rewrite.test, mview_rewrite_cte.test,
+mview_rewrite_sync.test.
