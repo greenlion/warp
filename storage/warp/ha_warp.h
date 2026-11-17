@@ -119,6 +119,9 @@ const uint64_t WARP_ROWID_BATCH_SIZE = 100000;
    then touch few blocks of the delete bitmap).  64 ids are one block of the
    bitmap, and what a handler does not use is lost, so the run is short. */
 const uint64_t WARP_HANDLER_ROWID_BATCH_SIZE = 4096;
+/* the row ids that are reserved in the state file at a time, see
+   warp_global_data::rowid_reserved */
+const uint64_t WARP_ROWID_RESERVE = 16 * 1024 * 1024;
 
 #define BLOB_MEMROOT_ALLOC_SIZE 8192
 
@@ -904,6 +907,15 @@ class warp_global_data {
   // in 10000 row batches is fine.  This value is persisted
   // between database restarts.
   uint64_t next_rowid = 1;
+
+  /* The row ids up to this one are reserved in the state file: the file
+     has this value, the ids below it are handed out from memory
+     (get_next_rowid_batch).  The state file is written, twice and with
+     fsync, under the mutex of the state: writing it for every batch of row
+     ids made every connection that loads rows wait for it (two thirds of
+     the time of a parallel load).  After a crash the row ids go on from the
+     reserved one: at most WARP_ROWID_RESERVE of them are never used. */
+  uint64_t rowid_reserved = 0;
 
   /* this is used to read/write on disk state */
   struct on_disk_state {
