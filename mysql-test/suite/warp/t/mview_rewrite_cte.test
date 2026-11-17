@@ -91,8 +91,11 @@ CREATE MATERIALIZED VIEW by_nation REFRESH MANUAL AS
 --source $q_check
 --let $mvr_query = WITH t AS ((SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey ORDER BY n DESC, o_custkey LIMIT 3)) SELECT * FROM t
 --source $q_check
+# (the notes of EXPLAIN FORMAT=TREE are not the same in every version)
+--disable_warnings
 --replace_regex /cost=[0-9.e+-]*/cost=#/ /rows=[0-9.e+-]*/rows=#/
 EXPLAIN FORMAT=TREE WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT * FROM t WHERE n > 7;
+--enable_warnings
 
 --echo #
 --echo # Not rewritten: set operations in the common table expression, a
