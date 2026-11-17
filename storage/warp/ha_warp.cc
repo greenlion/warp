@@ -2223,8 +2223,19 @@ int ha_warp::info(uint flag) {
   const uint64_t own_rows = table_row_count();
   uint64_t least_row_count = own_rows;
   bool is_fact_table = true;
+  /* A materialized view is a table of the statement (the statement reads
+     it, or MVIEW_REWRITE made it read it in the place of the fact table and
+     the dimensions that the view joins): the statement is not the star that
+     warp_adjust_table_stats_for_joins is for.  The largest table that is
+     left may be a dimension, and with the small count for it the optimizer
+     joins it first, without a join condition (TPC-DS query 59 with a view
+     for its common table expression: date_dim twice, 365 x 365 rows). */
+  bool mview_in_statement = false;
   for(TABLE *cur_table = table->in_use->open_tables; cur_table != NULL;
       cur_table = cur_table->next) {
+    if(cur_table->s != nullptr && cur_table->s->mview_kind == 1) {
+      mview_in_statement = true;
+    }
     ha_warp *other = dynamic_cast<ha_warp *>(cur_table->file);
     if(other == NULL || other->share == NULL || other->share == share) {
       continue;
@@ -2274,6 +2285,7 @@ int ha_warp::info(uint flag) {
     }
   }
   if(is_fact_table && !is_partition_child && !subquery_instance &&
+     !mview_in_statement &&
      THDVAR(table->in_use, adjust_table_stats_for_joins)) {
     stats.records = least_row_count+2;
   }
