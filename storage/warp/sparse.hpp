@@ -501,6 +501,42 @@ public:
     return (word >> bit_offset) & 1;
   }
 
+  /* True if a bit of bitnum_lo .. bitnum_hi may be set: the words that hold
+     these bits are looked at, so a bit next to the range also makes it true.
+     False means that none of them is set.  A scan of rows whose numbers are
+     all in the range does not have to look at the bitmap for every row. */
+  inline bool any_set_in_range(unsigned long long bitnum_lo, unsigned long long bitnum_hi) {
+    if(bitnum_lo == 0) {
+      bitnum_lo = 1;
+    }
+    if(bitnum_hi < bitnum_lo) {
+      return false;
+    }
+    const read_map *m = rmap.load(std::memory_order_acquire);
+    if(m == NULL ||
+       m->generation.load(std::memory_order_acquire) != read_generation.load(std::memory_order_acquire)) {
+      m = refresh_read_map();
+    }
+    if(rmap_failed) {
+      return true;
+    }
+    const unsigned long long nwords = m->len / BLOCK_SIZE;
+    /* the word of a bit is (bitnum - 1) / MAX_BITS (see is_set), except for
+       the multiples of MAX_BITS, which are in the same word or the one
+       before: the word before the first one is looked at too */
+    unsigned long long first = (bitnum_lo - 1) / MAX_BITS;
+    if(first > 0) {
+      --first;
+    }
+    const unsigned long long last = bitnum_hi / MAX_BITS;
+    for(unsigned long long w = first; w <= last && w < nwords; ++w) {
+      if(__atomic_load_n(&m->base[w], __ATOMIC_RELAXED) != 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /* True if the file may have a bit set (it is not empty).  A scan does not
      have to look at the bitmap for every row if this is false. */
   inline bool may_have_bits() {

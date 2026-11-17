@@ -1,0 +1,145 @@
+--echo #
+--echo # Star aggregation a block of rows at a time (warp_star_aggregation_blocks):
+--echo # the lookups of the dimensions (a table indexed by the key, with a bitmap
+--echo # when few keys have a row, a hash table for keys that are far apart), the
+--echo # sums whose operations can and can not overflow, and the partitions whose
+--echo # rows are all visible, which are not checked row by row.  Every result is
+--echo # the one of InnoDB, a block at a time and row by row.
+--echo #
+
+call mtr.add_suppression("WARP: aggregation of");
+SET SESSION cte_max_recursion_depth = 1000000;
+SET SESSION warp_parallel_hash_join = 0;
+
+SELECT @@global.warp_star_aggregation_blocks, @@session.warp_star_aggregation_blocks;
+
+# kb: the key of a dimension of 100000 rows; kh: keys that are far apart
+CREATE TABLE f (id INT NOT NULL, kb INT NOT NULL, kh BIGINT NOT NULL, ks INT NOT NULL,
+                a INT NOT NULL, b INT, c BIGINT NOT NULL, t TINYINT NOT NULL, q INT NOT NULL)
+  ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE db (k INT NOT NULL PRIMARY KEY, n INT, g VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE dh (k BIGINT NOT NULL PRIMARY KEY, g INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE ds (k INT NOT NULL PRIMARY KEY, g INT, n INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+INSERT INTO f WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 200000)
+  SELECT x, 1 + (x * 7919) % 110000, ((x * 31) % 250) * 1000003, x % 40,
+         2000000000 + x % 1000, IF(x % 11 = 0, NULL, x % 37 - 10), x * 1000003, x % 5 - 2,
+         2000000000 - x % 77 FROM s;
+INSERT INTO db WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 100000)
+  SELECT x, x % 1000, CONCAT('G', x % 6) FROM s;
+INSERT INTO dh WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 200)
+  SELECT x * 1000003, x % 9 FROM s;
+INSERT INTO ds WITH RECURSIVE s(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM s WHERE x < 34)
+  SELECT x, x % 4, x % 3 FROM s;
+
+CREATE TABLE fi ENGINE=InnoDB SELECT * FROM f;
+CREATE TABLE dbi ENGINE=InnoDB SELECT * FROM db;
+CREATE TABLE dhi ENGINE=InnoDB SELECT * FROM dh;
+CREATE TABLE dsi ENGINE=InnoDB SELECT * FROM ds;
+
+--echo # The engine joins and aggregates
+--replace_regex /  *\(cost=[^)]*\)//
+--disable_warnings
+EXPLAIN FORMAT=TREE SELECT db.g, SUM(a) FROM f JOIN db ON f.kb = db.k WHERE n = 7 GROUP BY db.g;
+--enable_warnings
+
+--let $label = few keys of a large dimension have a row (bitmap)
+--let $q_w = SELECT db.g, SUM(a) s, COUNT(*) n FROM f JOIN db ON f.kb = db.k WHERE n = 7 GROUP BY db.g
+--let $q_i = SELECT dbi.g, SUM(a) s, COUNT(*) n FROM fi JOIN dbi ON fi.kb = dbi.k WHERE n = 7 GROUP BY dbi.g
+--source suite/warp/include/star_check.inc
+
+--let $label = most keys of a large dimension have a row
+--let $q_w = SELECT db.g, SUM(a) s, SUM(b) sb, COUNT(b) cb FROM f JOIN db ON f.kb = db.k WHERE n <> 7 GROUP BY db.g
+--let $q_i = SELECT dbi.g, SUM(a) s, SUM(b) sb, COUNT(b) cb FROM fi JOIN dbi ON fi.kb = dbi.k WHERE n <> 7 GROUP BY dbi.g
+--source suite/warp/include/star_check.inc
+
+--let $label = keys that are far apart (hash)
+--let $q_w = SELECT dh.g, SUM(a) s, MIN(b) mi, MAX(c) ma FROM f JOIN dh ON f.kh = dh.k GROUP BY dh.g
+--let $q_i = SELECT dhi.g, SUM(a) s, MIN(b) mi, MAX(c) ma FROM fi JOIN dhi ON fi.kh = dhi.k GROUP BY dhi.g
+--source suite/warp/include/star_check.inc
+
+--let $label = three dimensions, a condition on the fact table
+--let $q_w = SELECT db.g gb, dh.g gh, ds.g gs, SUM(a - q) s1, SUM(b * t) s2, COUNT(*) n FROM f JOIN db ON f.kb = db.k JOIN dh ON f.kh = dh.k JOIN ds ON f.ks = ds.k WHERE db.n < 500 AND ds.n > 0 AND f.t <> 0 GROUP BY db.g, dh.g, ds.g
+--let $q_i = SELECT dbi.g gb, dhi.g gh, dsi.g gs, SUM(a - q) s1, SUM(b * t) s2, COUNT(*) n FROM fi JOIN dbi ON fi.kb = dbi.k JOIN dhi ON fi.kh = dhi.k JOIN dsi ON fi.ks = dsi.k WHERE dbi.n < 500 AND dsi.n > 0 AND fi.t <> 0 GROUP BY dbi.g, dhi.g, dsi.g
+--source suite/warp/include/star_check.inc
+
+--let $label = scattered rows of the fact table
+--let $q_w = SELECT ds.g, SUM(a) s, AVG(b) av FROM f JOIN ds ON f.ks = ds.k WHERE f.id % 3 = 1 AND f.b > 5 GROUP BY ds.g
+--let $q_i = SELECT dsi.g, SUM(a) s, AVG(b) av FROM fi JOIN dsi ON fi.ks = dsi.k WHERE fi.id % 3 = 1 AND fi.b > 5 GROUP BY dsi.g
+--source suite/warp/include/star_check.inc
+
+--let $label = one group: sums of INT, of INT * INT (near the largest BIGINT values), of BIGINT
+--let $q_w = SELECT SUM(a) sa, SUM(a * q) saq, SUM(c) sc, SUM(b) sb, COUNT(b) cb, COUNT(*) n, SUM(a * q - c) d FROM f JOIN ds ON f.ks = ds.k WHERE ds.n < 2
+--let $q_i = SELECT SUM(a) sa, SUM(a * q) saq, SUM(c) sc, SUM(b) sb, COUNT(b) cb, COUNT(*) n, SUM(a * q - c) d FROM fi JOIN dsi ON fi.ks = dsi.k WHERE dsi.n < 2
+--source suite/warp/include/star_check.inc
+
+--let $label = groups: INT * INT and a nullable operand
+--let $q_w = SELECT ds.g, SUM(a * q) saq, SUM(a * b) sab, SUM(c * t + b) sct FROM f JOIN ds ON f.ks = ds.k GROUP BY ds.g
+--let $q_i = SELECT dsi.g, SUM(a * q) saq, SUM(a * b) sab, SUM(c * t + b) sct FROM fi JOIN dsi ON fi.ks = dsi.k GROUP BY dsi.g
+--source suite/warp/include/star_check.inc
+
+--echo # An operation that overflows is an error, as it is for MySQL
+--error ER_DATA_OUT_OF_RANGE
+SELECT SUM(c * c) FROM f JOIN ds ON f.ks = ds.k;
+SET SESSION warp_star_aggregation_blocks = OFF;
+--error ER_DATA_OUT_OF_RANGE
+SELECT SUM(c * c) FROM f JOIN ds ON f.ks = ds.k;
+SET SESSION warp_star_aggregation_blocks = ON;
+
+--echo #
+--echo # The rows that a transaction may not see
+--echo #
+--echo # deleted rows, in partitions that were read before
+DELETE FROM f WHERE id % 17 = 0;
+DELETE FROM fi WHERE id % 17 = 0;
+--let $label = after a delete
+--let $q_w = SELECT ds.g, SUM(a) s, COUNT(*) n FROM f JOIN ds ON f.ks = ds.k GROUP BY ds.g
+--let $q_i = SELECT dsi.g, SUM(a) s, COUNT(*) n FROM fi JOIN dsi ON fi.ks = dsi.k GROUP BY dsi.g
+--source suite/warp/include/star_check.inc
+
+UPDATE f SET a = a + 1 WHERE id % 1000 = 3;
+UPDATE fi SET a = a + 1 WHERE id % 1000 = 3;
+--let $label = after an update
+--source suite/warp/include/star_check.inc
+
+--echo # rows of a transaction that has not committed, and of one that rolled back
+--connect (con2, localhost, root,,)
+BEGIN;
+INSERT INTO f SELECT id + 1000000, kb, kh, ks, a, b, c, t, q FROM fi WHERE id < 5000;
+DELETE FROM f WHERE id BETWEEN 100 AND 2000;
+--connection default
+--let $label = another transaction has inserted and deleted
+--source suite/warp/include/star_check.inc
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+--connection con2
+--echo # the transaction sees its own rows
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+SET SESSION warp_star_aggregation_blocks = OFF;
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+SET SESSION warp_star_aggregation_blocks = ON;
+ROLLBACK;
+--connection default
+--let $label = after the rollback
+--source suite/warp/include/star_check.inc
+
+--echo # REPEATABLE READ: the rows of the transactions that commit later are not seen
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+--connection con2
+INSERT INTO f SELECT id + 2000000, kb, kh, ks, a, b, c, t, q FROM fi WHERE id < 3000;
+DELETE FROM f WHERE id BETWEEN 50000 AND 50999;
+--connection default
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+SET SESSION warp_star_aggregation_blocks = OFF;
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+SET SESSION warp_star_aggregation_blocks = ON;
+COMMIT;
+--echo # and are seen by the next transaction
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+SET SESSION warp_star_aggregation_blocks = OFF;
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+SET SESSION warp_star_aggregation_blocks = ON;
+--disconnect con2
+
+DROP TABLE f, db, dh, ds, fi, dbi, dhi, dsi;

@@ -39,7 +39,10 @@
 #define WARP_STAR_AGG_H
 
 #include <sys/stat.h>
+#include <algorithm>
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 
@@ -76,19 +79,64 @@ struct warp_star_dim {
   std::vector<uint32_t> dense;      // code + 1 of the key - dense_min (0: no row) or MULTI | index
   int64_t dense_min = 0;
   uint64_t dense_range = 0;
-  std::unordered_map<int64_t, uint32_t> sparse;  // same for keys that do not fit a dense table
+  /* a bit per entry of dense, set if the key has a row: when few keys have
+     one and dense is larger than the processor cache, most lookups end here */
+  std::vector<uint64_t> dense_bits;
+  /* the same for keys that do not fit a dense table: open addressing, a slot
+     is empty if its value is 0 */
+  std::vector<int64_t> hash_keys;
+  std::vector<uint32_t> hash_values;
+  uint64_t hash_mask = 0;
   std::vector<std::vector<uint32_t>> multi;      // the codes of a key that has several rows
   bool has_multi = false;
+
+  static inline uint64_t hash_of(int64_t key) {
+    uint64_t h = (uint64_t)key * 0x9E3779B97F4A7C15ULL;
+    return h ^ (h >> 29);
+  }
+  void hash_init(size_t nkeys) {
+    uint64_t size = 16;
+    while(size < nkeys * 2) {
+      size <<= 1;
+    }
+    hash_keys.assign(size, 0);
+    hash_values.assign(size, 0);
+    hash_mask = size - 1;
+  }
+  /* the slot of the key, an empty one (value 0) if the key is new */
+  inline uint32_t &hash_slot(int64_t key) {
+    uint64_t at = hash_of(key) & hash_mask;
+    while(hash_values[at] != 0 && hash_keys[at] != key) {
+      at = (at + 1) & hash_mask;
+    }
+    hash_keys[at] = key;
+    return hash_values[at];
+  }
+  inline uint32_t hash_find(int64_t key) const {
+    uint64_t at = hash_of(key) & hash_mask;
+    for(;;) {
+      const uint32_t value = hash_values[at];
+      if(value == 0 || hash_keys[at] == key) {
+        return value;
+      }
+      at = (at + 1) & hash_mask;
+    }
+  }
 
   /* The code of a key: 0 if the key has no row (not a match), code + 1, or
      MULTI | index of the list of codes. */
   inline uint32_t lookup(int64_t key) const {
     if(dense_range != 0) {
       const uint64_t k = (uint64_t)key - (uint64_t)dense_min;
-      return k < dense_range ? dense[k] : 0;
+      if(k >= dense_range) {
+        return 0;
+      }
+      if(!dense_bits.empty() && ((dense_bits[k >> 6] >> (k & 63)) & 1) == 0) {
+        return 0;
+      }
+      return dense[k];
     }
-    auto it = sparse.find(key);
-    return it == sparse.end() ? 0 : it->second;
+    return hash_mask != 0 ? hash_find(key) : 0;
   }
 };
 
@@ -191,8 +239,22 @@ struct warp_star_acc {
   std::unordered_map<warp_star_dkey, std::vector<warp_i128>, warp_star_dkey_hash> dhash;
   bool overflow = false;
   size_t overflow_sum = 0;
+  /* rows that were looked up in every dimension and rows that had a match:
+     the dimension that keeps the fewest rows is looked up first */
+  std::vector<uint64_t> dim_in, dim_out;
 
   inline size_t width() const { return 2 * nsums + 1; }
+  /* the block of the group, the row is not counted */
+  inline warp_i128 *group(uint64_t gid) {
+    if(flat) {
+      return &block[gid * width()];
+    }
+    auto &v = hash[gid];
+    if(v.empty()) {
+      v.assign(width(), 0);
+    }
+    return v.data();
+  }
   /* adds the block of another accumulator */
   void add_block(warp_i128 *dst, const warp_i128 *src) const {
     for(size_t m = 0; m < nsums; ++m) {
@@ -299,6 +361,7 @@ struct warp_star_agg {
   std::vector<uint> fact_cols;    // fields of the fact table read from every partition
   std::vector<uint> null_cols;    // fields whose NULL markers are read
   std::vector<int> key_slot;      // position of the join column of every dimension in fact_cols
+  bool blocks = true;             // warp_star_aggregation_blocks
   std::string fact_where;         // pushed down conditions of the fact table (FastBit syntax)
   std::vector<uint> where_fields; // fields in fact_where
 
@@ -1059,40 +1122,169 @@ static bool warp_star_build_dim(warp_star_dim &dim, std::string *error) {
       hi = std::max(hi, e.key);
     }
     const uint64_t range = (uint64_t)hi - (uint64_t)lo + 1;
+    /* A table indexed by the key is the fastest lookup, also when few of
+       the keys have a row (a dimension with a selective condition): up to
+       2^24 entries (64 MB) whatever the number of keys, and more if the
+       table is at least 1/16 full. */
     if(range != 0 && range <= (1ULL << 27) &&
-       range <= std::max<uint64_t>(keys.size() * 16, 1ULL << 20)) {
+       range <= std::max<uint64_t>(keys.size() * 16, 1ULL << 24)) {
       dim.dense.assign(range, 0);
       dim.dense_min = lo;
       dim.dense_range = range;
       for(const entry &e : keys) {
         add(dim.dense[(uint64_t)e.key - (uint64_t)lo], e.code);
       }
+      /* the bits: for a table of more than 256 KB of which less than half
+         of the entries have a row */
+      if(range > (1ULL << 16) && keys.size() < range / 2) {
+        dim.dense_bits.assign((range + 63) / 64, 0);
+        for(const entry &e : keys) {
+          const uint64_t k = (uint64_t)e.key - (uint64_t)lo;
+          dim.dense_bits[k >> 6] |= 1ULL << (k & 63);
+        }
+      }
     } else {
+      dim.hash_init(keys.size());
       for(const entry &e : keys) {
-        add(dim.sparse[e.key], e.code);
+        add(dim.hash_slot(e.key), e.code);
       }
     }
   }
   return true;
 }
 
-/* the rows of one partition that a transaction may not see; empty if all */
+/* What a partition holds of transactions and row ids: the transactions that
+   wrote its rows and the range of its row ids.  With these a query knows,
+   without reading the two columns, that every row of the partition is
+   visible: all the transactions are visible to it, no row has a history lock
+   and no row id of the range is in the bitmap of the deleted rows.  That is
+   the answer of the checks that are made row by row otherwise (and that are
+   made when it is not the case).  The facts are kept for the files they were
+   read from: a partition that is written to or made again (purge) has other
+   files. */
+struct warp_star_file_id {
+  ino_t inode = 0;
+  off_t size = 0;
+  struct timespec mtime = {0, 0};
+  bool read(const std::string &path) {
+    struct stat st;
+    if(stat(path.c_str(), &st) != 0) {
+      return false;
+    }
+    inode = st.st_ino;
+    size = st.st_size;
+    mtime = st.st_mtim;
+    return true;
+  }
+  bool operator==(const warp_star_file_id &o) const {
+    return inode == o.inode && size == o.size && mtime.tv_sec == o.mtime.tv_sec &&
+           mtime.tv_nsec == o.mtime.tv_nsec;
+  }
+};
+struct warp_star_part_facts {
+  warp_star_file_id trx_file, rowid_file;
+  size_t nrows = 0;
+  std::vector<uint64_t> trx_ids;   // the transactions of the rows
+  bool many_trx = false;           // more than are kept: not known
+  uint64_t min_rowid = 0, max_rowid = 0;
+};
+static const size_t WARP_STAR_MAX_PART_TRX = 256;
+static std::mutex warp_star_facts_mutex;
+static std::unordered_map<std::string, std::shared_ptr<const warp_star_part_facts>> warp_star_facts;
+
+/* The rows of the partition that the transaction may not see: empty if it
+   may see all of them, else a marker per row. */
 static bool warp_star_invisible(ibis::part *part, const warp_star_snapshot &snap,
                                 std::vector<uint8_t> *invisible) {
   invisible->clear();
   const size_t nrows = part->nRows();
+  const std::string dir = part->currentDataDir();
   ibis::array_t<uint64_t> trx_array, rowid_array;
   const ibis::column *tcol = part->getColumn("t");
-  if(tcol == nullptr || tcol->getValuesArray(&trx_array) != 0 ||
-     trx_array.size() != nrows) {
+  const ibis::column *rcol = part->getColumn("r");
+  if(tcol == nullptr) {
+    return false;
+  }
+
+  std::shared_ptr<const warp_star_part_facts> facts;
+  warp_star_file_id trx_file, rowid_file;
+  const bool have_files =
+      rcol != nullptr && trx_file.read(dir + "/t") && rowid_file.read(dir + "/r");
+  if(have_files) {
+    {
+      std::lock_guard<std::mutex> guard(warp_star_facts_mutex);
+      auto found = warp_star_facts.find(dir);
+      if(found != warp_star_facts.end()) {
+        facts = found->second;
+      }
+    }
+    if(facts != nullptr && !(facts->nrows == nrows && facts->trx_file == trx_file &&
+                             facts->rowid_file == rowid_file)) {
+      facts.reset();
+    }
+    if(facts == nullptr) {
+      /* the two columns are read once, for the queries that follow */
+      if(tcol->getValuesArray(&trx_array) != 0 || trx_array.size() != nrows ||
+         rcol->getValuesArray(&rowid_array) != 0 || rowid_array.size() != nrows) {
+        return false;
+      }
+      auto made = std::make_shared<warp_star_part_facts>();
+      made->trx_file = trx_file;
+      made->rowid_file = rowid_file;
+      made->nrows = nrows;
+      const uint64_t *trx_ids = trx_array.begin();
+      const uint64_t *row_ids = rowid_array.begin();
+      uint64_t previous = 0, lo = UINT64_MAX, hi = 0;
+      for(size_t i = 0; i < nrows; ++i) {
+        if((i == 0 || trx_ids[i] != previous) && !made->many_trx) {
+          previous = trx_ids[i];
+          if(std::find(made->trx_ids.begin(), made->trx_ids.end(), previous) ==
+             made->trx_ids.end()) {
+            if(made->trx_ids.size() == WARP_STAR_MAX_PART_TRX) {
+              made->many_trx = true;
+            } else {
+              made->trx_ids.push_back(previous);
+            }
+          }
+        }
+        lo = std::min(lo, row_ids[i]);
+        hi = std::max(hi, row_ids[i]);
+      }
+      made->min_rowid = lo;
+      made->max_rowid = hi;
+      facts = made;
+      std::lock_guard<std::mutex> guard(warp_star_facts_mutex);
+      if(warp_star_facts.size() >= 1000000) {
+        warp_star_facts.clear();
+      }
+      warp_star_facts[dir] = facts;
+    }
+
+    bool all_visible = !facts->many_trx;
+    for(size_t k = 0; all_visible && k < facts->trx_ids.size(); ++k) {
+      all_visible = warp_star_trx_visible(snap, facts->trx_ids[k]);
+    }
+    if(all_visible && snap.check_rowids) {
+      all_visible = !warp_state->has_history_locks() &&
+                    !warp_state->delete_bitmap->any_set_in_range(facts->min_rowid,
+                                                                 facts->max_rowid);
+    }
+    if(all_visible) {
+      return true;
+    }
+  }
+
+  /* row by row */
+  if(trx_array.size() != nrows &&
+     (tcol->getValuesArray(&trx_array) != 0 || trx_array.size() != nrows)) {
     return false;
   }
   const uint64_t *trx_ids = trx_array.begin();
   const uint64_t *row_ids = nullptr;
   if(snap.check_rowids) {
-    const ibis::column *rcol = part->getColumn("r");
-    if(rcol == nullptr || rcol->getValuesArray(&rowid_array) != 0 ||
-       rowid_array.size() != nrows) {
+    if(rowid_array.size() != nrows &&
+       (rcol == nullptr || rcol->getValuesArray(&rowid_array) != 0 ||
+        rowid_array.size() != nrows)) {
       return false;
     }
     row_ids = rowid_array.begin();
@@ -1154,6 +1346,446 @@ static inline bool warp_star_eval(const warp_star_sum &sum,
   *result = stack[0];
   return true;
 }
+
+/* ---------------------------------------------------------------------- */
+/* Blocks of rows.  The rows of a partition that pass the conditions are   */
+/* processed WARP_STAR_BLOCK at a time: a block is a list of row numbers.  */
+/* Every step is a loop over the block that does one thing with one type  */
+/* of column (the join keys of a dimension are looked up and the rows     */
+/* without a match leave the list, an operation of a SUM argument is      */
+/* computed for all the rows, the values are added to the groups), which  */
+/* is what the compiler and the processor are good at.                    */
+/* ---------------------------------------------------------------------- */
+static const size_t WARP_STAR_BLOCK = 2048;
+
+/* calls f with the values of the column in their type */
+template <class F>
+static inline auto warp_star_typed(const warp_star_col &col, F &&f) {
+  switch(col.type) {
+    case ibis::BYTE:   return f(col.i8.begin());
+    case ibis::UBYTE:  return f(col.u8.begin());
+    case ibis::SHORT:  return f(col.i16.begin());
+    case ibis::USHORT: return f(col.u16.begin());
+    case ibis::INT:    return f(col.i32.begin());
+    case ibis::UINT:   return f(col.u32.begin());
+    default:           return f(col.i64.begin());
+  }
+}
+
+/* the values that a column of this type can have */
+static void warp_star_col_bounds(const warp_star_col &col, warp_i128 *lo, warp_i128 *hi) {
+  switch(col.type) {
+    case ibis::BYTE:   *lo = INT8_MIN;  *hi = INT8_MAX;   break;
+    case ibis::UBYTE:  *lo = 0;         *hi = UINT8_MAX;  break;
+    case ibis::SHORT:  *lo = INT16_MIN; *hi = INT16_MAX;  break;
+    case ibis::USHORT: *lo = 0;         *hi = UINT16_MAX; break;
+    case ibis::INT:    *lo = INT32_MIN; *hi = INT32_MAX;  break;
+    case ibis::UINT:   *lo = 0;         *hi = UINT32_MAX; break;
+    default:           *lo = INT64_MIN; *hi = INT64_MAX;  break;
+  }
+}
+
+/* Can the argument of the SUM overflow a BIGINT?  The answer comes from the
+   types of the columns: INT * INT can not, so the operations need no
+   check.  *magnitude is the largest absolute value of the result (only if
+   the answer is no), *depth the number of values on the stack. */
+static bool warp_star_sum_fits(const warp_star_sum &sum, const std::vector<warp_star_col> &cols,
+                               warp_i128 *magnitude, size_t *depth) {
+  warp_i128 lo[16], hi[16];
+  int top = 0;
+  bool fits = true;
+  *depth = 1;
+  for(const warp_star_op &op : sum.ops) {
+    if(op.kind == warp_star_op::COLUMN) {
+      warp_star_col_bounds(cols[op.slot], &lo[top], &hi[top]);
+      ++top;
+    } else if(op.kind == warp_star_op::CONSTANT) {
+      lo[top] = hi[top] = op.value;
+      ++top;
+    } else {
+      const warp_i128 blo = lo[top - 1], bhi = hi[top - 1];
+      --top;
+      const warp_i128 alo = lo[top - 1], ahi = hi[top - 1];
+      warp_i128 rlo, rhi;
+      if(!fits) {
+        rlo = INT64_MIN;
+        rhi = INT64_MAX;
+      } else if(op.kind == warp_star_op::ADD) {
+        rlo = alo + blo;
+        rhi = ahi + bhi;
+      } else if(op.kind == warp_star_op::SUB) {
+        rlo = alo - bhi;
+        rhi = ahi - blo;
+      } else {
+        const warp_i128 c[4] = {alo * blo, alo * bhi, ahi * blo, ahi * bhi};
+        rlo = std::min(std::min(c[0], c[1]), std::min(c[2], c[3]));
+        rhi = std::max(std::max(c[0], c[1]), std::max(c[2], c[3]));
+      }
+      if(rlo < INT64_MIN || rhi > INT64_MAX) {
+        fits = false;
+        rlo = INT64_MIN;
+        rhi = INT64_MAX;
+      }
+      lo[top - 1] = rlo;
+      hi[top - 1] = rhi;
+    }
+    *depth = std::max(*depth, (size_t)top);
+  }
+  *magnitude = top > 0 ? std::max(-lo[0], hi[0]) : 0;
+  return fits;
+}
+
+/* The argument of the SUM for the n rows of sel, into out.  scratch has
+   room for the other values of the stack.  checked: the operations are
+   checked for overflow, false is returned if one of the rows whose argument
+   is not NULL (valid, nullptr: all) overflows. */
+static bool warp_star_eval_block(const warp_star_sum &sum, const std::vector<warp_star_col> &cols,
+                                 const uint32_t *sel, size_t n, bool checked,
+                                 const uint8_t *valid, int64_t *out, int64_t *scratch) {
+  int64_t *level[16];
+  level[0] = out;
+  for(int k = 1; k < 16; ++k) {
+    level[k] = scratch + (size_t)(k - 1) * WARP_STAR_BLOCK;
+  }
+  int top = 0;
+  for(const warp_star_op &op : sum.ops) {
+    if(op.kind == warp_star_op::COLUMN) {
+      int64_t *dst = level[top++];
+      warp_star_typed(cols[op.slot], [&](const auto *data) {
+        for(size_t i = 0; i < n; ++i) {
+          dst[i] = (int64_t)data[sel[i]];
+        }
+        return 0;
+      });
+    } else if(op.kind == warp_star_op::CONSTANT) {
+      int64_t *dst = level[top++];
+      const int64_t value = op.value;
+      for(size_t i = 0; i < n; ++i) {
+        dst[i] = value;
+      }
+    } else {
+      const int64_t *b = level[--top];
+      int64_t *a = level[top - 1];
+      if(!checked) {
+        /* the unsigned operations have the same bits and are defined */
+        if(op.kind == warp_star_op::ADD) {
+          for(size_t i = 0; i < n; ++i) a[i] = (int64_t)((uint64_t)a[i] + (uint64_t)b[i]);
+        } else if(op.kind == warp_star_op::SUB) {
+          for(size_t i = 0; i < n; ++i) a[i] = (int64_t)((uint64_t)a[i] - (uint64_t)b[i]);
+        } else {
+          for(size_t i = 0; i < n; ++i) a[i] = (int64_t)((uint64_t)a[i] * (uint64_t)b[i]);
+        }
+      } else {
+        bool overflow = false;
+        for(size_t i = 0; i < n; ++i) {
+          int64_t r = 0;
+          bool o;
+          if(op.kind == warp_star_op::ADD) {
+            o = __builtin_add_overflow(a[i], b[i], &r);
+          } else if(op.kind == warp_star_op::SUB) {
+            o = __builtin_sub_overflow(a[i], b[i], &r);
+          } else {
+            o = __builtin_mul_overflow(a[i], b[i], &r);
+          }
+          overflow = overflow || (o && (valid == nullptr || valid[i] != 0));
+          a[i] = r;
+        }
+        if(overflow) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+/* The rows of the block that have a row in the dimension stay in sel (n of
+   them come in, the number that stay is returned); the code of the
+   dimension row is added to their group number in gid.  rows is nullptr if
+   the block is the n rows that follow first_row.  first: no dimension was
+   looked up yet, the group numbers start at 0.  Not for dimensions that
+   have several rows for a key. */
+static size_t warp_star_probe(const warp_star_dim &dim, const warp_star_col &col,
+                              const uint32_t *rows, uint32_t first_row, size_t n, bool first,
+                              uint32_t *sel, uint64_t *gid) {
+  return warp_star_typed(col, [&](const auto *data) -> size_t {
+    const uint64_t stride = dim.stride;
+    size_t out = 0;
+    if(dim.dense_range != 0) {
+      const uint32_t *dense = dim.dense.data();
+      const uint64_t min = (uint64_t)dim.dense_min, range = dim.dense_range;
+      if(!dim.dense_bits.empty()) {
+        /* few keys have a row: the bit is tested, the table is read for
+           the rows that stay */
+        const uint64_t *bits = dim.dense_bits.data();
+        for(size_t i = 0; i < n; ++i) {
+          const uint32_t row = rows != nullptr ? rows[i] : first_row + (uint32_t)i;
+          const uint64_t k = (uint64_t)(int64_t)data[row] - min;
+          if(k < range && ((bits[k >> 6] >> (k & 63)) & 1) != 0) {
+            const uint64_t g = first ? 0 : gid[i];
+            sel[out] = row;
+            gid[out] = g + (uint64_t)(dense[k] - 1) * stride;
+            ++out;
+          }
+        }
+      } else {
+        /* without a branch: the row is written and stays if it has a match */
+        for(size_t i = 0; i < n; ++i) {
+          const uint32_t row = rows != nullptr ? rows[i] : first_row + (uint32_t)i;
+          const uint64_t k = (uint64_t)(int64_t)data[row] - min;
+          const uint32_t slot = k < range ? dense[k] : 0;
+          const uint64_t g = first ? 0 : gid[i];
+          sel[out] = row;
+          gid[out] = g + (uint64_t)(slot - 1) * stride;
+          out += slot != 0;
+        }
+      }
+    } else if(dim.hash_mask != 0) {
+      for(size_t i = 0; i < n; ++i) {
+        const uint32_t row = rows != nullptr ? rows[i] : first_row + (uint32_t)i;
+        const uint32_t slot = dim.hash_find((int64_t)data[row]);
+        const uint64_t g = first ? 0 : gid[i];
+        sel[out] = row;
+        gid[out] = g + (uint64_t)(slot - 1) * stride;
+        out += slot != 0;
+      }
+    }
+    return out;
+  });
+}
+
+/* what the blocks of a partition need */
+struct warp_star_blocks {
+  warp_star_agg &plan;
+  const std::vector<warp_star_col> &cols;
+  const std::vector<warp_star_col> &nulls;
+  const std::vector<uint8_t> &invisible;
+  warp_star_acc *acc;
+  size_t ndims, nsums;
+  std::vector<size_t> order;        // the dimensions, the most selective first
+  std::vector<uint8_t> checked;     // per sum: the operations can overflow
+  std::vector<uint8_t> small;       // per sum: a block of values can be added as BIGINT
+  std::vector<uint32_t> sel;
+  std::vector<uint64_t> gid;
+  std::vector<int64_t> values;      // per sum, WARP_STAR_BLOCK each
+  std::vector<uint8_t> valid;       // per sum: the argument is not NULL
+  std::vector<int64_t> scratch;
+
+  warp_star_blocks(warp_star_agg &plan_arg, const std::vector<warp_star_col> &cols_arg,
+                   const std::vector<warp_star_col> &nulls_arg,
+                   const std::vector<uint8_t> &invisible_arg, warp_star_acc *acc_arg)
+      : plan(plan_arg), cols(cols_arg), nulls(nulls_arg), invisible(invisible_arg),
+        acc(acc_arg), ndims(plan_arg.dims.size()), nsums(plan_arg.sums.size()) {
+    if(acc->dim_in.size() != ndims) {
+      acc->dim_in.assign(ndims, 0);
+      acc->dim_out.assign(ndims, 0);
+    }
+    for(size_t d = 0; d < ndims; ++d) {
+      order.push_back(d);
+    }
+    /* by the part of the rows that had a match in the partitions before */
+    std::stable_sort(order.begin(), order.end(), [this](size_t a, size_t b) {
+      const double ra = acc->dim_in[a] == 0 ? 1.0 : (double)acc->dim_out[a] / acc->dim_in[a];
+      const double rb = acc->dim_in[b] == 0 ? 1.0 : (double)acc->dim_out[b] / acc->dim_in[b];
+      return ra < rb;
+    });
+    size_t depth = 1;
+    checked.assign(nsums, 0);
+    small.assign(nsums, 0);
+    for(size_t m = 0; m < nsums; ++m) {
+      warp_i128 magnitude = 0;
+      size_t d = 1;
+      checked[m] = !warp_star_sum_fits(plan.sums[m], cols, &magnitude, &d);
+      small[m] = !checked[m] && magnitude <= INT64_MAX / (int64_t)WARP_STAR_BLOCK;
+      depth = std::max(depth, d);
+    }
+    sel.resize(WARP_STAR_BLOCK);
+    gid.resize(WARP_STAR_BLOCK);
+    values.resize(nsums * WARP_STAR_BLOCK);
+    valid.resize(nsums * WARP_STAR_BLOCK);
+    scratch.resize(depth * WARP_STAR_BLOCK);
+  }
+
+  /* A block: the n rows of rows, or the n rows that follow first_row if
+     rows is nullptr.  False: a SUM overflowed (it is in the accumulator). */
+  bool block(const uint32_t *rows, uint32_t first_row, size_t n) {
+    uint32_t *s = sel.data();
+    uint64_t *g = gid.data();
+    if(!invisible.empty()) {
+      size_t out = 0;
+      for(size_t i = 0; i < n; ++i) {
+        const uint32_t row = rows != nullptr ? rows[i] : first_row + (uint32_t)i;
+        s[out] = row;
+        out += invisible[row] == 0;
+      }
+      n = out;
+      rows = s;
+    }
+    if(ndims == 0) {
+      for(size_t i = 0; i < n; ++i) {
+        s[i] = rows != nullptr ? rows[i] : first_row + (uint32_t)i;
+        g[i] = 0;
+      }
+    }
+    for(size_t k = 0; k < ndims && n > 0; ++k) {
+      const size_t d = order[k];
+      acc->dim_in[d] += n;
+      n = warp_star_probe(plan.dims[d], cols[plan.key_slot[d]], rows, first_row, n, k == 0, s, g);
+      acc->dim_out[d] += n;
+      rows = s;
+    }
+    if(n == 0) {
+      return true;
+    }
+
+    /* the arguments of the sums */
+    for(size_t m = 0; m < nsums; ++m) {
+      const warp_star_sum &sum = plan.sums[m];
+      uint8_t *ok = nullptr;
+      if(!sum.null_slots.empty()) {
+        ok = &valid[m * WARP_STAR_BLOCK];
+        bool is_first = true;
+        for(int ns : sum.null_slots) {
+          warp_star_typed(nulls[ns], [&](const auto *data) {
+            if(is_first) {
+              for(size_t i = 0; i < n; ++i) ok[i] = data[s[i]] == 0;
+            } else {
+              for(size_t i = 0; i < n; ++i) ok[i] &= data[s[i]] == 0;
+            }
+            return 0;
+          });
+          is_first = false;
+        }
+      }
+      if(sum.kind != warp_star_sum::COUNT &&
+         !warp_star_eval_block(sum, cols, s, n, checked[m] != 0, ok,
+                               &values[m * WARP_STAR_BLOCK], scratch.data())) {
+        acc->overflow = true;
+        acc->overflow_sum = m;
+        return false;
+      }
+    }
+
+    /* into the groups */
+    if(!acc->flat) {
+      for(size_t i = 0; i < n; ++i) {
+        warp_i128 *b = acc->group(g[i]);
+        b[2 * nsums] += 1;
+        for(size_t m = 0; m < nsums; ++m) {
+          if(!plan.sums[m].null_slots.empty() && valid[m * WARP_STAR_BLOCK + i] == 0) {
+            continue;
+          }
+          add_value(b, m, values[m * WARP_STAR_BLOCK + i]);
+        }
+      }
+      return true;
+    }
+    const size_t width = acc->width();
+    warp_i128 *base = acc->block.data();
+    if(acc->groups == 1) {
+      base[2 * nsums] += n;
+    } else {
+      for(size_t i = 0; i < n; ++i) {
+        g[i] *= width;
+        base[g[i] + 2 * nsums] += 1;
+      }
+    }
+    for(size_t m = 0; m < nsums; ++m) {
+      const uint8_t *ok = plan.sums[m].null_slots.empty() ? nullptr : &valid[m * WARP_STAR_BLOCK];
+      const int64_t *v = &values[m * WARP_STAR_BLOCK];
+      const bool adds = plan.extreme[m] == 0;
+      if(acc->groups == 1 && adds) {
+        /* one group: the values of the block are added up */
+        uint64_t count = 0;
+        if(plan.sums[m].kind == warp_star_sum::COUNT) {
+          if(ok == nullptr) {
+            count = n;
+          } else {
+            for(size_t i = 0; i < n; ++i) count += ok[i];
+          }
+          base[nsums + m] += count;
+          continue;
+        }
+        if(small[m]) {
+          int64_t total = 0;
+          if(ok == nullptr) {
+            for(size_t i = 0; i < n; ++i) total += v[i];
+            count = n;
+          } else {
+            for(size_t i = 0; i < n; ++i) {
+              total += ok[i] ? v[i] : 0;
+              count += ok[i];
+            }
+          }
+          base[m] += total;
+        } else {
+          warp_i128 total = 0;
+          for(size_t i = 0; i < n; ++i) {
+            if(ok == nullptr || ok[i]) {
+              total += v[i];
+              ++count;
+            }
+          }
+          base[m] += total;
+        }
+        base[nsums + m] += count;
+        continue;
+      }
+      const size_t scale = acc->groups == 1 ? 0 : 1;
+      for(size_t i = 0; i < n; ++i) {
+        if(ok != nullptr && ok[i] == 0) {
+          continue;
+        }
+        add_value(base + g[i] * scale, m, v[i]);
+      }
+    }
+    return true;
+  }
+
+  /* the value of one row for sum m of the block b of its group */
+  inline void add_value(warp_i128 *b, size_t m, int64_t value) {
+    if(plan.sums[m].kind == warp_star_sum::COUNT) {
+      b[nsums + m] += 1;
+      return;
+    }
+    if(plan.extreme[m] == 0) {
+      b[m] += value;
+    } else if(b[nsums + m] == 0 || (plan.extreme[m] == 1 ? value < b[m] : value > b[m])) {
+      b[m] = value;
+    }
+    b[nsums + m] += 1;
+  }
+
+  /* all the rows of hits */
+  bool run(const ibis::bitvector *hits) {
+    std::vector<uint32_t> pending(WARP_STAR_BLOCK);
+    size_t npending = 0;
+    for(ibis::bitvector::indexSet ix = hits->firstIndexSet(); ix.nIndices() > 0; ++ix) {
+      const ibis::bitvector::word_t *indices = ix.indices();
+      if(ix.isRange() && indices[1] - indices[0] >= 64) {
+        if(npending > 0) {
+          if(!block(pending.data(), 0, npending)) return false;
+          npending = 0;
+        }
+        for(uint32_t row = indices[0]; row < indices[1];) {
+          const size_t n = std::min<size_t>(WARP_STAR_BLOCK, indices[1] - row);
+          if(!block(nullptr, row, n)) return false;
+          row += (uint32_t)n;
+        }
+        continue;
+      }
+      const size_t count = ix.isRange() ? indices[1] - indices[0] : ix.nIndices();
+      for(size_t j = 0; j < count; ++j) {
+        pending[npending++] = ix.isRange() ? indices[0] + (uint32_t)j : indices[j];
+        if(npending == WARP_STAR_BLOCK) {
+          if(!block(pending.data(), 0, npending)) return false;
+          npending = 0;
+        }
+      }
+    }
+    return npending == 0 || block(pending.data(), 0, npending);
+  }
+};
 
 /* one partition of the fact table */
 static bool warp_star_partition(warp_star_agg &plan, ibis::part *part,
@@ -1330,6 +1962,14 @@ static bool warp_star_partition(warp_star_agg &plan, ibis::part *part,
     return true;
   };
 
+  /* a block of rows at a time, unless a key of a dimension has several rows
+     or the groups are split by the columns of COUNT(DISTINCT): row by row */
+  if(!has_multi && ndcols == 0 && plan.blocks) {
+    warp_star_blocks blocks(plan, cols, nulls, invisible, acc);
+    blocks.run(hits);
+    return true;  // an overflow is in acc
+  }
+
   for(ibis::bitvector::indexSet ix = hits->firstIndexSet(); ix.nIndices() > 0; ++ix) {
     const ibis::bitvector::word_t *indices = ix.indices();
     if(ix.isRange()) {
@@ -1366,6 +2006,7 @@ static bool warp_star_execute(warp_star_agg &plan, std::string *error) {
   snap.repeatable_read = (trx->isolation_level == ISO_REPEATABLE_READ ||
                           trx->isolation_level == ISO_SERIALIZABLE);
   snap.check_rowids = warp_state->has_history_locks() || warp_state->delete_bitmap->may_have_bits();
+  plan.blocks = THDVAR(thd, star_aggregation_blocks);
 
   /* no row is written while the columns are read */
   warp_table_read_lock fact_lock(plan.fact_handler->get_warp_share()->data_dir_name);
