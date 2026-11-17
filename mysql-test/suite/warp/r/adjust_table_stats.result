@@ -43,5 +43,44 @@ id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered
 #	#	g	#	#	#	#	#	#	1002	#	#
 Warnings:
 #	#	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`f` join `test`.`g` where (`test`.`g`.`a` = `test`.`f`.`a`)
+#
+# A materialized view is a table of the statement: the statement is
+# not a star, no table gets the small number of rows (the largest one
+# may be a dimension: the view stands for the fact table)
+#
+CREATE MATERIALIZED VIEW mv ENGINE=WARP REFRESH MANUAL AS
+SELECT b, COUNT(*) AS n FROM f WHERE b <= 3 GROUP BY b;
+CREATE MATERIALIZED VIEW mvi ENGINE=InnoDB REFRESH MANUAL AS
+SELECT b, COUNT(*) AS n FROM f WHERE b <= 3 GROUP BY b;
+EXPLAIN SELECT COUNT(*) FROM g JOIN d ON g.a = d.a;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+#	#	d	#	#	#	#	#	#	10	#	#
+#	#	g	#	#	#	#	#	#	12	#	#
+Warnings:
+#	#	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`g` join `test`.`d` where (`test`.`g`.`a` = `test`.`d`.`a`)
+# the real number of rows of g
+EXPLAIN SELECT COUNT(*) FROM g JOIN d ON g.a = d.a JOIN mv ON mv.b = d.c;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+#	#	mv	#	#	#	#	#	#	3	#	#
+#	#	d	#	#	#	#	#	#	10	#	#
+#	#	g	#	#	#	#	#	#	5000	#	#
+Warnings:
+#	#	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`g` join `test`.`d` join `test`.`mv` where ((`test`.`g`.`a` = `test`.`d`.`a`) and (`test`.`d`.`c` = `test`.`mv`.`b`))
+EXPLAIN SELECT COUNT(*) FROM g JOIN d ON g.a = d.a JOIN mvi ON mvi.b = d.c;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+#	#	mvi	#	#	#	#	#	#	3	#	#
+#	#	d	#	#	#	#	#	#	10	#	#
+#	#	g	#	#	#	#	#	#	5000	#	#
+Warnings:
+#	#	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`g` join `test`.`d` join `test`.`mvi` where ((`test`.`g`.`a` = `test`.`d`.`a`) and (`test`.`d`.`c` = `test`.`mvi`.`b`))
+# and adjusted again in the next statement without a view
+EXPLAIN SELECT COUNT(*) FROM g JOIN d ON g.a = d.a;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+#	#	d	#	#	#	#	#	#	10	#	#
+#	#	g	#	#	#	#	#	#	12	#	#
+Warnings:
+#	#	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`g` join `test`.`d` where (`test`.`g`.`a` = `test`.`d`.`a`)
+DROP MATERIALIZED VIEW mv;
+DROP MATERIALIZED VIEW mvi;
 SET SESSION warp_adjust_table_stats_for_joins = DEFAULT;
 DROP TABLE f, d, g;

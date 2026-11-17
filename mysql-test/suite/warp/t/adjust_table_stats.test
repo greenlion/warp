@@ -30,5 +30,28 @@ EXPLAIN SELECT COUNT(*) FROM f JOIN d ON f.a = d.a;
 --echo # f is not the largest table of this join: its real number of rows
 --replace_column 1 # 2 # 4 # 5 # 6 # 7 # 8 # 9 # 11 # 12 #
 EXPLAIN SELECT COUNT(*) FROM f JOIN g ON f.a = g.a;
+
+--echo #
+--echo # A materialized view is a table of the statement: the statement is
+--echo # not a star, no table gets the small number of rows (the largest one
+--echo # may be a dimension: the view stands for the fact table)
+--echo #
+CREATE MATERIALIZED VIEW mv ENGINE=WARP REFRESH MANUAL AS
+  SELECT b, COUNT(*) AS n FROM f WHERE b <= 3 GROUP BY b;
+CREATE MATERIALIZED VIEW mvi ENGINE=InnoDB REFRESH MANUAL AS
+  SELECT b, COUNT(*) AS n FROM f WHERE b <= 3 GROUP BY b;
+--replace_column 1 # 2 # 4 # 5 # 6 # 7 # 8 # 9 # 11 # 12 #
+EXPLAIN SELECT COUNT(*) FROM g JOIN d ON g.a = d.a;
+--echo # the real number of rows of g
+--replace_column 1 # 2 # 4 # 5 # 6 # 7 # 8 # 9 # 11 # 12 #
+EXPLAIN SELECT COUNT(*) FROM g JOIN d ON g.a = d.a JOIN mv ON mv.b = d.c;
+--replace_column 1 # 2 # 4 # 5 # 6 # 7 # 8 # 9 # 11 # 12 #
+EXPLAIN SELECT COUNT(*) FROM g JOIN d ON g.a = d.a JOIN mvi ON mvi.b = d.c;
+--echo # and adjusted again in the next statement without a view
+--replace_column 1 # 2 # 4 # 5 # 6 # 7 # 8 # 9 # 11 # 12 #
+EXPLAIN SELECT COUNT(*) FROM g JOIN d ON g.a = d.a;
+DROP MATERIALIZED VIEW mv;
+DROP MATERIALIZED VIEW mvi;
+
 SET SESSION warp_adjust_table_stats_for_joins = DEFAULT;
 DROP TABLE f, d, g;
