@@ -148,9 +148,6 @@ EXPLAIN
             -> Group aggregate: sum(by_cust.mv$count)  (cost=# rows=#)
                 -> Index scan on by_cust using mv$ix_group  (cost=# rows=#)
 
-Warnings:
-Note	1105	Query 'EXPLAIN FORMAT=TREE WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT * FROM t WHERE n > 7' rewritten to 'EXPLAIN FORMAT=TREE WITH t AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`) SELECT * FROM t WHERE n > 7' by a query rewrite plugin
-Note	1003	with `t` as (/* select#2 */ select `test`.`by_cust`.`mv$g0` AS `o_custkey`,cast(coalesce(sum(`test`.`by_cust`.`mv$count`),0) as signed) AS `n` from `test`.`by_cust` group by `test`.`by_cust`.`mv$g0` having (cast(coalesce(sum(`test`.`by_cust`.`mv$count`),0) as signed) > 7)) /* select#1 */ select `t`.`o_custkey` AS `o_custkey`,`t`.`n` AS `n` from `t`
 #
 # Not rewritten: set operations in the common table expression, a
 # recursive one, one with subqueries, a WITH clause that is not the
