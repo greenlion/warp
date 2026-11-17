@@ -1,0 +1,125 @@
+--echo #
+--echo # MVIEW_REWRITE, subqueries and derived tables: a subquery or derived
+--echo # table that is one query block is rewritten as if it were a statement
+--echo # of its own, in the text of the statement; the rest of the statement
+--echo # is as it was.  Every statement is run with and without the plugin
+--echo # and must give the same rows.
+--echo #
+
+--let $q_check = suite/warp/include/mview_rewrite_check.inc
+
+CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_name VARCHAR(25) NOT NULL,
+  c_nation INT NOT NULL);
+CREATE TABLE orders (o_orderkey INT PRIMARY KEY, o_custkey INT NOT NULL,
+  o_status CHAR(1) NOT NULL, o_price DECIMAL(12,2) NOT NULL,
+  o_date DATE NOT NULL,
+  FOREIGN KEY (o_custkey) REFERENCES customer (c_custkey));
+INSERT INTO customer
+  WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 30)
+  SELECT k, CONCAT('Customer#', k), k % 5 FROM s;
+INSERT INTO orders
+  WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 200)
+  SELECT k, (k * 7 % 30) + 1, ELT(k % 3 + 1, 'F', 'O', 'P'),
+         (k * 13 % 500) + 0.25, DATE'2025-01-01' + INTERVAL (k * 3 % 365) DAY
+  FROM s;
+
+SET SESSION mview_rewrite_use_manual_views = ON;
+
+CREATE MATERIALIZED VIEW by_cust REFRESH MANUAL AS
+  SELECT o_custkey, o_status, COUNT(*) AS n, SUM(o_price) AS total
+  FROM orders GROUP BY o_custkey, o_status;
+
+--echo #
+--echo # Derived tables
+--echo #
+--let $mvr_query = SELECT c_name, n FROM customer, (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) d WHERE o_custkey = c_custkey AND n > 6 ORDER BY c_name
+--source $q_check
+--echo # two of them, an outer join, a list of column names
+--let $mvr_query = SELECT c_name, f.total, o.cnt FROM customer LEFT JOIN (SELECT o_custkey, SUM(o_price) AS total FROM orders WHERE o_status = 'F' GROUP BY o_custkey) f ON f.o_custkey = c_custkey LEFT JOIN (SELECT o_custkey, COUNT(*) FROM orders WHERE o_status = 'O' GROUP BY o_custkey) o (k, cnt) ON o.k = c_custkey WHERE c_custkey < 8
+--source $q_check
+--echo # a derived table in a derived table: the inner one (the outer one has
+--echo # a derived table, it is not rewritten)
+--let $mvr_query = SELECT MAX(n), MIN(n) FROM (SELECT n FROM (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) d1 WHERE n > 3) d2
+--source $q_check
+
+--echo #
+--echo # Subqueries: IN, EXISTS, scalar, in the select list, in HAVING
+--echo #
+--let $mvr_query = SELECT c_name FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7)
+--source $q_check
+--let $mvr_query = SELECT c_name FROM customer WHERE c_custkey NOT IN (SELECT o_custkey FROM orders WHERE o_status = 'P' GROUP BY o_custkey HAVING SUM(o_price) > 500)
+--source $q_check
+--let $mvr_query = SELECT c_name, (SELECT COUNT(*) FROM orders WHERE o_status = 'F') AS f_orders FROM customer WHERE c_custkey < 4
+--source $q_check
+--let $mvr_query = SELECT o_custkey, SUM(o_price) AS total FROM orders GROUP BY o_custkey HAVING SUM(o_price) > (SELECT SUM(o_price) / 25 FROM orders)
+--source $q_check
+--let $mvr_query = SELECT COUNT(*) FROM customer WHERE EXISTS (SELECT o_custkey, COUNT(*) FROM orders WHERE o_status = 'X' GROUP BY o_custkey)
+--source $q_check
+--echo # the arms of a set operation
+--let $mvr_query = SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7) UNION SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) < 6)
+--source $q_check
+
+--echo #
+--echo # A subquery that reads a column of the outer query is not a statement
+--echo # of its own: it is not rewritten
+--echo #
+--let $mvr_query = SELECT c_name, (SELECT COUNT(*) FROM orders WHERE o_custkey = c_custkey) AS n FROM customer WHERE c_custkey < 4
+--source $q_check
+--let $mvr_query = SELECT c_name FROM customer c WHERE EXISTS (SELECT o_custkey FROM orders WHERE o_custkey = c.c_custkey GROUP BY o_custkey HAVING COUNT(*) > 7)
+--source $q_check
+--let $mvr_query = SELECT c_name, d.n FROM customer, LATERAL (SELECT COUNT(*) AS n FROM orders WHERE o_custkey = c_custkey) d WHERE c_custkey < 4
+--source $q_check
+--echo # the subquery in it that does not is
+--let $mvr_query = SELECT c_name FROM customer c WHERE 7 < (SELECT COUNT(*) FROM orders WHERE o_custkey = c.c_custkey AND o_price > (SELECT SUM(o_price) / 1000 FROM orders))
+--source $q_check
+
+--echo #
+--echo # With a WITH clause: the common table expressions and the subqueries,
+--echo # also the subqueries in a common table expression that is not
+--echo # rewritten as a whole (read once, and read twice)
+--echo #
+--let $mvr_query = WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT c_name, n FROM t, customer WHERE o_custkey = c_custkey AND c_custkey IN (SELECT o_custkey FROM orders WHERE o_status = 'F' GROUP BY o_custkey HAVING COUNT(*) > 2) AND n > 7
+--source $q_check
+--let $mvr_query = WITH t AS (SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7)) SELECT COUNT(*) FROM t
+--source $q_check
+
+--let $mvr_query = WITH t AS (SELECT c_custkey AS k FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7)) SELECT COUNT(*) FROM t t1, t t2 WHERE t1.k = t2.k + 1
+--source $q_check
+--echo #
+--echo # The statement that is one query block is rewritten as before; the
+--echo # text around the subqueries is kept (comments, EXPLAIN)
+--echo #
+--let $mvr_query = SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7
+--source $q_check
+--let $mvr_query = SELECT /* ( */ c_name, ')' FROM customer WHERE c_custkey IN /* ) */ ( /* ( */ SELECT o_custkey FROM orders WHERE o_status <> ')' GROUP BY o_custkey HAVING COUNT(*) > 4 /* ) */ ) /* ( */ AND c_name <> '('
+--source $q_check
+--disable_warnings
+--replace_regex /cost=[0-9.e+-]*/cost=#/ /rows=[0-9.e+-]*/rows=#/
+EXPLAIN FORMAT=TREE SELECT c_name, n FROM customer, (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) d WHERE o_custkey = c_custkey AND n > 7;
+--enable_warnings
+
+--echo #
+--echo # The notes of the trace say where the subquery is
+--echo #
+SET SESSION mview_rewrite_trace = ON;
+--disable_result_log
+SELECT c_name FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7) AND c_nation = (SELECT MIN(c_nation) FROM customer);
+--enable_result_log
+--replace_regex /positions: .*/positions: #/
+SHOW WARNINGS;
+SET SESSION mview_rewrite_trace = OFF;
+
+--echo # INSERT ... SELECT, UPDATE and DELETE are not rewritten
+CREATE TABLE copy (k INT);
+--let $before = query_get_value(SHOW GLOBAL STATUS LIKE 'Mview_rewrite_rewritten', Value, 1)
+INSERT INTO copy SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 6);
+DELETE FROM copy WHERE k IN (SELECT o_custkey FROM orders WHERE o_status = 'F' GROUP BY o_custkey HAVING COUNT(*) > 3);
+SELECT COUNT(*) FROM copy;
+--let $after = query_get_value(SHOW GLOBAL STATUS LIKE 'Mview_rewrite_rewritten', Value, 1)
+--let $assert_text = INSERT and DELETE are not rewritten
+--let $assert_cond = $after = $before
+--source include/assert.inc
+
+DROP TABLE copy;
+DROP MATERIALIZED VIEW by_cust;
+DROP TABLE orders, customer;

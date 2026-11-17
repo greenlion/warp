@@ -4992,6 +4992,8 @@ bool PT_subquery::do_contextualize(Parse_context *pc) {
   }
 
   query_block = inner_pc.select->master_query_expression()->first_query_block();
+  query_block->master_query_expression()->m_parsed_text_start = m_pos.raw.start;
+  query_block->master_query_expression()->m_parsed_text_end = m_pos.raw.end;
   if (inner_pc.finalize_query_expression()) return true;
   inner_pc.m_stack.pop_back();
   assert(inner_pc.m_stack.size() == 0);

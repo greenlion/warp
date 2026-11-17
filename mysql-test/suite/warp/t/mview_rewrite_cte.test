@@ -99,18 +99,19 @@ EXPLAIN FORMAT=TREE WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP
 
 --echo #
 --echo # Not rewritten: set operations in the common table expression, a
---echo # recursive one, one with subqueries, a WITH clause that is not the
---echo # one of the statement
+--echo # recursive one, one that reads a column of the statement
 --echo #
 --let $mvr_query = WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey UNION ALL SELECT o_custkey, COUNT(*) FROM orders GROUP BY o_custkey) SELECT COUNT(*), SUM(n) FROM t
 --source $q_check
 --let $mvr_query = WITH RECURSIVE t (k, n) AS (SELECT o_custkey, COUNT(*) FROM orders GROUP BY o_custkey UNION ALL SELECT k + 100, n FROM t WHERE k < 100) SELECT COUNT(*), SUM(n) FROM t
 --source $q_check
---let $mvr_query = WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders WHERE o_custkey IN (SELECT c_custkey FROM customer WHERE c_nation = 1) GROUP BY o_custkey) SELECT COUNT(*), SUM(n) FROM t
---source $q_check
---let $mvr_query = SELECT * FROM (WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT COUNT(*), SUM(n) FROM t) d
+--let $mvr_query = SELECT c_name, (WITH t AS (SELECT COUNT(*) AS n FROM orders WHERE o_custkey = c_custkey) SELECT n FROM t) AS n FROM customer WHERE c_custkey < 4
 --source $q_check
 
+--echo # a WITH clause that is not the one of the statement (see also
+--echo # mview_rewrite_subquery.test)
+--let $mvr_query = SELECT * FROM (WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT COUNT(*), SUM(n) FROM t) d
+--source $q_check
 --echo # in a recursive WITH clause the ones that are not recursive are
 --let $mvr_query = WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 3), t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT k, n FROM s, t WHERE k = o_custkey
 --source $q_check
