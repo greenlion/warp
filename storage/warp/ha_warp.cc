@@ -9731,9 +9731,17 @@ uint64_t warp_global_data::get_next_trx_id() {
 uint64_t warp_global_data::get_next_rowid_batch(uint64_t count) {
   mtx.lock();
   next_rowid += count;
-  write();
+  /* the state file is only written when the row ids that it has reserved
+     are used up, see rowid_reserved */
+  if(next_rowid > rowid_reserved) {
+    rowid_reserved = next_rowid + WARP_ROWID_RESERVE;
+    write();
+  }
+  /* read under the mutex: another connection may take the next batch as
+     soon as it is released */
+  const uint64_t batch = next_rowid;
   mtx.unlock();
-  return next_rowid;
+  return batch;
 }
 
 /* Only transactions that are for write are registered as open
@@ -10010,7 +10018,9 @@ uint64_t warp_global_data::get_state_and_return_version() {
 
   next_trx_id = state_record->next_trx_id;
   trx_id_reserved = next_trx_id;
+  /* the row ids below the one of the file may have been handed out */
   next_rowid = state_record->next_rowid;
+  rowid_reserved = next_rowid;
   state_counter = state_record->state_counter;
 
   return state_record->version;
@@ -10314,7 +10324,7 @@ void warp_global_data::write() {
     sql_print_error("seek on warp_state failed!");
     assert(false);
   }
-  record.next_rowid  = next_rowid;
+  record.next_rowid  = rowid_reserved > next_rowid ? rowid_reserved : next_rowid;
   record.next_trx_id = trx_id_reserved > next_trx_id ? trx_id_reserved : next_trx_id;
   record.version     = WARP_VERSION;
   record.state_counter = ++state_counter;
@@ -10338,7 +10348,7 @@ void warp_global_data::write() {
     assert(false);
   }  
   fflush(fp);
-  record.next_rowid  = next_rowid;
+  record.next_rowid  = rowid_reserved > next_rowid ? rowid_reserved : next_rowid;
   record.next_trx_id = trx_id_reserved > next_trx_id ? trx_id_reserved : next_trx_id;
   record.version     = WARP_VERSION;
   record.state_counter = ++state_counter;
@@ -10483,6 +10493,9 @@ warp_global_data::~warp_global_data() {
   }
   delete delete_bitmap;
   delete_bitmap=NULL;
+  /* a clean shutdown gives back the row ids that were reserved and not
+     handed out */
+  rowid_reserved = next_rowid;
   write();
   fclose(fp);
   
