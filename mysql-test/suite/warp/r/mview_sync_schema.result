@@ -1,0 +1,58 @@
+#
+# A statement that changes a table without row events (DDL) refreshes the
+# views of the table completely.  A statement on a table of the same name
+# in another schema is not a statement on the table: the daemon found the
+# name of the table in it and refreshed the views (CREATE TABLE lineorder
+# in a second copy of a schema refreshed every view of the first one).
+#
+call mtr.add_suppression("WARP_MVIEW");
+CREATE DATABASE one;
+CREATE DATABASE two;
+CREATE TABLE one.t (id INT PRIMARY KEY, grp INT, v INT) ENGINE=InnoDB;
+CREATE TABLE one.d (grp INT PRIMARY KEY, name VARCHAR(10)) ENGINE=InnoDB;
+INSERT INTO one.t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+INSERT INTO one.d VALUES (1, 'a'), (2, 'b');
+one.v_j: 3 rows, 0 missing, 0 extra
+one.v_a: 2 rows, 0 missing, 0 extra
+# tables of the same names in another schema: named without a schema in
+# a session of that schema, and with the schema from another one
+USE two;
+CREATE TABLE t (id INT PRIMARY KEY, grp INT, v INT) ENGINE=InnoDB;
+CREATE TABLE d (grp INT PRIMARY KEY, name VARCHAR(10)) ENGINE=InnoDB;
+ALTER TABLE t ADD COLUMN w INT;
+CREATE INDEX i ON t (grp);
+TRUNCATE TABLE d;
+USE one;
+ALTER TABLE two.t DROP COLUMN w;
+ALTER TABLE `two` . `d` ADD COLUMN x INT;
+RENAME TABLE two.d TO two.d2;
+DROP TABLE two.t, `two`.`d2`;
+USE test;
+INSERT INTO one.t VALUES (4, 2, 40);
+one.v_j: 4 rows, 0 missing, 0 extra
+one.v_a: 2 rows, 0 missing, 0 extra
+views_refreshed_for_the_other_schema
+0
+# the table itself, named with its schema from a session of another one
+USE two;
+ALTER TABLE one.t ADD COLUMN extra INT;
+USE test;
+one.v_j: 4 rows, 0 missing, 0 extra
+views_refreshed_for_the_table
+1
+# and without a schema in a session of its schema
+USE one;
+TRUNCATE TABLE d;
+INSERT INTO d VALUES (1, 'z');
+USE test;
+one.v_j: 2 rows, 0 missing, 0 extra
+views_refreshed_for_the_table
+1
+SELECT * FROM one.v_j ORDER BY id;
+id	v	name
+1	10	z
+2	20	z
+DROP MATERIALIZED VIEW one.v_j;
+DROP MATERIALIZED VIEW one.v_a;
+DROP DATABASE one;
+DROP DATABASE two;
