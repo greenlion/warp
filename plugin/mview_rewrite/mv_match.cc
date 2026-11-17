@@ -38,6 +38,7 @@
 
 #include "my_sqlcommand.h"
 #include "mysql/strings/m_ctype.h"
+#include "sql/parse_tree_nodes.h"  // PT_with_clause
 #include "sql/auth/auth_acls.h"
 #include "sql/auth/auth_common.h"
 #include "sql/item_func.h"
@@ -1357,10 +1358,16 @@ bool check_statement(THD *thd, std::string *why) {
     *why = "EXPLAIN ... INTO or FOR SCHEMA";
     return false;
   }
+  return true;
+}
+
+/** The statement is one query block (no WITH: see rewrite_ctes()). */
+bool check_single_block(THD *thd, std::string *why) {
+  LEX *lex = thd->lex;
   Query_expression *unit = lex->unit;
   if (!unit->is_simple() || lex->query_block->next_query_block() != nullptr ||
-      unit->m_with_clause != nullptr || lex->query_block != unit->first_query_block()) {
-    *why = "set operations or WITH";
+      lex->query_block != unit->first_query_block()) {
+    *why = "set operations";
     return false;
   }
   if (lex->query_block->active_options() & OPTION_FOUND_ROWS) {
@@ -1400,18 +1407,21 @@ bool analyse_view_tables(THD *thd, View *view, Catalog *catalog,
   return false;
 }
 
-bool rewrite_statement(THD *thd, const Registry &registry,
-                       const Options &options, std::string *sql,
-                       std::vector<std::string> *notes, Counters *counters) {
+namespace {
+
+/**
+  Rewrite one query block: the statement, or the query expression of a
+  common table expression.
+  @param[out] sql  the block, reading a view
+*/
+bool rewrite_block(THD *thd, Query_block *qb, const Registry &registry,
+                   const Options &options, std::string *sql,
+                   std::vector<std::string> *notes, Counters *counters) {
   std::string why;
-  if (!check_statement(thd, &why)) {
-    if (options.trace) notes->push_back("the query is not used: " + why);
-    return false;
-  }
 
   /* nothing to do if no view has a table of the statement */
   bool known = false;
-  for (Table_ref *tr = thd->lex->query_block->get_table_list(); tr != nullptr;
+  for (Table_ref *tr = qb->get_table_list(); tr != nullptr;
        tr = tr->next_local) {
     if (tr->db != nullptr && tr->table_name != nullptr &&
         registry.id(std::string(tr->db) + "." + tr->table_name) >= 0)
@@ -1425,7 +1435,7 @@ bool rewrite_statement(THD *thd, const Registry &registry,
 
   Catalog catalog(thd, false);
   Block q;
-  if (make_block(thd, thd->lex->query_block, &catalog, false, &q, &why)) {
+  if (make_block(thd, qb, &catalog, false, &q, &why)) {
     if (options.trace) notes->push_back("the query is not used: " + why);
     return false;
   }
@@ -1523,7 +1533,144 @@ bool rewrite_statement(THD *thd, const Registry &registry,
       return false;
     }
   }
-  *sql = explain_prefix(thd->lex) + best.sql;
+  *sql = best.sql;
+  return true;
+}
+
+/** Every reference to a common table expression in and under a block. */
+void collect_cte_references(Query_block *qb, std::vector<Table_ref *> *out,
+                            int depth) {
+  if (depth > 64) return;
+  for (Table_ref *tr = qb->get_table_list(); tr != nullptr;
+       tr = tr->next_local) {
+    if (tr->common_table_expr() != nullptr &&
+        tr->derived_query_expression() != nullptr)
+      out->push_back(tr);
+  }
+  for (Query_expression *unit = qb->first_inner_query_expression();
+       unit != nullptr; unit = unit->next_query_expression()) {
+    for (Query_block *inner = unit->first_query_block(); inner != nullptr;
+         inner = inner->next_query_block())
+      collect_cte_references(inner, out, depth + 1);
+  }
+}
+
+/**
+  A statement with a WITH clause: the query expression of every common
+  table expression that is one query block is rewritten as if it were a
+  statement of its own, and put in the text of the statement in the place
+  of the original.  The rest of the statement is as it was.
+
+  The blocks are the ones the parser made for the references to the common
+  table expressions: a name in them that is another common table
+  expression is a derived table there, not a base table of that name.
+*/
+bool rewrite_ctes(THD *thd, const Registry &registry, const Options &options,
+                  std::string *sql, std::vector<std::string> *notes,
+                  Counters *counters) {
+  LEX *lex = thd->lex;
+  PT_with_clause *with = lex->unit->m_with_clause;
+  const char *text = thd->query().str;
+  const size_t length = thd->query().length;
+
+  std::vector<Table_ref *> references;
+  for (Query_block *qb = lex->unit->first_query_block(); qb != nullptr;
+       qb = qb->next_query_block())
+    collect_cte_references(qb, &references, 0);
+
+  struct Replacement {
+    size_t offset, length;
+    std::string sql;
+  };
+  std::vector<Replacement> replacements;
+  for (PT_common_table_expr *cte : with->elements()) {
+    const std::string name =
+        "common table expression " +
+        quote(std::string(cte->name().str, cte->name().length));
+    Table_ref *reference = nullptr;
+    for (Table_ref *tr : references) {
+      if (cte->is(tr->common_table_expr())) {
+        reference = tr;
+        break;
+      }
+    }
+    if (reference == nullptr) continue;  // not used: not parsed
+    std::string why;
+    Query_expression *unit = reference->derived_query_expression();
+    Query_block *qb = unit->first_query_block();
+    if (reference->common_table_expr()->recursive)
+      why = "recursive";
+    else if (!unit->is_simple() || qb == nullptr ||
+             qb->next_query_block() != nullptr)
+      why = "set operations";
+    else if (unit->m_with_clause != nullptr)
+      why = "WITH";
+    else if (qb->active_options() & OPTION_FOUND_ROWS)
+      why = "SQL_CALC_FOUND_ROWS";
+    /* where its text is: ( query expression ) */
+    const POS &pos = cte->subquery_pos();
+    if (why.empty() &&
+        (pos.raw.start == nullptr || pos.raw.start < text ||
+         pos.raw.end > text + length || pos.raw.end < pos.raw.start + 2 ||
+         *pos.raw.start != '(' || *(pos.raw.end - 1) != ')'))
+      why = "its text is not in the statement";
+    if (!why.empty()) {
+      if (options.trace)
+        notes->push_back(name + ": the query is not used: " + why);
+      continue;
+    }
+    std::string block_sql;
+    std::vector<std::string> block_notes;
+    const bool rewritten = rewrite_block(thd, qb, registry, options,
+                                         &block_sql, &block_notes, counters);
+    for (const std::string &note : block_notes)
+      notes->push_back(name + ": " + note);
+    if (!rewritten) continue;
+    Replacement r;
+    r.offset = static_cast<size_t>(pos.raw.start - text);
+    r.length = static_cast<size_t>(pos.raw.end - pos.raw.start);
+    r.sql = "(" + block_sql + ")";
+    replacements.push_back(std::move(r));
+  }
+  if (replacements.empty()) return false;
+
+  std::sort(replacements.begin(), replacements.end(),
+            [](const Replacement &a, const Replacement &b) {
+              return a.offset < b.offset;
+            });
+  sql->clear();
+  size_t at = 0;
+  for (const Replacement &r : replacements) {
+    if (r.offset < at) return false;  // they cannot overlap
+    sql->append(text + at, r.offset - at);
+    sql->append(r.sql);
+    at = r.offset + r.length;
+  }
+  sql->append(text + at, length - at);
+  return true;
+}
+
+}  // namespace
+
+bool rewrite_statement(THD *thd, const Registry &registry,
+                       const Options &options, std::string *sql,
+                       std::vector<std::string> *notes, Counters *counters) {
+  std::string why;
+  if (!check_statement(thd, &why)) {
+    if (options.trace) notes->push_back("the query is not used: " + why);
+    return false;
+  }
+  if (thd->lex->unit->m_with_clause != nullptr)
+    return rewrite_ctes(thd, registry, options, sql, notes, counters);
+  if (!check_single_block(thd, &why)) {
+    if (options.trace) notes->push_back("the query is not used: " + why);
+    return false;
+  }
+  std::string block_sql;
+  if (!rewrite_block(thd, thd->lex->query_block, registry, options,
+                     &block_sql, notes, counters))
+    return false;
+  *sql = explain_prefix(thd->lex) + block_sql;
   return true;
 }
 

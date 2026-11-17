@@ -2384,6 +2384,10 @@ bool PT_with_list::push_back(PT_common_table_expr *el) {
   return m_elements.push_back(el);
 }
 
+const POS &PT_common_table_expr::subquery_pos() const {
+  return m_subq_node->m_pos;
+}
+
 PT_common_table_expr::PT_common_table_expr(
     const POS &pos, const LEX_STRING &name, const LEX_STRING &subq_text,
     uint subq_text_offs, PT_subquery *subq_node,

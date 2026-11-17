@@ -303,6 +303,9 @@ class PT_common_table_expr : public Parse_tree_node {
   bool is(const Common_table_expr *other) const {
     return other == &m_postparse;
   }
+  /// Where the query expression (with its parentheses) is in the statement
+  /// that was parsed: for a plugin that rewrites it.
+  const POS &subquery_pos() const;
   void print(const THD *thd, String *str, enum_query_type query_type);
   bool do_contextualize(Parse_context *pc) override;
 
@@ -397,6 +400,11 @@ class PT_with_clause : public Parse_tree_node {
     m_most_inner_in_parsing = old;
   }
   void print(const THD *thd, String *str, enum_query_type query_type);
+  /// The common table expressions of the clause.
+  const Mem_root_array<PT_common_table_expr *> &elements() const {
+    return m_list->elements();
+  }
+  bool recursive() const { return m_recursive; }
 
  protected:
   void add_json_info(Json_object *obj) override {
