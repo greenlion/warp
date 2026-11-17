@@ -484,6 +484,63 @@ static bool mentions(const char *query, size_t length,
   return false;
 }
 
+/* Whether the statement names the table `db`.`table`: it has the name of
+   the table as a whole word, with the schema before it, or without a
+   schema when the schema of the session that ran the statement
+   (default_db) is the one of the table.  The names are compared without
+   case for ASCII letters.
+
+   Conservative as mentions() is, but not across schemas: a statement on a
+   table of the same name in another schema (CREATE TABLE lineorder ... in
+   a second copy of a schema) is not a statement on the table. */
+static bool mentions_table(const char *query, size_t length,
+                           const std::string &db, const std::string &table,
+                           const std::string &default_db) {
+  const size_t n = table.size();
+  if (n == 0 || n > length) return false;
+  const bool default_is_db =
+      default_db.empty() || strcasecmp(default_db.c_str(), db.c_str()) == 0;
+  for (size_t i = 0; i + n <= length; i++) {
+    if (strncasecmp(query + i, table.data(), n) != 0) continue;
+    if (i > 0 && is_ident_char(static_cast<unsigned char>(query[i - 1])))
+      continue;
+    if (i + n < length &&
+        is_ident_char(static_cast<unsigned char>(query[i + n])))
+      continue;
+    /* what is before the name: [`]schema[`] [.] [`] */
+    size_t at = i;
+    if (at > 0 && query[at - 1] == '`') at--;
+    while (at > 0 && (query[at - 1] == ' ' || query[at - 1] == '\t')) at--;
+    if (at == 0 || query[at - 1] != '.') {
+      if (default_is_db) return true;  // no schema: the one of the session
+      continue;
+    }
+    at--;  // the dot
+    while (at > 0 && (query[at - 1] == ' ' || query[at - 1] == '\t')) at--;
+    size_t end = at;
+    if (end > 0 && query[end - 1] == '`') {
+      end--;
+      size_t begin = end;
+      while (begin > 0 && query[begin - 1] != '`') begin--;
+      if (end - begin == db.size() &&
+          strncasecmp(query + begin, db.data(), db.size()) == 0)
+        return true;
+    } else {
+      size_t begin = end;
+      while (begin > 0 &&
+             is_ident_char(static_cast<unsigned char>(query[begin - 1])))
+        begin--;
+      if (end - begin == db.size() &&
+          strncasecmp(query + begin, db.data(), db.size()) == 0)
+        return true;
+      /* nothing that is a name before the dot: not understood, the
+         statement is taken for one on the table */
+      if (end == begin) return true;
+    }
+  }
+  return false;
+}
+
 /* The first words of a statement, upper case, without comments. `rest` is
    set to the text after the second word. */
 static void leading_words(const char *query, size_t length, size_t max_words,
@@ -2278,9 +2335,13 @@ void Daemon::process_query(Query_log_event *ev) {
 
   bool any = false;
   Changes &target = in_trx ? trx : batch.changes;
+  /* the schema of the session that ran the statement: a table that the
+     statement names without a schema is of it */
+  const std::string default_db =
+      ev->db != nullptr ? std::string(ev->db, ev->db_len) : std::string();
   for (const auto &entry : tracked) {
     const Tracked_table &table = entry.second;
-    if (mentions(query, length, table.table) ||
+    if (mentions_table(query, length, table.db, table.table, default_db) ||
         (drop_schema && mentions(query, length, table.db))) {
       target.refresh_tables.insert(entry.first);
       any = true;

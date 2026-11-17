@@ -1,0 +1,91 @@
+--echo #
+--echo # A statement that changes a table without row events (DDL) refreshes the
+--echo # views of the table completely.  A statement on a table of the same name
+--echo # in another schema is not a statement on the table: the daemon found the
+--echo # name of the table in it and refreshed the views (CREATE TABLE lineorder
+--echo # in a second copy of a schema refreshed every view of the first one).
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+call mtr.add_suppression("WARP_MVIEW");
+
+CREATE DATABASE one;
+CREATE DATABASE two;
+CREATE TABLE one.t (id INT PRIMARY KEY, grp INT, v INT) ENGINE=InnoDB;
+CREATE TABLE one.d (grp INT PRIMARY KEY, name VARCHAR(10)) ENGINE=InnoDB;
+INSERT INTO one.t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+INSERT INTO one.d VALUES (1, 'a'), (2, 'b');
+--let $sel_j = SELECT t.id, t.v, d.name FROM one.t JOIN one.d ON d.grp = t.grp
+--let $sel_a = SELECT grp, COUNT(*) AS n, SUM(v) AS s FROM one.t GROUP BY grp
+--disable_query_log
+eval CREATE MATERIALIZED VIEW one.v_j ENGINE=InnoDB AS $sel_j;
+eval CREATE MATERIALIZED VIEW one.v_a ENGINE=InnoDB AS $sel_a;
+--enable_query_log
+--let $mview = one.v_j
+--let $mview_select = $sel_j
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = one.v_a
+--let $mview_select = $sel_a
+--source suite/warp/include/mview_sync_check.inc
+--source suite/warp/include/mview_sync_wait.inc
+--let $refreshes = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_mview_full_refreshes', Value, 1)
+
+--echo # tables of the same names in another schema: named without a schema in
+--echo # a session of that schema, and with the schema from another one
+USE two;
+CREATE TABLE t (id INT PRIMARY KEY, grp INT, v INT) ENGINE=InnoDB;
+CREATE TABLE d (grp INT PRIMARY KEY, name VARCHAR(10)) ENGINE=InnoDB;
+ALTER TABLE t ADD COLUMN w INT;
+CREATE INDEX i ON t (grp);
+TRUNCATE TABLE d;
+USE one;
+ALTER TABLE two.t DROP COLUMN w;
+ALTER TABLE `two` . `d` ADD COLUMN x INT;
+RENAME TABLE two.d TO two.d2;
+DROP TABLE two.t, `two`.`d2`;
+USE test;
+INSERT INTO one.t VALUES (4, 2, 40);
+--let $mview = one.v_j
+--let $mview_select = $sel_j
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = one.v_a
+--let $mview_select = $sel_a
+--source suite/warp/include/mview_sync_check.inc
+--source suite/warp/include/mview_sync_wait.inc
+--let $refreshes2 = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_mview_full_refreshes', Value, 1)
+--disable_query_log
+eval SELECT $refreshes2 - $refreshes AS views_refreshed_for_the_other_schema;
+--enable_query_log
+
+--echo # the table itself, named with its schema from a session of another one
+USE two;
+ALTER TABLE one.t ADD COLUMN extra INT;
+USE test;
+--let $mview = one.v_j
+--let $mview_select = $sel_j
+--source suite/warp/include/mview_sync_check.inc
+--source suite/warp/include/mview_sync_wait.inc
+--let $refreshes3 = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_mview_full_refreshes', Value, 1)
+--disable_query_log
+eval SELECT $refreshes3 - $refreshes2 > 0 AS views_refreshed_for_the_table;
+--enable_query_log
+
+--echo # and without a schema in a session of its schema
+USE one;
+TRUNCATE TABLE d;
+INSERT INTO d VALUES (1, 'z');
+USE test;
+--let $mview = one.v_j
+--let $mview_select = $sel_j
+--source suite/warp/include/mview_sync_check.inc
+--source suite/warp/include/mview_sync_wait.inc
+--let $refreshes4 = query_get_value(SHOW GLOBAL STATUS LIKE 'Warp_mview_full_refreshes', Value, 1)
+--disable_query_log
+eval SELECT $refreshes4 - $refreshes3 > 0 AS views_refreshed_for_the_table;
+--enable_query_log
+SELECT * FROM one.v_j ORDER BY id;
+
+DROP MATERIALIZED VIEW one.v_j;
+DROP MATERIALIZED VIEW one.v_a;
+DROP DATABASE one;
+DROP DATABASE two;
