@@ -1,0 +1,67 @@
+--echo #
+--echo # A SYNCHRONOUS materialized view that reads no column of its table:
+--echo # SELECT COUNT(*) FROM t.  The daemon took the definition for
+--echo # inconsistent (no referenced columns) and marked the view STALE, and
+--echo # the view was never used for a query.
+--echo #
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+call mtr.add_suppression("WARP_MVIEW");
+
+--let $q_check = suite/warp/include/mview_rewrite_check.inc
+CREATE TABLE t (id INT PRIMARY KEY, grp INT, v INT) ENGINE=InnoDB;
+CREATE TABLE w (a INT, b INT) ENGINE=WARP;
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+INSERT INTO w VALUES (1, 1), (2, 2), (3, NULL), (3, NULL);
+--let $sel_t = SELECT COUNT(*) AS cnt FROM t
+--let $sel_w = SELECT COUNT(*) AS cnt FROM w
+--let $sel_tw = SELECT COUNT(*) AS cnt FROM t, w
+--disable_query_log
+eval CREATE MATERIALIZED VIEW mv_t ENGINE=InnoDB AS $sel_t;
+eval CREATE MATERIALIZED VIEW mv_w ENGINE=WARP AS $sel_w;
+eval CREATE MATERIALIZED VIEW mv_tw ENGINE=InnoDB AS $sel_tw;
+--enable_query_log
+--let $check = suite/warp/include/mview_sync_count_check.inc
+--source $check
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+
+--echo # rows are inserted, changed and deleted
+INSERT INTO t VALUES (4, 2, 40), (5, 3, 50);
+INSERT INTO w VALUES (9, 9);
+--source $check
+UPDATE t SET v = v + 1;
+UPDATE w SET b = 0 WHERE b IS NULL;
+--source $check
+DELETE FROM t WHERE id IN (1, 4);
+DELETE FROM w WHERE a = 3 LIMIT 1;
+--source $check
+BEGIN;
+INSERT INTO t VALUES (6, 1, 60), (7, 1, 70);
+DELETE FROM t WHERE id = 2;
+COMMIT;
+BEGIN;
+INSERT INTO t VALUES (8, 1, 80);
+ROLLBACK;
+--source $check
+SELECT * FROM mv_t;
+SELECT * FROM mv_w;
+SELECT * FROM mv_tw;
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+
+--echo # the views are used for the queries
+--let $mvr_query = SELECT COUNT(*) AS cnt FROM t
+--source suite/warp/include/mview_rewrite_wait.inc
+--source $q_check
+--let $mvr_query = SELECT COUNT(*) FROM w
+--source suite/warp/include/mview_rewrite_wait.inc
+--source $q_check
+
+--echo # every row goes
+DELETE FROM t;
+--source $check
+SELECT * FROM mv_t;
+
+DROP MATERIALIZED VIEW mv_t;
+DROP MATERIALIZED VIEW mv_w;
+DROP MATERIALIZED VIEW mv_tw;
+DROP TABLE t, w;

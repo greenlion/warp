@@ -1,0 +1,74 @@
+#
+# A SYNCHRONOUS materialized view that reads no column of its table:
+# SELECT COUNT(*) FROM t.  The daemon took the definition for
+# inconsistent (no referenced columns) and marked the view STALE, and
+# the view was never used for a query.
+#
+call mtr.add_suppression("WARP_MVIEW");
+CREATE TABLE t (id INT PRIMARY KEY, grp INT, v INT) ENGINE=InnoDB;
+CREATE TABLE w (a INT, b INT) ENGINE=WARP;
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+INSERT INTO w VALUES (1, 1), (2, 2), (3, NULL), (3, NULL);
+mv_t: 1 rows, 0 missing, 0 extra
+mv_w: 1 rows, 0 missing, 0 extra
+mv_tw: 1 rows, 0 missing, 0 extra
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+stale_views
+0
+# rows are inserted, changed and deleted
+INSERT INTO t VALUES (4, 2, 40), (5, 3, 50);
+INSERT INTO w VALUES (9, 9);
+mv_t: 1 rows, 0 missing, 0 extra
+mv_w: 1 rows, 0 missing, 0 extra
+mv_tw: 1 rows, 0 missing, 0 extra
+UPDATE t SET v = v + 1;
+UPDATE w SET b = 0 WHERE b IS NULL;
+mv_t: 1 rows, 0 missing, 0 extra
+mv_w: 1 rows, 0 missing, 0 extra
+mv_tw: 1 rows, 0 missing, 0 extra
+DELETE FROM t WHERE id IN (1, 4);
+DELETE FROM w WHERE a = 3 LIMIT 1;
+mv_t: 1 rows, 0 missing, 0 extra
+mv_w: 1 rows, 0 missing, 0 extra
+mv_tw: 1 rows, 0 missing, 0 extra
+BEGIN;
+INSERT INTO t VALUES (6, 1, 60), (7, 1, 70);
+DELETE FROM t WHERE id = 2;
+COMMIT;
+BEGIN;
+INSERT INTO t VALUES (8, 1, 80);
+ROLLBACK;
+mv_t: 1 rows, 0 missing, 0 extra
+mv_w: 1 rows, 0 missing, 0 extra
+mv_tw: 1 rows, 0 missing, 0 extra
+SELECT * FROM mv_t;
+cnt
+4
+SELECT * FROM mv_w;
+cnt
+4
+SELECT * FROM mv_tw;
+cnt
+16
+SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
+stale_views
+0
+# the views are used for the queries
+SELECT COUNT(*) AS cnt FROM t;
+# rewritten
+SELECT `mv_t`.`mv$count` AS `cnt` FROM `test`.`mv_t` `mv_t`
+SELECT COUNT(*) FROM w;
+# rewritten
+SELECT `mv_w`.`mv$count` AS `COUNT(*)` FROM `test`.`mv_w` `mv_w`
+# every row goes
+DELETE FROM t;
+mv_t: 1 rows, 0 missing, 0 extra
+mv_w: 1 rows, 0 missing, 0 extra
+mv_tw: 1 rows, 0 missing, 0 extra
+SELECT * FROM mv_t;
+cnt
+0
+DROP MATERIALIZED VIEW mv_t;
+DROP MATERIALIZED VIEW mv_w;
+DROP MATERIALIZED VIEW mv_tw;
+DROP TABLE t, w;
