@@ -1,0 +1,111 @@
+#
+# Star aggregation a block of rows at a time (warp_star_aggregation_blocks):
+# the lookups of the dimensions (a table indexed by the key, with a bitmap
+# when few keys have a row, a hash table for keys that are far apart), the
+# sums whose operations can and can not overflow, and the partitions whose
+# rows are all visible, which are not checked row by row.  Every result is
+# the one of InnoDB, a block at a time and row by row.
+#
+call mtr.add_suppression("WARP: aggregation of");
+SET SESSION cte_max_recursion_depth = 1000000;
+SET SESSION warp_parallel_hash_join = 0;
+SELECT @@global.warp_star_aggregation_blocks, @@session.warp_star_aggregation_blocks;
+@@global.warp_star_aggregation_blocks	@@session.warp_star_aggregation_blocks
+1	1
+CREATE TABLE f (id INT NOT NULL, kb INT NOT NULL, kh BIGINT NOT NULL, ks INT NOT NULL,
+a INT NOT NULL, b INT, c BIGINT NOT NULL, t TINYINT NOT NULL, q INT NOT NULL)
+ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE db (k INT NOT NULL PRIMARY KEY, n INT, g VARCHAR(8)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE dh (k BIGINT NOT NULL PRIMARY KEY, g INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE ds (k INT NOT NULL PRIMARY KEY, g INT, n INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO f WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 200000)
+SELECT x, 1 + (x * 7919) % 110000, ((x * 31) % 250) * 1000003, x % 40,
+2000000000 + x % 1000, IF(x % 11 = 0, NULL, x % 37 - 10), x * 1000003, x % 5 - 2,
+2000000000 - x % 77 FROM s;
+INSERT INTO db WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 100000)
+SELECT x, x % 1000, CONCAT('G', x % 6) FROM s;
+INSERT INTO dh WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 200)
+SELECT x * 1000003, x % 9 FROM s;
+INSERT INTO ds WITH RECURSIVE s(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM s WHERE x < 34)
+SELECT x, x % 4, x % 3 FROM s;
+CREATE TABLE fi ENGINE=InnoDB SELECT * FROM f;
+CREATE TABLE dbi ENGINE=InnoDB SELECT * FROM db;
+CREATE TABLE dhi ENGINE=InnoDB SELECT * FROM dh;
+CREATE TABLE dsi ENGINE=InnoDB SELECT * FROM ds;
+# The engine joins and aggregates
+EXPLAIN FORMAT=TREE SELECT db.g, SUM(a) FROM f JOIN db ON f.kb = db.k WHERE n = 7 GROUP BY db.g;
+EXPLAIN
+-> Table scan on <temporary>
+    -> Aggregate using temporary table
+        -> Table scan on f
+
+few keys of a large dimension have a row (bitmap): 3 rows
+most keys of a large dimension have a row: 6 rows
+keys that are far apart (hash): 9 rows
+three dimensions, a condition on the fact table: 108 rows
+scattered rows of the fact table: 4 rows
+one group: sums of INT, of INT * INT (near the largest BIGINT values), of BIGINT: 1 rows
+groups: INT * INT and a nullable operand: 4 rows
+# An operation that overflows is an error, as it is for MySQL
+SELECT SUM(c * c) FROM f JOIN ds ON f.ks = ds.k;
+ERROR 22003: BIGINT value is out of range in 'BIGINT value is out of range in '(`test`.`f`.`c` * `test`.`f`.`c`)''
+SET SESSION warp_star_aggregation_blocks = OFF;
+SELECT SUM(c * c) FROM f JOIN ds ON f.ks = ds.k;
+ERROR 22003: BIGINT value is out of range in 'BIGINT value is out of range in '(`test`.`f`.`c` * `test`.`f`.`c`)''
+SET SESSION warp_star_aggregation_blocks = ON;
+#
+# The rows that a transaction may not see
+#
+# deleted rows, in partitions that were read before
+DELETE FROM f WHERE id % 17 = 0;
+DELETE FROM fi WHERE id % 17 = 0;
+after a delete: 4 rows
+UPDATE f SET a = a + 1 WHERE id % 1000 = 3;
+UPDATE fi SET a = a + 1 WHERE id % 1000 = 3;
+after an update: 4 rows
+# rows of a transaction that has not committed, and of one that rolled back
+BEGIN;
+INSERT INTO f SELECT id + 1000000, kb, kh, ks, a, b, c, t, q FROM fi WHERE id < 5000;
+DELETE FROM f WHERE id BETWEEN 100 AND 2000;
+another transaction has inserted and deleted: 4 rows
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+n	s
+164706	329412081858968
+# the transaction sees its own rows
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+n	s
+167259	334518083091085
+SET SESSION warp_star_aggregation_blocks = OFF;
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+n	s
+167259	334518083091085
+SET SESSION warp_star_aggregation_blocks = ON;
+ROLLBACK;
+after the rollback: 4 rows
+# REPEATABLE READ: the rows of the transactions that commit later are not seen
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+n	s
+164706	329412081858968
+INSERT INTO f SELECT id + 2000000, kb, kh, ks, a, b, c, t, q FROM fi WHERE id < 3000;
+DELETE FROM f WHERE id BETWEEN 50000 AND 50999;
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+n	s
+164706	329412081858968
+SET SESSION warp_star_aggregation_blocks = OFF;
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+n	s
+164706	329412081858968
+SET SESSION warp_star_aggregation_blocks = ON;
+COMMIT;
+# and are seen by the next transaction
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+n	s
+166352	332704082677441
+SET SESSION warp_star_aggregation_blocks = OFF;
+SELECT COUNT(*) n, SUM(a) s FROM f JOIN ds ON f.ks = ds.k;
+n	s
+166352	332704082677441
+SET SESSION warp_star_aggregation_blocks = ON;
+DROP TABLE f, db, dh, ds, fi, dbi, dhi, dsi;

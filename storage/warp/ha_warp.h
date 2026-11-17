@@ -427,6 +427,11 @@ static MYSQL_THDVAR_BOOL(star_aggregation, PLUGIN_VAR_NOCMDARG,
                           "aggregate (SUM ... GROUP BY) inside the engine, in parallel by partition",
                           nullptr, nullptr, true);
 
+static MYSQL_THDVAR_BOOL(star_aggregation_blocks, PLUGIN_VAR_NOCMDARG,
+                          "Star aggregation processes the rows of the fact table a block at a time (the join keys of "
+                          "a block are looked up, then the sums of the rows that are left are computed); OFF: row by row",
+                          nullptr, nullptr, true);
+
 static MYSQL_THDVAR_BOOL(parallel_hash_join, PLUGIN_VAR_NOCMDARG,
                           "Join the tables of a query that joins WARP tables with equalities (inner joins) inside the "
                           "engine: hash tables are made of the smaller tables and the partitions of the largest one are "
@@ -525,6 +530,7 @@ SYS_VAR* system_variables[] = {
   MYSQL_SYSVAR(partition_filter),
   MYSQL_SYSVAR(adjust_table_stats_for_joins),
   MYSQL_SYSVAR(star_aggregation),
+  MYSQL_SYSVAR(star_aggregation_blocks),
   MYSQL_SYSVAR(parallel_hash_join),
   MYSQL_SYSVAR(parallel_aggregation),
   MYSQL_SYSVAR(semi_key_pushdown),
