@@ -1613,8 +1613,9 @@ static bool definition_usable(const Mview_def &def, std::string *why) {
   }
   for (size_t t = 0; t < def.tables.size(); t++) {
     const Mview_table &table = def.tables[t];
-    if (table.ref_columns.empty() ||
-        table.ref_columns.size() != table.ref_ordinals.size()) {
+    /* A view may read no column of a table (SELECT COUNT(*) FROM t): the
+       rows of the table are counted, their delta table only has the sign. */
+    if (table.ref_columns.size() != table.ref_ordinals.size()) {
       *why = "the referenced columns of " + table.db + "." + table.table +
              " are inconsistent";
       return false;
