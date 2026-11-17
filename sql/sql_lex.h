@@ -852,6 +852,15 @@ class Query_expression {
   */
   PT_with_clause *m_with_clause;
   /**
+    Where the text of this query expression is, with its parentheses, in the
+    text that was parsed, if it is a subquery or a derived table (set by
+    PT_subquery); nullptr if not.  For a plugin that rewrites the statement:
+    the text is the statement only if the pointers are in it (a common table
+    expression is parsed from a copy of its text).
+  */
+  const char *m_parsed_text_start{nullptr};
+  const char *m_parsed_text_end{nullptr};
+  /**
     If this query expression is underlying of a derived table, the derived
     table. NULL if none.
   */

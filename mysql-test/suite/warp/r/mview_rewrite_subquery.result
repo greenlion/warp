@@ -1,0 +1,134 @@
+#
+# MVIEW_REWRITE, subqueries and derived tables: a subquery or derived
+# table that is one query block is rewritten as if it were a statement
+# of its own, in the text of the statement; the rest of the statement
+# is as it was.  Every statement is run with and without the plugin
+# and must give the same rows.
+#
+CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_name VARCHAR(25) NOT NULL,
+c_nation INT NOT NULL);
+CREATE TABLE orders (o_orderkey INT PRIMARY KEY, o_custkey INT NOT NULL,
+o_status CHAR(1) NOT NULL, o_price DECIMAL(12,2) NOT NULL,
+o_date DATE NOT NULL,
+FOREIGN KEY (o_custkey) REFERENCES customer (c_custkey));
+INSERT INTO customer
+WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 30)
+SELECT k, CONCAT('Customer#', k), k % 5 FROM s;
+INSERT INTO orders
+WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 200)
+SELECT k, (k * 7 % 30) + 1, ELT(k % 3 + 1, 'F', 'O', 'P'),
+(k * 13 % 500) + 0.25, DATE'2025-01-01' + INTERVAL (k * 3 % 365) DAY
+FROM s;
+SET SESSION mview_rewrite_use_manual_views = ON;
+CREATE MATERIALIZED VIEW by_cust REFRESH MANUAL AS
+SELECT o_custkey, o_status, COUNT(*) AS n, SUM(o_price) AS total
+FROM orders GROUP BY o_custkey, o_status;
+#
+# Derived tables
+#
+SELECT c_name, n FROM customer, (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) d WHERE o_custkey = c_custkey AND n > 6 ORDER BY c_name;
+# rewritten
+SELECT c_name, n FROM customer, (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`) d WHERE o_custkey = c_custkey AND n > 6 ORDER BY c_name
+# two of them, an outer join, a list of column names
+SELECT c_name, f.total, o.cnt FROM customer LEFT JOIN (SELECT o_custkey, SUM(o_price) AS total FROM orders WHERE o_status = 'F' GROUP BY o_custkey) f ON f.o_custkey = c_custkey LEFT JOIN (SELECT o_custkey, COUNT(*) FROM orders WHERE o_status = 'O' GROUP BY o_custkey) o (k, cnt) ON o.k = c_custkey WHERE c_custkey < 8;
+# rewritten
+SELECT c_name, f.total, o.cnt FROM customer LEFT JOIN (SELECT `by_cust`.`mv$g0` AS `o_custkey`, SUM(`by_cust`.`mv$s1`) AS `total` FROM `test`.`by_cust` `by_cust` WHERE (`by_cust`.`mv$g1` = 'F') GROUP BY `by_cust`.`mv$g0`) f ON f.o_custkey = c_custkey LEFT JOIN (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `COUNT(*)` FROM `test`.`by_cust` `by_cust` WHERE (`by_cust`.`mv$g1` = 'O') GROUP BY `by_cust`.`mv$g0`) o (k, cnt) ON o.k = c_custkey WHERE c_custkey < 8
+# a derived table in a derived table: the inner one (the outer one has
+# a derived table, it is not rewritten)
+SELECT MAX(n), MIN(n) FROM (SELECT n FROM (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) d1 WHERE n > 3) d2;
+# rewritten
+SELECT MAX(n), MIN(n) FROM (SELECT n FROM (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`) d1 WHERE n > 3) d2
+#
+# Subqueries: IN, EXISTS, scalar, in the select list, in HAVING
+#
+SELECT c_name FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7);
+# rewritten
+SELECT c_name FROM customer WHERE c_custkey IN (SELECT `by_cust`.`mv$g0` AS `o_custkey` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0` HAVING ((CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) > 7)))
+SELECT c_name FROM customer WHERE c_custkey NOT IN (SELECT o_custkey FROM orders WHERE o_status = 'P' GROUP BY o_custkey HAVING SUM(o_price) > 500);
+# rewritten
+SELECT c_name FROM customer WHERE c_custkey NOT IN (SELECT `by_cust`.`mv$g0` AS `o_custkey` FROM `test`.`by_cust` `by_cust` WHERE (`by_cust`.`mv$g1` = 'P') GROUP BY `by_cust`.`mv$g0` HAVING ((SUM(`by_cust`.`mv$s1`) > 500)))
+SELECT c_name, (SELECT COUNT(*) FROM orders WHERE o_status = 'F') AS f_orders FROM customer WHERE c_custkey < 4;
+# rewritten
+SELECT c_name, (SELECT CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `COUNT(*)` FROM `test`.`by_cust` `by_cust` WHERE (`by_cust`.`mv$g1` = 'F')) AS f_orders FROM customer WHERE c_custkey < 4
+SELECT o_custkey, SUM(o_price) AS total FROM orders GROUP BY o_custkey HAVING SUM(o_price) > (SELECT SUM(o_price) / 25 FROM orders);
+# rewritten
+SELECT o_custkey, SUM(o_price) AS total FROM orders GROUP BY o_custkey HAVING SUM(o_price) > (SELECT (SUM(`by_cust`.`mv$s1`) / 25) AS `SUM(o_price) / 25` FROM `test`.`by_cust` `by_cust`)
+SELECT COUNT(*) FROM customer WHERE EXISTS (SELECT o_custkey, COUNT(*) FROM orders WHERE o_status = 'X' GROUP BY o_custkey);
+# rewritten
+SELECT COUNT(*) FROM customer WHERE EXISTS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `COUNT(*)` FROM `test`.`by_cust` `by_cust` WHERE (`by_cust`.`mv$g1` = 'X') GROUP BY `by_cust`.`mv$g0`)
+# the arms of a set operation
+SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7) UNION SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) < 6);
+# rewritten
+SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT `by_cust`.`mv$g0` AS `o_custkey` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0` HAVING ((CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) > 7))) UNION SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT `by_cust`.`mv$g0` AS `o_custkey` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0` HAVING ((CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) < 6)))
+#
+# A subquery that reads a column of the outer query is not a statement
+# of its own: it is not rewritten
+#
+SELECT c_name, (SELECT COUNT(*) FROM orders WHERE o_custkey = c_custkey) AS n FROM customer WHERE c_custkey < 4;
+# not rewritten
+SELECT c_name FROM customer c WHERE EXISTS (SELECT o_custkey FROM orders WHERE o_custkey = c.c_custkey GROUP BY o_custkey HAVING COUNT(*) > 7);
+# not rewritten
+SELECT c_name, d.n FROM customer, LATERAL (SELECT COUNT(*) AS n FROM orders WHERE o_custkey = c_custkey) d WHERE c_custkey < 4;
+# not rewritten
+# the subquery in it that does not is
+SELECT c_name FROM customer c WHERE 7 < (SELECT COUNT(*) FROM orders WHERE o_custkey = c.c_custkey AND o_price > (SELECT SUM(o_price) / 1000 FROM orders));
+# rewritten
+SELECT c_name FROM customer c WHERE 7 < (SELECT COUNT(*) FROM orders WHERE o_custkey = c.c_custkey AND o_price > (SELECT (SUM(`by_cust`.`mv$s1`) / 1000) AS `SUM(o_price) / 1000` FROM `test`.`by_cust` `by_cust`))
+#
+# With a WITH clause: the common table expressions and the subqueries,
+# also the subqueries in a common table expression that is not
+# rewritten as a whole (read once, and read twice)
+#
+WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT c_name, n FROM t, customer WHERE o_custkey = c_custkey AND c_custkey IN (SELECT o_custkey FROM orders WHERE o_status = 'F' GROUP BY o_custkey HAVING COUNT(*) > 2) AND n > 7;
+# rewritten
+WITH t AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`) SELECT c_name, n FROM t, customer WHERE o_custkey = c_custkey AND c_custkey IN (SELECT `by_cust`.`mv$g0` AS `o_custkey` FROM `test`.`by_cust` `by_cust` WHERE (`by_cust`.`mv$g1` = 'F') GROUP BY `by_cust`.`mv$g0` HAVING ((CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) > 2))) AND n > 7
+WITH t AS (SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7)) SELECT COUNT(*) FROM t;
+# rewritten
+WITH t AS (SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT `by_cust`.`mv$g0` AS `o_custkey` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0` HAVING ((CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) > 7)))) SELECT COUNT(*) FROM t
+WITH t AS (SELECT c_custkey AS k FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7)) SELECT COUNT(*) FROM t t1, t t2 WHERE t1.k = t2.k + 1;
+# rewritten
+WITH t AS (SELECT c_custkey AS k FROM customer WHERE c_custkey IN (SELECT `by_cust`.`mv$g0` AS `o_custkey` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0` HAVING ((CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) > 7)))) SELECT COUNT(*) FROM t t1, t t2 WHERE t1.k = t2.k + 1
+#
+# The statement that is one query block is rewritten as before; the
+# text around the subqueries is kept (comments, EXPLAIN)
+#
+SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7;
+# rewritten
+SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0` HAVING ((CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) > 7))
+SELECT /* ( */ c_name, ')' FROM customer WHERE c_custkey IN /* ) */ ( /* ( */ SELECT o_custkey FROM orders WHERE o_status <> ')' GROUP BY o_custkey HAVING COUNT(*) > 4 /* ) */ ) /* ( */ AND c_name <> '(';
+# rewritten
+SELECT /* ( */ c_name, ')' FROM customer WHERE c_custkey IN /* ) */ (SELECT `by_cust`.`mv$g0` AS `o_custkey` FROM `test`.`by_cust` `by_cust` WHERE ((`by_cust`.`mv$g1` <> ')')) GROUP BY `by_cust`.`mv$g0` HAVING ((CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) > 4))) /* ( */ AND c_name <> '('
+EXPLAIN FORMAT=TREE SELECT c_name, n FROM customer, (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) d WHERE o_custkey = c_custkey AND n > 7;
+EXPLAIN
+-> Nested loop inner join  (cost=# rows=#)
+    -> Filter: (d.o_custkey is not null)  (cost=# rows=#)
+        -> Table scan on d  (cost=# rows=#)
+            -> Materialize  (cost=# rows=#)
+                -> Filter: (cast(coalesce(sum(by_cust.mv$count),0) as signed) > 7)  (cost=# rows=#)
+                    -> Group aggregate: sum(by_cust.mv$count)  (cost=# rows=#)
+                        -> Index scan on by_cust using mv$ix_group  (cost=# rows=#)
+    -> Single-row index lookup on customer using PRIMARY (c_custkey = d.o_custkey)  (cost=# rows=#)
+
+#
+# The notes of the trace say where the subquery is
+#
+SET SESSION mview_rewrite_trace = ON;
+SELECT c_name FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7) AND c_nation = (SELECT MIN(c_nation) FROM customer);
+SHOW WARNINGS;
+Level	Code	Message
+Note	1105	mview_rewrite: no materialized view has a table of the query
+Note	1105	mview_rewrite: subquery at character 133: no materialized view has a table of the query
+Note	1105	mview_rewrite: subquery at character 48: view `test`.`by_cust`: matches: SELECT `by_cust`.`mv$g0` AS `o_custkey` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0` HAVING ((CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) > 7))
+Note	1105	Query 'SELECT c_name FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 7) AND c_nation = (SELECT MIN(c_nation) FROM customer)' rewritten to 'SELECT c_name FROM customer WHERE c_custkey IN (SELECT `by_cust`.`mv$g0` AS `o_custkey` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0` HAVING ((CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) > 7))) AND c_nation = (SELECT MIN(c_nation) FROM customer)' by a query rewrite plugin
+SET SESSION mview_rewrite_trace = OFF;
+# INSERT ... SELECT, UPDATE and DELETE are not rewritten
+CREATE TABLE copy (k INT);
+INSERT INTO copy SELECT c_custkey FROM customer WHERE c_custkey IN (SELECT o_custkey FROM orders GROUP BY o_custkey HAVING COUNT(*) > 6);
+DELETE FROM copy WHERE k IN (SELECT o_custkey FROM orders WHERE o_status = 'F' GROUP BY o_custkey HAVING COUNT(*) > 3);
+SELECT COUNT(*) FROM copy;
+COUNT(*)
+14
+include/assert.inc [INSERT and DELETE are not rewritten]
+DROP TABLE copy;
+DROP MATERIALIZED VIEW by_cust;
+DROP TABLE orders, customer;

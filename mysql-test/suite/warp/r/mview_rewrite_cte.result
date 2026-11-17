@@ -150,17 +150,19 @@ EXPLAIN
 
 #
 # Not rewritten: set operations in the common table expression, a
-# recursive one, one with subqueries, a WITH clause that is not the
-# one of the statement
+# recursive one, one that reads a column of the statement
 #
 WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey UNION ALL SELECT o_custkey, COUNT(*) FROM orders GROUP BY o_custkey) SELECT COUNT(*), SUM(n) FROM t;
 # not rewritten
 WITH RECURSIVE t (k, n) AS (SELECT o_custkey, COUNT(*) FROM orders GROUP BY o_custkey UNION ALL SELECT k + 100, n FROM t WHERE k < 100) SELECT COUNT(*), SUM(n) FROM t;
 # not rewritten
-WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders WHERE o_custkey IN (SELECT c_custkey FROM customer WHERE c_nation = 1) GROUP BY o_custkey) SELECT COUNT(*), SUM(n) FROM t;
+SELECT c_name, (WITH t AS (SELECT COUNT(*) AS n FROM orders WHERE o_custkey = c_custkey) SELECT n FROM t) AS n FROM customer WHERE c_custkey < 4;
 # not rewritten
+# a WITH clause that is not the one of the statement (see also
+# mview_rewrite_subquery.test)
 SELECT * FROM (WITH t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT COUNT(*), SUM(n) FROM t) d;
-# not rewritten
+# rewritten
+SELECT * FROM (WITH t AS (SELECT `by_cust`.`mv$g0` AS `o_custkey`, CAST(COALESCE(SUM(`by_cust`.`mv$count`),0) AS SIGNED) AS `n` FROM `test`.`by_cust` `by_cust` GROUP BY `by_cust`.`mv$g0`) SELECT COUNT(*), SUM(n) FROM t) d
 # in a recursive WITH clause the ones that are not recursive are
 WITH RECURSIVE s (k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM s WHERE k < 3), t AS (SELECT o_custkey, COUNT(*) AS n FROM orders GROUP BY o_custkey) SELECT k, n FROM s, t WHERE k = o_custkey;
 # rewritten
