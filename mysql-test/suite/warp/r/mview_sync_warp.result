@@ -112,7 +112,6 @@ cid	name	oid	amount
 SELECT VARIABLE_VALUE AS stale_views FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_stale_views';
 stale_views
 0
-SELECT VARIABLE_VALUE AS full_refreshes FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes';
 full_refreshes
 0
 DROP MATERIALIZED VIEW ww_left, ww_where, ww_cnt, ww_grp, ww_ldist, iw_left, iw_grp, wi_left, wi_grp;
