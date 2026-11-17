@@ -216,7 +216,7 @@ ENDIF()
 # It is added to the version comment (@@version_comment, mysqld --version,
 # the banner of the mysql client); @@version stays the version of MySQL,
 # which clients and tools parse.
-SET(WARP_VERSION "WARP 2.0 beta 4")
+SET(WARP_VERSION "WARP 2.0 beta 5")
 FOREACH(comment_var COMPILATION_COMMENT COMPILATION_COMMENT_SERVER)
   IF(NOT "${${comment_var}}" MATCHES "WARP ")
     SET(${comment_var} "${${comment_var}} - ${WARP_VERSION}")
