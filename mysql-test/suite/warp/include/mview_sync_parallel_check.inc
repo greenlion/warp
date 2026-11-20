@@ -1,0 +1,13 @@
+# Checks the views of mview_sync_parallel.test against their defining queries.
+--let $mview = p_join
+--let $mview_select = $sel_join
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = p_minmax
+--let $mview_select = $sel_minmax
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = p_one
+--let $mview_select = $sel_one
+--source suite/warp/include/mview_sync_check.inc
+--let $mview = p_nog
+--let $mview_select = $sel_nog
+--source suite/warp/include/mview_sync_check.inc
