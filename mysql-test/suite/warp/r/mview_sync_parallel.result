@@ -1,0 +1,76 @@
+#
+# WARP_MVIEW daemon: a batch that changed many rows of one WARP table is
+# applied to the aggregate views by several sessions
+# (warp_mview_apply_threads).  Every session loads batches of the
+# changed rows into a delta table of its own and computes its part of
+# the change of the groups; the views are not refreshed.
+#
+call mtr.add_suppression("WARP_MVIEW");
+SHOW GLOBAL VARIABLES LIKE 'warp_mview_apply_threads';
+Variable_name	Value
+warp_mview_apply_threads	8
+CREATE TABLE pd (id INT NOT NULL, region VARCHAR(10), PRIMARY KEY (id)) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE pf (id INT NOT NULL, d_id INT, amount INT) ENGINE=WARP DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+INSERT INTO pd VALUES (0, 'north'), (1, 'south'), (2, 'east'), (3, NULL), (4, 'west'), (5, 'north'), (6, 'south');
+CREATE MATERIALIZED VIEW p_join ENGINE=WARP REFRESH SYNCHRONOUS AS SELECT d.region, COUNT(*) AS n, SUM(f.amount) AS s, COUNT(f.amount) AS c FROM pf f JOIN pd d ON f.d_id = d.id WHERE d.id <> 6 GROUP BY d.region;
+CREATE MATERIALIZED VIEW p_minmax ENGINE=WARP REFRESH SYNCHRONOUS AS SELECT d.region, MIN(f.amount) AS mn, MAX(f.amount) AS mx FROM pf f JOIN pd d ON f.d_id = d.id GROUP BY d.region;
+CREATE MATERIALIZED VIEW p_one ENGINE=WARP REFRESH SYNCHRONOUS AS SELECT d_id, COUNT(*) AS n, SUM(amount) AS s FROM pf GROUP BY d_id;
+CREATE MATERIALIZED VIEW p_nog ENGINE=InnoDB REFRESH SYNCHRONOUS AS SELECT COUNT(*) AS n, SUM(amount) AS s FROM pf;
+p_join: 0 rows, 0 missing, 0 extra
+p_minmax: 0 rows, 0 missing, 0 extra
+p_one: 0 rows, 0 missing, 0 extra
+p_nog: 1 rows, 0 missing, 0 extra
+# 250000 rows are inserted by one statement
+SET SESSION cte_max_recursion_depth = 1000000;
+INSERT INTO pf WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 250000) SELECT x, x MOD 8, IF(x MOD 11 = 0, NULL, x MOD 1000) FROM n;
+p_join: 5 rows, 0 missing, 0 extra
+p_minmax: 5 rows, 0 missing, 0 extra
+p_one: 8 rows, 0 missing, 0 extra
+p_nog: 1 rows, 0 missing, 0 extra
+# 250000 rows are updated: an old and a new image of every row
+UPDATE pf SET amount = amount + 7, d_id = (d_id + 1) MOD 8;
+p_join: 5 rows, 0 missing, 0 extra
+p_minmax: 5 rows, 0 missing, 0 extra
+p_one: 8 rows, 0 missing, 0 extra
+p_nog: 1 rows, 0 missing, 0 extra
+# a few rows: the daemon applies them alone
+INSERT INTO pf VALUES (300001, 2, 5000), (300002, 3, -5);
+p_join: 5 rows, 0 missing, 0 extra
+p_minmax: 5 rows, 0 missing, 0 extra
+p_one: 8 rows, 0 missing, 0 extra
+p_nog: 1 rows, 0 missing, 0 extra
+# 225000 rows are deleted, with the largest and the smallest amounts
+DELETE FROM pf WHERE id > 25000;
+p_join: 5 rows, 0 missing, 0 extra
+p_minmax: 5 rows, 0 missing, 0 extra
+p_one: 8 rows, 0 missing, 0 extra
+p_nog: 1 rows, 0 missing, 0 extra
+# many rows of the dimension table too: both tables changed
+INSERT INTO pf WITH RECURSIVE n(x) AS (SELECT 400001 UNION ALL SELECT x + 1 FROM n WHERE x < 620000) SELECT x, x MOD 8, x MOD 100 FROM n;
+UPDATE pd SET region = 'south' WHERE id = 2;
+p_join: 4 rows, 0 missing, 0 extra
+p_minmax: 4 rows, 0 missing, 0 extra
+p_one: 8 rows, 0 missing, 0 extra
+p_nog: 1 rows, 0 missing, 0 extra
+full_refreshes
+0
+applied_by_several_sessions
+1
+SELECT VARIABLE_VALUE AS apply_errors FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_apply_errors';
+apply_errors
+0
+# one session: the daemon applies the rows alone
+SET GLOBAL warp_mview_apply_threads = 1;
+UPDATE pf SET amount = amount - 3;
+p_join: 4 rows, 0 missing, 0 extra
+p_minmax: 4 rows, 0 missing, 0 extra
+p_one: 8 rows, 0 missing, 0 extra
+p_nog: 1 rows, 0 missing, 0 extra
+applied_by_several_sessions
+0
+SET GLOBAL warp_mview_apply_threads = DEFAULT;
+DROP MATERIALIZED VIEW p_join;
+DROP MATERIALIZED VIEW p_minmax;
+DROP MATERIALIZED VIEW p_one;
+DROP MATERIALIZED VIEW p_nog;
+DROP TABLE pf, pd;

@@ -10,10 +10,10 @@ WARP_MVIEW	ACTIVE	DAEMON
 SHOW GLOBAL VARIABLES LIKE 'warp_mview%';
 Variable_name	Value
 warp_mview_adopt_refresh	ON
+warp_mview_apply_threads	8
 warp_mview_batch_rows	10000
 warp_mview_batch_transactions	1000
 warp_mview_enabled	ON
-warp_mview_full_refresh_threshold	100000
 warp_mview_idle_wait_timeout	1000
 warp_mview_in_list_chunk_size	1000
 warp_mview_lock_wait_timeout	60
@@ -58,20 +58,18 @@ SELECT COUNT(*) AS manual_has_b4 FROM mv_m WHERE bid = 4;
 manual_has_b4
 1
 #
-# More changed keys than warp_mview_full_refresh_threshold: the views
-# are rebuilt
+# Many changed keys: the changes are applied to the views, the views
+# are not rebuilt
 #
-SET GLOBAL warp_mview_full_refresh_threshold = 10;
 SET GLOBAL warp_mview_in_list_chunk_size = 3;
 mv_i: 105 rows, 0 missing, 0 extra
 mv_w: 105 rows, 0 missing, 0 extra
 views_were_refreshed
-1
-# below the threshold, with several IN lists per statement
+0
+# a few keys, with several IN lists per statement
 UPDATE a SET v = v + 1 WHERE id BETWEEN 100 AND 104;
 mv_i: 105 rows, 0 missing, 0 extra
 mv_w: 105 rows, 0 missing, 0 extra
-SET GLOBAL warp_mview_full_refresh_threshold = DEFAULT;
 SET GLOBAL warp_mview_in_list_chunk_size = DEFAULT;
 #
 # Pause and resume

@@ -82,6 +82,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -134,10 +135,10 @@ static bool sv_adopt_refresh = true;
 static unsigned long sv_batch_rows = 10000;
 static unsigned long sv_batch_transactions = 1000;
 static unsigned long sv_in_list_chunk_size = 1000;
-static unsigned long sv_full_refresh_threshold = 100000;
 static unsigned long sv_idle_wait_timeout = 1000; /* milliseconds */
 static unsigned long sv_lock_wait_timeout = 60;   /* seconds */
 static unsigned long sv_retry_limit = 3;
+static unsigned long sv_apply_threads = 8;
 static unsigned long sv_pin_lock_wait_timeout = 1; /* seconds */
 static unsigned long sv_pin_duty_percent = 10;
 static unsigned long sv_pin_min_interval = 0; /* milliseconds */
@@ -175,10 +176,13 @@ static MYSQL_SYSVAR_ULONG(
     nullptr, 1000, 1, 100000, 0);
 
 static MYSQL_SYSVAR_ULONG(
-    full_refresh_threshold, sv_full_refresh_threshold, PLUGIN_VAR_RQCMDARG,
-    "When one batch has more changed keys than this for a view, the view is "
-    "rebuilt with REFRESH MATERIALIZED VIEW instead of key by key.",
-    nullptr, nullptr, 100000, 1, ULONG_MAX, 0);
+    apply_threads, sv_apply_threads, PLUGIN_VAR_RQCMDARG,
+    "Sessions that apply the changed rows of a batch to an aggregate "
+    "materialized view whose base tables are all WARP tables, when the "
+    "batch changed many rows of one table: every session loads batches of "
+    "the changed rows and computes their part of the change of the view. "
+    "1: the daemon applies the rows alone.",
+    nullptr, nullptr, 8, 1, 64, 0);
 
 static MYSQL_SYSVAR_ULONG(
     idle_wait_timeout, sv_idle_wait_timeout, PLUGIN_VAR_RQCMDARG,
@@ -249,6 +253,7 @@ static std::atomic<unsigned long long> st_pin_lock_us{0};
 static std::atomic<unsigned long long> st_pin_wait_us{0};
 static std::atomic<unsigned long long> st_snapshots{0};
 static std::atomic<unsigned long long> st_full_refreshes{0};
+static std::atomic<unsigned long long> st_parallel_applies{0};
 static std::atomic<unsigned long long> st_apply_errors{0};
 static std::atomic<unsigned long long> st_stale_views{0};
 static std::atomic<unsigned long long> st_views{0};
@@ -334,6 +339,9 @@ static int show_snapshots(MYSQL_THD, SHOW_VAR *var, char *buff) {
 }
 static int show_full_refreshes(MYSQL_THD, SHOW_VAR *var, char *buff) {
   return show_number(st_full_refreshes.load(), var, buff);
+}
+static int show_parallel_applies(MYSQL_THD, SHOW_VAR *var, char *buff) {
+  return show_number(st_parallel_applies.load(), var, buff);
 }
 static int show_apply_errors(MYSQL_THD, SHOW_VAR *var, char *buff) {
   return show_number(st_apply_errors.load(), var, buff);
@@ -757,6 +765,9 @@ struct View_rt {
   /// The temporary tables of the view in the session of the daemon.
   std::vector<std::string> tmp_tables;
   bool tmp_ready{false};
+  /// The delta tables of the view are WARP tables: all the base tables of
+  /// the view are (see all_tables_warp()).
+  bool warp_delta{false};
 
   /* aggregate views */
   std::string state_table;  ///< `state_db`.`state_name`
@@ -809,6 +820,11 @@ class Daemon {
   typedef std::vector<std::pair<bool, std::string>> Result_row;
   bool exec_rows(const std::string &sql, Sql_error *error,
                  std::vector<Result_row> *rows);
+  bool exec_rows_on(THD *session, const std::string &sql, Sql_error *error,
+                    std::vector<Result_row> *rows);
+  static std::string hex_select(const std::string &select, size_t columns);
+  bool insert_rows(const std::vector<Result_row> &rows,
+                   const std::string &insert_head, Sql_error *error);
   bool copy_rows(const std::string &select, size_t columns,
                  const std::string &insert_head, Sql_error *error);
   void rollback();
@@ -859,7 +875,11 @@ class Daemon {
   bool apply_view_once(size_t view,
                        const std::map<std::string, Key_sets> &keys,
                        Sql_error *error, std::string *need_refresh);
+  bool all_tables_warp(const Mview_def &def);
+  bool clear_delta_table(size_t view, const Mview_table &table,
+                         const std::string &name, Sql_error *error);
   bool create_delta_table(const Mview_table &table, const std::string &name,
+                          bool warp,
                           Sql_error *error);
   bool ensure_key_table(size_t view, Sql_error *error);
   bool insert_keys(const std::string &head, const std::string &tail,
@@ -913,10 +933,23 @@ class Daemon {
   bool fill_delta(size_t view, size_t instance, const std::string &delta,
                   bool old_only, int ordinal, my_off_t pos, unsigned from_trx,
                   size_t *rows, std::string *why_not, Sql_error *error);
+  bool fill_delta_range(THD *session, size_t view, size_t instance,
+                        const std::string &delta, bool old_only, int ordinal,
+                        my_off_t pos, unsigned from_trx, size_t begin,
+                        size_t end, size_t *rows, std::string *why_not,
+                        Sql_error *error);
+  static std::string delta_table_sql(const Mview_table &table,
+                                     const std::string &name, bool warp);
+  int parallel_instance(size_t view) const;
+  size_t agg_term_columns(const Mview_def &def) const;
+  bool apply_delta_parallel(size_t view, size_t instance, int ordinal,
+                            my_off_t pos, size_t *rows, std::string *why_not,
+                            Sql_error *error);
   std::string agg_term(size_t view, const std::string &from,
                        const std::string &weight, bool single) const;
   bool apply_delta(size_t view, const std::vector<size_t> &changed,
-                   Sql_error *error, Agg_outcome *outcome);
+                   Sql_error *error, Agg_outcome *outcome,
+                   bool terms_done = false);
   bool apply_recompute(size_t view, const std::vector<size_t> &changed,
                        Sql_error *error, Agg_outcome *outcome);
   bool recompute_groups(size_t view, Sql_error *error);
@@ -1178,18 +1211,24 @@ bool Daemon::exec(const std::string &sql, Sql_error *error,
 /* All rows of a result.  first: the value is NULL. */
 bool Daemon::exec_rows(const std::string &sql, Sql_error *error,
                        std::vector<Result_row> *rows) {
-  if (current_thd != thd) thd->store_globals();
-  thd->reset_for_next_command();
-  thd->set_query_id(next_query_id());
-  thd->set_time();
+  return exec_rows_on(thd, sql, error, rows);
+}
+
+/* In a session of the thread that calls (see exec_on()) */
+bool Daemon::exec_rows_on(THD *session, const std::string &sql,
+                          Sql_error *error, std::vector<Result_row> *rows) {
+  if (current_thd != session) session->store_globals();
+  session->reset_for_next_command();
+  session->set_query_id(next_query_id());
+  session->set_time();
   rows->clear();
 
-  Ed_connection connection(thd);
+  Ed_connection connection(session);
   LEX_STRING text;
   text.str = const_cast<char *>(sql.c_str());
   text.length = sql.length();
   if (connection.execute_direct(text)) {
-    last_failed_sql = sql.substr(0, 600);
+    if (session == thd) last_failed_sql = sql.substr(0, 600);
     if (error != nullptr) {
       error->code = connection.get_last_errno();
       const char *message = connection.get_last_error();
@@ -1231,8 +1270,7 @@ bool Daemon::exec_rows(const std::string &sql, Sql_error *error,
   @param select       the query; it must have `columns` columns
   @param insert_head  "INSERT INTO t (c, ...) VALUES "
 */
-bool Daemon::copy_rows(const std::string &select, size_t columns,
-                       const std::string &insert_head, Sql_error *error) {
+std::string Daemon::hex_select(const std::string &select, size_t columns) {
   std::string sql = "SELECT ";
   std::string names;
   for (size_t i = 0; i < columns; i++) {
@@ -1241,9 +1279,19 @@ bool Daemon::copy_rows(const std::string &select, size_t columns,
     names += std::string(i ? ", " : "") + name;
   }
   sql += " FROM (" + select + ") AS `mvx` (" + names + ")";
-  std::vector<Result_row> rows;
-  if (exec_rows(sql, error, &rows)) return true;
+  return sql;
+}
 
+bool Daemon::copy_rows(const std::string &select, size_t columns,
+                       const std::string &insert_head, Sql_error *error) {
+  std::vector<Result_row> rows;
+  if (exec_rows(hex_select(select, columns), error, &rows)) return true;
+  return insert_rows(rows, insert_head, error);
+}
+
+/* Insert the rows of a result of hex_select() */
+bool Daemon::insert_rows(const std::vector<Result_row> &rows,
+                         const std::string &insert_head, Sql_error *error) {
   const size_t chunk = sv_in_list_chunk_size ? sv_in_list_chunk_size : 1;
   std::string insert;
   size_t pending = 0;
@@ -2712,8 +2760,10 @@ bool Daemon::ensure_key_table(size_t view, Sql_error *error) {
     }
   }
   if (v.join_where) {
+    v.warp_delta = all_tables_warp(def);
     for (size_t t = 0; t < def.tables.size(); t++) {
-      if (create_delta_table(def.tables[t], v.tmp_tables[1 + t], error)) {
+      if (create_delta_table(def.tables[t], v.tmp_tables[1 + t], v.warp_delta,
+                             error)) {
         exec("ROLLBACK");
         return true;
       }
@@ -2900,7 +2950,8 @@ bool Daemon::apply_view_once(size_t view,
     std::vector<size_t> changed;
     for (size_t t = 0; t < def.tables.size(); t++) {
       if (t == def.root) continue;
-      if (exec("DELETE FROM " + v.tmp_tables[1 + t], error)) return true;
+      if (clear_delta_table(view, def.tables[t], v.tmp_tables[1 + t], error))
+        return true;
       size_t rows = 0;
       if (fill_delta(view, t, v.tmp_tables[1 + t], true, -1, 0,
                      join_from_trx, &rows, need_refresh, error))
@@ -3696,19 +3747,59 @@ std::string Daemon::agg_term(size_t view, const std::string &from,
     nv  the new rows of the changed groups   (delta capable)
     rg  the groups that are computed again   (with GROUP BY)
 */
+/* True if every base table of the view is a WARP table.  The delta tables
+   of such a view are WARP tables too: the statements that join the changed
+   rows to the base tables then have only WARP tables, and WARP runs them
+   in parallel (a delta table of another engine is scanned by one thread,
+   with a lookup in every other table for each of its rows). */
+bool Daemon::all_tables_warp(const Mview_def &def) {
+  if (def.tables.empty()) return false;
+  std::string sql = "SELECT CAST(COUNT(*) AS CHAR) FROM "
+                    "information_schema.tables WHERE engine = 'WARP' AND "
+                    "(FALSE";
+  std::set<std::string> seen;
+  for (const Mview_table &table : def.tables) {
+    if (!seen.insert(table_key(table.db, table.table)).second) continue;
+    sql += " OR (table_schema = CONVERT(_utf8mb4 X'" + to_hex(table.db) +
+           "' USING utf8mb3) AND table_name = CONVERT(_utf8mb4 X'" +
+           to_hex(table.table) + "' USING utf8mb3))";
+  }
+  sql += ")";
+  Sql_error error;
+  long long count = 0;
+  if (exec(sql, &error, &count)) return false;
+  return count == static_cast<long long>(seen.size());
+}
+
+/* Empty a delta table.  The rows that are deleted from a WARP table stay
+   in its files until they are purged, and a delta table is filled and
+   emptied for every batch: a WARP delta table is made again instead. */
+bool Daemon::clear_delta_table(size_t view, const Mview_table &table,
+                               const std::string &name, Sql_error *error) {
+  if (!rt[view].warp_delta) return exec("DELETE FROM " + name, error);
+  if (exec("DROP TEMPORARY TABLE IF EXISTS " + name, error)) return true;
+  return create_delta_table(table, name, true, error);
+}
+
 /* A delta table: the referenced columns of a table instance and the sign
    of the image.  The columns come from the NULL side of an outer join:
    they keep their types and lose NOT NULL. */
 bool Daemon::create_delta_table(const Mview_table &table,
-                                const std::string &name, Sql_error *error) {
-  std::string sql =
-      "CREATE TEMPORARY TABLE " + name + " ENGINE=InnoDB AS SELECT ";
+                                const std::string &name, bool warp,
+                                Sql_error *error) {
+  return exec(delta_table_sql(table, name, warp), error);
+}
+
+std::string Daemon::delta_table_sql(const Mview_table &table,
+                                    const std::string &name, bool warp) {
+  std::string sql = "CREATE TEMPORARY TABLE " + name +
+                    (warp ? " ENGINE=WARP" : " ENGINE=InnoDB") + " AS SELECT ";
   for (const std::string &column : table.ref_columns)
     sql += "`mvb`." + qi(column) + ", ";
   sql += "`mvo`.`mv$sign` FROM (SELECT CAST(0 AS SIGNED) AS `mv$sign`) AS "
          "`mvo` LEFT JOIN " + qname(table.db, table.table) +
          " AS `mvb` ON FALSE LIMIT 0";
-  return exec(sql, error);
+  return sql;
 }
 
 bool Daemon::ensure_agg_tables(size_t view, Sql_error *error) {
@@ -3719,9 +3810,11 @@ bool Daemon::ensure_agg_tables(size_t view, Sql_error *error) {
   for (const std::string &table : v.tmp_tables)
     exec("DROP TEMPORARY TABLE IF EXISTS " + table);
 
+  v.warp_delta = all_tables_warp(def);
   for (size_t t = 0; t < n; t++) {
     const Mview_table &table = def.tables[t];
-    if (create_delta_table(table, v.tmp_tables[t], error)) return true;
+    if (create_delta_table(table, v.tmp_tables[t], v.warp_delta, error))
+      return true;
   }
   const std::string &gd = v.tmp_tables[n], &gs = v.tmp_tables[n + 1],
                     &nv = v.tmp_tables[n + 2], &rg = v.tmp_tables[n + 3];
@@ -3763,10 +3856,25 @@ bool Daemon::fill_delta(size_t view, size_t instance,
                         const std::string &delta, bool old_only, int ordinal,
                         my_off_t pos, unsigned from_trx, size_t *rows,
                         std::string *why_not, Sql_error *error) {
+  return fill_delta_range(thd, view, instance, delta, old_only, ordinal, pos,
+                          from_trx, 0, ~static_cast<size_t>(0), rows, why_not,
+                          error);
+}
+
+/* The images of the changes [begin, end) of the table instance, in a
+   session of the thread that calls: the sessions of apply_delta_parallel()
+   load a part of the changes each.  The batch is only read. */
+bool Daemon::fill_delta_range(THD *session, size_t view, size_t instance,
+                              const std::string &delta, bool old_only,
+                              int ordinal, my_off_t pos, unsigned from_trx,
+                              size_t begin, size_t end, size_t *rows,
+                              std::string *why_not, Sql_error *error) {
   const Mview_table &table = views[view].tables[instance];
   *rows = 0;
   auto changes = batch.changes.tables.find(table_key(table.db, table.table));
   if (changes == batch.changes.tables.end()) return false;
+  const std::vector<Row_change> &all = changes->second.rows;
+  if (end > all.size()) end = all.size();
 
   std::vector<int> slots;
   std::string head = "INSERT INTO " + delta + " (";
@@ -3782,10 +3890,14 @@ bool Daemon::fill_delta(size_t view, size_t instance,
   }
   head += "`mv$sign`) VALUES ";
 
-  const size_t chunk = sv_in_list_chunk_size ? sv_in_list_chunk_size : 1;
+  size_t chunk = sv_in_list_chunk_size ? sv_in_list_chunk_size : 1;
+  /* Every statement that inserts into a WARP table writes its rows to the
+     column files: many rows in a statement, not a file write for a few. */
+  if (rt[view].warp_delta && chunk < 100000) chunk = 100000;
   std::string sql;
   size_t pending = 0;
-  for (const Row_change &row : changes->second.rows) {
+  for (size_t at = begin; at < end; at++) {
+    const Row_change &row = all[at];
     if (row.trx < from_trx || !row_is_after(row, ordinal, pos)) continue;
     const bool has_old = row.kind != Row_change::INSERT;
     const bool has_new = row.kind != Row_change::DELETE && !old_only;
@@ -3832,12 +3944,13 @@ bool Daemon::fill_delta(size_t view, size_t instance,
       sql += tuple;
       (*rows)++;
       if (++pending == chunk) {
-        if (exec(sql, error)) return true;
+        if (exec_on(session, sql, error, nullptr, nullptr)) return true;
         pending = 0;
       }
     }
   }
-  if (pending > 0 && exec(sql, error)) return true;
+  if (pending > 0 && exec_on(session, sql, error, nullptr, nullptr))
+    return true;
   return false;
 }
 
@@ -3882,8 +3995,187 @@ bool Daemon::recompute_groups(size_t view, Sql_error *error) {
     whose count is 0, when there is a GROUP BY), compute the groups of rg
     from the base tables.
 */
+/* The rows of a term of the change of the groups: the group expressions,
+   the count and the states */
+size_t Daemon::agg_term_columns(const Mview_def &def) const {
+  size_t columns = def.group_exprs.size() + 1;
+  for (const Mview_agg_state &state : def.states)
+    columns += state.kind == Mview_agg_state::MIN ||
+                       state.kind == Mview_agg_state::MAX
+                   ? 2
+                   : 1;
+  return columns;
+}
+
+/* The table instance whose changed rows are applied by several sessions
+   (apply_delta_parallel), -1 if the daemon applies the batch alone: the
+   delta tables are WARP tables, the changes of the view are sums of the
+   changes of parts of the rows, one table instance has changes (the terms
+   of two changed instances join the changed rows of the one to those of
+   the other) and they are many. */
+static const size_t PARALLEL_BATCH_ROWS = 100000;
+
+int Daemon::parallel_instance(size_t view) const {
+  const Mview_def &def = views[view];
+  if (sv_apply_threads <= 1 || !rt[view].warp_delta || !def.delta_capable ||
+      snapshot_open)
+    return -1;
+  int found = -1;
+  for (size_t t = 0; t < def.tables.size(); t++) {
+    auto changes = batch.changes.tables.find(
+        table_key(def.tables[t].db, def.tables[t].table));
+    if (changes == batch.changes.tables.end() || changes->second.rows.empty())
+      continue;
+    if (found >= 0) return -1;
+    if (changes->second.rows.size() < 2 * PARALLEL_BATCH_ROWS) return -1;
+    found = static_cast<int>(t);
+  }
+  return found;
+}
+
+/**
+  Apply the changed rows of one table instance with several sessions.
+
+  The changed rows are taken by the sessions a batch of PARALLEL_BATCH_ROWS
+  at a time.  Every session loads its batches into a delta table of its
+  own (a temporary table is the table of one session), computes the terms
+  of the change of the groups from it, as apply_delta() does from the
+  delta table of the daemon, and gives the rows back: the change of a group
+  is the sum of its terms, they are inserted into gd by the daemon.  The
+  sessions read the base tables while the daemon has them locked (or the
+  view reads none), so they see what the daemon sees.
+
+  @param[out] rows     images loaded
+  @param[out] why_not  set when the images cannot be used (see fill_delta)
+*/
+bool Daemon::apply_delta_parallel(size_t view, size_t instance, int ordinal,
+                                  my_off_t pos, size_t *rows,
+                                  std::string *why_not, Sql_error *error) {
+  const Mview_def &def = views[view];
+  const View_rt &v = rt[view];
+  const size_t n = def.tables.size();
+  const Mview_table &table = def.tables[instance];
+  *rows = 0;
+  auto changes = batch.changes.tables.find(table_key(table.db, table.table));
+  if (changes == batch.changes.tables.end()) return false;
+  const size_t total = changes->second.rows.size();
+  const size_t batches = (total + PARALLEL_BATCH_ROWS - 1) / PARALLEL_BATCH_ROWS;
+  const size_t sessions = std::min<size_t>(sv_apply_threads, batches);
+
+  /* the statements of every session */
+  const std::string &delta = v.tmp_tables[instance];
+  std::vector<std::string> sources = base_sources(def);
+  sources[instance] = delta;
+  const std::string weight = "(1 * " + qi(table.alias) + ".`mv$sign`)";
+  const std::string select =
+      hex_select(agg_term(view, substitute(def, sources), weight, true),
+                 agg_term_columns(def));
+  const std::string timeout = std::to_string(sv_lock_wait_timeout);
+  const std::vector<std::string> setup = {
+      "SET NAMES utf8mb4",
+      "SET SESSION sql_log_bin = 0",
+      "SET SESSION sql_mode = ''",
+      "SET SESSION time_zone = '+00:00'",
+      "SET SESSION transaction_isolation = 'READ-COMMITTED'",
+      "SET SESSION autocommit = 0",
+      "SET SESSION lock_wait_timeout = " + timeout,
+      "SET SESSION warp_lock_wait_timeout = " + timeout,
+      "USE " + qi(def.db),
+      delta_table_sql(table, delta, true),
+  };
+
+  struct Shared {
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    std::atomic<size_t> images{0};
+    std::mutex mutex;
+    Sql_error error;
+    std::string why;
+    std::vector<std::vector<Result_row>> results;
+  } shared;
+  shared.results.resize(sessions);
+
+  auto work = [&](size_t me) {
+    my_thread_init();
+    int stack_base;
+    THD *session = make_session(&stack_base);
+    Sql_error mine;
+    std::string why;
+    bool bad = session == nullptr;
+    if (bad) {
+      mine.code = ER_OUT_OF_RESOURCES;
+      mine.message = "no session for the changed rows of a materialized view";
+    } else {
+      mview_set_maintenance_mode(session, true);
+      for (const std::string &sql : setup) {
+        if (exec_on(session, sql, &mine, nullptr, nullptr)) {
+          bad = true;
+          break;
+        }
+      }
+    }
+    while (!bad && !shared.failed.load() && !stop_requested.load()) {
+      const size_t at = shared.next.fetch_add(1);
+      if (at >= batches) break;
+      size_t images = 0;
+      bad = fill_delta_range(session, view, instance, delta, false, ordinal,
+                             pos, 0, at * PARALLEL_BATCH_ROWS,
+                             std::min(total, (at + 1) * PARALLEL_BATCH_ROWS),
+                             &images, &why, &mine);
+      shared.images.fetch_add(images);
+      if (!why.empty()) break;
+    }
+    if (!bad && why.empty() && !shared.failed.load() &&
+        !stop_requested.load())
+      bad = exec_rows_on(session, select, &mine, &shared.results[me]);
+    if (bad || !why.empty()) {
+      std::lock_guard<std::mutex> guard(shared.mutex);
+      if (bad && !shared.failed.load()) shared.error = mine;
+      if (!why.empty() && shared.why.empty()) shared.why = why;
+      if (bad) shared.failed.store(true);
+    }
+    if (session != nullptr) {
+      exec_on(session, "ROLLBACK", nullptr, nullptr, nullptr);
+      session->store_globals();
+      session->get_protocol_classic()->end_net();
+      session->release_resources();
+      Global_THD_manager::get_instance()->remove_thd(session);
+      delete session;
+    }
+    my_thread_end();
+  };
+
+  std::vector<std::thread> threads;
+  for (size_t i = 0; i < sessions; i++) threads.emplace_back(work, i);
+  for (std::thread &thread : threads) thread.join();
+  thd->store_globals();
+
+  *rows = shared.images.load();
+  if (shared.failed.load()) {
+    if (error != nullptr) *error = shared.error;
+    return true;
+  }
+  if (!shared.why.empty()) {
+    *why_not = shared.why;
+    return false;
+  }
+  if (stop_requested.load()) {
+    if (error != nullptr) {
+      error->code = ER_QUERY_INTERRUPTED;
+      error->message = "the materialized view daemon is stopping";
+    }
+    return true;
+  }
+  const std::string head = "INSERT INTO " + v.tmp_tables[n] + " VALUES ";
+  for (const std::vector<Result_row> &result : shared.results)
+    if (insert_rows(result, head, error)) return true;
+  st_parallel_applies.fetch_add(1);
+  return false;
+}
+
 bool Daemon::apply_delta(size_t view, const std::vector<size_t> &changed,
-                         Sql_error *error, Agg_outcome *outcome) {
+                         Sql_error *error, Agg_outcome *outcome,
+                         bool terms_done) {
   const Mview_def &def = views[view];
   const View_rt &v = rt[view];
   const size_t n = def.tables.size();
@@ -3895,7 +4187,9 @@ bool Daemon::apply_delta(size_t view, const std::vector<size_t> &changed,
     return false;
   }
 
-  for (unsigned mask = 1; mask < (1U << changed.size()); mask++) {
+  /* terms_done: the terms are in gd (apply_delta_parallel) */
+  for (unsigned mask = 1; !terms_done && mask < (1U << changed.size());
+       mask++) {
     std::vector<std::string> sources = base_sources(def);
     std::string weight;
     unsigned bits = 0;
@@ -4150,11 +4444,20 @@ bool Daemon::apply_agg_once(size_t view, Sql_error *error,
   for (size_t t = 0; t < v.tmp_tables.size(); t++) {
     const bool exists = t < n || (t < n + 3 && def.delta_capable) ||
                         (t == n + 3 && !def.group_exprs.empty());
-    if (exists && exec("DELETE FROM " + v.tmp_tables[t], error)) return true;
+    if (!exists) continue;
+    if (t < n ? clear_delta_table(view, def.tables[t], v.tmp_tables[t], error)
+              : exec("DELETE FROM " + v.tmp_tables[t], error))
+      return true;
   }
   std::vector<size_t> changed;
   size_t images = 0;
+  /* the changed rows of this table instance are loaded by several sessions */
+  const int parallel = parallel_instance(view);
   for (size_t t = 0; t < n; t++) {
+    if (static_cast<int>(t) == parallel) {
+      changed.push_back(t);
+      continue;
+    }
     size_t rows = 0;
     if (fill_delta(view, t, v.tmp_tables[t], false, ordinal, v.pos, 0, &rows,
                    why, error))
@@ -4172,8 +4475,20 @@ bool Daemon::apply_agg_once(size_t view, Sql_error *error,
       *outcome = Agg_outcome::NEED_PIN;
       return false;
     }
-    if (def.delta_capable ? apply_delta(view, changed, error, outcome)
-                          : apply_recompute(view, changed, error, outcome))
+    if (parallel >= 0) {
+      size_t rows = 0;
+      if (apply_delta_parallel(view, static_cast<size_t>(parallel), ordinal,
+                               v.pos, &rows, why, error))
+        return true;
+      if (!why->empty()) {
+        *outcome = Agg_outcome::NEED_REFRESH;
+        return false;
+      }
+      images += rows;
+    }
+    if (def.delta_capable
+            ? apply_delta(view, changed, error, outcome, parallel >= 0)
+            : apply_recompute(view, changed, error, outcome))
       return true;
     if (*outcome != Agg_outcome::DONE) {
       if (*outcome == Agg_outcome::NEED_REFRESH)
@@ -4296,8 +4611,7 @@ Apply_result Daemon::apply_batch(bool allow_defer) {
     for (size_t i = 0; i < views.size(); i++)
       if (views[i].is_aggregate && rt[i].maintained && !rt[i].needs_refresh &&
           position_usable(i) && reads_base_tables(i) && view_is_pinned(i) &&
-          rows_after_position(i) > 0 &&
-          rows_after_position(i) <= sv_full_refresh_threshold)
+          rows_after_position(i) > 0)
         order.push_back(i);
     for (size_t i = 0; i < views.size(); i++)
       if (join_where_needs_pin(i) && view_is_pinned(i)) order.push_back(i);
@@ -4358,10 +4672,9 @@ Apply_result Daemon::apply_batch(bool allow_defer) {
            the view: the position follows the reader, so that the file it
            names is not purged. */
         if (rows == 0 && v.pos_file == base_name(batch.end_file)) continue;
-        if (rows > sv_full_refresh_threshold) {
-          result = refresh_view(i, "more changed rows than "
-                                   "warp_mview_full_refresh_threshold");
-        } else if (allow_defer && rows > 0 && reads_base_tables(i) &&
+        /* The changes are always applied to the view, however many there
+           are: the view is not rebuilt because many rows changed. */
+        if (allow_defer && rows > 0 && reads_base_tables(i) &&
                    !view_is_pinned(i)) {
           deferred = true; /* waits for the base tables to be locked */
           continue;
@@ -4393,9 +4706,6 @@ Apply_result Daemon::apply_batch(bool allow_defer) {
       } else if (key_count == 0) {
         join_where_done(i);
         continue;
-      } else if (key_count > sv_full_refresh_threshold) {
-        result = refresh_view(i, "more changed keys than "
-                                 "warp_mview_full_refresh_threshold");
       } else if (join_where_needs_pin(i) && !view_is_pinned(i)) {
         if (!allow_defer) return Apply_result::REPIN;
         deferred = true; /* waits for the base tables to be locked */
@@ -4411,9 +4721,6 @@ Apply_result Daemon::apply_batch(bool allow_defer) {
                                "used");
     } else if (key_count == 0) {
       continue;
-    } else if (key_count > sv_full_refresh_threshold) {
-      result = refresh_view(i, "more changed keys than "
-                               "warp_mview_full_refresh_threshold");
     } else {
       result = apply_view(i, keys);
     }
@@ -4767,7 +5074,7 @@ SYS_VAR *warp_mview_system_variables[] = {
     MYSQL_SYSVAR(batch_rows),
     MYSQL_SYSVAR(batch_transactions),
     MYSQL_SYSVAR(in_list_chunk_size),
-    MYSQL_SYSVAR(full_refresh_threshold),
+    MYSQL_SYSVAR(apply_threads),
     MYSQL_SYSVAR(idle_wait_timeout),
     MYSQL_SYSVAR(lock_wait_timeout),
     MYSQL_SYSVAR(retry_limit),
@@ -4811,6 +5118,9 @@ SHOW_VAR warp_mview_status_variables[] = {
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_mview_full_refreshes", (char *)&warp_mview::show_full_refreshes,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Warp_mview_parallel_applies",
+     (char *)&warp_mview::show_parallel_applies, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"Warp_mview_apply_errors", (char *)&warp_mview::show_apply_errors,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Warp_mview_maintained_views", (char *)&warp_mview::show_views, SHOW_FUNC,

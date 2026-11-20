@@ -59,11 +59,10 @@ DELETE FROM b WHERE id = 4;
 SELECT COUNT(*) AS manual_has_b4 FROM mv_m WHERE bid = 4;
 
 --echo #
---echo # More changed keys than warp_mview_full_refresh_threshold: the views
---echo # are rebuilt
+--echo # Many changed keys: the changes are applied to the views, the views
+--echo # are not rebuilt
 --echo #
 --let $refreshes = `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes'`
-SET GLOBAL warp_mview_full_refresh_threshold = 10;
 SET GLOBAL warp_mview_in_list_chunk_size = 3;
 --disable_query_log
 INSERT INTO a WITH RECURSIVE n(x) AS (SELECT 100 UNION ALL SELECT x + 1 FROM n WHERE x < 199) SELECT x, x, CONCAT('n', x) FROM n;
@@ -73,15 +72,14 @@ INSERT INTO a WITH RECURSIVE n(x) AS (SELECT 100 UNION ALL SELECT x + 1 FROM n W
 --let $mview = mv_w
 --source suite/warp/include/mview_sync_check.inc
 --disable_query_log
-eval SELECT VARIABLE_VALUE - $refreshes >= 2 AS views_were_refreshed FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes';
+eval SELECT VARIABLE_VALUE - $refreshes AS views_were_refreshed FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Warp_mview_full_refreshes';
 --enable_query_log
---echo # below the threshold, with several IN lists per statement
+--echo # a few keys, with several IN lists per statement
 UPDATE a SET v = v + 1 WHERE id BETWEEN 100 AND 104;
 --let $mview = mv_i
 --source suite/warp/include/mview_sync_check.inc
 --let $mview = mv_w
 --source suite/warp/include/mview_sync_check.inc
-SET GLOBAL warp_mview_full_refresh_threshold = DEFAULT;
 SET GLOBAL warp_mview_in_list_chunk_size = DEFAULT;
 
 --echo #
