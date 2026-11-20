@@ -297,6 +297,15 @@ class warp_partition_write_lock {
       sql_print_warning("WARP: rows are written by a thread that is reading %s",
                         part_dir.c_str());
     }
+    /* The structure is only locked until the lock of the new partition is
+       held: no scan had the table locked at that moment, and a scan that
+       starts now finds the lock of the partition and waits for it.  The
+       partition is written without the lock of the structure, so the other
+       connections that load the table create their partitions meanwhile. */
+    if(structure_locked_ && locked_) {
+      set_->structure.unlock();
+      structure_locked_ = false;
+    }
   }
   ~warp_partition_write_lock() {
     if(locked_) lock_->unlock();
